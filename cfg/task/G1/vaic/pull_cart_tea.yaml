@@ -1,0 +1,114 @@
+# @package task
+defaults:
+  - base/hdmi-base
+  - _self_
+
+name: G1PullCart
+
+enable_cameras: false # student true, else false
+camera_width: 64
+camera_height: 36
+
+num_envs: 4096 # student 512, else 4096
+
+viewer:
+  env_spacing: 5.0
+  lookat: [0.5, -2.5, 0.8]
+  eye: [3, 2, 1.]
+
+terrain: plane
+
+robot:
+  name: g1
+  robot_type: g1_29dof_rubberhand-feet_box-eef_box-body_capsule
+
+command:
+  data_path: data/motion/g1/mirobotA/pull_cart
+  root_body_name: "pelvis"
+
+  # reset_range: [0, 100]
+  
+  replay_motion: False
+
+  pose_range:
+    y: [-0.01, 0.01]
+
+  object_asset_name: "cart"
+  object_body_name:  "board_deck"
+  object_joint_name: ["front_left_wheel_joint_0","front_right_wheel_joint_0","rear_left_wheel_joint_0","rear_right_wheel_joint_0", "front_left_wheel_joint_1","front_right_wheel_joint_1","rear_left_wheel_joint_1","rear_right_wheel_joint_1"]
+
+  object_pose_range:
+    y: [-0.01, 0.01]
+
+  contact_eef_body_name: ["right_wrist_yaw_link"]
+  contact_eef_pos_offset:
+    - [-0.05, 0.0, 0.0]  # right wrist
+  contact_target_pos_offset:
+    - [0.43, 0.10, 0.65]  # right wrist
+
+observation:
+  priv:
+    object_joint_pos:    {}
+    object_joint_vel:    {}
+    object_joint_torque: {}
+  object_:
+    object_pos_b:    {}
+    object_ori_b:    {}
+  object_geo_:
+    object_points:    {}
+  depth:
+    depth_camera:    {camera_name: "tiled_camera"}
+  vel_command:
+    ref_root_vel_future_b: {}
+    ref_contact_flag_future: {}
+
+randomization:
+  object_joint_randomization:
+    armature_range: [0.0, 0.01]
+
+    friction_range: [0.01, 0.1]
+    damping_range: [0.01, 0.1]
+
+  object_body_randomization:
+    static_dynamic_friction_ratio_range: [1.0, 2.0]
+    dynamic_friction_range: [0.3, 0.8]
+    restitution_range: [0.0, 0.2]
+    mass_range: [11.0, 13.0]
+    wheel_mass_range: [0.2, 0.4]
+  
+  body_scale:
+    name: "cart"
+    scale_range: [0.9, 1.1]
+    homogeneous_scale: true
+
+  push:
+    body_names: ["right_wrist_yaw_link"]
+
+
+termination:
+  cum_object_pos_error:     {min_steps: 5000}
+  cum_object_ori_error:     {min_steps: 5000}
+
+reward:
+  # tracking:
+  #   tracking_upper_body_pos(keypoint_pos_tracking_product):
+  #     body_names: [".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
+  #     weight: 0.5
+  #     sigma: 0.25
+  #   tracking_lower_body_pos(keypoint_pos_tracking_product):
+  #     body_names: [".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link"]
+  #     weight: 0.5
+  #     sigma: 0.5
+
+  #   tracking_upper_body_ori(keypoint_ori_tracking_product):
+  #     body_names: [".*_shoulder_pitch_link", ".*_elbow_link", ".*_wrist_yaw_link"]
+  #     weight: 0.5
+  #     sigma: 0.5
+  #   tracking_lower_body_ori(keypoint_ori_tracking_product):
+  #     body_names: [".*_hip_pitch_link", ".*_knee_link", ".*_ankle_roll_link"]
+  #     weight: 0.5
+  #     sigma: 1.0
+  feet:
+    feet_air_time:      {weight: 0.5, enabled: true, body_names: .*ankle_roll_link, thres: 0.3, soft_discount: 1.0}
+    feet_air_lift:      {weight: 0.5, enabled: true, body_names: .*ankle_roll_link, low_thres: 0.10, high_thres: 0.18, sigma: 1.0}
+    feet_contact:       {weight: 0.5, enabled: true, body_names: .*ankle_roll_link, sigma: 0.25}
