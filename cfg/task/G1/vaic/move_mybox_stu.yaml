@@ -23,7 +23,6 @@ robot:
   robot_type: g1_29dof_rubberhand-feet_box-eef_box-body_capsule
 
 command:
-  # data_path: data/motion/g1/mybox/box_1
   data_path: data/motion/g1/mirobotA/box_1
   root_body_name: "pelvis"
 
