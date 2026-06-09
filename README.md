@@ -5,7 +5,7 @@
 	<img alt="Website" src="https://img.shields.io/badge/Website-Visit-blue?style=flat&logo=google-chrome"/>
 </a>
 
-<a href="https://arxiv.org/abs/xxxx.xxxxx">
+<a href="https://arxiv.org/abs/2606.09286">
 	<img alt="Arxiv" src="https://img.shields.io/badge/Paper-Arxiv-b31b1b?style=flat&logo=arxiv"/>
 </a>
 
@@ -85,7 +85,7 @@ If you find our work useful for your research, please consider citing us:
 @article{li2026vaic,
   title = {VAIC: Vision-Guided Humanoid Agile Object Interaction Control via Decoupled Commands},
   author = {Li, Dongting and Wu, Qianyang and Chen, Xingyu and Li, Liang and Lin, Yuhang and Wu, Sikai and Zhang, Guoyao and Zhou, Mingliang and Xiang, Diyun and Zhang, Qiang and Xu, Renjing and Ma, Jianzhu},
-  journal = {arXiv preprint arXiv:xxxx.xxxxx},
+  journal = {arXiv preprint arXiv:2606.09286},
   year = {2026}
 }
 ```
