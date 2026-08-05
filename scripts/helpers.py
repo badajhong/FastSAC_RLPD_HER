@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import hydra
 import numpy as np
+import random
 import time
 import wandb
 import logging
@@ -114,8 +115,16 @@ class EpisodeStats:
         return self._episodes.item()
 
 
-def make_env_policy(cfg: DictConfig):
+def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     OmegaConf.set_struct(cfg, False)
+
+    # Environment imports and construction may run startup randomization. Seed
+    # every RNG first so independent training processes are reproducible.
+    seed = int(cfg.seed)
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+
     from active_adaptation.envs import SimpleEnv
     from torchrl.envs.transforms import TransformedEnv, Compose, InitTracker, VecNorm, StepCounter
     
@@ -131,7 +140,37 @@ def make_env_policy(cfg: DictConfig):
 
     base_env = SimpleEnv(cfg.task)
 
-    checkpoint_path = parse_checkpoint_path(cfg.checkpoint_path)
+    auto_resolve_replay = (
+        configure_replay
+        and cfg.algo.get("teacher_buffer_path", "__missing__") is None
+    )
+    checkpoint_path = parse_checkpoint_path(
+        cfg.checkpoint_path,
+        download_replay=auto_resolve_replay,
+        replay_filename=cfg.algo.get(
+            "teacher_buffer_filename", "teacher_replay_buffer.h5"
+        ),
+    )
+    if (
+        auto_resolve_replay
+        and checkpoint_path is not None
+    ):
+        # A relative basename such as ``checkpoint_final.pt`` has an empty
+        # dirname. Resolve it first so the adjacent H5 is still discovered.
+        search_root = os.path.dirname(os.path.abspath(checkpoint_path))
+        candidates = []
+        for root, _, files in os.walk(search_root):
+            if cfg.algo.teacher_buffer_filename in files:
+                candidates.append(os.path.join(root, cfg.algo.teacher_buffer_filename))
+        candidates.sort()
+        if len(candidates) > 1:
+            raise RuntimeError(
+                "Multiple teacher replay buffers were found beside the checkpoint; "
+                f"set algo.teacher_buffer_path explicitly: {candidates}"
+            )
+        if candidates:
+            cfg.algo.teacher_buffer_path = candidates[0]
+            print(colored(f"[Info]: Found teacher replay buffer: {candidates[0]}", "green"))
     if checkpoint_path is not None:
         state_dict = torch.load(checkpoint_path, weights_only=False)
     else:
@@ -178,6 +217,13 @@ def make_env_policy(cfg: DictConfig):
     if "policy" in state_dict.keys():
         print(colored("[Info]: Load policy from checkpoint.", "green"))
         policy.load_state_dict(state_dict["policy"])
+
+    if (
+        configure_replay
+        and cfg.algo.get("phase") == "finetune"
+        and hasattr(policy, "configure_offline_replay")
+    ):
+        policy.configure_offline_replay(cfg.algo.teacher_buffer_path)
     
     if hasattr(policy, "make_tensordict_primer"):
         primer = policy.make_tensordict_primer()
@@ -376,4 +422,3 @@ def plot_obs_histogram(
     plt.tight_layout()
     plt.savefig(os.path.join(os.path.dirname(__file__), "trajs_obs_hist.png"))
     plt.close()
-    

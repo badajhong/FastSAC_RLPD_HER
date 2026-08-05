@@ -54,16 +54,49 @@ def main(cfg: DictConfig):
     run.config.update(OmegaConf.to_container(cfg))
     
     default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-    run_idx = run.name.split("-")[-1]
+    # Recent W&B offline versions may leave ``run.name`` unset until the user
+    # assigns it; the stable run id is a safe local fallback.
+    run_idx = (run.name or run.id).split("-")[-1]
     run.name = f"{run_idx}-{default_run_name}"
     setproctitle(run.name)
 
+    os.makedirs(run.dir, exist_ok=True)
     cfg_save_path = os.path.join(run.dir, "cfg.yaml")
     OmegaConf.save(cfg, cfg_save_path)
     run.save(cfg_save_path, policy="now")
     run.save(os.path.join(run.dir, "config.yaml"), policy="now")
 
-    env, policy, vecnorm = make_env_policy(cfg)
+    env, policy, vecnorm = make_env_policy(cfg, configure_replay=True)
+
+    # Teacher FastSAC needs a device FIFO on every training rank. H5 itself is
+    # written only by the rank-0 checkpoint hook below.
+    requires_training_replay = (
+        hasattr(policy, "requires_training_replay")
+        and policy.requires_training_replay()
+    )
+    if (
+        cfg.algo.get("phase") == "train"
+        and hasattr(policy, "configure_teacher_replay")
+        and (
+            requires_training_replay
+            or (
+                aa.is_main_process()
+                and cfg.algo.get("save_teacher_buffer", False)
+            )
+        )
+    ):
+        replay_name = cfg.algo.teacher_buffer_filename
+        replay_path = os.path.join(run.dir, replay_name)
+        restore_path = None
+        if cfg.checkpoint_path is not None:
+            restore_path = cfg.algo.get("teacher_buffer_path")
+        elif cfg.algo.get("teacher_buffer_path") is not None:
+            raise ValueError(
+                "algo.teacher_buffer_path requires checkpoint_path for a "
+                "same-stage teacher replay resume."
+            )
+        policy.configure_teacher_replay(replay_path, restore_path=restore_path)
+        logging.info(f"Teacher replay buffer: {replay_path}")
 
     import inspect
     import shutil
@@ -88,6 +121,11 @@ def main(cfg: DictConfig):
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
     def save(policy, checkpoint_name: str, artifact: bool=False):
+        replay_snapshot_path = None
+        if hasattr(policy, "snapshot_teacher_replay"):
+            replay_snapshot_path = policy.snapshot_teacher_replay(
+                env.current_iter, checkpoint_name
+            )
         ckpt_path = os.path.join(run.dir, f"{checkpoint_name}.pt")
         state_dict = OrderedDict()
         state_dict["wandb"] = {"name": run.name, "id": run.id}
@@ -98,13 +136,28 @@ def main(cfg: DictConfig):
             state_dict["vecnorm"] = vecnorm.state_dict()
         torch.save(state_dict, ckpt_path)
         if artifact:
-            artifact = wandb.Artifact(
+            model_artifact = wandb.Artifact(
                 f"{type(env).__name__}-{type(policy).__name__}",
                 type="model"
             )
-            artifact.add_file(ckpt_path)
-            run.log_artifact(artifact)
+            model_artifact.add_file(ckpt_path)
+            run.log_artifact(model_artifact)
         run.save(ckpt_path, policy="now", base_path=run.dir)
+        if artifact and replay_snapshot_path is not None:
+            # Upload one closed, atomically replaced final snapshot. Periodic
+            # snapshots remain local and are overwritten at the next checkpoint.
+            run.save(replay_snapshot_path, policy="now", base_path=run.dir)
+        elif artifact and hasattr(policy, "get_offline_replay_path"):
+            # Keep the immutable teacher dataset reachable from a student
+            # FastSAC run too, so checkpoint_path=run:<student-run> can restart
+            # without separately specifying the original teacher run.
+            offline_replay_path = policy.get_offline_replay_path()
+            if offline_replay_path is not None:
+                run.save(
+                    offline_replay_path,
+                    policy="now",
+                    base_path=os.path.dirname(offline_replay_path),
+                )
         logging.info(f"Saved checkpoint to {str(ckpt_path)}")
 
     assert env.training
@@ -116,6 +169,10 @@ def main(cfg: DictConfig):
     # 4. --- Training Loop ---
     carry = env.reset()
     rollout_policy: TensorDictModuleBase = policy.get_rollout_policy("train")
+    interleaved_updates = (
+        hasattr(policy, "uses_interleaved_updates")
+        and policy.uses_interleaved_updates()
+    )
 
     with torch.inference_mode():
         tmp_carry = rollout_policy(carry.clone(False))
@@ -141,23 +198,53 @@ def main(cfg: DictConfig):
     env_frames = 0
     start_iter = env.current_iter
     for i in progress:
+        if hasattr(policy, "begin_transition_collection"):
+            policy.begin_transition_collection()
         rollout_start = time.perf_counter()
+        interleaved_training_time = 0.0
         with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
             torch.compiler.cudagraph_mark_step_begin() # for compiled policy
             env.set_progress(start_iter + i)
             for step in range(cfg.algo.train_every):
                 carry = rollout_policy(carry)
                 td, carry = env.step_and_maybe_reset(carry)
+                if interleaved_updates:
+                    update_start = time.perf_counter()
+                    # Replay tensors are ordinary device tensors, so gradients
+                    # can run here even though environment collection is under
+                    # inference mode.
+                    with torch.inference_mode(False), torch.enable_grad():
+                        policy.collect_environment_step(td, carry)
+                    interleaved_training_time += (
+                        time.perf_counter() - update_start
+                    )
+                elif hasattr(policy, "capture_timeout_final_observations"):
+                    # The first return still owns the transformed pre-reset
+                    # observation; ``carry`` has already been reset where done.
+                    policy.capture_timeout_final_observations(td, step)
                 td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
                 data_buf[:, step] = td
-            policy.critic(data_buf)
-            values = data_buf["state_value"]
-            data_buf["next", "state_value"] = torch.where(
-                data_buf["next", "done"],
-                values, # a walkaround to avoid storing the next states
-                torch.cat([values[:, 1:], policy.critic(carry.copy())["state_value"].unsqueeze(1)], dim=1)
+            if (
+                not interleaved_updates
+                and hasattr(policy, "capture_rollout_final_observation")
+            ):
+                policy.capture_rollout_final_observation(carry)
+            requires_value_bootstrap = (
+                not hasattr(policy, "requires_value_bootstrap")
+                or policy.requires_value_bootstrap()
             )
-        rollout_time = time.perf_counter() - rollout_start
+            if requires_value_bootstrap:
+                policy.critic(data_buf)
+                values = data_buf["state_value"]
+                data_buf["next", "state_value"] = torch.where(
+                    data_buf["next", "done"],
+                    values, # a walkaround to avoid storing the next states
+                    torch.cat([values[:, 1:], policy.critic(carry.copy())["state_value"].unsqueeze(1)], dim=1)
+                )
+        rollout_time = max(
+            time.perf_counter() - rollout_start - interleaved_training_time,
+            1e-9,
+        )
 
         episode_stats.add(data_buf)
         env_frames += data_buf.numel()
@@ -169,7 +256,9 @@ def main(cfg: DictConfig):
                 info[key] = torch.mean(v.float()).item()
         training_start = time.perf_counter()
         info.update(policy.train_op(data_buf))
-        training_time = time.perf_counter() - training_start
+        training_time = (
+            time.perf_counter() - training_start + interleaved_training_time
+        )
         info.update(env.extra)
         info.update(env.stats_ema)
 
@@ -211,4 +300,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

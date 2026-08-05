@@ -22,9 +22,14 @@
 
 import os
 import importlib
+from tensordict.nn import set_composite_lp_aggregate
+
+# Keep the current TorchRL contract explicitly.  Future TensorDict versions
+# otherwise change ProbabilisticActor log-prob keys from the aggregated
+# ``sample_log_prob`` tensor expected throughout VAIC to per-leaf keys.
+set_composite_lp_aggregate(True).set()
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 for file in os.listdir(dir_path):
     if file.endswith(".py") and file != "__init__.py":
         importlib.import_module(f".{file[:-3]}", __package__)
-

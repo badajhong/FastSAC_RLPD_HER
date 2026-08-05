@@ -539,7 +539,11 @@ class PPOVEL(TensorDictModuleBase):
             primers["adapt_hx"] = spec
         if hasattr(self, "temporal_depth_gru"):
             primers["depth_hx"] = depth_spec
-        return TensorDictPrimer(primers, reset_key="done")
+        # Each child spec already contains the environment batch dimension
+        # [num_envs, feature_dim].  Set the Composite shape to the parent batch
+        # instead of expanding the children a second time (which would create
+        # [num_envs, num_envs, feature_dim] and allocate many GiB).
+        return TensorDictPrimer(primers, reset_key="done", expand_specs=False)
 
     def get_rollout_policy(self, mode: str="train"):
         modules = []
@@ -712,6 +716,13 @@ class PPOVEL(TensorDictModuleBase):
                 minibatch[PRIV_PRED_KEY] = minibatch[PRIV_FEATURE_KEY].detach()
                 dist_student = self.actor_adapt.get_dist(minibatch)
                 adapt_loss = (dist_teacher.mean - dist_student.mean).square().mean()
+                if getattr(self, "actor_backend", None) == "hoi_fastsac_tanh_gaussian_v1":
+                    std_loss = (
+                        dist_teacher.scale.detach().log()
+                        - dist_student.scale.log()
+                    ).square().mean()
+                    adapt_loss = adapt_loss + std_loss
+                    info["adapt/std_loss"] = std_loss.detach()
 
                 self.opt_adapt_actor.zero_grad()
                 adapt_loss.backward()
@@ -795,6 +806,13 @@ class PPOVEL(TensorDictModuleBase):
                     dist_student = self.actor_adapt.get_dist(minibatch)
 
                     adapt_loss = (dist_teacher.mean - dist_student.mean).square().mean()
+                    if getattr(self, "actor_backend", None) == "hoi_fastsac_tanh_gaussian_v1":
+                        std_loss = (
+                            dist_teacher.scale.detach().log()
+                            - dist_student.scale.log()
+                        ).square().mean()
+                        adapt_loss = adapt_loss + std_loss
+                        info["adapt/std_loss"] = std_loss
 
                     self.opt_adapt_actor.zero_grad()
                     adapt_loss.backward()
@@ -1024,7 +1042,10 @@ class PPOVEL(TensorDictModuleBase):
         lr_policy = state_dict.get("lr_policy", None)
         if lr_policy is not None:
             self.lr_policy = lr_policy
-            for param_group in self.opt_policy.param_groups:
-                param_group["lr"] = self.lr_policy
+            # True FastSAC deliberately disables PPO's policy optimizer while
+            # retaining this loader for the unchanged VAIC module tree.
+            if isinstance(self.opt_policy, torch.optim.Optimizer):
+                for param_group in self.opt_policy.param_groups:
+                    param_group["lr"] = self.lr_policy
 
         return failed_keys

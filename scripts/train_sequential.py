@@ -40,6 +40,13 @@ CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
 def run_training_stage(cfg: DictConfig, return_queue: multiprocessing.Queue = None) -> str:
     OmegaConf.set_struct(cfg, False)
+
+    if cfg.algo.get("name") == "fastsac_vel":
+        raise RuntimeError(
+            "Off-policy FastSAC stages must use scripts/train.py. "
+            "scripts/train_sequential.py does not own the timeout/final-state, "
+            "GPU replay, or paired-H5 checkpoint hooks required for a correct run."
+        )
     
     print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
     app_launcher = AppLauncher(
@@ -69,7 +76,7 @@ def run_training_stage(cfg: DictConfig, return_queue: multiprocessing.Queue = No
 
     # 2. --- Environment and Policy Creation ---
     # `make_env_policy` will handle loading the checkpoint if `cfg.checkpoint_path` is set
-    env, policy, vecnorm = make_env_policy(cfg)
+    env, policy, vecnorm = make_env_policy(cfg, configure_replay=True)
 
     # Save policy source code for reproducibility
     source_path = inspect.getfile(policy.__class__)

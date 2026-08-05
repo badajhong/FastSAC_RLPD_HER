@@ -58,8 +58,28 @@ Teacher policy
 ```bash
 # train policy
 python scripts/train.py algo=ppo_vel_train task=G1/vaic/skateboard_tea
+
+# True HOI-style FastSAC teacher: stochastic actor, twin distributional Q,
+# entropy-temperature update, target Q, replay actor updates, and HOI's
+# 8 updates/vector-step cadence all train from the beginning (after its
+# default 10-step replay warm-up). Each environment step is inserted and
+# trained before the teacher selects the next action, matching HOI ordering.
+# VAIC observations/rewards/terminations and teacher->student distillation stay unchanged.
+# The GPU replay trains FastSAC immediately and is not cleared at iteration 5100;
+# paired H5 snapshots select only rows collected from iteration 5100 onward.
+python scripts/train.py algo=fastsac_vel_train task=G1/vaic/skateboard_tea
+# Same-stage resume restores model weights, active AdamW moments, counters, and
+# the dedicated replay-sampling RNG state (the simulator itself starts reset).
+# At/after the H5 gate it restores the exact matching export-eligible FIFO tail.
+# A checkpoint before the gate has no H5 by design, so its replay starts empty.
+# Old PPO-based fastsac_vel_train checkpoints are rejected by an algorithm marker.
+# total_frames is a new additional training budget after the resume.
+# For W&B exact replay resume, use the final checkpoint/H5 pair. Periodic H5
+# snapshots are overwritten locally and are not uploaded to W&B.
+python scripts/train.py algo=fastsac_vel_train task=G1/vaic/skateboard_tea checkpoint_path=run:<fastsac_vel_train-wandb-run-path>
 # evaluate policy
 python scripts/play.py algo=ppo_vel_train task=G1/vaic/skateboard_tea checkpoint_path=run:<wandb-run-path>
+python scripts/play.py algo=fastsac_vel_train task=G1/vaic/skateboard_tea checkpoint_path=run:<fastsac_vel_train-wandb-run-path>
 ```
 
 Student policy
@@ -67,6 +87,13 @@ Student policy
 ```bash
 # train policy
 python scripts/train.py algo=ppo_vel_finetune task=G1/vaic/skateboard_stu checkpoint_path=run:<student_wandb-run-path>
+# Train the student with 50% gated teacher H5 + 50% new online rollout data.
+# The checkpoint transfers the FastSAC teacher/Q weights and the already
+# distilled same-structure student actor; depth/adaptation + EMA keep VAIC logic.
+python scripts/train.py algo=fastsac_vel_finetune task=G1/vaic/skateboard_stu checkpoint_path=run:<fastsac_vel_train-wandb-run-path>
+# A final fastsac_vel_finetune run also carries the paired offline teacher
+# replay. Same-stage optimizer state is restored, while its online FIFO and the
+# environment rollout state intentionally begin empty/reset.
 # evaluate policy
 python scripts/play.py algo=ppo_vel_finetune task=G1/vaic/skateboard_stu checkpoint_path=run:<student_wandb-run-path>
 ```

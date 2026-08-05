@@ -87,14 +87,21 @@ def init_wandb(cfg):
     return run
 
 
-def parse_checkpoint_path(path: str=None):
+def parse_checkpoint_path(
+    path: str=None,
+    download_replay: bool=False,
+    replay_filename: str="teacher_replay_buffer.h5",
+):
     """
     Parse a checkpoint path from local or wandb.
     If `path` is of the form `run:<wandb_run_id>`, it will be downloaded from wandb.
     If `path` is of the form `run:<wandb_run_id>:<checkpoint_num>`, it will download the specific checkpoint.
 
     Args:
-        path (str or None): Path to a checkpoint. 
+        path (str or None): Path to a checkpoint.
+        download_replay (bool): Also download the teacher H5 for training
+            resume/finetuning. Evaluation and export leave this disabled.
+        replay_filename (str): Exact H5 basename to download with the model.
 
     Returns:
         str: Path to the checkpoint.
@@ -110,21 +117,32 @@ def parse_checkpoint_path(path: str=None):
         
         api = wandb.Api()
         run = api.run(run_path)
-        root = os.path.join(os.path.dirname(__file__), "wandb", run.name)
+        # A display name is mutable and may contain path separators. Cache by
+        # W&B's stable run id so different resumes cannot collide accidentally.
+        root = os.path.join(os.path.dirname(__file__), "wandb", run.id)
         os.makedirs(root, exist_ok=True)
 
         checkpoints = []
+        replay_files = []
         for file in run.files():
             print(file.name)
-            if "checkpoint" in file.name:
-                checkpoints.append(file)
+            basename = os.path.basename(file.name)
+            # Match the replay first: a user-selected replay basename is
+            # allowed to contain the word "checkpoint" and must never be
+            # mistaken for a model checkpoint.
+            if download_replay and basename == replay_filename:
+                replay_files.append(file)
+            elif basename.startswith("checkpoint_") and basename.endswith(".pt"):
+                suffix = basename[len("checkpoint_"):-3]
+                if suffix == "final" or suffix.isdigit():
+                    checkpoints.append(file)
             elif file.name == "files/cfg.yaml":
                 file.download(root, replace=True)
 
         def sort_by_time(file):
-            number_str = file.name[:-3].split("_")[-1]
+            number_str = os.path.basename(file.name)[:-3].split("_")[-1]
             if number_str == "final":
-                return 100000
+                return float("inf")
             else:
                 return int(number_str)
 
@@ -134,22 +152,29 @@ def parse_checkpoint_path(path: str=None):
         if target_checkpoint_num is not None:
             target_checkpoint = None
             for checkpoint in checkpoints:
-                number_str = checkpoint.name[:-3].split("_")[-1]
+                number_str = os.path.basename(checkpoint.name)[:-3].split("_")[-1]
                 if number_str == target_checkpoint_num:
                     target_checkpoint = checkpoint
                     break
             
             if target_checkpoint is None:
-                available_nums = [f.name[:-3].split("_")[-1] for f in checkpoints]
+                available_nums = [
+                    os.path.basename(f.name)[:-3].split("_")[-1]
+                    for f in checkpoints
+                ]
                 raise ValueError(f"Checkpoint {target_checkpoint_num} not found. Available checkpoints: {available_nums}")
             
             checkpoint = target_checkpoint
         else:
             # Use the latest checkpoint (existing behavior)
+            if not checkpoints:
+                raise ValueError(f"No model checkpoint was found in W&B run {run_path}")
             checkpoint = checkpoints[-1]
         
         path = os.path.join(root, checkpoint.name)
         print(f"Downloading checkpoint to {path}")
         checkpoint.download(root, replace=True)
+        for replay_file in replay_files:
+            print(f"Downloading teacher replay buffer {replay_file.name}")
+            replay_file.download(root, replace=True)
     return path
-
