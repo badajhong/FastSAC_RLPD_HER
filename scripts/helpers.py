@@ -115,8 +115,120 @@ class EpisodeStats:
         return self._episodes.item()
 
 
+def apply_teacher_replay_buffer_path_alias(cfg: DictConfig):
+    """Resolve the user-facing Stage-2 offline H5 path.
+
+    Hydra changes into its run directory before ``main`` executes. Resolve an
+    explicit CLI path against Hydra's original working directory so a relative
+    path entered from the repository root still points to the intended file.
+    Stage-1's compact learning FIFO is ephemeral and cannot be supplied here.
+    """
+    explicit_path = cfg.get("teacher_replay_buffer_path", None)
+    supports_teacher_replay = "teacher_buffer_path" in cfg.algo
+    internal_path = (
+        cfg.algo.get("teacher_buffer_path", None)
+        if supports_teacher_replay
+        else None
+    )
+    if explicit_path is None and internal_path is None:
+        return None
+    if not supports_teacher_replay:
+        raise ValueError(
+            "teacher_replay_buffer_path is only supported by an algorithm with "
+            "teacher replay support."
+        )
+    if cfg.algo.get("phase", None) == "train":
+        raise ValueError(
+            "Stage-1 fastsac_vel_train uses an ephemeral compact learning FIFO "
+            "and does not accept teacher_replay_buffer_path. Supply the H5 only "
+            "to fastsac_vel_finetune after collecting it in a separate process."
+        )
+    if cfg.get("checkpoint_path", None) is None:
+        raise ValueError(
+            "teacher_replay_buffer_path (or algo.teacher_buffer_path) must be "
+            "used with checkpoint_path so policy weights and replay provenance "
+            "come from the same saved training state."
+        )
+
+    def absolute_path(path):
+        path = os.path.expanduser(os.fspath(path))
+        return os.path.realpath(hydra.utils.to_absolute_path(path))
+
+    resolved_explicit = (
+        absolute_path(explicit_path) if explicit_path is not None else None
+    )
+    resolved_internal = (
+        absolute_path(internal_path) if internal_path is not None else None
+    )
+    selected_path = resolved_explicit or resolved_internal
+    if not os.path.isfile(selected_path):
+        raise FileNotFoundError(
+            f"Teacher replay buffer does not exist or is not a file: {selected_path}"
+        )
+
+    if (
+        resolved_explicit is not None
+        and resolved_internal is not None
+        and resolved_explicit != resolved_internal
+    ):
+        raise ValueError(
+            "Conflicting teacher replay paths: teacher_replay_buffer_path="
+            f"{resolved_explicit!r}, algo.teacher_buffer_path="
+            f"{resolved_internal!r}."
+        )
+
+    if explicit_path is not None:
+        cfg.teacher_replay_buffer_path = selected_path
+    cfg.algo.teacher_buffer_path = selected_path
+    return selected_path
+
+
+def apply_fastsac_buffer_steps(cfg: DictConfig):
+    """Derive the flat Stage-1 FastSAC FIFO size from an env-local horizon.
+
+    HOI expresses replay capacity as steps per vector environment, while VAIC's
+    device FIFO is flat. ``task.buffer_steps`` keeps the HOI-facing CLI and this
+    helper translates it to ``num_envs * buffer_steps`` before policy creation.
+    A null value preserves the explicit/default ``teacher_buffer_capacity``.
+    """
+    buffer_steps = cfg.task.get("buffer_steps", None)
+    if buffer_steps is None:
+        return None
+
+    supports_teacher_replay = "teacher_buffer_capacity" in cfg.algo
+    if not supports_teacher_replay or cfg.algo.get("phase", None) != "train":
+        raise ValueError(
+            "task.buffer_steps is only supported by Stage-1 FastSAC teacher "
+            "training."
+        )
+
+    num_envs = cfg.task.get("num_envs", None)
+    replay_shape = (
+        ("task.num_envs", num_envs),
+        ("task.buffer_steps", buffer_steps),
+    )
+    for name, value in replay_shape:
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if int(value) < 1:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+    capacity = int(num_envs) * int(buffer_steps)
+    cfg.algo.teacher_buffer_capacity = capacity
+    logging.info(
+        "FastSAC replay horizon: %d envs x %d steps = %d transitions.",
+        int(num_envs),
+        int(buffer_steps),
+        capacity,
+    )
+    return capacity
+
+
 def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     OmegaConf.set_struct(cfg, False)
+
+    if configure_replay:
+        apply_teacher_replay_buffer_path_alias(cfg)
 
     # Environment imports and construction may run startup randomization. Seed
     # every RNG first so independent training processes are reproducible.
@@ -126,7 +238,14 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     torch.manual_seed(seed)
 
     from active_adaptation.envs import SimpleEnv
-    from torchrl.envs.transforms import TransformedEnv, Compose, InitTracker, VecNorm, StepCounter
+    from torchrl.envs.transforms import (
+        TransformedEnv,
+        Compose,
+        InitTracker,
+        RenameTransform,
+        StepCounter,
+        VecNorm,
+    )
     
     policy_in_keys = cfg.algo.get("in_keys", ["policy", "priv"])
 
@@ -140,8 +259,13 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
 
     base_env = SimpleEnv(cfg.task)
 
+    replay_consumer = (
+        cfg.algo.get("phase", None) == "finetune"
+        or bool(cfg.algo.get("save_teacher_buffer", False))
+    )
     auto_resolve_replay = (
         configure_replay
+        and replay_consumer
         and cfg.algo.get("teacher_buffer_path", "__missing__") is None
     )
     checkpoint_path = parse_checkpoint_path(
@@ -187,6 +311,24 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     vecnorm = VecNorm(obs_keys, decay=0.9999)
     vecnorm(base_env.fake_tensordict())
 
+    raw_replay_observations = (
+        configure_replay
+        and bool(cfg.algo.get("sac_replay_raw_observations", False))
+        and cfg.algo.get("phase", None) in ("train", "finetune")
+    )
+    if raw_replay_observations:
+        raw_keys = [
+            ("_fastsac_raw", *key) if isinstance(key, tuple)
+            else ("_fastsac_raw", key)
+            for key in obs_keys
+        ]
+        # Copy before VecNorm. Inverting normalized rollout tensors later is
+        # not valid because current, next, and reset states can see different
+        # running-stat snapshots.
+        transform.append(RenameTransform(
+            obs_keys, raw_keys, create_copy=True
+        ))
+
     if "vecnorm" in state_dict.keys():
         print(colored("[Info]: Load VecNorm from checkpoint.", "green"))
         vecnorm.load_state_dict(state_dict["vecnorm"])
@@ -213,6 +355,14 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         device=base_env.device,
         env=env
     )
+
+    if raw_replay_observations:
+        if not hasattr(policy, "configure_replay_vecnorm"):
+            raise TypeError(
+                "sac_replay_raw_observations requires a policy with "
+                "configure_replay_vecnorm()."
+            )
+        policy.configure_replay_vecnorm(vecnorm)
     
     if "policy" in state_dict.keys():
         print(colored("[Info]: Load policy from checkpoint.", "green"))

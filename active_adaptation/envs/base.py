@@ -163,6 +163,16 @@ class _Env(EnvBase):
                 "stats": {
                     "episode_len": UnboundedContinuous([self.num_envs, 1]),
                     "success": UnboundedContinuous([self.num_envs, 1]),
+                    # Neutral cause flags for algorithms that distinguish a
+                    # real time limit from command/motion completion. They are
+                    # deliberately stats (not done-spec leaves), so reset
+                    # behavior remains exactly unchanged.
+                    "episode_time_limit": Binary(
+                        1, [self.num_envs, 1], dtype=bool, device=self.device
+                    ),
+                    "command_finished": Binary(
+                        1, [self.num_envs, 1], dtype=bool, device=self.device
+                    ),
                 },
             },
             shape=[self.num_envs]
@@ -383,11 +393,18 @@ class _Env(EnvBase):
         if len(env_ids):
             self._reset_idx(env_ids)
             self.scene.reset(env_ids)
+            # State writes invalidate link/sensor caches.  Refresh them without
+            # advancing physics so reset callbacks and the first policy input
+            # observe the pose that was just written, rather than the previous
+            # episode's state.
+            if self.backend in ("isaac", "mujoco"):
+                self.sim.forward()
+                self.scene.update(0.0)
         self.episode_length_buf[env_ids] = 0
         for callback in self._reset_callbacks:
             callback(env_ids)
         tensordict = TensorDict({}, self.num_envs, device=self.device)
-        tensordict.update(self.observation_spec.zero())
+        self._compute_observation(tensordict)
         end = time.perf_counter()
         self.reset_time = self.reset_time * self._stats_ema_decay + (end - start)
         return tensordict
@@ -499,9 +516,15 @@ class _Env(EnvBase):
 
         self._compute_observation(tensordict)
         terminated = self._compute_termination()
-        truncated = (self.episode_length_buf >= self.max_episode_length).unsqueeze(1)
+        episode_time_limit = (
+            self.episode_length_buf >= self.max_episode_length
+        ).unsqueeze(1)
+        command_finished = torch.zeros_like(episode_time_limit)
         if hasattr(self.command_manager, "finished"):
-            truncated = truncated | self.command_manager.finished
+            command_finished = self.command_manager.finished.bool()
+        truncated = episode_time_limit | command_finished
+        self.stats["episode_time_limit"][:] = episode_time_limit
+        self.stats["command_finished"][:] = command_finished
         tensordict.set("terminated", terminated)
         tensordict.set("truncated", truncated)
         tensordict.set("done", terminated | truncated)

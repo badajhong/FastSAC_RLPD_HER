@@ -20,7 +20,7 @@ class root_ang_vel_history(Observation):
         buffer_size = max(history_steps) + 1
         self.buffer = torch.zeros((self.num_envs, buffer_size, 3), device=self.device)
         self.update()
-    
+
     def reset(self, env_ids):
         root_ang_vel_b = self.asset.data.root_ang_vel_b[env_ids]
         root_ang_vel_b = root_ang_vel_b.unsqueeze(1).expand(-1, self.buffer.shape[1], -1)
@@ -54,7 +54,7 @@ class projected_gravity_history(Observation):
         if self.noise_std > 0:
             projected_gravity_b = random_noise(projected_gravity_b, self.noise_std)
             projected_gravity_b = projected_gravity_b / projected_gravity_b.norm(dim=-1, keepdim=True)
-        self.buffer[env_ids] = self.asset.data.projected_gravity_b[env_ids].unsqueeze(1)
+        self.buffer[env_ids] = projected_gravity_b
     
     def update(self):
         projected_gravity_b = self.asset.data.projected_gravity_b
@@ -102,10 +102,14 @@ class joint_pos_history(Observation):
         self.joint_pos[:, substep % 2] = self.asset.data.joint_pos[:, self.joint_ids]
     
     def reset(self, env_ids):
-        joint_pos = self.asset.data.joint_pos[env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)]
-        joint_pos2 = self.asset.data.joint_pos[env_ids][:, self.joint_ids]
-        assert torch.allclose(joint_pos, joint_pos2)
-        self.buffer[env_ids] = self.asset.data.joint_pos[env_ids.unsqueeze(1), self.joint_ids.unsqueeze(0)].unsqueeze(1)
+        joint_pos = self.asset.data.joint_pos[env_ids][:, self.joint_ids]
+        joint_pos = joint_pos.unsqueeze(1).expand(-1, self.buffer_size, -1)
+        if self.noise_std > 0:
+            joint_pos = random_noise(joint_pos, self.noise_std)
+        self.buffer[env_ids] = joint_pos
+        self.joint_pos[env_ids] = self.asset.data.joint_pos[env_ids][
+            :, self.joint_ids
+        ].unsqueeze(1)
     
     def update(self):
         self.buffer = self.buffer.roll(1, 1)
@@ -322,12 +326,23 @@ class depth_camera(Observation):
                 size=(len(env_ids),),
                 dtype=torch.int32
             )
-    
-    def compute(self) -> torch.Tensor:
-        depth_img_current = self.camera.data.output["distance_to_image_plane"].squeeze(-1)  # [N, H, W]
-        # update the depth image buffer with the latest depth image
+
+        # A reset observation must contain the current camera frame in every
+        # possible delay slot.  Updating only reset environments preserves the
+        # temporal history of environments that are still running.
+        depth_img_current = self.camera.data.output[
+            "distance_to_image_plane"
+        ].squeeze(-1)
+        self.depth_img_buffer[env_ids] = depth_img_current[env_ids].unsqueeze(1)
+
+    def update(self):
+        depth_img_current = self.camera.data.output[
+            "distance_to_image_plane"
+        ].squeeze(-1)
         self.depth_img_buffer = self.depth_img_buffer.roll(1, dims=1)
         self.depth_img_buffer[:, 0] = depth_img_current
+
+    def compute(self) -> torch.Tensor:
         depth_img = self.depth_img_buffer[self.all_env_ids, self.delay, :, :]
         
         # TODO: does not support different kernel sizes and sigmas for each environment, not batched

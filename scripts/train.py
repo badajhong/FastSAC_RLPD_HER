@@ -22,7 +22,13 @@ from tensordict.nn import TensorDictModuleBase
 from tensordict import TensorDict
 
 # local import
-from helpers import make_env_policy, EpisodeStats, evaluate
+from helpers import (
+    EpisodeStats,
+    apply_fastsac_buffer_steps,
+    apply_teacher_replay_buffer_path_alias,
+    evaluate,
+    make_env_policy,
+)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -36,7 +42,9 @@ CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
-    
+    apply_teacher_replay_buffer_path_alias(cfg)
+    apply_fastsac_buffer_steps(cfg)
+
     print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
     app_launcher = AppLauncher(
         OmegaConf.to_container(cfg.app),
@@ -68,15 +76,16 @@ def main(cfg: DictConfig):
 
     env, policy, vecnorm = make_env_policy(cfg, configure_replay=True)
 
-    # Teacher FastSAC needs a device FIFO on every training rank. H5 itself is
-    # written only by the rank-0 checkpoint hook below.
+    # Replay-producing algorithms need their live FIFO on every training rank.
+    # H5 itself is written only by the rank-0 checkpoint hook below.  Capability
+    # checks are intentional: PPO-BC/DAgger is a finetune phase but also trains
+    # Q from replay and exports teacher-executed transitions.
     requires_training_replay = (
         hasattr(policy, "requires_training_replay")
         and policy.requires_training_replay()
     )
     if (
-        cfg.algo.get("phase") == "train"
-        and hasattr(policy, "configure_teacher_replay")
+        hasattr(policy, "configure_teacher_replay")
         and (
             requires_training_replay
             or (
@@ -96,7 +105,15 @@ def main(cfg: DictConfig):
                 "same-stage teacher replay resume."
             )
         policy.configure_teacher_replay(replay_path, restore_path=restore_path)
-        logging.info(f"Teacher replay buffer: {replay_path}")
+        if cfg.algo.get("phase") == "train" and not cfg.algo.get(
+            "save_teacher_buffer", False
+        ):
+            logging.info(
+                "Stage-1 FastSAC uses a device-only compact learning replay; "
+                "no teacher H5 will be written."
+            )
+        else:
+            logging.info(f"Teacher replay buffer: {replay_path}")
 
     import inspect
     import shutil
@@ -176,7 +193,18 @@ def main(cfg: DictConfig):
 
     with torch.inference_mode():
         tmp_carry = rollout_policy(carry.clone(False))
-        tmp_td, _ = env.step_and_maybe_reset(tmp_carry.clone(False))
+        # This warm-up step fixes rollout buffer shapes, but it also advances
+        # the physical simulator.  Keep its returned state as the first real
+        # carry so policy observations cannot lag one control step behind the
+        # robot/reference state.
+        tmp_td, carry = env.step_and_maybe_reset(tmp_carry.clone(False))
+        if interleaved_updates:
+            # Stage-1 replay has already consumed one-step raw aliases. Keep
+            # them only in carry; retaining them in the N x T diagnostics
+            # rollout would duplicate a large fraction of observation memory.
+            tmp_td = tmp_td.exclude(
+                "_fastsac_raw", ("next", "_fastsac_raw")
+            )
         tmp_td["next"] = tmp_td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
 
     N = env.num_envs
@@ -207,6 +235,17 @@ def main(cfg: DictConfig):
             env.set_progress(start_iter + i)
             for step in range(cfg.algo.train_every):
                 carry = rollout_policy(carry)
+                actuator_context = None
+                if hasattr(policy, "capture_q_actuator_context"):
+                    # Delay/alpha may be resampled by step_and_maybe_reset for
+                    # completed rows. Snapshot the Q-only context while it still
+                    # belongs to the action and transition being collected.
+                    actuator_context = policy.capture_q_actuator_context()
+                if (
+                    not interleaved_updates
+                    and hasattr(policy, "record_rollout_q_actuator_context")
+                ):
+                    policy.record_rollout_q_actuator_context(actuator_context)
                 td, carry = env.step_and_maybe_reset(carry)
                 if interleaved_updates:
                     update_start = time.perf_counter()
@@ -214,14 +253,23 @@ def main(cfg: DictConfig):
                     # can run here even though environment collection is under
                     # inference mode.
                     with torch.inference_mode(False), torch.enable_grad():
-                        policy.collect_environment_step(td, carry)
+                        policy.collect_environment_step(
+                            td, carry, actuator_context
+                        )
                     interleaved_training_time += (
                         time.perf_counter() - update_start
                     )
-                elif hasattr(policy, "capture_timeout_final_observations"):
+                elif hasattr(policy, "capture_truncation_final_observations"):
                     # The first return still owns the transformed pre-reset
-                    # observation; ``carry`` has already been reset where done.
-                    policy.capture_timeout_final_observations(td, step)
+                    # timeout observation; ``carry`` has already reset that
+                    # row. The environment also labels command completion as
+                    # truncated, but FastSAC treats it as a non-bootstrapping
+                    # task terminal and therefore needs no final-state capture.
+                    policy.capture_truncation_final_observations(td, step)
+                if interleaved_updates:
+                    td = td.exclude(
+                        "_fastsac_raw", ("next", "_fastsac_raw")
+                    )
                 td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
                 data_buf[:, step] = td
             if (

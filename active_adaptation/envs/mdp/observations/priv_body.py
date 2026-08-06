@@ -136,6 +136,18 @@ class root_linvel_b(Observation):
     
     def reset(self, env_ids: torch.Tensor):
         self.ema.reset(env_ids)
+        # The simulator reset writes the motion's non-zero root velocity. Seed
+        # the EMA with that physical value so the returned reset observation is
+        # real, rather than zero/stale from the previous episode.
+        root_lin_vel_w = self.asset.data.root_lin_vel_w[env_ids]
+        self.ema.sum[env_ids] = root_lin_vel_w.unsqueeze(1)
+        self.ema.cnt[env_ids] = 1.0
+        self.ema.ema = self.ema.sum / self.ema.cnt.clamp_min(1.0)
+        if self.yaw_only:
+            quat = yaw_quat(self.asset.data.root_quat_w[env_ids]).unsqueeze(1)
+        else:
+            quat = self.asset.data.root_quat_w[env_ids].unsqueeze(1)
+        self.quat[env_ids] = quat
     
     def post_step(self, substep):
         self.ema.update(self.asset.data.root_lin_vel_w)

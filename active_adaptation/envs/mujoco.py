@@ -40,6 +40,7 @@ class MJArticulationData:
     
     joint_stiffness: ArrayType = None
     joint_damping: ArrayType = None
+    soft_joint_pos_limits: ArrayType = None
 
     body_pos_w: ArrayType = None
     body_quat_w: ArrayType = None
@@ -128,6 +129,7 @@ class MJArticulation:
 
         joint_qposadr = []
         joint_qveladr = []
+        joint_ranges = []
         for i in range(self.mj_model.nu):
             actuator = self.mj_model.actuator(i)
             if actuator.trntype == mujoco.mjtTrn.mjTRN_JOINT:
@@ -136,6 +138,10 @@ class MJArticulation:
                 self.joint_names_mjc.append(joint.name)
                 joint_qposadr.append(self.mj_model.jnt_qposadr[joint_id])
                 joint_qveladr.append(self.mj_model.jnt_dofadr[joint_id])
+                if self.mj_model.jnt_limited[joint_id]:
+                    joint_ranges.append(self.mj_model.jnt_range[joint_id].copy())
+                else:
+                    joint_ranges.append(np.array([-np.inf, np.inf]))
         
         if not set(self.joint_names_isaac) == set(self.joint_names_mjc):
             warnings.warn(
@@ -154,6 +160,7 @@ class MJArticulation:
         self.body_adrs = np.array(body_adrs)
         self.joint_qposadr = np.array(joint_qposadr)
         self.joint_qveladr = np.array(joint_qveladr)
+        self.joint_ranges = np.asarray(joint_ranges)[self._jnt_mjc2isaac]
         
         # read/write mujoco data in isaac order
         self.body_adrs_read = self.body_adrs[self._body_mjc2isaac]
@@ -190,6 +197,9 @@ class MJArticulation:
             default_inertia=diag_inertia.diag_embed().flatten(1)[None],
             joint_stiffness=joint_stiffness[None],
             joint_damping=joint_damping[None],
+            soft_joint_pos_limits=torch.as_tensor(
+                self.joint_ranges, dtype=torch.float32
+            )[None],
             applied_torque=torch.zeros(1, self.num_joints),
             # batch_size=[1]
         )
@@ -474,6 +484,10 @@ class MJSim:
 
     def has_gui(self):
         return True
+
+    def forward(self):
+        """Refresh MuJoCo kinematics after direct reset-state writes."""
+        mujoco.mj_forward(self.mj_model, self.mj_data)
 
     def step(self, render: bool=False):
         mujoco.mj_step(self.mj_model, self.mj_data)

@@ -67,6 +67,27 @@ class JointPosition(ActionManager):
         self.default_joint_pos = self.asset.data.default_joint_pos.clone()
         self.offset = torch.zeros_like(self.default_joint_pos)
 
+        # Motion-tracking commands expose references in dataset joint order.
+        # Cache the mapping once so reset can initialize delayed action history
+        # to a safe reference target instead of the robot default pose.
+        self.reference_joint_indices = None
+        dataset = getattr(self.env.command_manager, "dataset", None)
+        if dataset is not None:
+            missing = [
+                name for name in self.joint_names
+                if name not in dataset.joint_names
+            ]
+            if missing:
+                raise ValueError(
+                    "Motion dataset cannot seed the reset action buffer; "
+                    f"missing controlled joints: {missing}"
+                )
+            self.reference_joint_indices = torch.tensor(
+                [dataset.joint_names.index(name) for name in self.joint_names],
+                dtype=torch.long,
+                device=self.device,
+            )
+
         with torch.device(self.device):
             action_buf_hist = max((self.max_delay - 1) // self.env.decimation + 1, 3)
             self.action_buf = torch.zeros(
@@ -94,6 +115,19 @@ class JointPosition(ActionManager):
         )
         self.alpha[env_ids] = alpha
 
+        if self.reference_joint_indices is not None and hasattr(
+            self.env.command_manager, "current_ref_motion"
+        ):
+            ref_joint_pos = self.env.command_manager.current_ref_motion.joint_pos[
+                env_ids
+            ][:, self.reference_joint_indices]
+            default_joint_pos = self.default_joint_pos[env_ids][:, self.joint_ids]
+            ref_action = (
+                ref_joint_pos - default_joint_pos
+            ) / self.action_scaling
+            self.applied_action[env_ids] = ref_action
+            self.action_buf[env_ids] = ref_action.unsqueeze(-1)
+
     def __call__(self, action: torch.Tensor, substep: int):
         if substep == 0:
             if isinstance(action, TensorDictBase):
@@ -116,5 +150,11 @@ class JointPosition(ActionManager):
 
         pos_target = self.default_joint_pos + self.offset
         pos_target[:, self.joint_ids] += self.applied_action * self.action_scaling
+        limits = self.asset.data.soft_joint_pos_limits[:, self.joint_ids]
+        pos_target[:, self.joint_ids] = torch.clamp(
+            pos_target[:, self.joint_ids],
+            min=limits[..., 0],
+            max=limits[..., 1],
+        )
         self.asset.set_joint_position_target(pos_target)
         

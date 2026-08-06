@@ -22,6 +22,21 @@ class _history(Observation):
     def update(self):
         self._buffer = self._buffer.roll(1, 1)
         self._buffer[:, 0] = self.obs_this_step
+
+    def reset(self, env_ids):
+        """Fill reset histories from the reset pose without rolling other envs."""
+        if len(env_ids) == 0:
+            return
+        non_reset = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        non_reset[env_ids] = False
+        saved_buffer = self._buffer[non_reset].clone()
+        saved_current = self.obs_this_step[non_reset].clone()
+        # Dynamic dispatch computes this history's value from current physics.
+        self.update()
+        reset_value = self._buffer[env_ids, 0].clone()
+        self._buffer[env_ids] = reset_value.unsqueeze(1)
+        self._buffer[non_reset] = saved_buffer
+        self.obs_this_step[non_reset] = saved_current
     
     def compute(self):
         return self._buffer[:, self.history_steps].reshape(self.num_envs, -1)
@@ -45,6 +60,12 @@ class joint_pos_history_amp(_history):
     
     def post_step(self, substep):
         self.joint_pos[:, substep % 2] = self.asset.data.joint_pos[:, self.joint_ids]
+
+    def reset(self, env_ids):
+        joint_pos = self.asset.data.joint_pos[env_ids][:, self.joint_ids]
+        self.joint_pos[env_ids] = joint_pos.unsqueeze(1)
+        self.obs_this_step[env_ids] = joint_pos
+        self._buffer[env_ids] = joint_pos.unsqueeze(1)
     
     def update(self):
         joint_pos = self.joint_pos.mean(1)
@@ -70,6 +91,12 @@ class joint_vel_history_amp(_history):
     
     def post_step(self, substep):
         self.joint_vel[:, substep % 2] = self.asset.data.joint_vel[:, self.joint_ids]
+
+    def reset(self, env_ids):
+        joint_vel = self.asset.data.joint_vel[env_ids][:, self.joint_ids]
+        self.joint_vel[env_ids] = joint_vel.unsqueeze(1)
+        self.obs_this_step[env_ids] = joint_vel
+        self._buffer[env_ids] = joint_vel.unsqueeze(1)
 
     def update(self):
         joint_vel = self.joint_vel.mean(1)

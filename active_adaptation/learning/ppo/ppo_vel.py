@@ -571,7 +571,16 @@ class PPOVEL(TensorDictModuleBase):
             modules.append(self.adapt_ema)
             modules.append(self.actor_adapt)
 
-        out_keys = ["sample_log_prob", "action"] + self.dist_keys
+        # PPO actors request rollout log-probabilities, while the FastSAC actor
+        # deliberately does not produce them. Select the key only when the
+        # configured actor actually exposes it; TensorDictSequential rejects
+        # unavailable selected outputs during construction.
+        out_keys = ["action"] + self.dist_keys
+        rollout_actor = (
+            self.actor if self.cfg.phase == "train" else self.actor_adapt
+        )
+        if "sample_log_prob" in rollout_actor.out_keys:
+            out_keys.insert(0, "sample_log_prob")
         if self.cfg.adapt_module == "gru" and mode == "train":
             out_keys.append(("next", "adapt_hx"))
         if has_depth and mode == "train":
@@ -716,7 +725,10 @@ class PPOVEL(TensorDictModuleBase):
                 minibatch[PRIV_PRED_KEY] = minibatch[PRIV_FEATURE_KEY].detach()
                 dist_student = self.actor_adapt.get_dist(minibatch)
                 adapt_loss = (dist_teacher.mean - dist_student.mean).square().mean()
-                if getattr(self, "actor_backend", None) == "hoi_fastsac_tanh_gaussian_v1":
+                if getattr(self, "actor_backend", None) in {
+                    "hoi_fastsac_tanh_gaussian_v1",
+                    "vaic_fastsac_tanh_gaussian_v2",
+                }:
                     std_loss = (
                         dist_teacher.scale.detach().log()
                         - dist_student.scale.log()
@@ -774,10 +786,23 @@ class PPOVEL(TensorDictModuleBase):
                 total_loss.backward()
 
                 all_params = list(self.adapt_module.parameters())
+                depth_grad_norm = torch.zeros((), device=self.device)
                 if self.cfg.use_object_adapt:
                     all_params += list(self.object_adapt.parameters())
                 if hasattr(self, "temporal_depth_gru"):
-                    all_params += list(self.temporal_depth_gru.parameters())
+                    depth_params = list(self.temporal_depth_gru.parameters())
+                    # Measure the depth CNN/GRU contribution without modifying
+                    # its gradients before the joint adaptation clip.
+                    depth_parameter_norms = [
+                        parameter.grad.detach().norm(2)
+                        for parameter in depth_params
+                        if parameter.grad is not None
+                    ]
+                    if depth_parameter_norms:
+                        depth_grad_norm = torch.stack(
+                            depth_parameter_norms
+                        ).norm(2)
+                    all_params += depth_params
                 opt_adapt_grad_norm = nn.utils.clip_grad_norm_(all_params, self.cfg.max_grad_norm)
                 self.opt_adapt.step()
 
@@ -785,6 +810,8 @@ class PPOVEL(TensorDictModuleBase):
                 info["adapt/priv_loss"] = priv_loss
                 info["adapt/object_loss"] = object_loss
                 info["adapt/grad_norm"] = opt_adapt_grad_norm
+                if hasattr(self, "temporal_depth_gru"):
+                    info["adapt/depth_grad_norm"] = depth_grad_norm
                 info["adapt/priv_feature_norm"] = minibatch[PRIV_FEATURE_KEY].norm(p=2, dim=-1).mean()
                 info["adapt/priv_pred_norm"] = minibatch[PRIV_PRED_KEY].norm(p=2, dim=-1).mean()
                 if "_depth_feature" in minibatch.keys():
@@ -806,7 +833,10 @@ class PPOVEL(TensorDictModuleBase):
                     dist_student = self.actor_adapt.get_dist(minibatch)
 
                     adapt_loss = (dist_teacher.mean - dist_student.mean).square().mean()
-                    if getattr(self, "actor_backend", None) == "hoi_fastsac_tanh_gaussian_v1":
+                    if getattr(self, "actor_backend", None) in {
+                        "hoi_fastsac_tanh_gaussian_v1",
+                        "vaic_fastsac_tanh_gaussian_v2",
+                    }:
                         std_loss = (
                             dist_teacher.scale.detach().log()
                             - dist_student.scale.log()
@@ -840,6 +870,19 @@ class PPOVEL(TensorDictModuleBase):
             soft_copy_(self.temporal_depth_gru, self.temporal_depth_gru_ema, 0.04)
         
         infos = {k: v.mean().item() for k, v in sorted(torch.stack(infos).items())}
+        if hasattr(self, "temporal_depth_gru"):
+            with torch.no_grad():
+                squared_error = torch.zeros((), device=self.device)
+                parameter_count = 0
+                for online, ema in zip(
+                    self.temporal_depth_gru.parameters(),
+                    self.temporal_depth_gru_ema.parameters(),
+                ):
+                    squared_error += (online - ema).square().sum()
+                    parameter_count += online.numel()
+                infos["adapt/depth_ema_rms_gap"] = (
+                    squared_error / max(parameter_count, 1)
+                ).sqrt().item()
         return infos
     
     @torch.no_grad()

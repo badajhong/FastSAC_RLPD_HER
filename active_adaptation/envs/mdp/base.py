@@ -170,7 +170,14 @@ class Observation(Generic[CT], _RegistryMixin):
         pass
 
     def reset(self, env_ids: torch.Tensor):
-        """Called after episode termination"""
+        """Refresh stateless/cache-only observations after an environment reset.
+
+        Temporal observations override this method and reset only their selected
+        environments.  The default is appropriate for observations whose
+        ``update`` method merely rebuilds a cache from the current simulator and
+        command state.
+        """
+        self.update()
 
     def debug_draw(self):
         """Called at each step **after** simulation, if GUI is enabled"""

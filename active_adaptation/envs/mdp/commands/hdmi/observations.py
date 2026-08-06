@@ -354,14 +354,20 @@ class ref_contact_pos_b(RobotObjectTrackObservation):
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
             self.episodic_noise[env_ids] = torch.empty(len(env_ids), *self.command_manager.contact_target_pos_w.shape[1:], device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+        self._refresh(env_ids)
     
     def update(self):
-        if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.command_manager.contact_target_pos_w).clamp(-3, 3) * self.noise_std
+        self._refresh(torch.arange(self.num_envs, device=self.device))
 
-        ref_contact_target_pos_w = self.command_manager.contact_target_pos_w # shape: [num_envs, n, 3]
-        robot_root_pos_w = self.command_manager.robot_root_pos_w[:, None, :] # shape: [num_envs, 1, 3]
-        robot_root_quat_w = self.command_manager.robot_root_quat_w[:, None, :] # shape: [num_envs, 1, 4]
+    def _refresh(self, env_ids):
+        if self.noise_std > 0.0:
+            self.step_noise[env_ids] = torch.randn_like(
+                self.command_manager.contact_target_pos_w[env_ids]
+            ).clamp(-3, 3) * self.noise_std
+
+        ref_contact_target_pos_w = self.command_manager.contact_target_pos_w[env_ids]
+        robot_root_pos_w = self.command_manager.robot_root_pos_w[env_ids, None, :]
+        robot_root_quat_w = self.command_manager.robot_root_quat_w[env_ids, None, :]
 
         if self.yaw_only:
             robot_root_quat_w = yaw_quat(robot_root_quat_w)
@@ -370,7 +376,11 @@ class ref_contact_pos_b(RobotObjectTrackObservation):
         if self.noise_std > 0.0:
             noise = torch.randn_like(ref_contact_pos_b).clamp(-1, 1) * self.noise_std
             ref_contact_pos_b += noise
-        self.ref_contact_pos_b = ref_contact_pos_b + self.episodic_noise + self.step_noise
+        self.ref_contact_pos_b[env_ids] = (
+            ref_contact_pos_b
+            + self.episodic_noise[env_ids]
+            + self.step_noise[env_ids]
+        )
 
     def compute(self):
         return self.ref_contact_pos_b.view(self.num_envs, -1)
@@ -410,16 +420,26 @@ class object_xy_b(RobotObjectTrackObservation):
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
             self.episodic_noise[env_ids] = torch.empty(len(env_ids), 2, device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+        self._refresh(env_ids)
 
     def update(self):
+        self._refresh(torch.arange(self.num_envs, device=self.device))
+
+    def _refresh(self, env_ids):
         if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.object_xy_b).clamp(-3, 3) * self.noise_std
-        object_pos_w = self.command_manager.object.data.root_link_pos_w # shape: [num_envs, 3]
-        robot_root_pos_w = self.command_manager.robot_root_pos_w # shape: [num_envs, 3]
-        robot_root_quat_w = self.command_manager.robot_root_quat_w # shape: [num_envs, 4]
+            self.step_noise[env_ids] = torch.randn_like(
+                self.object_xy_b[env_ids]
+            ).clamp(-3, 3) * self.noise_std
+        object_pos_w = self.command_manager.object.data.root_link_pos_w[env_ids]
+        robot_root_pos_w = self.command_manager.robot_root_pos_w[env_ids]
+        robot_root_quat_w = self.command_manager.robot_root_quat_w[env_ids]
         robot_root_quat_w = yaw_quat(robot_root_quat_w)
 
-        self.object_xy_b = quat_apply_inverse(robot_root_quat_w, object_pos_w - robot_root_pos_w)[:, :2] + self.episodic_noise + self.step_noise
+        self.object_xy_b[env_ids] = (
+            quat_apply_inverse(robot_root_quat_w, object_pos_w - robot_root_pos_w)[:, :2]
+            + self.episodic_noise[env_ids]
+            + self.step_noise[env_ids]
+        )
 
     def compute(self):
         return self.object_xy_b.view(self.num_envs, -1)
@@ -440,17 +460,27 @@ class object_heading_b(RobotObjectTrackObservation):
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
             self.episodic_noise[env_ids] = torch.empty(len(env_ids), 1, device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+        self._refresh(env_ids)
 
     def update(self):
+        self._refresh(torch.arange(self.num_envs, device=self.device))
+
+    def _refresh(self, env_ids):
         if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.object_yaw_b).clamp(-3, 3) * self.noise_std
-        object_quat_w = self.command_manager.object.data.root_link_quat_w # shape: [num_envs, 4]
-        robot_root_quat_w = self.command_manager.robot_root_quat_w # shape: [num_envs, 4]
+            self.step_noise[env_ids] = torch.randn_like(
+                self.object_yaw_b[env_ids]
+            ).clamp(-3, 3) * self.noise_std
+        object_quat_w = self.command_manager.object.data.root_link_quat_w[env_ids]
+        robot_root_quat_w = self.command_manager.robot_root_quat_w[env_ids]
 
         object_yaw_w = yaw_from_quat(object_quat_w)
         robot_root_yaw_w = yaw_from_quat(robot_root_quat_w)
         
-        self.object_yaw_b = wrap_to_pi(object_yaw_w - robot_root_yaw_w)[:, None] + self.episodic_noise + self.step_noise
+        self.object_yaw_b[env_ids] = (
+            wrap_to_pi(object_yaw_w - robot_root_yaw_w)[:, None]
+            + self.episodic_noise[env_ids]
+            + self.step_noise[env_ids]
+        )
 
     def compute(self):
         object_heading_b = torch.cat([torch.cos(self.object_yaw_b), torch.sin(self.object_yaw_b)], dim=-1).view(self.num_envs, -1)
@@ -665,14 +695,20 @@ class ref_contact2_pos_b(RobotObjectTrackObservation):
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
             self.episodic_noise[env_ids] = torch.empty(len(env_ids), *self.command_manager.contact2_target_pos_w.shape[1:], device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+        self._refresh(env_ids)
     
     def update(self):
-        if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.command_manager.contact2_target_pos_w).clamp(-3, 3) * self.noise_std
+        self._refresh(torch.arange(self.num_envs, device=self.device))
 
-        ref_contact_target_pos_w = self.command_manager.contact2_target_pos_w # shape: [num_envs, n, 3]
-        robot_root_pos_w = self.command_manager.robot_root_pos_w[:, None, :] # shape: [num_envs, 1, 3]
-        robot_root_quat_w = self.command_manager.robot_root_quat_w[:, None, :] # shape: [num_envs, 1, 4]
+    def _refresh(self, env_ids):
+        if self.noise_std > 0.0:
+            self.step_noise[env_ids] = torch.randn_like(
+                self.command_manager.contact2_target_pos_w[env_ids]
+            ).clamp(-3, 3) * self.noise_std
+
+        ref_contact_target_pos_w = self.command_manager.contact2_target_pos_w[env_ids]
+        robot_root_pos_w = self.command_manager.robot_root_pos_w[env_ids, None, :]
+        robot_root_quat_w = self.command_manager.robot_root_quat_w[env_ids, None, :]
 
         if self.yaw_only:
             robot_root_quat_w = yaw_quat(robot_root_quat_w)
@@ -681,7 +717,11 @@ class ref_contact2_pos_b(RobotObjectTrackObservation):
         if self.noise_std > 0.0:
             noise = torch.randn_like(ref_contact_pos_b).clamp(-1, 1) * self.noise_std
             ref_contact_pos_b += noise
-        self.ref_contact_pos_b = ref_contact_pos_b + self.episodic_noise + self.step_noise
+        self.ref_contact_pos_b[env_ids] = (
+            ref_contact_pos_b
+            + self.episodic_noise[env_ids]
+            + self.step_noise[env_ids]
+        )
 
     def compute(self):
         return self.ref_contact_pos_b.view(self.num_envs, -1)
@@ -722,16 +762,26 @@ class object2_xy_b(RobotObjectTrackObservation):
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
             self.episodic_noise[env_ids] = torch.empty(len(env_ids), 2, device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+        self._refresh(env_ids)
 
     def update(self):
+        self._refresh(torch.arange(self.num_envs, device=self.device))
+
+    def _refresh(self, env_ids):
         if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.object_xy_b).clamp(-3, 3) * self.noise_std
-        object_pos_w = self.command_manager.object2.data.root_link_pos_w # shape: [num_envs, 3]
-        robot_root_pos_w = self.command_manager.robot_root_pos_w # shape: [num_envs, 3]
-        robot_root_quat_w = self.command_manager.robot_root_quat_w # shape: [num_envs, 4]
+            self.step_noise[env_ids] = torch.randn_like(
+                self.object_xy_b[env_ids]
+            ).clamp(-3, 3) * self.noise_std
+        object_pos_w = self.command_manager.object2.data.root_link_pos_w[env_ids]
+        robot_root_pos_w = self.command_manager.robot_root_pos_w[env_ids]
+        robot_root_quat_w = self.command_manager.robot_root_quat_w[env_ids]
         robot_root_quat_w = yaw_quat(robot_root_quat_w)
 
-        self.object_xy_b = quat_apply_inverse(robot_root_quat_w, object_pos_w - robot_root_pos_w)[:, :2] + self.episodic_noise + self.step_noise
+        self.object_xy_b[env_ids] = (
+            quat_apply_inverse(robot_root_quat_w, object_pos_w - robot_root_pos_w)[:, :2]
+            + self.episodic_noise[env_ids]
+            + self.step_noise[env_ids]
+        )
 
     def compute(self):
         return self.object_xy_b.view(self.num_envs, -1)
@@ -752,17 +802,27 @@ class object2_heading_b(RobotObjectTrackObservation):
     def reset(self, env_ids):
         if self.episodic_noise_std > 0.0:
             self.episodic_noise[env_ids] = torch.empty(len(env_ids), 1, device=self.device).uniform_(-1, 1) * self.episodic_noise_std
+        self._refresh(env_ids)
 
     def update(self):
+        self._refresh(torch.arange(self.num_envs, device=self.device))
+
+    def _refresh(self, env_ids):
         if self.noise_std > 0.0:
-            self.step_noise = torch.randn_like(self.object_yaw_b).clamp(-3, 3) * self.noise_std
-        object_quat_w = self.command_manager.object2.data.root_link_quat_w # shape: [num_envs, 4]
-        robot_root_quat_w = self.command_manager.robot_root_quat_w # shape: [num_envs, 4]
+            self.step_noise[env_ids] = torch.randn_like(
+                self.object_yaw_b[env_ids]
+            ).clamp(-3, 3) * self.noise_std
+        object_quat_w = self.command_manager.object2.data.root_link_quat_w[env_ids]
+        robot_root_quat_w = self.command_manager.robot_root_quat_w[env_ids]
 
         object_yaw_w = yaw_from_quat(object_quat_w)
         robot_root_yaw_w = yaw_from_quat(robot_root_quat_w)
         
-        self.object_yaw_b = wrap_to_pi(object_yaw_w - robot_root_yaw_w)[:, None] + self.episodic_noise + self.step_noise
+        self.object_yaw_b[env_ids] = (
+            wrap_to_pi(object_yaw_w - robot_root_yaw_w)[:, None]
+            + self.episodic_noise[env_ids]
+            + self.step_noise[env_ids]
+        )
 
     def compute(self):
         object_heading_b = torch.cat([torch.cos(self.object_yaw_b), torch.sin(self.object_yaw_b)], dim=-1).view(self.num_envs, -1)

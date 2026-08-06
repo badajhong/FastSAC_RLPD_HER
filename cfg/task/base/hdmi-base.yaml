@@ -11,6 +11,9 @@ viewer:
 terrain: plane
 
 num_envs: 4096
+# Optional Stage-1 FastSAC replay horizon per vector environment. When set,
+# train.py derives algo.teacher_buffer_capacity = num_envs * buffer_steps.
+buffer_steps: null
 max_episode_length: 1000
 
 sim:

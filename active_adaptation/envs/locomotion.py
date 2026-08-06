@@ -5,6 +5,7 @@ from isaaclab.utils import configclass
 
 import active_adaptation
 from active_adaptation.envs.base import _Env
+from active_adaptation.utils.tensordict import zero_tensordict_rows_
 
 class SimpleEnv(_Env):
     def __init__(self, cfg):
@@ -279,7 +280,9 @@ class SimpleEnv(_Env):
             # sim_cfg.physx.gpu_max_rigid_contact_count = 2**21
             # sim_cfg.physx.gpu_max_rigid_patch_count = 2**21
             sim_cfg.physx.gpu_found_lost_pairs_capacity = 2538320*5 # 2**20
-            sim_cfg.physx.gpu_found_lost_aggregate_pairs_capacity = 61999079*4 + 2**24 # 2**26
+            # Skateboard scenes with 4096 environments require about 490M
+            # aggregate pairs. Use the next power of two to leave some headroom.
+            sim_cfg.physx.gpu_found_lost_aggregate_pairs_capacity = 2**29
             sim_cfg.physx.gpu_total_aggregate_pairs_capacity = 2**23*5
             sim_cfg.physx.enable_stabilization = False
             # sim_cfg.physx.gpu_collision_stack_size = 2**25
@@ -340,7 +343,7 @@ class SimpleEnv(_Env):
                 init_root_state, 
                 env_ids=env_ids
             )
-        self.stats[env_ids] = 0.
+        zero_tensordict_rows_(self.stats, env_ids)
 
     def render(self, mode: str="human"):
         # look_at_env_id = self.lookat_env_i
@@ -397,5 +400,3 @@ class SimpleEnv(_Env):
                     size=1.0,
                     color=(1.0, 0.0, 0.0, 0.5)  # red with transparency
                 )
-
-

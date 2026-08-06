@@ -20,6 +20,9 @@ eval_render: false
 save_interval: 300
 seed: 0
 checkpoint_path: null
+# Optional explicit teacher H5 used with checkpoint_path. This top-level alias
+# is copied to algo.teacher_buffer_path before checkpoint/replay resolution.
+teacher_replay_buffer_path: null
 vecnorm: ${oc.select:algo.vecnorm,train}
 
 camera_follow: true

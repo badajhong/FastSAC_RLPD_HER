@@ -236,8 +236,30 @@ class RobotTracking(Command):
             return torch.ones(self.num_envs, 1, dtype=bool, device=self.device)
         return (self.t >= self.motion_len).unsqueeze(1)
 
+    def reset(self, env_ids: torch.Tensor):
+        """Refresh reset references without advancing unaffected environments.
+
+        ``update`` materializes references from the current ``t`` and then
+        increments it.  During a partial reset, rewind the other environments by
+        one frame before invoking the existing polymorphic update path.  Their
+        net time advance is therefore zero, while reset environments advance
+        exactly once from their newly sampled phase.
+        """
+        if len(env_ids) == 0:
+            return
+        non_reset = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        non_reset[env_ids] = False
+        saved_t = self.t[non_reset].clone()
+        self.t[non_reset] = (saved_t - 1).clamp_min(0)
+        self._reset_refresh = True
+        try:
+            self.update()
+        finally:
+            self._reset_refresh = False
+            self.t[non_reset] = saved_t
+
     def update(self):
-        if hasattr(self, "motion_frames"):
+        if hasattr(self, "motion_frames") and not getattr(self, "_reset_refresh", False):
             motion_frame = {}
             motion_frame["body_pos_w"] = self.asset.data.body_link_pos_w.cpu()
             motion_frame["body_quat_w"] = self.asset.data.body_link_quat_w.cpu()
@@ -770,7 +792,7 @@ class RobotObjectTracking(RobotTracking):
 
     def update(self):
         super().update()
-        if hasattr(self, "motion_frames"):
+        if hasattr(self, "motion_frames") and not getattr(self, "_reset_refresh", False):
             motion_frame = self.motion_frames[-1]
             # add object data to the motion frame
             object_pos_w = self.object.data.body_link_pos_w[:, self.object_body_id_asset].cpu()
@@ -823,7 +845,14 @@ class RobotObjectTracking(RobotTracking):
                 self.object2_joint_pos = self.object2.data.joint_pos[:, self.object2_joint_idx_asset]
                 self.object2_joint_vel = self.object2.data.joint_vel[:, self.object2_joint_idx_asset]
 
-        idx = (self.motion_starts + self.t).unsqueeze(1) + self.future_steps.unsqueeze(0)
+        # ``RobotTracking.update`` has already advanced ``t`` after building
+        # ``future_ref_motion``.  Index contact labels from that same pre-
+        # increment frame so contact flags align exactly with pose references.
+        reference_t = (self.t - 1).clamp_min(0)
+        idx = (
+            (self.motion_starts + reference_t).unsqueeze(1)
+            + self.future_steps.unsqueeze(0)
+        )
         idx.clamp_max_(self.motion_ends.unsqueeze(1) - 1)
         self.ref_object_contact_future = self._object_contact[idx]
         self.ref_body_contact_future = self._body_contact[idx]
