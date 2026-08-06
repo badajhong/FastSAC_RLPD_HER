@@ -33,7 +33,10 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     PPOBCDaggerFinetuneConfig,
     _valid_teacher_action_rows,
 )
-from active_adaptation.learning.ppo.fastsac_vel import TEACHER_REPLAY_FIELDS
+from active_adaptation.learning.ppo.fastsac_vel import (
+    BCDaggerOfflineReplayH5,
+    TEACHER_REPLAY_FIELDS,
+)
 
 
 EXPECTED_DAGGER_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
@@ -81,6 +84,14 @@ def test_config_store_registers_exact_student_observation_surface():
     assert dagger.dagger_actor_huber_delta == pytest.approx(1.0)
     assert dagger.dagger_action_clip == pytest.approx(20.0)
     assert dagger.dagger_batch_size == 4096
+    assert dagger.dagger_replay_raw_observations is True
+    assert set(dagger.replay_raw_observation_keys) == {
+        VEL_CMD_KEY,
+        OBS_KEY,
+        OBS_PRIV_KEY,
+        CMD_KEY,
+    }
+    assert DEPTH_KEY not in dagger.replay_raw_observation_keys
     assert dagger.save_teacher_buffer is True
     assert dagger.q_num_atoms > 1
     assert dagger.q_v_min < dagger.q_v_max
@@ -395,6 +406,124 @@ def test_timeout_uses_true_final_state_while_command_completion_is_terminal():
     assert policy._last_truncation_finals_used == 1
 
 
+def test_dagger_transition_ring_uses_raw_current_next_and_timeout_final():
+    policy = _bare_policy(train_every=2)
+    policy.q_actor_keys = ["actor_obs"]
+    policy.q_critic_keys = ["critic_obs"]
+    policy._q_actor_dim = 1
+    policy._q_critic_dim = 1
+    policy.action_dim = 1
+    policy._replay_vecnorm_keys = {"actor_obs", "critic_obs"}
+    policy._scalarize_q_reward = lambda reward: reward.sum(dim=-1)
+    policy._rollout_final_batch = {
+        "next_observations": torch.tensor([[999.0]]),
+        "next_critic_observations": torch.tensor([[1999.0]]),
+    }
+    policy._truncation_final_batches = [
+        {
+            "indices": torch.tensor([0]),
+            "next_observations": torch.tensor([[777.0]]),
+            "next_critic_observations": torch.tensor([[1777.0]]),
+        }
+    ]
+    done = torch.tensor([[[True], [False]]])
+    rollout = TensorDict(
+        {
+            # Main fields are post-VecNorm and deliberately very different.
+            "actor_obs": torch.tensor([[[1.0], [2.0]]]),
+            "critic_obs": torch.tensor([[[11.0], [12.0]]]),
+            "_fastsac_raw": TensorDict(
+                {
+                    "actor_obs": torch.tensor([[[101.0], [102.0]]]),
+                    "critic_obs": torch.tensor([[[111.0], [112.0]]]),
+                },
+                batch_size=[1, 2],
+            ),
+            ACTION_KEY: torch.zeros(1, 2, 1),
+            TEACHER_ACTION_KEY: torch.zeros(1, 2, 1),
+            TEACHER_ACTION_VALID_KEY: torch.ones(1, 2, dtype=torch.bool),
+            IS_STUDENT_ACTION_KEY: torch.zeros(1, 2, dtype=torch.bool),
+            "step_count": torch.tensor([[[6], [7]]]),
+            "next": TensorDict(
+                {
+                    "reward": torch.zeros(1, 2, 1),
+                    "done": done,
+                    "terminated": torch.zeros_like(done),
+                    "discount": torch.ones(1, 2, 1),
+                    "stats": TensorDict(
+                        {
+                            "episode_time_limit": done,
+                            "command_finished": torch.zeros_like(done),
+                        },
+                        batch_size=[1, 2],
+                    ),
+                },
+                batch_size=[1, 2],
+            ),
+        },
+        batch_size=[1, 2],
+    )
+
+    chunks = list(policy._dagger_transition_chunks(rollout))
+
+    assert torch.equal(chunks[0]["observations"], torch.tensor([[101.0]]))
+    assert torch.equal(chunks[1]["observations"], torch.tensor([[102.0]]))
+    # Timeout uses the captured pre-reset final state, not step 1/reset state.
+    assert torch.equal(chunks[0]["next_observations"], torch.tensor([[777.0]]))
+    # Last non-timeout row uses the raw rollout carry captured after the loop.
+    assert torch.equal(chunks[1]["next_observations"], torch.tensor([[999.0]]))
+
+
+def test_dagger_sample_time_normalization_is_once_and_non_mutating():
+    policy = _bare_policy()
+    policy.q_actor_keys = ["normalized", "latent"]
+    policy.q_critic_keys = ["critic"]
+    policy._q_actor_widths = [2, 1]
+    policy._q_critic_widths = [2]
+    policy._replay_vecnorm_keys = {"normalized", "critic"}
+    object.__setattr__(
+        policy,
+        "_replay_vecnorm",
+        SimpleNamespace(
+            eps=1e-4,
+            loc={
+                "normalized": torch.tensor([10.0, 20.0]),
+                "critic": torch.tensor([100.0, 200.0]),
+            },
+            scale={
+                "normalized": torch.tensor([2.0, 4.0]),
+                "critic": torch.tensor([10.0, 20.0]),
+            },
+        ),
+    )
+    batch = {
+        "observations": torch.tensor([[12.0, 24.0, 7.0]]),
+        "next_observations": torch.tensor([[8.0, 12.0, 9.0]]),
+        "critic_observations": torch.tensor([[110.0, 220.0]]),
+        "next_critic_observations": torch.tensor([[90.0, 160.0]]),
+        "actions": torch.ones(1, 1),
+    }
+    original = {key: value.clone() for key, value in batch.items()}
+
+    prepared = policy._prepare_dagger_learning_batch(batch)
+
+    assert torch.equal(
+        prepared["observations"], torch.tensor([[1.0, 1.0, 7.0]])
+    )
+    assert torch.equal(
+        prepared["next_observations"], torch.tensor([[-1.0, -2.0, 9.0]])
+    )
+    assert torch.equal(
+        prepared["critic_observations"], torch.tensor([[1.0, 1.0]])
+    )
+    assert torch.equal(
+        prepared["next_critic_observations"], torch.tensor([[-1.0, -2.0]])
+    )
+    assert torch.equal(prepared["actions"], batch["actions"])
+    for key, value in original.items():
+        assert torch.equal(batch[key], value)
+
+
 class _NoTrainingReplay:
     def __init__(self):
         self.size = 0
@@ -472,6 +601,7 @@ def test_train_op_never_calls_ppo_and_exports_only_teacher_executed_rows():
 
 def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
     path = tmp_path / "teacher_replay_buffer.h5"
+    fingerprint = "sha256:" + "a" * 64
     replay = _DaggerTeacherReplayBuffer(
         path,
         capacity=4,
@@ -483,6 +613,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
         replay_id="paired-replay",
         actor_obs_keys=["a", "b"],
         critic_obs_keys=["c"],
+        vecnorm_fingerprint=fingerprint,
     )
     rows = {
         "observations": torch.arange(8, dtype=torch.float32).reshape(4, 2),
@@ -512,6 +643,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
         replay_id="paired-replay",
         actor_obs_keys=["a", "b"],
         critic_obs_keys=["c"],
+        vecnorm_fingerprint=fingerprint,
     )
     restored.restore(path, expected_metadata=metadata)
 
@@ -520,8 +652,92 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
     assert torch.equal(restored.data["actions"], rows["actions"])
     assert metadata["actor_backend"].startswith("vaic_ppo_")
     assert metadata["replay_observation_semantics"] == (
-        "normalized_frozen_vecnorm_v1"
+        "raw_pre_vecnorm_sample_current_v1"
     )
+    assert metadata["format_version"] == 2
+    assert metadata["vecnorm_fingerprint"] == fingerprint
+
+    offline = BCDaggerOfflineReplayH5(
+        path,
+        actor_dim=2,
+        critic_dim=3,
+        action_dim=1,
+        expected_actor_obs_keys=["a", "b"],
+        expected_critic_obs_keys=["c"],
+        expected_vecnorm_fingerprint=fingerprint,
+    )
+    assert offline.size == 4
+    assert offline.observations_pre_normalized is False
+    assert torch.equal(offline.data["actions"], rows["actions"])
+    with pytest.raises(ValueError, match="fingerprint"):
+        BCDaggerOfflineReplayH5(
+            path,
+            actor_dim=2,
+            critic_dim=3,
+            action_dim=1,
+            expected_vecnorm_fingerprint="sha256:" + "f" * 64,
+        )
+
+
+def test_stage2_accepts_legacy_normalized_dagger_h5_but_rejects_mixed_schema(
+    tmp_path,
+):
+    import h5py
+
+    path = tmp_path / "teacher_replay_buffer.h5"
+    fingerprint = "sha256:" + "b" * 64
+    replay = _DaggerTeacherReplayBuffer(
+        path,
+        capacity=2,
+        actor_dim=1,
+        critic_dim=1,
+        action_dim=1,
+        seed=0,
+        device="cpu",
+        actor_obs_keys=["actor"],
+        critic_obs_keys=["critic"],
+        vecnorm_fingerprint=fingerprint,
+    )
+    replay.append(
+        {
+            "observations": torch.tensor([[1.0], [2.0]]),
+            "critic_observations": torch.tensor([[3.0], [4.0]]),
+            "actions": torch.zeros(2, 1),
+            "rewards": torch.zeros(2),
+            "dones": torch.zeros(2, dtype=torch.bool),
+            "truncations": torch.zeros(2, dtype=torch.bool),
+            "discounts": torch.ones(2),
+            "next_observations": torch.tensor([[5.0], [6.0]]),
+            "next_critic_observations": torch.tensor([[7.0], [8.0]]),
+        }
+    )
+    replay.snapshot(1, "checkpoint_1")
+    with h5py.File(path, "r+") as h5:
+        h5.attrs["format_version"] = 1
+        h5.attrs["replay_observation_semantics"] = (
+            "normalized_frozen_vecnorm_v1"
+        )
+        del h5.attrs["vecnorm_fingerprint"]
+
+    legacy = BCDaggerOfflineReplayH5(
+        path,
+        actor_dim=1,
+        critic_dim=1,
+        action_dim=1,
+        expected_actor_obs_keys=["actor"],
+        expected_critic_obs_keys=["critic"],
+    )
+    assert legacy.observations_pre_normalized is True
+
+    with h5py.File(path, "r+") as h5:
+        h5.attrs["format_version"] = 2
+    with pytest.raises(ValueError, match="Unsupported.*schema"):
+        BCDaggerOfflineReplayH5(
+            path,
+            actor_dim=1,
+            critic_dim=1,
+            action_dim=1,
+        )
 
 
 class _TinyTwinC51(nn.Module):

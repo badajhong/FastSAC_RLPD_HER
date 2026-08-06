@@ -299,6 +299,99 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         state_dict = torch.load(checkpoint_path, weights_only=False)
     else:
         state_dict = {}
+
+    # Stage-2 can now warm-start directly from the dedicated PPO-BC DAgger
+    # checkpoint. Resolve this before constructing transforms/policy because
+    # the source determines the actor adapter and Q action coordinates.
+    if (
+        cfg.algo.get("phase", None) == "finetune"
+        and str(cfg.algo.get("_target_", "")).endswith(".FastSACVelFinetune")
+    ):
+        policy_state = state_dict.get("policy", {})
+        configured_source = str(
+            cfg.algo.get("finetune_checkpoint_source", "auto")
+        )
+        detected_algorithm = policy_state.get("training_algorithm")
+        detected_backend = policy_state.get("actor_backend")
+        if configured_source == "auto":
+            if detected_algorithm == "vaic_ppo_bc_dagger_student_v1":
+                configured_source = "bc_dagger"
+            elif detected_backend == "vaic_fastsac_bc_dagger_adapter_v1":
+                configured_source = "bc_dagger"
+            else:
+                configured_source = "fastsac"
+        if configured_source not in ("fastsac", "bc_dagger"):
+            raise ValueError(
+                "algo.finetune_checkpoint_source must be auto, fastsac, or "
+                f"bc_dagger; got {configured_source!r}"
+            )
+        cfg.algo.finetune_checkpoint_source = configured_source
+        if configured_source == "bc_dagger":
+            direct_dagger_transfer = (
+                detected_algorithm == "vaic_ppo_bc_dagger_student_v1"
+            )
+            source_q_backend = policy_state.get(
+                "dagger_backend_config" if direct_dagger_transfer
+                else "q_backend_config"
+            )
+            if not isinstance(source_q_backend, dict):
+                raise ValueError(
+                    "BC-DAgger transfer checkpoint is missing its Q backend "
+                    "configuration"
+                )
+            # Construct Q1/Q2 with the exact saved topology before loading.
+            # The dedicated DAgger path intentionally uses 101 C51 atoms while
+            # native FastSAC historically defaulted to 501.
+            q_fields = {
+                "q_hidden_dim": (
+                    "q_hidden_dim" if direct_dagger_transfer else "hidden_dim"
+                ),
+                "q_num_atoms": (
+                    "q_num_atoms" if direct_dagger_transfer else "num_atoms"
+                ),
+                "q_v_min": "q_v_min" if direct_dagger_transfer else "v_min",
+                "q_v_max": "q_v_max" if direct_dagger_transfer else "v_max",
+                "q_layer_norm": (
+                    "q_layer_norm" if direct_dagger_transfer else "layer_norm"
+                ),
+            }
+            for destination, source in q_fields.items():
+                if source not in source_q_backend:
+                    raise ValueError(
+                        "BC-DAgger transfer checkpoint lacks required Q field "
+                        f"{source!r}"
+                    )
+                cfg.algo[destination] = source_q_backend[source]
+            incompatible = {
+                "q_action_coordinates": cfg.algo.get(
+                    "q_action_coordinates", "absolute"
+                ) != "absolute",
+                "q_action_fusion": cfg.algo.get(
+                    "q_action_fusion", "early"
+                ) != "early",
+                "q_reference_dueling": bool(cfg.algo.get(
+                    "q_reference_dueling", False
+                )),
+                "q_condition_on_actuator_state": bool(cfg.algo.get(
+                    "q_condition_on_actuator_state", False
+                )),
+            }
+            enabled = [name for name, invalid in incompatible.items() if invalid]
+            if enabled:
+                raise ValueError(
+                    "BC-DAgger FastSAC transfer requires its original direct, "
+                    "absolute-action Q topology; incompatible settings: "
+                    f"{enabled}"
+                )
+            # The pretrained DAgger Q consumed absolute executable actions.
+            # Keep that exact coordinate system instead of silently feeding its
+            # weights FastSAC's optional affine-normalized action columns.
+            cfg.algo.sac_q_normalize_actions = False
+            print(colored(
+                "[Info]: FastSAC finetune source: PPO-BC DAgger "
+                "(bounded actor adapter, raw-action Q transfer).",
+                "green",
+            ))
     
     obs_keys = [
         key for key, spec in base_env.observation_spec.items(True, True) 
@@ -313,20 +406,40 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
 
     raw_replay_observations = (
         configure_replay
-        and bool(cfg.algo.get("sac_replay_raw_observations", False))
+        and bool(
+            cfg.algo.get("sac_replay_raw_observations", False)
+            or cfg.algo.get("dagger_replay_raw_observations", False)
+        )
         and cfg.algo.get("phase", None) in ("train", "finetune")
     )
     if raw_replay_observations:
+        configured_raw_keys = cfg.algo.get(
+            "replay_raw_observation_keys", None
+        )
+        if configured_raw_keys is not None:
+            requested_raw_keys = set(configured_raw_keys)
+            replay_obs_keys = [
+                key for key in obs_keys if key in requested_raw_keys
+            ]
+            missing_raw_keys = requested_raw_keys.difference(obs_keys)
+            if missing_raw_keys:
+                logging.info(
+                    "Configured raw replay keys are absent from this task and "
+                    "will be ignored: %s",
+                    sorted(missing_raw_keys),
+                )
+        else:
+            replay_obs_keys = obs_keys
         raw_keys = [
             ("_fastsac_raw", *key) if isinstance(key, tuple)
             else ("_fastsac_raw", key)
-            for key in obs_keys
+            for key in replay_obs_keys
         ]
         # Copy before VecNorm. Inverting normalized rollout tensors later is
         # not valid because current, next, and reset states can see different
         # running-stat snapshots.
         transform.append(RenameTransform(
-            obs_keys, raw_keys, create_copy=True
+            replay_obs_keys, raw_keys, create_copy=True
         ))
 
     if "vecnorm" in state_dict.keys():
@@ -359,7 +472,7 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     if raw_replay_observations:
         if not hasattr(policy, "configure_replay_vecnorm"):
             raise TypeError(
-                "sac_replay_raw_observations requires a policy with "
+                "raw replay observations require a policy with "
                 "configure_replay_vecnorm()."
             )
         policy.configure_replay_vecnorm(vecnorm)

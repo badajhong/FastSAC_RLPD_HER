@@ -150,11 +150,5 @@ class JointPosition(ActionManager):
 
         pos_target = self.default_joint_pos + self.offset
         pos_target[:, self.joint_ids] += self.applied_action * self.action_scaling
-        limits = self.asset.data.soft_joint_pos_limits[:, self.joint_ids]
-        pos_target[:, self.joint_ids] = torch.clamp(
-            pos_target[:, self.joint_ids],
-            min=limits[..., 0],
-            max=limits[..., 1],
-        )
         self.asset.set_joint_position_target(pos_target)
         

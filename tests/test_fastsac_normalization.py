@@ -4,7 +4,10 @@ import torch
 from tensordict import TensorDict
 from torchrl.envs.transforms import Compose, RenameTransform, VecNorm
 
-from active_adaptation.learning.ppo.fastsac_vel import FastSACVEL
+from active_adaptation.learning.ppo.fastsac_vel import (
+    FastSACVEL,
+    _vecnorm_state_fingerprint,
+)
 
 
 def test_copy_before_vecnorm_preserves_exact_raw_observation():
@@ -35,6 +38,19 @@ class _FixedVecNorm:
         self.scale = TensorDict(
             {"normalized": torch.tensor([2.0, 4.0])}, batch_size=[]
         )
+
+
+def test_vecnorm_fingerprint_tracks_exact_fixed_coordinates():
+    first = _FixedVecNorm()
+    same = _FixedVecNorm()
+    changed = _FixedVecNorm()
+    changed.scale["normalized"][0] = 3.0
+
+    fingerprint = _vecnorm_state_fingerprint(first)
+
+    assert fingerprint.startswith("sha256:")
+    assert fingerprint == _vecnorm_state_fingerprint(same)
+    assert fingerprint != _vecnorm_state_fingerprint(changed)
 
 
 def test_teacher_replay_batch_uses_one_current_vecnorm_snapshot_without_update():

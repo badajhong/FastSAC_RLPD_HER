@@ -37,6 +37,8 @@ from .common import (
     hard_copy_,
 )
 from .fastsac_vel import (
+    FASTSAC_RAW_OBSERVATION_ROOT,
+    REPLAY_OBSERVATION_SEMANTICS,
     SAC_REWARD_SCALARIZATION,
     TEACHER_REPLAY_FIELDS,
     TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
@@ -45,6 +47,7 @@ from .fastsac_vel import (
     _filter_replay_rows,
     _sac_bootstrap_mask,
     _vaic_truncation_mask,
+    _vecnorm_state_fingerprint,
 )
 from .ppo_vel import (
     DEPTH_KEY,
@@ -64,8 +67,11 @@ from .ppo_vel import (
 PPO_BC_DAGGER_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
 PPO_BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_independent_normal_bc_dagger_v1"
 DAGGER_TEACHER_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
-DAGGER_TEACHER_REPLAY_FORMAT_VERSION = 1
-DAGGER_REPLAY_OBSERVATION_SEMANTICS = "normalized_frozen_vecnorm_v1"
+DAGGER_TEACHER_REPLAY_FORMAT_VERSION = 2
+DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS = (
+    "normalized_frozen_vecnorm_v1"
+)
+DAGGER_REPLAY_OBSERVATION_SEMANTICS = REPLAY_OBSERVATION_SEMANTICS
 DAGGER_INITIAL_TRANSITION_FILTER = "step_count_gt_5"
 DAGGER_ACTION_PARAMETERIZATION = (
     "absolute_executable_bernoulli_teacher_or_student_v1"
@@ -135,6 +141,18 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
     dagger_buffer_device: str = "cpu"
     dagger_batch_size: int = 4096
     dagger_updates_per_rollout: int = 32
+    # Both replay rings store pre-VecNorm environment fields. BC/Q normalize
+    # sampled minibatches once with the frozen teacher-checkpoint statistics.
+    dagger_replay_raw_observations: bool = True
+    # Do not duplicate the large depth image in the N x T rollout. Perception
+    # still consumes the normal depth field; only direct actor/Q replay inputs
+    # need a pre-VecNorm alias.
+    replay_raw_observation_keys: tuple[str, ...] = (
+        VEL_CMD_KEY,
+        OBS_KEY,
+        OBS_PRIV_KEY,
+        CMD_KEY,
+    )
 
     q_hidden_dim: int = 768
     q_num_atoms: int = 101
@@ -312,6 +330,15 @@ class _DeviceReplay:
 class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
     """Teacher-executed FIFO with a DAgger-specific, truthful H5 manifest."""
 
+    def __init__(self, *args, vecnorm_fingerprint, **kwargs):
+        super().__init__(*args, **kwargs)
+        fingerprint = str(vecnorm_fingerprint or "")
+        if not fingerprint.startswith("sha256:"):
+            raise ValueError(
+                "Raw DAgger replay requires a checkpoint VecNorm fingerprint"
+            )
+        self.vecnorm_fingerprint = fingerprint
+
     def checkpoint_metadata(self):
         has_snapshot = self.last_snapshot_id is not None
         return {
@@ -320,6 +347,7 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
             "initial_transition_filter": DAGGER_INITIAL_TRANSITION_FILTER,
             "action_parameterization": DAGGER_ACTION_PARAMETERIZATION,
             "replay_observation_semantics": DAGGER_REPLAY_OBSERVATION_SEMANTICS,
+            "vecnorm_fingerprint": self.vecnorm_fingerprint,
             "reward_scalarization": SAC_REWARD_SCALARIZATION,
             "truncation_next_observation": TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
             "replay_id": self.replay_id,
@@ -355,12 +383,20 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
         with h5py.File(source_path, "r") as replay:
             if str(replay.attrs.get("format", "")) != DAGGER_TEACHER_REPLAY_FORMAT:
                 raise ValueError(f"Not a VAIC PPO-BC DAgger replay: {source_path}")
-            if int(replay.attrs.get("format_version", 0)) != 1:
+            if int(replay.attrs.get("format_version", 0)) != (
+                DAGGER_TEACHER_REPLAY_FORMAT_VERSION
+            ):
                 raise ValueError("Unsupported PPO-BC DAgger replay version")
             if str(replay.attrs.get("replay_observation_semantics", "")) != (
                 DAGGER_REPLAY_OBSERVATION_SEMANTICS
             ):
                 raise ValueError("DAgger replay observation semantics mismatch")
+            if str(replay.attrs.get("vecnorm_fingerprint", "")) != (
+                self.vecnorm_fingerprint
+            ):
+                raise ValueError(
+                    "DAgger replay VecNorm fingerprint does not match checkpoint"
+                )
             required_attrs = {
                 "teacher_only": True,
                 "storage_policy": "circular_fifo",
@@ -432,6 +468,16 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                     raise ValueError(
                         "DAgger replay snapshot does not match checkpoint"
                     )
+                expected_fingerprint = expected_metadata.get(
+                    "vecnorm_fingerprint"
+                )
+                if (
+                    expected_fingerprint
+                    and str(expected_fingerprint) != self.vecnorm_fingerprint
+                ):
+                    raise ValueError(
+                        "Checkpoint teacher replay VecNorm fingerprint mismatch"
+                    )
             if size:
                 self._allocate()
                 for name in self.storage_fields:
@@ -490,13 +536,16 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                     {
                         "format": DAGGER_TEACHER_REPLAY_FORMAT,
                         "format_version": DAGGER_TEACHER_REPLAY_FORMAT_VERSION,
-                        "source": "frozen_ppo_teacher_executed_only",
+                        "source": (
+                            "frozen_ppo_teacher_executed_raw_observations"
+                        ),
                         "teacher_only": True,
                         "storage_policy": "circular_fifo",
                         "storage_order": "oldest_to_newest",
                         "initial_transition_filter": DAGGER_INITIAL_TRANSITION_FILTER,
                         "action_parameterization": DAGGER_ACTION_PARAMETERIZATION,
                         "replay_observation_semantics": DAGGER_REPLAY_OBSERVATION_SEMANTICS,
+                        "vecnorm_fingerprint": self.vecnorm_fingerprint,
                         "reward_scalarization": SAC_REWARD_SCALARIZATION,
                         "truncation_next_observation": TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
                         "actor_backend": PPO_BC_DAGGER_ACTOR_BACKEND,
@@ -681,14 +730,17 @@ class PPOBCDaggerFinetune(PPOVEL):
         self.q_critic_keys = [OBS_PRIV_KEY, OBS_KEY, command_key]
         if observation_spec.get(OBJECT_KEY, None) is not None:
             self.q_critic_keys.append(OBJECT_KEY)
-        self._q_actor_dim = (
-            observation_spec[VEL_CMD_KEY].shape[-1]
-            + observation_spec[OBS_KEY].shape[-1]
-            + int(cfg.latent_dim)
-        )
-        self._q_critic_dim = sum(
-            observation_spec[key].shape[-1] for key in self.q_critic_keys
-        )
+        self._q_actor_widths = [
+            int(observation_spec[VEL_CMD_KEY].shape[-1]),
+            int(observation_spec[OBS_KEY].shape[-1]),
+            int(cfg.latent_dim),
+        ]
+        self._q_critic_widths = [
+            int(observation_spec[key].shape[-1])
+            for key in self.q_critic_keys
+        ]
+        self._q_actor_dim = sum(self._q_actor_widths)
+        self._q_critic_dim = sum(self._q_critic_widths)
         self.qnet = _build_isolated_q_network(
             self._q_critic_dim,
             self.action_dim,
@@ -728,6 +780,9 @@ class PPOBCDaggerFinetune(PPOVEL):
         self.teacher_replay = None
         self.teacher_replay_id = str(uuid.uuid4())
         self._loaded_teacher_replay_metadata = None
+        object.__setattr__(self, "_replay_vecnorm", None)
+        self._replay_vecnorm_keys = set()
+        self._replay_vecnorm_fingerprint = None
         self._rollout_final_batch = None
         self._truncation_final_batches = []
         self._last_truncation_finals_used = 0
@@ -754,6 +809,10 @@ class PPOBCDaggerFinetune(PPOVEL):
         )
         if cfg.phase != "finetune" or cfg.vecnorm != "eval":
             raise ValueError("PPO-BC DAgger requires phase=finetune and vecnorm=eval")
+        if not bool(cfg.dagger_replay_raw_observations):
+            raise ValueError(
+                "PPO-BC DAgger requires dagger_replay_raw_observations=true"
+            )
         if cfg.enable_residual_distillation:
             raise ValueError(
                 "PPO-BC DAgger owns actor_adapt with one BC optimizer; disable "
@@ -860,6 +919,24 @@ class PPOBCDaggerFinetune(PPOVEL):
         if not self.cfg.save_teacher_buffer:
             self.teacher_replay = None
             return
+        if self._replay_vecnorm_fingerprint is None:
+            raise RuntimeError(
+                "Raw PPO-BC DAgger replay requires the checkpoint VecNorm "
+                "before configuring its H5"
+            )
+        if (
+            restore_path is not None
+            and self._loaded_teacher_replay_metadata is not None
+            and self._loaded_teacher_replay_metadata.get(
+                "replay_observation_semantics"
+            ) == DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS
+        ):
+            raise ValueError(
+                "A legacy normalized DAgger H5 cannot be resumed into the new "
+                "raw mutable FIFO because that would mix observation "
+                "coordinates. It remains valid as read-only Stage-2 offline "
+                "data; start a fresh BC-DAgger run to collect raw replay."
+            )
         self.teacher_replay = _DaggerTeacherReplayBuffer(
             path,
             self.cfg.teacher_buffer_capacity,
@@ -877,6 +954,7 @@ class PPOBCDaggerFinetune(PPOVEL):
             actor_backend=PPO_BC_DAGGER_ACTOR_BACKEND,
             actor_obs_keys=self.q_actor_keys,
             critic_obs_keys=self.q_critic_keys,
+            vecnorm_fingerprint=self._replay_vecnorm_fingerprint,
         )
         if (
             restore_path is not None
@@ -910,8 +988,92 @@ class PPOBCDaggerFinetune(PPOVEL):
             return None
         return self.teacher_replay.snapshot(iteration, checkpoint_name)
 
+    @staticmethod
+    def _raw_replay_key(key):
+        if isinstance(key, tuple):
+            return (FASTSAC_RAW_OBSERVATION_ROOT, *key)
+        return (FASTSAC_RAW_OBSERVATION_ROOT, key)
+
+    def configure_replay_vecnorm(self, vecnorm):
+        """Attach the frozen checkpoint VecNorm used by raw replay samples."""
+        object.__setattr__(self, "_replay_vecnorm", vecnorm)
+        self._replay_vecnorm_keys = set(vecnorm.in_keys)
+        self._replay_vecnorm_fingerprint = _vecnorm_state_fingerprint(vecnorm)
+        replay_sources = set(self.q_actor_keys).union(self.q_critic_keys)
+        required_raw = replay_sources.intersection(self._replay_vecnorm_keys)
+        missing = [
+            key
+            for key in required_raw
+            if self.observation_spec.get(self._raw_replay_key(key), None) is None
+        ]
+        if missing:
+            raise KeyError(
+                "PPO-BC DAgger raw replay aliases are missing for normalized "
+                f"observations: {sorted(missing)}"
+            )
+
+    def _replay_source(self, td, key):
+        if key not in self._replay_vecnorm_keys:
+            return td[key]
+        raw_key = self._raw_replay_key(key)
+        if raw_key not in td.keys(True, True):
+            raise KeyError(
+                "PPO-BC DAgger replay is missing raw observation alias "
+                f"{raw_key!r}"
+            )
+        return td[raw_key]
+
     def _cat_replay_sources(self, td, keys):
-        return torch.cat([td[key] for key in keys], dim=-1)
+        return torch.cat([self._replay_source(td, key) for key in keys], dim=-1)
+
+    def _vecnorm_snapshot(self):
+        vecnorm = self._replay_vecnorm
+        if vecnorm is None:
+            raise RuntimeError(
+                "PPO-BC DAgger raw replay requires configure_replay_vecnorm()"
+            )
+        return vecnorm.loc, vecnorm.scale
+
+    def _normalize_replay_value(self, key, value, snapshot):
+        if key not in self._replay_vecnorm_keys:
+            return value
+        loc, scale = snapshot
+        eps = float(self._replay_vecnorm.eps)
+        return (value - loc[key]) / scale[key].clamp_min(eps)
+
+    def _normalize_replay_flat(self, value, keys, widths, snapshot):
+        chunks = []
+        offset = 0
+        for key, width in zip(keys, widths):
+            chunk = value[..., offset : offset + width]
+            chunks.append(self._normalize_replay_value(key, chunk, snapshot))
+            offset += width
+        if offset != value.shape[-1]:
+            raise RuntimeError(
+                f"DAgger replay split consumed {offset} of "
+                f"{value.shape[-1]} values"
+            )
+        return torch.cat(chunks, dim=-1)
+
+    def _prepare_dagger_learning_batch(self, batch):
+        """Normalize one raw DAgger minibatch without mutating replay data."""
+        snapshot = self._vecnorm_snapshot()
+        prepared = dict(batch)
+        for field in ("observations", "next_observations"):
+            prepared[field] = self._normalize_replay_flat(
+                batch[field],
+                self.q_actor_keys,
+                self._q_actor_widths,
+                snapshot,
+            )
+        for field in ("critic_observations", "next_critic_observations"):
+            prepared[field] = self._normalize_replay_flat(
+                batch[field],
+                self.q_critic_keys,
+                self._q_critic_widths,
+                snapshot,
+            )
+        return prepared
 
     @staticmethod
     def _scalarize_q_reward(reward):
@@ -1160,10 +1322,12 @@ class PPOBCDaggerFinetune(PPOVEL):
                             self.q_rng,
                             valid_key=DAGGER_TEACHER_ACTION_VALID_KEY,
                         )
+                        batch = self._prepare_dagger_learning_batch(batch)
                         bc_metrics.append(self._bc_update(batch))
                 batch = self.dagger_replay.sample(
                     self.cfg.dagger_batch_size, self.device, self.q_rng
                 )
+                batch = self._prepare_dagger_learning_batch(batch)
                 q_metrics.append(self._q_update(batch))
 
         # Preserve the original VAIC supervised depth/object/latent updates and
@@ -1208,7 +1372,7 @@ class PPOBCDaggerFinetune(PPOVEL):
             "dagger/q_grad_norm": q_grad,
             "dagger/q_update_count": self.q_update_count,
             "dagger/truncation_finals": self._last_truncation_finals_used,
-            "dagger/replay_observation_frozen_vecnorm": 1.0,
+            "dagger/replay_observation_raw_pre_vecnorm": 1.0,
             "dagger/fixed_actor_anchor_enabled": 0.0,
         }
         info.update(adapt_info)
@@ -1271,6 +1435,7 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "replay_observation_semantics": (
                     DAGGER_REPLAY_OBSERVATION_SEMANTICS
                 ),
+                "vecnorm_fingerprint": self._replay_vecnorm_fingerprint,
                 "next_iter": int(self.env.current_iter) + 1,
             }
         )
@@ -1292,6 +1457,16 @@ class PPOBCDaggerFinetune(PPOVEL):
                 DAGGER_TEACHER_ACTION_SEMANTICS
             ):
                 raise ValueError("PPO-BC DAgger teacher action semantics mismatch")
+            checkpoint_fingerprint = state_dict.get("vecnorm_fingerprint")
+            if (
+                checkpoint_fingerprint is not None
+                and self._replay_vecnorm_fingerprint is not None
+                and str(checkpoint_fingerprint)
+                != self._replay_vecnorm_fingerprint
+            ):
+                raise ValueError(
+                    "PPO-BC DAgger checkpoint VecNorm fingerprint mismatch"
+                )
             actual_config = state_dict.get("dagger_backend_config")
             expected_config = self._checkpoint_config() if hasattr(self, "device") else None
             if actual_config is not None and expected_config is not None:

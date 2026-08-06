@@ -21,14 +21,24 @@ from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict.nn import TensorDictModuleBase
 from tensordict import TensorDict
 
-# local import
-from helpers import (
-    EpisodeStats,
-    apply_fastsac_buffer_steps,
-    apply_teacher_replay_buffer_path_alias,
-    evaluate,
-    make_env_policy,
-)
+# Local import that works both for ``python scripts/train.py`` and package
+# imports used by dedicated entrypoints/tests.
+try:
+    from .helpers import (
+        EpisodeStats,
+        apply_fastsac_buffer_steps,
+        apply_teacher_replay_buffer_path_alias,
+        evaluate,
+        make_env_policy,
+    )
+except ImportError:
+    from helpers import (
+        EpisodeStats,
+        apply_fastsac_buffer_steps,
+        apply_teacher_replay_buffer_path_alias,
+        evaluate,
+        make_env_policy,
+    )
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -38,8 +48,7 @@ torch.backends.cudnn.benchmark = False
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
-@hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
-def main(cfg: DictConfig):
+def run_training(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     apply_teacher_replay_buffer_path_alias(cfg)
@@ -343,6 +352,11 @@ def main(cfg: DictConfig):
     run_path = f"{entity}/{project}/{run_id}"
     
     return run_path
+
+
+@hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
+def main(cfg: DictConfig):
+    return run_training(cfg)
 
 
 

@@ -1,3 +1,4 @@
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -10,13 +11,16 @@ from active_adaptation.learning.ppo.fastsac_vel import (
     FastSACVelFinetuneConfig,
     FastSACVelFinetune,
     FastSACVEL,
+    FastSACTanhNormal,
     NEXT_TEACHER_REF_ACTION_FIELD,
+    PRE_NORMALIZED_REPLAY_KEY,
     TEACHER_REPLAY_FIELDS,
     TEACHER_REF_ACTION_FIELD,
     TeacherReplayBuffer,
     _validate_fastsac_finetune_config,
 )
-from active_adaptation.learning.ppo.common import ACTION_KEY
+from active_adaptation.learning.modules.distributions import IndependentNormal
+from active_adaptation.learning.ppo.common import ACTION_KEY, Actor
 from active_adaptation.learning.ppo.ppo_vel import REF_JPOS_KEY
 
 
@@ -70,6 +74,8 @@ def test_student_keeps_ppo_vel_finetune_vaic_inputs_and_removes_legacy_config():
     assert fastsac.sac_policy_frequency == 2
     assert fastsac.sac_actor_lr == 3e-4
     assert fastsac.sac_max_grad_norm == 0.0
+    assert fastsac.finetune_checkpoint_source == "auto"
+    assert fastsac.teacher_buffer_capacity == 1_048_576
     with pytest.raises(ConfigLoadError):
         store.load("algo/ppo_fastsac_vel_train.yaml")
 
@@ -468,6 +474,137 @@ def test_rlpd_offline_only_mix_does_not_require_online_rows():
     assert all(value.shape[0] == 4 for value in mixed.values())
 
 
+def test_rlpd_marks_only_legacy_bc_dagger_rows_as_pre_normalized():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(sac_batch_size=4, teacher_buffer_ratio=0.5)
+    policy.device = torch.device("cpu")
+    policy.q_rng = torch.Generator().manual_seed(0)
+
+    class _Replay:
+        size = 8
+
+        def __init__(self, pre_normalized):
+            self.observations_pre_normalized = pre_normalized
+
+        def sample(self, count, device=None, generator=None):
+            return {
+                key: value
+                for key, value in _fake_transitions(count=count).items()
+                if key in TEACHER_REPLAY_FIELDS
+            }
+
+    policy.online_replay = _Replay(False)
+    policy.offline_replay = _Replay(True)
+    mixed = policy._mix_batch()
+
+    marker = mixed[PRE_NORMALIZED_REPLAY_KEY]
+    assert marker.dtype is torch.bool
+    assert int(marker.sum()) == 2
+    assert marker.numel() == 4
+
+
+def test_stage2_normalizes_online_rows_but_preserves_bc_dagger_rows():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    object.__setattr__(policy, "_replay_vecnorm", SimpleNamespace())
+    policy._vecnorm_snapshot = lambda: object()
+    policy.q_actor_keys = ["actor"]
+    policy.q_critic_keys = ["critic"]
+    policy._q_actor_widths = [2]
+    policy._q_critic_widths = [3]
+    policy._normalize_replay_flat = (
+        lambda values, keys, widths, snapshot: values + 10.0
+    )
+    batch = {
+        "observations": torch.zeros(2, 2),
+        "next_observations": torch.ones(2, 2),
+        "critic_observations": torch.zeros(2, 3),
+        "next_critic_observations": torch.ones(2, 3),
+        PRE_NORMALIZED_REPLAY_KEY: torch.tensor([False, True]),
+    }
+
+    prepared = policy._prepare_student_learning_batch(batch)
+
+    assert torch.equal(prepared["observations"][0], torch.full((2,), 10.0))
+    assert torch.equal(prepared["observations"][1], torch.zeros(2))
+    assert PRE_NORMALIZED_REPLAY_KEY not in prepared
+
+
+def test_stage2_normalizes_new_raw_dagger_and_online_rows_together():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    object.__setattr__(policy, "_replay_vecnorm", SimpleNamespace())
+    policy._vecnorm_snapshot = lambda: object()
+    policy.q_actor_keys = ["actor"]
+    policy.q_critic_keys = ["critic"]
+    policy._q_actor_widths = [2]
+    policy._q_critic_widths = [3]
+    policy._normalize_replay_flat = (
+        lambda values, keys, widths, snapshot: values + 10.0
+    )
+    # No PRE_NORMALIZED_REPLAY_KEY: both new DAgger and online rows are raw.
+    batch = {
+        "observations": torch.zeros(2, 2),
+        "next_observations": torch.ones(2, 2),
+        "critic_observations": torch.zeros(2, 3),
+        "next_critic_observations": torch.ones(2, 3),
+    }
+
+    prepared = policy._prepare_student_learning_batch(batch)
+
+    assert torch.equal(prepared["observations"], torch.full((2, 2), 10.0))
+    assert torch.equal(
+        prepared["critic_observations"], torch.full((2, 3), 10.0)
+    )
+
+
+def test_bc_dagger_actor_adapter_preserves_mean_and_has_sac_gradients():
+    class _BCActor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.core = Actor(2, init_noise_scale=0.5)
+            self.core(torch.zeros(1, 3))
+            with torch.no_grad():
+                self.core.actor_mean.weight.zero_()
+                self.core.actor_mean.bias.copy_(torch.tensor([0.2, -0.3]))
+                # Compatibility load converts PPO std=0.5 to log(0.5).
+                self.core.actor_std.fill_(float(torch.tensor(0.5).log()))
+
+        def get_dist(self, td):
+            loc, scale = self.core(torch.zeros(*td.batch_size, 3))
+            return IndependentNormal(loc, scale)
+
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    policy.actor_adapt = _BCActor()
+    policy.cfg = SimpleNamespace(
+        fastsac_log_std_min=-5.0,
+        fastsac_log_std_max=0.0,
+    )
+    low = torch.tensor([-1.0, -1.0])
+    high = torch.tensor([1.0, 1.0])
+    policy._fastsac_action_low = low.tolist()
+    policy._fastsac_action_high = high.tolist()
+    policy.dist_cls = functools.partial(
+        FastSACTanhNormal, low=low, high=high, event_dims=1
+    )
+    td = TensorDict({}, batch_size=[4])
+
+    dist = policy._bc_dagger_actor_dist_from_td(td)
+    action, log_prob = dist.rsample_with_log_prob(
+        generator=torch.Generator().manual_seed(0)
+    )
+
+    assert torch.allclose(
+        dist.mean, torch.tensor([0.2, -0.3]).expand(4, -1), atol=1e-6
+    )
+    assert ((action > low) & (action < high)).all()
+    (-log_prob.mean()).backward()
+    assert policy.actor_adapt.core.actor_mean.weight.grad is not None
+    assert policy.actor_adapt.core.actor_std.grad is not None
+
+
 def test_fastsac_rejects_second_actor_optimizer_from_distillation():
     assert FastSACVelFinetuneConfig().enable_residual_distillation is False
     cfg = SimpleNamespace(enable_residual_distillation=True)
@@ -494,6 +631,7 @@ def test_fastsac_rejects_second_actor_optimizer_from_distillation():
         ("sac_q_action_input_gain", float("inf")),
         ("sac_clipped_double_q", "true"),
         ("sac_use_autotune", "true"),
+        ("vecnorm", "train"),
     ],
 )
 def test_stage2_rejects_invalid_sac_config(field, value):

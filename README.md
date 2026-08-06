@@ -245,7 +245,7 @@ python scripts/train.py \
   checkpoint_path=run:<fastsac_vel_train-wandb-run-path>
 
 # evaluate policy
-python scripts/play.py algo=ppo_vel_train task=G1/vaic/skateboard_tea checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-04/11-53-02-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_300.pt
+python scripts/play.py algo=ppo_vel_train task=G1/vaic/skateboard_tea checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt
 python scripts/play.py algo=fastsac_vel_train task=G1/vaic/skateboard_tea checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-05/15-54-33-G1Skateboard-fastsac_vel/wandb/latest-run/files/checkpoint_300.pt
 ```
 
@@ -256,11 +256,11 @@ python scripts/play.py algo=fastsac_vel_train task=G1/vaic/skateboard_tea checkp
 # VAIC depth/object/adaptation supervision and EMA updates remain enabled.
 # Independent C51 Q1/Q2 and target-Q1/target-Q2 learn every executed
 # teacher/student transition and are saved separately in each checkpoint.
-python scripts/train.py \
-  wandb.project=vaic_dagger \
-  algo=ppo_bc_dagger_finetune \
+python scripts/bc_dagger.py \
   task=G1/vaic/skateboard_stu \
-  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt
+  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
+  total_frames=19660800 \
+  algo.dagger_beta_decay_rollouts=1000
 ```
 
 The default beta follows the HOI R1 DAgger schedule: `1.0 -> 0.0` over 4,000

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -33,6 +34,7 @@ from torchrl.modules.distributions import TanhNormal
 
 from .common import (
     ACTION_KEY,
+    Actor,
     CMD_KEY,
     DONE_KEY,
     OBS_KEY,
@@ -53,6 +55,7 @@ from .ppo_vel import (
     PRIV_PRED_KEY,
     REF_JPOS_KEY,
     VEL_CMD_KEY,
+    ZeroDepthInjector,
 )
 
 
@@ -66,6 +69,17 @@ TEACHER_REPLAY_INITIAL_TRANSITION_FILTER = "step_count_gt_1"
 TEACHER_REPLAY_MIN_STEP_COUNT = 1
 STUDENT_REPLAY_MIN_STEP_COUNT = 5
 FASTSAC_ACTOR_BACKEND = "vaic_fastsac_tanh_gaussian_v2"
+BC_DAGGER_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
+BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_independent_normal_bc_dagger_v1"
+BC_DAGGER_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
+BC_DAGGER_REPLAY_FORMAT_VERSION = 2
+BC_DAGGER_LEGACY_REPLAY_FORMAT_VERSION = 1
+BC_DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS = (
+    "normalized_frozen_vecnorm_v1"
+)
+BC_DAGGER_REPLAY_OBSERVATION_SEMANTICS = REPLAY_OBSERVATION_SEMANTICS
+FASTSAC_BC_DAGGER_ACTOR_BACKEND = "vaic_fastsac_bc_dagger_adapter_v1"
+PRE_NORMALIZED_REPLAY_KEY = "_fastsac_pre_normalized_replay"
 FASTSAC_ACTION_PARAMETERIZATION = (
     "teacher_reference_centered_student_absolute_asymmetric_v2"
 )
@@ -126,6 +140,45 @@ FASTSAC_INDEPENDENT_DOUBLE_Q_SEMANTICS = (
     "independent_projected_c51_head_targets_v1"
 )
 FASTSAC_RAW_OBSERVATION_ROOT = "_fastsac_raw"
+
+
+def _vecnorm_state_fingerprint(vecnorm) -> str:
+    """Hash the exact fixed VecNorm coordinates used by replay consumers.
+
+    Raw replay is independent of normalization while stored, but transferred
+    actor/Q weights are not.  Pairing the H5 with this digest prevents a raw
+    dataset from being silently interpreted in a different observation frame.
+    """
+    digest = hashlib.sha256()
+    digest.update(b"vaic_vecnorm_loc_scale_v1\0")
+    in_keys = list(vecnorm.in_keys)
+    out_keys = list(getattr(vecnorm, "out_keys", in_keys))
+    if len(in_keys) != len(out_keys):
+        raise ValueError("VecNorm input/output key counts do not match")
+    digest.update(repr(float(vecnorm.eps)).encode("ascii"))
+    digest.update(b"\0")
+    for in_key, out_key in zip(in_keys, out_keys):
+        digest.update(
+            json.dumps(
+                {"in": in_key, "out": out_key},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\0")
+        for label, value in (
+            ("loc", vecnorm.loc[in_key]),
+            ("scale", vecnorm.scale[out_key]),
+        ):
+            tensor = value.detach().to("cpu").contiguous()
+            digest.update(label.encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(
+                np.asarray(tuple(tensor.shape), dtype=np.int64).tobytes()
+            )
+            digest.update(tensor.numpy().tobytes(order="C"))
+    return f"sha256:{digest.hexdigest()}"
 TEACHER_REF_ACTION_FIELD = "teacher_ref_action"
 NEXT_TEACHER_REF_ACTION_FIELD = "next_teacher_ref_action"
 TEACHER_OBJECT_GEO_FIELD = "teacher_object_geo"
@@ -2700,6 +2753,207 @@ class OfflineReplayH5:
         return {name: value[indices] for name, value in self.data.items()}
 
 
+class BCDaggerOfflineReplayH5:
+    """Load raw-v2 or legacy normalized-v1 BC-DAgger data for Stage 2."""
+
+    def __init__(
+        self,
+        path,
+        actor_dim,
+        critic_dim,
+        action_dim,
+        device="cpu",
+        max_size=None,
+        seed=0,
+        load_chunk_rows=4096,
+        expected_actor_obs_keys=None,
+        expected_critic_obs_keys=None,
+        expected_vecnorm_fingerprint=None,
+    ):
+        import h5py
+
+        if max_size is not None and int(max_size) < 1:
+            raise ValueError("offline replay max_size must be positive")
+        if int(load_chunk_rows) < 1:
+            raise ValueError("offline replay load_chunk_rows must be positive")
+        self.path = os.path.abspath(os.fspath(path))
+        self.device = torch.device(device)
+        self.rng = torch.Generator(device=self.device).manual_seed(int(seed))
+        shapes = {
+            "observations": (int(actor_dim),),
+            "critic_observations": (int(critic_dim),),
+            "actions": (int(action_dim),),
+            "rewards": (),
+            "dones": (),
+            "truncations": (),
+            "discounts": (),
+            "next_observations": (int(actor_dim),),
+            "next_critic_observations": (int(critic_dim),),
+        }
+        dtypes = {
+            name: torch.bool if name in ("dones", "truncations")
+            else torch.float32
+            for name in shapes
+        }
+        with h5py.File(self.path, "r") as replay:
+            if str(replay.attrs.get("format", "")) != BC_DAGGER_REPLAY_FORMAT:
+                raise ValueError(f"Not a VAIC PPO-BC DAgger replay: {self.path}")
+            version = int(replay.attrs.get("format_version", 0))
+            observation_semantics = str(
+                replay.attrs.get("replay_observation_semantics", "")
+            )
+            schema = (version, observation_semantics)
+            raw_schema = (
+                BC_DAGGER_REPLAY_FORMAT_VERSION,
+                BC_DAGGER_REPLAY_OBSERVATION_SEMANTICS,
+            )
+            legacy_schema = (
+                BC_DAGGER_LEGACY_REPLAY_FORMAT_VERSION,
+                BC_DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS,
+            )
+            if schema not in (raw_schema, legacy_schema):
+                raise ValueError(
+                    "Unsupported PPO-BC DAgger replay schema: "
+                    f"version={version}, observations={observation_semantics!r}"
+                )
+            self.observations_pre_normalized = schema == legacy_schema
+            actual_vecnorm_fingerprint = str(
+                replay.attrs.get("vecnorm_fingerprint", "")
+            )
+            if schema == raw_schema:
+                expected_fingerprint = str(
+                    expected_vecnorm_fingerprint or ""
+                )
+                if not expected_fingerprint.startswith("sha256:"):
+                    raise ValueError(
+                        "Raw BC-DAgger replay requires the Stage-2 checkpoint "
+                        "VecNorm fingerprint"
+                    )
+                if actual_vecnorm_fingerprint != expected_fingerprint:
+                    raise ValueError(
+                        "Raw BC-DAgger replay VecNorm fingerprint does not "
+                        "match the Stage-2 checkpoint"
+                    )
+            if str(replay.attrs.get("reward_scalarization", "")) != (
+                SAC_REWARD_SCALARIZATION
+            ):
+                raise ValueError("BC-DAgger replay reward scalarization mismatch")
+            if str(replay.attrs.get("actor_backend", "")) != (
+                BC_DAGGER_ACTOR_BACKEND
+            ):
+                raise ValueError("BC-DAgger replay actor backend mismatch")
+            actor_keys = json.loads(str(
+                replay.attrs.get("actor_obs_keys", "[]")
+            ))
+            critic_keys = json.loads(str(
+                replay.attrs.get("critic_obs_keys", "[]")
+            ))
+            if (
+                expected_actor_obs_keys is not None
+                and actor_keys != list(expected_actor_obs_keys)
+            ):
+                raise ValueError(
+                    f"BC-DAgger actor observation keys {actor_keys} do not "
+                    f"match Stage 2 {list(expected_actor_obs_keys)}"
+                )
+            if (
+                expected_critic_obs_keys is not None
+                and critic_keys != list(expected_critic_obs_keys)
+            ):
+                raise ValueError(
+                    f"BC-DAgger critic observation keys {critic_keys} do not "
+                    f"match Stage 2 {list(expected_critic_obs_keys)}"
+                )
+            expected_dims = (int(actor_dim), int(critic_dim), int(action_dim))
+            actual_dims = tuple(int(replay.attrs.get(name, -1)) for name in (
+                "actor_obs_dim", "critic_obs_dim", "action_dim"
+            ))
+            if actual_dims != expected_dims:
+                raise ValueError(
+                    f"BC-DAgger replay dimensions {actual_dims} do not match "
+                    f"Stage 2 {expected_dims}"
+                )
+            file_size = int(replay.attrs.get("num_transitions", -1))
+            if file_size < 1:
+                raise ValueError(f"BC-DAgger replay is empty: {self.path}")
+            self.size = (
+                file_size if max_size is None else min(file_size, int(max_size))
+            )
+            source_start = file_size - self.size
+            self.fields = tuple(TEACHER_REPLAY_FIELDS)
+            self.snapshot_metadata = {
+                "format": BC_DAGGER_REPLAY_FORMAT,
+                "format_version": version,
+                "replay_observation_semantics": observation_semantics,
+                "vecnorm_fingerprint": actual_vecnorm_fingerprint,
+                "snapshot_id": str(replay.attrs.get("snapshot_id", "")),
+                "snapshot_iteration": int(
+                    replay.attrs.get("snapshot_iteration", -1)
+                ),
+                "checkpoint_name": str(
+                    replay.attrs.get("checkpoint_name", "")
+                ),
+                "size": self.size,
+                "seen": int(replay.attrs.get("num_seen_transitions", -1)),
+                "observations_pre_normalized": (
+                    self.observations_pre_normalized
+                ),
+            }
+            self.data = {}
+            try:
+                for name in self.fields:
+                    expected_shape = (file_size, *shapes[name])
+                    actual_shape = (
+                        tuple(replay[name].shape) if name in replay else None
+                    )
+                    if actual_shape != expected_shape:
+                        raise ValueError(
+                            f"BC-DAgger replay field {name!r} has shape "
+                            f"{actual_shape}, expected {expected_shape}"
+                        )
+                    self.data[name] = torch.empty(
+                        (self.size, *shapes[name]),
+                        dtype=dtypes[name],
+                        device=self.device,
+                    )
+                for name in self.fields:
+                    for destination in range(
+                        0, self.size, int(load_chunk_rows)
+                    ):
+                        count = min(
+                            int(load_chunk_rows), self.size - destination
+                        )
+                        source = source_start + destination
+                        host = torch.from_numpy(np.asarray(
+                            replay[name][source : source + count]
+                        ))
+                        self.data[name][
+                            destination : destination + count
+                        ].copy_(host)
+            except torch.OutOfMemoryError as exc:
+                self.data.clear()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                raise RuntimeError(
+                    "Unable to load the BC-DAgger offline replay onto "
+                    f"{self.device}; reduce algo.teacher_buffer_capacity"
+                ) from exc
+
+    def sample(self, count, device=None):
+        output_device = self.device if device is None else torch.device(device)
+        indices = torch.randint(
+            0,
+            self.size,
+            (int(count),),
+            device=self.device,
+            generator=self.rng,
+        )
+        return {
+            name: value[indices].to(output_device)
+            for name, value in self.data.items()
+        }
+
+
 class OnlineReplay:
     """Device-resident circular replay collected by the FastSAC student."""
 
@@ -2941,8 +3195,14 @@ class FastSACVelFinetuneConfig(FastSACVelConfig):
     vecnorm: str = "eval"
     enable_residual_distillation: bool = False
     save_teacher_buffer: bool = False
+    # ``auto`` inspects checkpoint provenance in scripts/helpers.py.  A
+    # BC-DAgger source retains its PPO actor backbone behind a bounded SAC
+    # distribution adapter and retains the pretrained Q action coordinates.
+    finetune_checkpoint_source: str = "auto"
     teacher_buffer_ratio: float = 0.5
     online_buffer_capacity: int = 262_144
+    # Accept the doubled BC-DAgger offline FIFO without silently truncating it.
+    teacher_buffer_capacity: int = 1_048_576
 
 
 def _validate_fastsac_teacher_config(cfg) -> None:
@@ -3079,6 +3339,11 @@ def _validate_fastsac_teacher_config(cfg) -> None:
         )
 def _validate_fastsac_finetune_config(cfg) -> None:
     """Reject Stage-2 settings that would silently disable or corrupt SAC."""
+    if cfg.phase != "finetune" or cfg.vecnorm != "eval":
+        raise ValueError(
+            "FastSAC Stage 2 requires phase=finetune and vecnorm=eval so "
+            "offline and online raw replay share the checkpoint normalizer"
+        )
     if not isinstance(
         getattr(cfg, "q_condition_on_actuator_state", False), bool
     ):
@@ -3180,6 +3445,7 @@ class _FastSACVAICBase(PPOVEL):
         # belongs to the environment/checkpoint and must not be duplicated here.
         object.__setattr__(self, "_replay_vecnorm", None)
         self._replay_vecnorm_keys = set()
+        self._replay_vecnorm_fingerprint = None
         if cfg.q_hidden_dim < 4:
             raise ValueError("q_hidden_dim must be at least 4")
         _q_action_hidden_dim(
@@ -3637,6 +3903,7 @@ class _FastSACVAICBase(PPOVEL):
         """Attach VecNorm and validate every normalized replay source alias."""
         object.__setattr__(self, "_replay_vecnorm", vecnorm)
         self._replay_vecnorm_keys = set(vecnorm.in_keys)
+        self._replay_vecnorm_fingerprint = _vecnorm_state_fingerprint(vecnorm)
         replay_sources = set(self.q_critic_keys)
         replay_sources.update((VEL_CMD_KEY, OBS_KEY))
         if hasattr(self, "height_encoder"):
@@ -4057,6 +4324,24 @@ class FastSACVEL(_FastSACVAICBase):
         return action_low, action_high
 
     def _actor_backend_metadata(self):
+        if self.actor_backend == FASTSAC_BC_DAGGER_ACTOR_BACKEND:
+            return {
+                "action_parameterization": (
+                    "bc_dagger_absolute_mean_bounded_tanh_gaussian_v1"
+                ),
+                "source_actor_backend": BC_DAGGER_ACTOR_BACKEND,
+                "student_input_dim": self._q_actor_dim,
+                "action_dim": self.action_dim,
+                "log_std_parameter": "ppo_actor_std_reinterpreted_as_log_std",
+                "log_std_min": self.cfg.fastsac_log_std_min,
+                "log_std_max": self.cfg.fastsac_log_std_max,
+                "action_low": self._fastsac_action_low,
+                "action_high": self._fastsac_action_high,
+                "action_log_scale_sum": self._fastsac_action_log_scale_sum,
+                "joint_offset_low": self._fastsac_joint_offset_low,
+                "joint_offset_high": self._fastsac_joint_offset_high,
+                "joint_names": list(self.joint_names),
+            }
         return {
             "action_parameterization": FASTSAC_ACTION_PARAMETERIZATION,
             "teacher_input_dim": self._fastsac_teacher_actor_dim,
@@ -4400,7 +4685,71 @@ class FastSACVEL(_FastSACVAICBase):
         )
         return True
 
+    def _uses_bc_dagger_finetune_source(self) -> bool:
+        return (
+            getattr(self.cfg, "phase", "finetune") == "finetune"
+            and str(getattr(
+                self.cfg, "finetune_checkpoint_source", "fastsac"
+            )) == "bc_dagger"
+        )
+
+    @staticmethod
+    def _ppo_actor_core(actor) -> Actor:
+        cores = [module for module in actor.modules() if isinstance(module, Actor)]
+        if len(cores) != 1:
+            raise RuntimeError(
+                "Expected exactly one VAIC PPO Actor core, found "
+                f"{len(cores)}"
+            )
+        return cores[0]
+
+    def _configure_bc_dagger_actor_backend(self):
+        """Retain the trained BC actor and expose a bounded SAC distribution."""
+        if bool(getattr(self.cfg, "sac_q_normalize_actions", True)):
+            raise ValueError(
+                "BC-DAgger Q transfer requires sac_q_normalize_actions=false"
+            )
+        action_low, action_high = self._vaic_action_bounds()
+        self.dist_cls = functools.partial(
+            FastSACTanhNormal,
+            low=action_low,
+            high=action_high,
+            event_dims=1,
+        )
+        self.dist_keys = list(FastSACTanhNormal.dist_keys)
+        self.actor_backend = FASTSAC_BC_DAGGER_ACTOR_BACKEND
+        self._q_critic_widths = [
+            int(self.observation_spec[key].shape[-1])
+            for key in self.q_critic_keys
+        ]
+        self._q_actor_widths = [
+            int(self.observation_spec[VEL_CMD_KEY].shape[-1]),
+            int(self.observation_spec[OBS_KEY].shape[-1]),
+            int(self.cfg.latent_dim),
+        ]
+        self._fastsac_action_low = action_low.detach().cpu().tolist()
+        self._fastsac_action_high = action_high.detach().cpu().tolist()
+        self._fastsac_q_action_low = action_low.detach()
+        self._fastsac_q_action_scale = (
+            (action_high - action_low) * 0.5
+        ).detach()
+        self._fastsac_action_log_scale_sum = float(
+            torch.log((action_high - action_low) * 0.5).sum().item()
+        )
+
+        # Stage 2 uses neither PPO's value network nor its optimizers. Keep the
+        # loaded BC actor modules themselves, because they are the requested
+        # warm start for the bounded SAC adapter below.
+        self.opt_policy = None
+        self.opt_critic = None
+        for attribute in ("critic", "value_norm", "gae", "critic_loss_fn"):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+
     def _configure_actor_backend(self):
+        if self._uses_bc_dagger_finetune_source():
+            self._configure_bc_dagger_actor_backend()
+            return
         self._teacher_actor_std_reset_applied = False
         self._teacher_actor_std_reset_applied_q_updates = None
         self._teacher_actor_std_reset_event_q_updates = None
@@ -6502,7 +6851,7 @@ class FastSACVEL(_FastSACVAICBase):
         state["q_rng_state"] = self.q_rng.get_state()
         state["sac_action_rng_state"] = self.sac_action_rng.get_state()
         state["q_update_count"] = self.q_update_count
-        state["actor_backend"] = FASTSAC_ACTOR_BACKEND
+        state["actor_backend"] = self.actor_backend
         state["training_algorithm"] = (
             FASTSAC_TEACHER_TRAINING_ALGORITHM
             if self.cfg.phase == "train"
@@ -6574,11 +6923,11 @@ class FastSACVEL(_FastSACVAICBase):
             )
         _validate_pure_fastsac_checkpoint_provenance(state_dict)
         backend = state_dict.get("actor_backend")
-        if backend != FASTSAC_ACTOR_BACKEND:
+        if backend != self.actor_backend:
             raise ValueError(
-                "This algorithm requires a checkpoint produced by "
-                "the current algo=fastsac_vel_train actor backend; got "
-                f"actor_backend={backend!r}."
+                "FastSAC actor checkpoint backend does not match the configured "
+                f"Stage-2 source: checkpoint={backend!r}, "
+                f"expected={self.actor_backend!r}."
             )
         expected = self._actor_backend_metadata()
         actual = state_dict.get("actor_backend_config")
@@ -6739,6 +7088,29 @@ class FastSACVEL(_FastSACVAICBase):
         return failed
 
 
+class _BCDaggerSACRolloutActor(nn.Module):
+    """Execute the retained BC mean through Stage-2's bounded SAC adapter."""
+
+    in_keys = [VEL_CMD_KEY, OBS_KEY, PRIV_PRED_KEY]
+    out_keys = [ACTION_KEY, "loc", "scale"]
+
+    def __init__(self, owner: "FastSACVelFinetune", deterministic: bool):
+        super().__init__()
+        object.__setattr__(self, "_owner", owner)
+        self.deterministic = bool(deterministic)
+
+    def forward(self, td: TensorDict):
+        dist = self._owner._bc_dagger_actor_dist_from_td(td)
+        if self.deterministic:
+            action = dist.mean
+        else:
+            action, _ = dist.rsample_with_log_prob()
+        td[ACTION_KEY] = action
+        td["loc"] = dist.loc
+        td["scale"] = dist.scale
+        return td
+
+
 class FastSACVelFinetune(FastSACVEL):
     """VAIC student actor + HOI-style distributional FastSAC with RLPD replay."""
 
@@ -6789,34 +7161,53 @@ class FastSACVelFinetune(FastSACVEL):
         # from another FastSAC run/iteration is therefore valid.  Keep all
         # semantic/schema checks below, but intentionally do not pass the
         # checkpoint replay id or snapshot manifest to OfflineReplayH5.
-        self.offline_replay = OfflineReplayH5(
-            path, self._q_actor_dim, self._q_critic_dim, self.action_dim,
-            device=self.device, max_size=self.cfg.teacher_buffer_capacity,
-            seed=self.cfg.teacher_buffer_seed,
-            expected_actor_backend=self.actor_backend,
-            expected_actor_obs_keys=self.q_actor_keys,
-            expected_critic_obs_keys=self.q_critic_keys,
-            expected_q_action_fusion=getattr(
-                self.cfg, "q_action_fusion", "early"
-            ),
-            expected_q_action_hidden_dim=_q_action_hidden_dim(
-                getattr(self.cfg, "q_hidden_dim", 768),
-                getattr(self.cfg, "q_action_fusion", "early"),
-            ),
-            expected_q_action_coordinates=getattr(
-                self.cfg, "q_action_coordinates", "absolute"
-            ),
-            expected_q_reference_dueling=getattr(
-                self.cfg, "q_reference_dueling", False
-            ),
-            expected_q_actuator_context=(
-                getattr(
-                    self,
-                    "_q_actuator_context_metadata_value",
-                    {"enabled": False},
-                )
-            ),
-        )
+        if self._uses_bc_dagger_finetune_source():
+            self.offline_replay = BCDaggerOfflineReplayH5(
+                path,
+                self._q_actor_dim,
+                self._q_critic_dim,
+                self.action_dim,
+                # The doubled Skateboard FIFO is about 24 GiB and cannot share
+                # a 32-GiB GPU with Isaac, cameras and the networks. Keep the
+                # immutable dataset on host and transfer sampled rows only.
+                device="cpu",
+                max_size=self.cfg.teacher_buffer_capacity,
+                seed=self.cfg.teacher_buffer_seed,
+                expected_actor_obs_keys=self.q_actor_keys,
+                expected_critic_obs_keys=self.q_critic_keys,
+                expected_vecnorm_fingerprint=(
+                    self._replay_vecnorm_fingerprint
+                ),
+            )
+        else:
+            self.offline_replay = OfflineReplayH5(
+                path, self._q_actor_dim, self._q_critic_dim, self.action_dim,
+                device=self.device, max_size=self.cfg.teacher_buffer_capacity,
+                seed=self.cfg.teacher_buffer_seed,
+                expected_actor_backend=self.actor_backend,
+                expected_actor_obs_keys=self.q_actor_keys,
+                expected_critic_obs_keys=self.q_critic_keys,
+                expected_q_action_fusion=getattr(
+                    self.cfg, "q_action_fusion", "early"
+                ),
+                expected_q_action_hidden_dim=_q_action_hidden_dim(
+                    getattr(self.cfg, "q_hidden_dim", 768),
+                    getattr(self.cfg, "q_action_fusion", "early"),
+                ),
+                expected_q_action_coordinates=getattr(
+                    self.cfg, "q_action_coordinates", "absolute"
+                ),
+                expected_q_reference_dueling=getattr(
+                    self.cfg, "q_reference_dueling", False
+                ),
+                expected_q_actuator_context=(
+                    getattr(
+                        self,
+                        "_q_actuator_context_metadata_value",
+                        {"enabled": False},
+                    )
+                ),
+            )
         self.offline_replay_source_path = os.path.abspath(os.fspath(path))
 
     def get_offline_replay_path(self):
@@ -6825,9 +7216,11 @@ class FastSACVelFinetune(FastSACVEL):
     def load_state_dict(self, state_dict, strict=True):
         if "qnet" not in state_dict:
             raise KeyError(
-                "Checkpoint has no FastSAC Q1/Q2. Use a checkpoint trained with "
-                "algo=fastsac_vel_train."
+                "Checkpoint has no transferable Q1/Q2. Use a checkpoint trained "
+                "with scripts/bc_dagger.py or algo=fastsac_vel_train."
             )
+        if state_dict.get("training_algorithm") == BC_DAGGER_TRAINING_ALGORITHM:
+            return self._load_bc_dagger_state_dict(state_dict, strict)
         failed = super().load_state_dict(state_dict, strict)
         if "qnet" in failed or "qnet_target" in failed:
             raise RuntimeError("Failed to load teacher FastSAC Q1/Q2 from checkpoint")
@@ -6867,6 +7260,105 @@ class FastSACVelFinetune(FastSACVEL):
                 # Retain provenance for checkpoint logging, but do not require
                 # the next stage-2 invocation to select the identical dataset.
                 self._loaded_teacher_replay_metadata = copy.deepcopy(replay_state)
+        return failed
+
+    def _load_bc_dagger_state_dict(self, state_dict, strict=True):
+        if not self._uses_bc_dagger_finetune_source():
+            raise ValueError(
+                "A BC-DAgger checkpoint requires "
+                "algo.finetune_checkpoint_source=bc_dagger (or auto detection)"
+            )
+        if state_dict.get("actor_backend") != BC_DAGGER_ACTOR_BACKEND:
+            raise ValueError("BC-DAgger checkpoint actor backend mismatch")
+        checkpoint_fingerprint = state_dict.get("vecnorm_fingerprint")
+        if (
+            checkpoint_fingerprint is not None
+            and str(checkpoint_fingerprint)
+            != self._replay_vecnorm_fingerprint
+        ):
+            raise ValueError(
+                "BC-DAgger checkpoint VecNorm fingerprint does not match "
+                "the Stage-2 checkpoint normalizer"
+            )
+        backend_cfg = state_dict.get("dagger_backend_config")
+        if not isinstance(backend_cfg, dict):
+            raise ValueError("BC-DAgger checkpoint lacks backend configuration")
+        expected_q = {
+            "q_hidden_dim": int(self.cfg.q_hidden_dim),
+            "q_num_atoms": int(self.cfg.q_num_atoms),
+            "q_v_min": float(self.cfg.q_v_min),
+            "q_v_max": float(self.cfg.q_v_max),
+            "q_layer_norm": bool(self.cfg.q_layer_norm),
+        }
+        actual_q = {name: backend_cfg.get(name) for name in expected_q}
+        if actual_q != expected_q:
+            raise ValueError(
+                f"BC-DAgger Q configuration {actual_q} does not match "
+                f"Stage 2 {expected_q}"
+            )
+        source_q_updates = int(state_dict.get("q_update_count", 0))
+        if source_q_updates < 1:
+            raise RuntimeError("BC-DAgger checkpoint Q1/Q2 were never updated")
+
+        # The compatibility backend deliberately retained PPOVEL's actor tree,
+        # so this loads the exact BC actor, depth/EMA modules, Q1/Q2 and target
+        # Q1/Q2 without shape translation or partial-copy heuristics.
+        failed = PPOVEL.load_state_dict(self, state_dict, strict)
+        critical = {
+            "actor_adapt",
+            "qnet",
+            "qnet_target",
+            "encoder_priv",
+            "adapt_module",
+            "adapt_ema",
+        }
+        if self.cfg.use_object_adapt:
+            critical.update(("object_adapt", "object_adapt_ema"))
+        if hasattr(self, "temporal_depth_gru"):
+            critical.update((
+                "depth_cnn",
+                "temporal_depth_gru",
+                "temporal_depth_gru_ema",
+            ))
+        missing = critical.intersection(failed)
+        if missing:
+            raise RuntimeError(
+                "Failed to transfer critical BC-DAgger modules: "
+                f"{sorted(missing)}"
+            )
+
+        # In PPO this parameter represented a positive Normal standard
+        # deviation. Stage 2 reuses the same registered parameter as log-std so
+        # it remains checkpointable/optimizable without changing actor topology.
+        actor_core = self._ppo_actor_core(self.actor_adapt)
+        with torch.no_grad():
+            actor_core.actor_std.copy_(
+                actor_core.actor_std.clamp_min(1e-6).log().clamp(
+                    float(self.cfg.fastsac_log_std_min),
+                    float(self.cfg.fastsac_log_std_max),
+                )
+            )
+        self.qnet_target.requires_grad_(False)
+        self.q_update_count = 0
+        self.sac_update_count = 0
+        self.sac_actor_update_count = 0
+        self.sac_alpha_update_count = 0
+        self.sac_environment_steps = 0
+        self.sac_rollout_count = 0
+        self.q_rng.manual_seed(int(self.cfg.q_seed))
+        self.sac_action_rng.manual_seed(int(self.cfg.q_seed) + 1)
+        self.log_alpha.data.fill_(float(np.log(self.cfg.sac_alpha_init)))
+        self.teacher_replay_id = str(
+            state_dict.get("teacher_replay_id", self.teacher_replay_id)
+        )
+        self._loaded_checkpoint_phase = "bc_dagger"
+        self._loaded_teacher_replay_metadata = copy.deepcopy(
+            state_dict.get("teacher_replay_state")
+        )
+        logging.info(
+            "Transferred BC-DAgger actor/perception and pretrained Q1/Q2 + "
+            "targets into a fresh Stage-2 SAC optimizer/entropy process."
+        )
         return failed
 
     def state_dict(self):
@@ -7035,25 +7527,98 @@ class FastSACVelFinetune(FastSACVEL):
             OBS_KEY: actor_obs[..., vel_dim:vel_dim + policy_dim],
             PRIV_PRED_KEY: actor_obs[..., vel_dim + policy_dim:],
         }, batch_size=actor_obs.shape[:-1], device=actor_obs.device)
+        if self._uses_bc_dagger_finetune_source():
+            return self._bc_dagger_actor_dist_from_td(td)
         return self.actor_adapt.get_dist(td)
+
+    def _bc_dagger_actor_dist_from_td(self, td: TensorDict):
+        # actor_adapt retains the exact trained BC network. Its loc is already
+        # an absolute executable-action target; map that target into the latent
+        # of a bounded tanh Gaussian so deterministic Stage-2 rollout begins at
+        # the BC policy while SAC obtains valid rsample/log_prob semantics.
+        bc_dist = self.actor_adapt.get_dist(td)
+        mean_action = bc_dist.mean
+        action_low = torch.as_tensor(
+            self._fastsac_action_low,
+            device=mean_action.device,
+            dtype=mean_action.dtype,
+        )
+        action_high = torch.as_tensor(
+            self._fastsac_action_high,
+            device=mean_action.device,
+            dtype=mean_action.dtype,
+        )
+        action_scale = (action_high - action_low) * 0.5
+        action_bias = (action_high + action_low) * 0.5
+        normalized = ((mean_action - action_bias) / action_scale).clamp(
+            -1.0 + FASTSAC_REFERENCE_EPS,
+            1.0 - FASTSAC_REFERENCE_EPS,
+        )
+        loc = torch.atanh(normalized)
+        log_std = self._ppo_actor_core(
+            self.actor_adapt
+        ).actor_std.clamp(
+            float(self.cfg.fastsac_log_std_min),
+            float(self.cfg.fastsac_log_std_max),
+        )
+        scale = log_std.exp().expand_as(loc)
+        return self.dist_cls(loc, scale)
+
+    def get_rollout_policy(self, mode="train"):
+        if not self._uses_bc_dagger_finetune_source():
+            return super().get_rollout_policy(mode)
+        modules = []
+        has_depth = hasattr(self, "temporal_depth_gru")
+        if has_depth:
+            modules.append(self.temporal_depth_gru_ema)
+        else:
+            modules.append(ZeroDepthInjector(self.depth_feature_dim, self.device))
+        if self.cfg.use_object_adapt:
+            modules.append(self.object_adapt_ema)
+            modules.append(self.object_pred_transform)
+        modules.append(self.adapt_ema)
+        modules.append(_BCDaggerSACRolloutActor(
+            self, deterministic=mode != "train"
+        ))
+        out_keys = [ACTION_KEY, PRIV_PRED_KEY]
+        if self.cfg.adapt_module == "gru":
+            out_keys.append(("next", "adapt_hx"))
+        if has_depth:
+            out_keys.append(("next", "depth_hx"))
+        return Seq(*modules, selected_out_keys=out_keys)
 
     def _prepare_student_learning_batch(self, batch):
         """Normalize raw online/offline RLPD observations at sample time."""
         snapshot = self._vecnorm_snapshot()
         prepared = dict(batch)
+        pre_normalized = prepared.pop(PRE_NORMALIZED_REPLAY_KEY, None)
         for field in ("observations", "next_observations"):
-            prepared[field] = self._normalize_replay_flat(
+            normalized = self._normalize_replay_flat(
                 batch[field],
                 self.q_actor_keys,
                 self._q_actor_widths,
                 snapshot,
             )
+            prepared[field] = (
+                normalized
+                if pre_normalized is None
+                else torch.where(
+                    pre_normalized.reshape(-1, 1), batch[field], normalized
+                )
+            )
         for field in ("critic_observations", "next_critic_observations"):
-            prepared[field] = self._normalize_replay_flat(
+            normalized = self._normalize_replay_flat(
                 batch[field],
                 self.q_critic_keys,
                 self._q_critic_widths,
                 snapshot,
+            )
+            prepared[field] = (
+                normalized
+                if pre_normalized is None
+                else torch.where(
+                    pre_normalized.reshape(-1, 1), batch[field], normalized
+                )
             )
         return prepared
 
@@ -7080,16 +7645,35 @@ class FastSACVelFinetune(FastSACVEL):
         if online_count and self.online_replay.size < 1:
             raise RuntimeError("Cannot train student FastSAC from empty online replay")
         parts = []
+        pre_normalized_parts = []
         if online_count:
-            parts.append(self.online_replay.sample(
+            online = self.online_replay.sample(
                 online_count, self.device, generator=self.q_rng
+            )
+            parts.append(online)
+            pre_normalized_parts.append(torch.zeros(
+                online_count, dtype=torch.bool, device=self.device
             ))
         if offline_count:
             if self.offline_replay is None:
                 raise RuntimeError("Offline teacher replay was not configured")
-            parts.append(self.offline_replay.sample(offline_count, self.device))
+            offline = self.offline_replay.sample(offline_count, self.device)
+            parts.append(offline)
+            pre_normalized_parts.append(torch.full(
+                (offline_count,),
+                bool(getattr(
+                    self.offline_replay,
+                    "observations_pre_normalized",
+                    False,
+                )),
+                dtype=torch.bool,
+                device=self.device,
+            ))
         keys = self._student_replay_fields()
         mixed = {key: torch.cat([part[key] for part in parts], dim=0) for key in keys}
+        pre_normalized = torch.cat(pre_normalized_parts, dim=0)
+        if pre_normalized.any():
+            mixed[PRE_NORMALIZED_REPLAY_KEY] = pre_normalized
         permutation = torch.randperm(
             total, device=self.device, generator=self.q_rng
         )
