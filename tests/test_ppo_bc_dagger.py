@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -9,6 +10,9 @@ import torch.nn as nn
 from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict
 
+bc_dagger_module = importlib.import_module(
+    "active_adaptation.learning.ppo.ppo_bc_dagger"
+)
 from active_adaptation.learning.ppo.common import ACTION_KEY
 from active_adaptation.learning.ppo.ppo_vel import (
     CMD_KEY,
@@ -26,11 +30,17 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_REPLAY_TEACHER_ACTIONS,
     DAGGER_TEACHER_ACTION_KEY,
     DAGGER_TEACHER_ACTION_VALID_KEY,
+    PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
+    PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS,
+    PPO_BC_DAGGER_LEGACY_TRAINING_ALGORITHM,
+    PPO_BC_DAGGER_TRAINING_ALGORITHM,
     _DaggerRolloutPolicy,
     _DaggerTeacherReplayBuffer,
     _DeviceReplay,
     PPOBCDaggerFinetune,
     PPOBCDaggerFinetuneConfig,
+    _iql_expectile_loss,
+    _project_scalar_to_c51,
     _valid_teacher_action_rows,
 )
 from active_adaptation.learning.ppo.fastsac_vel import (
@@ -39,7 +49,7 @@ from active_adaptation.learning.ppo.fastsac_vel import (
 )
 
 
-EXPECTED_DAGGER_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
+EXPECTED_DAGGER_ALGORITHM = PPO_BC_DAGGER_TRAINING_ALGORITHM
 TEACHER_ACTION_KEY = "teacher_action"
 TEACHER_ACTION_VALID_KEY = "teacher_action_valid"
 IS_STUDENT_ACTION_KEY = "is_student_action"
@@ -95,6 +105,8 @@ def test_config_store_registers_exact_student_observation_surface():
     assert dagger.save_teacher_buffer is True
     assert dagger.q_num_atoms > 1
     assert dagger.q_v_min < dagger.q_v_max
+    assert dagger.iql_expectile == pytest.approx(0.7)
+    assert dagger.iql_value_lr > 0.0
 
 
 def test_config_dataclass_has_stage_local_beta_and_separate_q_targets():
@@ -122,6 +134,8 @@ def test_config_dataclass_has_stage_local_beta_and_separate_q_targets():
         "q_seed",
         "q_tau",
         "q_max_grad_norm",
+        "iql_expectile",
+        "iql_value_lr",
     ):
         assert hasattr(cfg, name), name
 
@@ -171,6 +185,60 @@ def test_beta_schedule_uses_stage_local_rollouts_and_has_exact_endpoints():
 
     policy.dagger_rollout_count = 10_000
     assert policy._teacher_mixture_probability() == pytest.approx(0.1)
+
+
+def test_iql_expectile_loss_weights_positive_and_negative_advantages():
+    difference = torch.tensor([2.0, -2.0, 0.0])
+
+    actual = _iql_expectile_loss(difference, expectile=0.8)
+
+    # IQL defines the residual as target_Q - V.  A high expectile must weigh
+    # under-estimated V (positive residual) more heavily than over-estimated V.
+    assert torch.allclose(actual, torch.tensor([3.2, 0.8, 0.0]))
+    assert actual[0] == pytest.approx(4.0 * actual[1])
+
+
+@pytest.mark.parametrize("expectile", [0.0, 1.0, -0.1, 1.1, float("nan")])
+def test_iql_expectile_loss_rejects_invalid_expectiles(expectile):
+    with pytest.raises(ValueError, match="expectile"):
+        _iql_expectile_loss(torch.tensor([1.0]), expectile)
+
+
+def test_iql_expectile_loss_rejects_nonfinite_residuals():
+    with pytest.raises(ValueError, match="finite"):
+        _iql_expectile_loss(torch.tensor([float("inf")]), 0.7)
+
+
+def test_scalar_iql_target_projects_to_two_c51_atoms_with_clipping():
+    support = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0])
+    scalar = torch.tensor([-3.0, -1.5, 0.0, 0.25, 2.0, 3.0])
+
+    projection = _project_scalar_to_c51(scalar, support)
+
+    assert projection.shape == (scalar.numel(), support.numel())
+    assert torch.allclose(projection.sum(-1), torch.ones_like(scalar))
+    assert (projection > 0.0).sum(-1).le(2).all()
+    expected_value = scalar.clamp(support[0], support[-1])
+    assert torch.allclose(projection @ support, expected_value)
+    assert torch.equal(projection[1], torch.tensor([0.5, 0.5, 0.0, 0.0, 0.0]))
+    assert torch.equal(projection[2], torch.tensor([0.0, 0.0, 1.0, 0.0, 0.0]))
+    assert torch.equal(projection[3], torch.tensor([0.0, 0.0, 0.75, 0.25, 0.0]))
+    assert torch.equal(projection[0], torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0]))
+    assert torch.equal(projection[-1], torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0]))
+
+
+@pytest.mark.parametrize(
+    ("target", "support", "message"),
+    (
+        (torch.zeros(1, 1), torch.tensor([-1.0, 0.0, 1.0]), "shape"),
+        (torch.zeros(1), torch.tensor([0.0]), "atom"),
+        (torch.zeros(1), torch.tensor([-1.0, 0.0, 2.0]), "uniform"),
+        (torch.tensor([float("nan")]), torch.tensor([-1.0, 0.0]), "finite"),
+    ),
+)
+def test_scalar_iql_target_projection_validates_inputs(target, support, message):
+    with pytest.raises(ValueError, match=message):
+        _project_scalar_to_c51(target, support)
 
 
 class _NoOpTensorDictModule(nn.Module):
@@ -554,6 +622,7 @@ def test_train_op_never_calls_ppo_and_exports_only_teacher_executed_rows():
         dagger_updates_per_rollout=1,
         dagger_bc_epochs=1,
         dagger_batch_size=1,
+        iql_expectile=0.7,
     )
     transitions = {
         "observations": torch.zeros(3, 1),
@@ -586,6 +655,7 @@ def test_train_op_never_calls_ppo_and_exports_only_teacher_executed_rows():
     policy.dagger_environment_steps = 0
     policy.bc_update_count = 0
     policy.q_update_count = 0
+    policy.iql_value_update_count = 0
     policy._last_truncation_finals_used = 0
 
     info = policy.train_op(TensorDict({}, batch_size=[1, 2]))
@@ -614,6 +684,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
         actor_obs_keys=["a", "b"],
         critic_obs_keys=["c"],
         vecnorm_fingerprint=fingerprint,
+        action_clip=20.0,
     )
     rows = {
         "observations": torch.arange(8, dtype=torch.float32).reshape(4, 2),
@@ -644,6 +715,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
         actor_obs_keys=["a", "b"],
         critic_obs_keys=["c"],
         vecnorm_fingerprint=fingerprint,
+        action_clip=20.0,
     )
     restored.restore(path, expected_metadata=metadata)
 
@@ -656,6 +728,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
     )
     assert metadata["format_version"] == 2
     assert metadata["vecnorm_fingerprint"] == fingerprint
+    assert metadata["action_clip"] == pytest.approx(20.0)
 
     offline = BCDaggerOfflineReplayH5(
         path,
@@ -665,6 +738,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
         expected_actor_obs_keys=["a", "b"],
         expected_critic_obs_keys=["c"],
         expected_vecnorm_fingerprint=fingerprint,
+        expected_action_clip=20.0,
     )
     assert offline.size == 4
     assert offline.observations_pre_normalized is False
@@ -677,6 +751,56 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
             action_dim=1,
             expected_vecnorm_fingerprint="sha256:" + "f" * 64,
         )
+
+    import h5py
+
+    with h5py.File(path, "r+") as h5:
+        h5["actions"][0, 0] = 20.01
+    with pytest.raises(ValueError, match="outside.*support"):
+        BCDaggerOfflineReplayH5(
+            path,
+            actor_dim=2,
+            critic_dim=3,
+            action_dim=1,
+            expected_actor_obs_keys=["a", "b"],
+            expected_critic_obs_keys=["c"],
+            expected_vecnorm_fingerprint=fingerprint,
+            expected_action_clip=20.0,
+        )
+
+
+def test_teacher_h5_rejects_action_outside_manifest_support(tmp_path):
+    replay = _DaggerTeacherReplayBuffer(
+        tmp_path / "teacher_replay_buffer.h5",
+        capacity=1,
+        actor_dim=1,
+        critic_dim=1,
+        action_dim=1,
+        seed=0,
+        device="cpu",
+        actor_obs_keys=["actor"],
+        critic_obs_keys=["critic"],
+        vecnorm_fingerprint="sha256:" + "c" * 64,
+        action_clip=20.0,
+    )
+    rows = {
+        "observations": torch.zeros(1, 1),
+        "critic_observations": torch.zeros(1, 1),
+        "actions": torch.tensor([[20.01]]),
+        "rewards": torch.zeros(1),
+        "dones": torch.zeros(1, dtype=torch.bool),
+        "truncations": torch.zeros(1, dtype=torch.bool),
+        "discounts": torch.ones(1),
+        "next_observations": torch.zeros(1, 1),
+        "next_critic_observations": torch.zeros(1, 1),
+    }
+
+    with pytest.raises(ValueError, match="action"):
+        replay.append(rows)
+
+    assert replay.size == 0
+    assert replay.seen == 0
+    assert replay.data == {}
 
 
 def test_stage2_accepts_legacy_normalized_dagger_h5_but_rejects_mixed_schema(
@@ -697,6 +821,7 @@ def test_stage2_accepts_legacy_normalized_dagger_h5_but_rejects_mixed_schema(
         actor_obs_keys=["actor"],
         critic_obs_keys=["critic"],
         vecnorm_fingerprint=fingerprint,
+        action_clip=20.0,
     )
     replay.append(
         {
@@ -774,41 +899,145 @@ class _StudentMean(nn.Module):
         return SimpleNamespace(mean=self.linear(obs))
 
 
-def test_q_update_uses_actual_actions_independent_twin_targets_and_no_actor_grad():
-    policy = _bare_policy(gamma=0.99, q_tau=0.5, q_max_grad_norm=0.0)
+class _InstrumentedIQLTwinC51(nn.Module):
+    """Tiny twin whose target copy exposes action-dependent expected Qs."""
+
+    def __init__(self, target_mode=False):
+        super().__init__()
+        self.logits = nn.Parameter(
+            torch.tensor([[0.2, -0.1, 0.0], [-0.2, 0.1, 0.3]])
+        )
+        self.register_buffer("support", torch.tensor([-1.0, 0.0, 1.0]))
+        self.target_mode = bool(target_mode)
+        self.calls = []
+
+    def forward(self, obs, actions):
+        self.calls.append((obs.detach().clone(), actions.detach().clone()))
+        if not self.target_mode:
+            return self.logits[:, None, :].expand(2, obs.shape[0], 3)
+
+        action = actions[:, 0]
+        # Q2 is always the conservative minimum.  Both heads depend on the
+        # replay action, making an actor-resampled or averaged-Q implementation
+        # observably wrong.
+        desired = torch.stack(
+            (0.2 * action + 0.25, 0.2 * action - 0.25), dim=0
+        )
+        probabilities = torch.zeros(
+            2, obs.shape[0], 3, dtype=obs.dtype, device=obs.device
+        )
+        probabilities[..., 0] = (1.0 - desired) * 0.5
+        probabilities[..., 2] = (1.0 + desired) * 0.5
+        # Keep the same parameter topology as the online twin for the EMA copy.
+        return probabilities.log() + self.logits[:, None, :] * 0.0
+
+    def values(self, logits):
+        return (logits.softmax(-1) * self.support).sum(-1)
+
+
+class _TrackingIQLValue(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(()))
+        self.calls = []
+
+    def forward(self, observations):
+        self.calls.append(observations.detach().clone())
+        return observations[:, 0] + self.bias
+
+
+def test_iql_q_update_uses_dataset_actions_min_target_q_and_timeout_bootstrap(
+    monkeypatch,
+):
+    policy = _bare_policy(
+        gamma=0.5,
+        q_tau=0.5,
+        q_max_grad_norm=0.0,
+        iql_expectile=0.7,
+    )
     policy.device = torch.device("cpu")
-    policy.qnet = _TinyTwinC51()
+    policy.qnet = _InstrumentedIQLTwinC51()
     policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.qnet_target.target_mode = True
+    policy.iql_value = _TrackingIQLValue()
     policy.opt_q = torch.optim.SGD(policy.qnet.parameters(), lr=0.2)
+    policy.opt_iql_value = torch.optim.SGD(
+        policy.iql_value.parameters(), lr=0.0
+    )
     policy.actor_adapt = _StudentMean()
-    policy._actor_dist_from_flat = (
-        lambda obs: policy.actor_adapt.get_dist_from_flat(obs)
+    policy._actor_dist_from_flat = lambda obs: pytest.fail(
+        "IQL critic update sampled the actor"
     )
     policy.q_update_count = 0
+    policy.iql_value_update_count = 0
+
+    projected_scalar = []
+    real_project = _project_scalar_to_c51
+
+    def capture_projection(target, support, **kwargs):
+        projected_scalar.append(target.detach().clone())
+        return real_project(target, support, **kwargs)
+
+    monkeypatch.setattr(
+        bc_dagger_module, "_project_scalar_to_c51", capture_projection
+    )
 
     batch = {
-        "observations": torch.zeros(2, 2),
-        "critic_observations": torch.zeros(2, 2),
-        "actions": torch.tensor([[0.25], [-0.75]]),
-        "rewards": torch.tensor([0.1, 0.2]),
-        "dones": torch.tensor([False, False]),
-        "truncations": torch.tensor([False, False]),
-        "discounts": torch.ones(2),
-        "next_observations": torch.ones(2, 2),
-        "next_critic_observations": torch.ones(2, 2),
+        "observations": torch.zeros(3, 2),
+        "critic_observations": torch.tensor(
+            [[-0.3, 1.0], [-0.3, 2.0], [-0.3, 3.0]]
+        ),
+        "actions": torch.tensor([[0.25], [-0.75], [0.5]]),
+        "rewards": torch.tensor([0.1, 0.2, 0.3]),
+        # row 0: ordinary; row 1: true terminal; row 2: time-limit timeout.
+        "dones": torch.tensor([False, True, True]),
+        "truncations": torch.tensor([False, False, True]),
+        "discounts": torch.tensor([1.0, 0.8, 0.5]),
+        "next_observations": torch.ones(3, 2),
+        "next_critic_observations": torch.tensor(
+            [[0.4, 4.0], [0.6, 5.0], [0.8, 6.0]]
+        ),
     }
     actor_before = policy.actor_adapt.linear.weight.detach().clone()
-
-    policy._q_update(batch)
-
-    assert torch.equal(policy.qnet.last_actions, batch["actions"])
-    assert not torch.equal(policy.qnet.logits[0], policy.qnet.logits[1])
-    assert not torch.equal(
-        policy.qnet_target.logits[0], policy.qnet_target.logits[1]
+    policy.actor_adapt.linear.weight.grad = torch.full_like(
+        policy.actor_adapt.linear.weight, 7.0
     )
+    actor_grad_before = policy.actor_adapt.linear.weight.grad.clone()
+
+    _, _, _, metrics = policy._q_update(batch)
+
+    assert len(policy.qnet.calls) == 1
+    assert len(policy.qnet_target.calls) == 1
+    assert torch.equal(policy.qnet.calls[0][1], batch["actions"])
+    assert torch.equal(policy.qnet_target.calls[0][1], batch["actions"])
+
+    expected_min_target_q = torch.tensor([-0.2, -0.4, -0.15])
+    assert metrics["target_q_mean"] == pytest.approx(
+        expected_min_target_q.mean().item(), abs=1e-6
+    )
+    expected_advantage = expected_min_target_q - batch[
+        "critic_observations"
+    ][:, 0]
+    assert metrics["value_loss"] == pytest.approx(
+        _iql_expectile_loss(expected_advantage, 0.7).mean().item(), abs=1e-6
+    )
+
+    # Only a true terminal suppresses V(next).  A timeout uses the captured
+    # final observation and therefore bootstraps just like an ordinary row.
+    assert len(projected_scalar) == 1
+    assert torch.allclose(projected_scalar[0], torch.tensor([0.3, 0.2, 0.5]))
+    assert len(policy.iql_value.calls) == 2
+    assert torch.equal(policy.iql_value.calls[0], batch["critic_observations"])
+    assert torch.equal(
+        policy.iql_value.calls[1], batch["next_critic_observations"]
+    )
+
     assert torch.equal(policy.actor_adapt.linear.weight, actor_before)
-    assert policy.actor_adapt.linear.weight.grad is None
+    assert torch.equal(
+        policy.actor_adapt.linear.weight.grad, actor_grad_before
+    )
     assert policy.q_update_count == 1
+    assert policy.iql_value_update_count == 1
 
 
 def test_legacy_ppo_bootstrap_accepts_fresh_q_but_same_stage_requires_both_qs(
@@ -822,7 +1051,9 @@ def test_legacy_ppo_bootstrap_accepts_fresh_q_but_same_stage_requires_both_qs(
     )
     policy.qnet = nn.Linear(2, 1, bias=False)
     policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.iql_value = nn.Linear(2, 1, bias=False)
     policy.q_update_count = 123
+    policy.iql_value_update_count = 123
     policy.dagger_rollout_count = 456
     policy.q_rng = torch.Generator().manual_seed(99)
     policy.dagger_rng = torch.Generator().manual_seed(100)
@@ -836,6 +1067,7 @@ def test_legacy_ppo_bootstrap_accepts_fresh_q_but_same_stage_requires_both_qs(
             "temporal_depth_gru_ema",
             "qnet",
             "qnet_target",
+            "iql_value",
         ],
     )
 
@@ -843,6 +1075,7 @@ def test_legacy_ppo_bootstrap_accepts_fresh_q_but_same_stage_requires_both_qs(
 
     assert set(failed).issuperset({"qnet", "qnet_target"})
     assert policy.q_update_count == 0
+    assert policy.iql_value_update_count == 0
     assert policy.dagger_rollout_count == 0
     assert torch.equal(
         policy.qnet.weight, policy.qnet_target.weight
@@ -856,6 +1089,146 @@ def test_legacy_ppo_bootstrap_accepts_fresh_q_but_same_stage_requires_both_qs(
     with pytest.raises((KeyError, ValueError, RuntimeError), match="qnet_target|target"):
         policy.load_state_dict(same_stage_without_target)
 
+    same_stage_without_value = {
+        "training_algorithm": EXPECTED_DAGGER_ALGORITHM,
+        "last_phase": "finetune",
+        "qnet": policy.qnet.state_dict(),
+        "qnet_target": policy.qnet_target.state_dict(),
+    }
+    with pytest.raises(KeyError, match="iql_value"):
+        policy.load_state_dict(same_stage_without_value)
+
+    with pytest.raises(ValueError, match="Legacy.*IQL"):
+        policy.load_state_dict(
+            {
+                "training_algorithm": PPO_BC_DAGGER_LEGACY_TRAINING_ALGORITHM,
+                "last_phase": "finetune",
+            }
+        )
+
+
+def test_same_stage_resume_restores_learning_state_without_teacher_h5(
+    monkeypatch,
+):
+    policy = _bare_policy(use_object_adapt=False)
+    policy.qnet = nn.Linear(2, 1, bias=False)
+    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.iql_value = nn.Linear(2, 1, bias=False)
+    policy.bc_module = nn.Linear(2, 1, bias=False)
+    policy.adapt_module_for_test = nn.Linear(2, 1, bias=False)
+    policy.bc_optimizer = torch.optim.AdamW(
+        policy.bc_module.parameters(), lr=1e-3
+    )
+    policy.opt_q = torch.optim.AdamW(policy.qnet.parameters(), lr=2e-3)
+    policy.opt_iql_value = torch.optim.Adam(
+        policy.iql_value.parameters(), lr=3e-3
+    )
+    policy.opt_adapt = torch.optim.AdamW(
+        policy.adapt_module_for_test.parameters(), lr=4e-3
+    )
+    policy.dagger_rng = torch.Generator().manual_seed(1)
+    policy.q_rng = torch.Generator().manual_seed(2)
+    progress = []
+    policy.env = SimpleNamespace(set_progress=progress.append)
+
+    source_modules = [
+        nn.Linear(2, 1, bias=False),
+        nn.Linear(2, 1, bias=False),
+        nn.Linear(2, 1, bias=False),
+        nn.Linear(2, 1, bias=False),
+    ]
+    source_optimizers = [
+        torch.optim.AdamW(source_modules[0].parameters(), lr=1e-3),
+        torch.optim.AdamW(source_modules[1].parameters(), lr=2e-3),
+        torch.optim.Adam(source_modules[2].parameters(), lr=3e-3),
+        torch.optim.AdamW(source_modules[3].parameters(), lr=4e-3),
+    ]
+    for index, (module, optimizer) in enumerate(
+        zip(source_modules, source_optimizers), start=1
+    ):
+        optimizer.zero_grad(set_to_none=True)
+        (module.weight.square().sum() * index).backward()
+        optimizer.step()
+
+    resumed_dagger_rng = torch.Generator().manual_seed(101)
+    resumed_q_rng = torch.Generator().manual_seed(202)
+    torch.rand(7, generator=resumed_dagger_rng)
+    torch.rand(9, generator=resumed_q_rng)
+    replay_metadata = {
+        "snapshot_id": "frozen-checkpoint-800",
+        "size": 1_048_576,
+    }
+    checkpoint = {
+        "training_algorithm": PPO_BC_DAGGER_TRAINING_ALGORITHM,
+        "last_phase": "finetune",
+        "qnet": policy.qnet.state_dict(),
+        "qnet_target": policy.qnet_target.state_dict(),
+        "iql_value": policy.iql_value.state_dict(),
+        "critic_learning_semantics": PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS,
+        "actor_learning_semantics": PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
+        "actor_backend": bc_dagger_module.PPO_BC_DAGGER_ACTOR_BACKEND,
+        "teacher_action_semantics": (
+            bc_dagger_module.DAGGER_TEACHER_ACTION_SEMANTICS
+        ),
+        "optimizer_resume_state": {
+            "bc_optimizer": source_optimizers[0].state_dict(),
+            "q_optimizer": source_optimizers[1].state_dict(),
+            "iql_value_optimizer": source_optimizers[2].state_dict(),
+            "adapt_optimizer": source_optimizers[3].state_dict(),
+        },
+        "dagger_rollout_count": 801,
+        "dagger_environment_steps": 25_632,
+        "bc_update_count": 25_632,
+        "q_update_count": 25_632,
+        "iql_value_update_count": 25_632,
+        "dagger_rng_state": resumed_dagger_rng.get_state(),
+        "q_rng_state": resumed_q_rng.get_state(),
+        "teacher_replay_id": "original-frozen-replay",
+        "teacher_replay_state": replay_metadata,
+        "next_iter": 6_801,
+    }
+
+    monkeypatch.setattr(
+        PPOVEL,
+        "load_state_dict",
+        lambda self, state_dict, strict=True: [],
+    )
+
+    policy.load_state_dict(checkpoint)
+
+    def assert_optimizer_state_equal(actual, expected):
+        actual_state = actual.state_dict()
+        assert actual_state["param_groups"] == expected["param_groups"]
+        assert actual_state["state"].keys() == expected["state"].keys()
+        for parameter_id in expected["state"]:
+            for key, expected_value in expected["state"][parameter_id].items():
+                actual_value = actual_state["state"][parameter_id][key]
+                if torch.is_tensor(expected_value):
+                    assert torch.equal(actual_value, expected_value)
+                else:
+                    assert actual_value == expected_value
+
+    for actual, source in zip(
+        (
+            policy.bc_optimizer,
+            policy.opt_q,
+            policy.opt_iql_value,
+            policy.opt_adapt,
+        ),
+        source_optimizers,
+    ):
+        assert_optimizer_state_equal(actual, source.state_dict())
+    assert policy.dagger_rollout_count == 801
+    assert policy.dagger_environment_steps == 25_632
+    assert policy.bc_update_count == 25_632
+    assert policy.q_update_count == 25_632
+    assert policy.iql_value_update_count == 25_632
+    assert torch.equal(policy.dagger_rng.get_state(), checkpoint["dagger_rng_state"])
+    assert torch.equal(policy.q_rng.get_state(), checkpoint["q_rng_state"])
+    assert policy.teacher_replay_id == "original-frozen-replay"
+    assert policy._loaded_teacher_replay_metadata == replay_metadata
+    assert progress == [6_801]
+
 
 def test_state_dict_names_online_and_target_q_separately():
     # This is deliberately a topology-level assertion. A single aliased module
@@ -863,6 +1236,7 @@ def test_state_dict_names_online_and_target_q_separately():
     policy = _bare_policy()
     policy.qnet = _TinyTwinC51()
     policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.iql_value = _TrackingIQLValue()
     children = dict(policy.named_children())
 
     assert children["qnet"] is not children["qnet_target"]
@@ -872,3 +1246,15 @@ def test_state_dict_names_online_and_target_q_separately():
     assert children["qnet"].logits.data_ptr() != (
         children["qnet_target"].logits.data_ptr()
     )
+    assert children["iql_value"] is not children["qnet"]
+
+
+def test_iql_checkpoint_markers_keep_actor_bc_only_and_value_stage_local():
+    policy = _bare_policy(**vars(PPOBCDaggerFinetuneConfig()))
+    checkpoint_config = policy._checkpoint_config()
+
+    assert EXPECTED_DAGGER_ALGORITHM.endswith("_iql_v2")
+    assert "expectile" in PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS
+    assert "bc_only" in PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS
+    assert checkpoint_config["iql_expectile"] == pytest.approx(0.7)
+    assert checkpoint_config["iql_value_lr"] > 0.0

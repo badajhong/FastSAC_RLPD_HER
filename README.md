@@ -254,8 +254,8 @@ python scripts/play.py algo=fastsac_vel_train task=G1/vaic/skateboard_tea checkp
 ```bash
 # Frozen PPO teacher + per-environment DAgger beta mixture + student BC.
 # VAIC depth/object/adaptation supervision and EMA updates remain enabled.
-# Independent C51 Q1/Q2 and target-Q1/target-Q2 learn every executed
-# teacher/student transition and are saved separately in each checkpoint.
+# A Stage-1-only IQL V network and independent C51 Q1/Q2 targets learn from
+# replay actions; the student actor remains pure DAgger BC.
 python scripts/bc_dagger.py \
   task=G1/vaic/skateboard_stu \
   checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
@@ -263,18 +263,116 @@ python scripts/bc_dagger.py \
   algo.dagger_beta_decay_rollouts=1000
 ```
 
-The default beta follows the HOI R1 DAgger schedule: `1.0 -> 0.0` over 4,000
-new DAgger rollouts. This path performs Huber behavior cloning and Q learning;
-it does not call PPO/GAE/value optimization or a SAC actor/entropy objective.
+The dedicated script default decays beta from `1.0 -> 0.0` over 1,800 new
+DAgger rollouts. This path performs Huber behavior cloning plus IQL-style
+critic/value pretraining; it does not call PPO/GAE/PPO-value optimization, an
+IQL advantage-weighted actor loss, or a SAC actor/entropy objective. Q1/Q2 keep
+the FastSAC C51 topology, while their scalar target is `r + gamma * V(next)`
+projected onto that support for direct Stage-2 weight transfer.
 Only valid, actually teacher-executed transitions are exported to
 `teacher_replay_buffer.h5`; the learning replay still contains every executed
-teacher/student transition. Observations in this H5 use the frozen PPO VecNorm
-coordinates and a truthful DAgger schema. The current `fastsac_vel_finetune`
-loader intentionally does not accept this H5 yet; add a schema-aware converter
-or consumer before using it as that command's offline FastSAC input.
+teacher/student transition. Observations in this H5 are stored before VecNorm
+and normalized with the checkpoint's fixed statistics when sampled. The
+`fastsac_vel_finetune` loader accepts this paired DAgger schema; it transfers
+the BC actor and IQL-pretrained Q/Q-target weights, then deliberately discards
+the Stage-1-only V network before ordinary Stage-2 FastSAC begins.
 
-The default CPU capacities are 131,072 learning rows and 524,288 teacher-export
-rows. For a smaller host-memory run, override both capacities explicitly with
+For this BC-DAgger bridge, Stage-2 **training** collection samples the same
+bounded tanh-Gaussian distribution used by the SAC targets and actor loss. Its
+dedicated log-standard-deviation starts at `0.01` raw action units, independently
+of the unused PPO/DAgger `actor_std=0.5`. The exact bounded command sent to the
+environment is retained in `ACTION_KEY` and therefore becomes the online replay
+action paired with its observed reward and next state. Evaluation and deployment
+remain the finite, clipped deterministic BC/SAC mean. A dedicated checkpointed
+rollout RNG keeps behavior sampling independent of SAC gradient sampling and the
+global environment RNG.
+
+The DAgger safety clip and SAC entropy coordinates are deliberately separate.
+The offline H5, rollout actor, environment, replay, and pretrained Q retain the
+symmetric executable safety support `[-20, 20]` (from `dagger_action_clip`),
+whereas entropy uses the fixed raw-action reference scale `1`. The safety bound
+therefore cannot inject a `log(20)` density offset into every action dimension
+or change the temperature merely because the emergency clip is wide. Set
+`algo.sac_deterministic_rollout=true` only for the deterministic collection
+ablation.
+
+Stage 2 first collects 98,304 accepted online transitions, then performs 8,000
+Q-only updates with actor, alpha, and perception optimizers frozen. The target
+still samples the frozen stochastic next action so Q learns on the behavior's
+actual support, but effective alpha and the entropy target term are **exactly
+zero**. This is a temporary hard-Bellman compatibility bridge for the
+IQL-pretrained critic, not removal of entropy from the subsequent SAC phase.
+
+After the bridge, actor candidates are considered every 128 Q updates. An actor
+tick is applied only when its predicted twin-Q gain over the frozen BC action is
+positive and larger than the twins' disagreement. Effective alpha starts at
+zero on the first confidence-approved actor tick and increases linearly to its
+learned value over the next 20,000 Q updates; the Q target, actor objective, and
+temperature update use that same effective alpha. Raw alpha starts at `1e-5`,
+and the raw-unit entropy target is the standard `-action_dim`
+(`sac_target_entropy_ratio=1`). There is no BC-loss anchor in this no-anchor SAC
+path. The guarded Stage-2 defaults are `sac_batch_size=512`,
+`q_lr=3e-5`, `sac_tau=0.001`, `sac_actor_lr=3e-7`, and
+`sac_policy_frequency=128`.
+
+Perception remains frozen for the whole stage because replay stores `priv_pred`,
+not the raw recurrent inputs needed to recompute it consistently. Stage-2
+checkpoints created before this stochastic-hard-bridge, confidence-gate, and
+alpha-ramp revision are intentionally incompatible. Do not resume an old
+Stage-2 checkpoint; restart from the original BC-DAgger checkpoint.
+
+To keep the BC student/depth/adaptation/EMA weights but start Stage-2 Q1/Q2
+from a fresh initialization, disable only the Q-weight transfer:
+
+```bash
+python scripts/train.py \
+  algo=fastsac_vel_finetune \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/path/to/bc-dagger/checkpoint_final.pt \
+  algo.load_pretrained_q=false
+```
+
+The default is `true`. With `false`, Stage-1 IQL Q/V weights and update counts
+are not required; both target critics become frozen exact copies of the fresh
+online Q networks. The BC actor and all student perception/EMA modules are
+still restored.
+
+To continue only the model training state from a DAgger checkpoint while
+leaving the existing `teacher_replay_buffer.h5` unchanged, use the dedicated
+resume argument:
+
+```bash
+python scripts/bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  bc_dagger_checkpoint=/home/hcc/research/VAIC/outputs/2026-08-06/19-02-24-G1Skateboard-ppo_bc_dagger/wandb/latest-run/files/checkpoint_800.pt \
+  total_frames=6537216 \
+  algo.dagger_beta_decay_rollouts=1000
+```
+
+This restores the student/teacher modules, depth/adaptation modules and EMAs,
+IQL V, Q1/Q2 and target Q1/Q2, all four optimizer states, the dedicated
+DAgger/Q RNG states, and training counters. At startup it validates the source
+H5's replay ID and VecNorm lineage, then makes an atomic, independent read-only
+copy at `<new-output>/teacher_replay_buffer.h5`, outside the W&B-watched
+`wandb/run-.../files/` directory. The source H5 is never modified, and the new
+copy receives no additional transitions or snapshots. This currently duplicates
+about 23 GiB; set `bc_dagger_copy_teacher_replay=false` to skip it.
+
+`total_frames` is the number of additional frames for the new process: the
+example adds 399 rollouts to checkpoint 800's 801 completed rollouts and ends at
+1,200. Reusing `total_frames=19660800` instead adds another 1,200 rollouts and
+ends at 2,001. The in-memory all-transition learning ring and the simulator
+episode state are not checkpointed, so they restart and the ring refills during
+roughly the first eight rollouts. A resumed run also creates a new W&B run.
+Stage 2 can auto-discover the copied H5 from a local resumed checkpoint path.
+The copy is not automatically uploaded to W&B, so `run:<resumed-run>` still
+needs an explicit local `teacher_replay_buffer_path` unless the H5 is uploaded
+separately. This applies to newly collected teacher H5 files too: automatic
+W&B replay upload is disabled by default because these files are 20+ GiB. Use
+`wandb.upload_teacher_replay=true` only for an intentional large upload.
+
+The default CPU capacities are 131,072 learning rows and 1,048,576
+teacher-export rows. For a smaller host-memory run, override both capacities with
 `algo.dagger_buffer_capacity=65536 algo.teacher_buffer_capacity=131072`.
 
 Student policy

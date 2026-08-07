@@ -9,6 +9,7 @@ import os
 import time
 import datetime
 
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf, DictConfig
 from collections import OrderedDict
 from tqdm import tqdm
@@ -28,16 +29,20 @@ try:
         EpisodeStats,
         apply_fastsac_buffer_steps,
         apply_teacher_replay_buffer_path_alias,
+        copy_frozen_teacher_replay,
         evaluate,
         make_env_policy,
+        teacher_replay_storage_dir,
     )
 except ImportError:
     from helpers import (
         EpisodeStats,
         apply_fastsac_buffer_steps,
         apply_teacher_replay_buffer_path_alias,
+        copy_frozen_teacher_replay,
         evaluate,
         make_env_policy,
+        teacher_replay_storage_dir,
     )
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -48,26 +53,103 @@ torch.backends.cudnn.benchmark = False
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
+
+def maybe_upload_teacher_replay(
+    run,
+    cfg: DictConfig,
+    policy,
+    replay_snapshot_path,
+    *,
+    artifact: bool,
+):
+    """Upload a final H5 only through an explicit W&B opt-in."""
+    if not artifact:
+        return None
+    replay_path = replay_snapshot_path
+    if replay_path is None and hasattr(policy, "get_offline_replay_path"):
+        replay_path = policy.get_offline_replay_path()
+    if replay_path is None:
+        return None
+    if not bool(cfg.wandb.get("upload_teacher_replay", False)):
+        logging.info(
+            "Keeping teacher replay local (W&B H5 upload disabled): %s",
+            replay_path,
+        )
+        return None
+    run.save(
+        replay_path,
+        policy="now",
+        base_path=os.path.dirname(replay_path),
+    )
+    return replay_path
+
+
+def make_wandb_settings(cfg: DictConfig):
+    """Prevent W&B's end-of-run directory scan from finding a local H5."""
+    replay_filename = cfg.algo.get("teacher_buffer_filename", None)
+    upload_enabled = bool(
+        cfg.wandb.get("upload_teacher_replay", False)
+    )
+    ignore_globs = ()
+    if replay_filename is not None and not upload_enabled:
+        ignore_globs = (str(replay_filename),)
+    return wandb.Settings(ignore_globs=ignore_globs)
+
+
 def run_training(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    if (
+        cfg.get("bc_dagger_checkpoint", None) is not None
+        and not bool(cfg.get("_bc_dagger_model_only_resume", False))
+    ):
+        raise ValueError(
+            "bc_dagger_checkpoint must be validated by scripts/bc_dagger.py; "
+            "use that dedicated entrypoint for model-only DAgger resume"
+        )
     apply_teacher_replay_buffer_path_alias(cfg)
     apply_fastsac_buffer_steps(cfg)
-
-    print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
-    app_launcher = AppLauncher(
-        OmegaConf.to_container(cfg.app),
-        distributed=aa.is_distributed(),
-        device=f"cuda:{aa.get_local_rank()}"
+    freeze_bc_dagger_teacher_replay = bool(
+        cfg.get("_bc_dagger_model_only_resume", False)
     )
-    simulation_app = app_launcher.app
 
     run = wandb.init(
         job_type=cfg.wandb.job_type,
         project=cfg.wandb.project,
         mode=cfg.wandb.mode,
         tags=cfg.wandb.tags,
+        settings=make_wandb_settings(cfg),
     )
+    os.makedirs(run.dir, exist_ok=True)
+    hydra_output_dir = (
+        HydraConfig.get().runtime.output_dir
+        if HydraConfig.initialized()
+        else None
+    )
+    replay_storage_dir = teacher_replay_storage_dir(
+        run.dir, hydra_output_dir
+    )
+    replay_copy_source = cfg.get(
+        "_bc_dagger_teacher_replay_copy_source", None
+    )
+    if (
+        freeze_bc_dagger_teacher_replay
+        and replay_copy_source is not None
+        and aa.is_main_process()
+    ):
+        print(
+            "Copying immutable teacher replay into the new output "
+            f"({os.path.getsize(replay_copy_source) / (1024**3):.2f} GiB)..."
+        )
+        copied_replay = copy_frozen_teacher_replay(
+            replay_copy_source,
+            replay_storage_dir,
+            cfg.algo.get(
+                "teacher_buffer_filename", "teacher_replay_buffer.h5"
+            ),
+        )
+        cfg._bc_dagger_teacher_replay_copy_path = copied_replay
+        print(f"Teacher replay copy ready: {copied_replay}")
     run.config.update(OmegaConf.to_container(cfg))
     
     default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
@@ -77,11 +159,20 @@ def run_training(cfg: DictConfig):
     run.name = f"{run_idx}-{default_run_name}"
     setproctitle(run.name)
 
-    os.makedirs(run.dir, exist_ok=True)
     cfg_save_path = os.path.join(run.dir, "cfg.yaml")
     OmegaConf.save(cfg, cfg_save_path)
     run.save(cfg_save_path, policy="now")
     run.save(os.path.join(run.dir, "config.yaml"), policy="now")
+
+    # Materialize a requested 20+ GiB frozen replay before launching Isaac so
+    # the simulator and GPU are not held idle during filesystem I/O.
+    print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
+    app_launcher = AppLauncher(
+        OmegaConf.to_container(cfg.app),
+        distributed=aa.is_distributed(),
+        device=f"cuda:{aa.get_local_rank()}"
+    )
+    simulation_app = app_launcher.app
 
     env, policy, vecnorm = make_env_policy(cfg, configure_replay=True)
 
@@ -94,7 +185,8 @@ def run_training(cfg: DictConfig):
         and policy.requires_training_replay()
     )
     if (
-        hasattr(policy, "configure_teacher_replay")
+        not freeze_bc_dagger_teacher_replay
+        and hasattr(policy, "configure_teacher_replay")
         and (
             requires_training_replay
             or (
@@ -104,7 +196,7 @@ def run_training(cfg: DictConfig):
         )
     ):
         replay_name = cfg.algo.teacher_buffer_filename
-        replay_path = os.path.join(run.dir, replay_name)
+        replay_path = os.path.join(replay_storage_dir, replay_name)
         restore_path = None
         if cfg.checkpoint_path is not None:
             restore_path = cfg.algo.get("teacher_buffer_path")
@@ -148,7 +240,10 @@ def run_training(cfg: DictConfig):
 
     def save(policy, checkpoint_name: str, artifact: bool=False):
         replay_snapshot_path = None
-        if hasattr(policy, "snapshot_teacher_replay"):
+        if (
+            not freeze_bc_dagger_teacher_replay
+            and hasattr(policy, "snapshot_teacher_replay")
+        ):
             replay_snapshot_path = policy.snapshot_teacher_replay(
                 env.current_iter, checkpoint_name
             )
@@ -169,21 +264,13 @@ def run_training(cfg: DictConfig):
             model_artifact.add_file(ckpt_path)
             run.log_artifact(model_artifact)
         run.save(ckpt_path, policy="now", base_path=run.dir)
-        if artifact and replay_snapshot_path is not None:
-            # Upload one closed, atomically replaced final snapshot. Periodic
-            # snapshots remain local and are overwritten at the next checkpoint.
-            run.save(replay_snapshot_path, policy="now", base_path=run.dir)
-        elif artifact and hasattr(policy, "get_offline_replay_path"):
-            # Keep the immutable teacher dataset reachable from a student
-            # FastSAC run too, so checkpoint_path=run:<student-run> can restart
-            # without separately specifying the original teacher run.
-            offline_replay_path = policy.get_offline_replay_path()
-            if offline_replay_path is not None:
-                run.save(
-                    offline_replay_path,
-                    policy="now",
-                    base_path=os.path.dirname(offline_replay_path),
-                )
+        maybe_upload_teacher_replay(
+            run,
+            cfg,
+            policy,
+            replay_snapshot_path,
+            artifact=artifact,
+        )
         logging.info(f"Saved checkpoint to {str(ckpt_path)}")
 
     assert env.training
@@ -326,8 +413,16 @@ def run_training(cfg: DictConfig):
         info["rollout_fps"] = data_buf.numel() / rollout_time
         info["training_time"] = training_time
 
-        if should_save(i):
-            save(policy, f"checkpoint_{i}")
+        checkpoint_index = i
+        if (
+            bool(cfg.get("_bc_dagger_model_only_resume", False))
+            and hasattr(policy, "dagger_rollout_count")
+        ):
+            # Preserve the original zero-based filename convention while using
+            # the cumulative DAgger stage counter in a resumed W&B run.
+            checkpoint_index = max(int(policy.dagger_rollout_count) - 1, 0)
+        if should_save(checkpoint_index):
+            save(policy, f"checkpoint_{checkpoint_index}")
 
         if aa.is_main_process():
             # print(OmegaConf.to_yaml({k: v for k, v in info.items() if (isinstance(v, (float, int)) and not k.startswith("performance_reward"))}))

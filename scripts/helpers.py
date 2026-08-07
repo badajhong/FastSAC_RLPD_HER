@@ -7,6 +7,9 @@ import time
 import wandb
 import logging
 import os
+import shutil
+import stat
+import tempfile
 import datetime
 
 from typing import Sequence, List, Tuple, TYPE_CHECKING
@@ -183,6 +186,138 @@ def apply_teacher_replay_buffer_path_alias(cfg: DictConfig):
     return selected_path
 
 
+def copy_frozen_teacher_replay(source_path, run_dir, filename):
+    """Atomically make an independent, read-only replay copy in a new run.
+
+    The source is deliberately never opened for writing.  A source stat check
+    before and after the copy rejects a concurrently changing H5 instead of
+    publishing a torn offline dataset.
+    """
+    source_path = os.path.realpath(os.path.abspath(os.fspath(source_path)))
+    run_dir = os.path.realpath(os.path.abspath(os.fspath(run_dir)))
+    filename = os.fspath(filename)
+    if (
+        not filename
+        or filename in (".", "..")
+        or os.path.basename(filename) != filename
+    ):
+        raise ValueError("Teacher replay copy requires a file basename")
+    if not os.path.isfile(source_path):
+        raise FileNotFoundError(
+            f"Frozen teacher replay source does not exist: {source_path}"
+        )
+
+    os.makedirs(run_dir, exist_ok=True)
+    destination = os.path.join(run_dir, filename)
+    if os.path.lexists(destination):
+        raise FileExistsError(
+            f"Refusing to overwrite teacher replay copy: {destination}"
+        )
+    if os.path.realpath(destination) == source_path:
+        raise ValueError("Teacher replay source and destination are identical")
+
+    source_before = os.stat(source_path, follow_symlinks=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{filename}.", suffix=".copying", dir=run_dir
+    )
+    os.close(descriptor)
+    try:
+        logging.info(
+            "Copying immutable teacher replay (%0.2f GiB): %s -> %s",
+            source_before.st_size / (1024**3),
+            source_path,
+            destination,
+        )
+        shutil.copy2(source_path, temporary)
+        source_after = os.stat(source_path, follow_symlinks=True)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+        if any(
+            getattr(source_before, field) != getattr(source_after, field)
+            for field in stable_fields
+        ):
+            raise RuntimeError(
+                "Teacher replay source changed during copy; refusing a torn H5"
+            )
+        copied = os.stat(temporary, follow_symlinks=True)
+        if copied.st_size != source_before.st_size:
+            raise RuntimeError(
+                "Teacher replay copy size does not match its immutable source"
+            )
+        # The resumed DAgger run and Stage 2 only consume this offline dataset.
+        os.chmod(temporary, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+    logging.info("Immutable teacher replay copy ready: %s", destination)
+    return destination
+
+
+def teacher_replay_storage_dir(wandb_files_dir, hydra_output_dir=None):
+    """Return the Hydra output root outside W&B's recursively watched files."""
+    files_dir = os.path.realpath(
+        os.path.abspath(os.fspath(wandb_files_dir))
+    )
+    if hydra_output_dir is not None:
+        output_dir = os.path.realpath(
+            os.path.abspath(os.fspath(hydra_output_dir))
+        )
+        if os.path.commonpath((files_dir, output_dir)) == files_dir:
+            raise ValueError(
+                "Teacher replay storage must be outside W&B's files directory"
+            )
+        return output_dir
+    if os.path.basename(files_dir) != "files":
+        raise ValueError(
+            f"Expected a W&B files directory, got: {files_dir}"
+        )
+    wandb_dir = os.path.dirname(os.path.dirname(files_dir))
+    if os.path.basename(wandb_dir) != "wandb":
+        raise ValueError(
+            f"Cannot derive Hydra output root from W&B path: {files_dir}"
+        )
+    return os.path.dirname(wandb_dir)
+
+
+def find_local_teacher_replay(checkpoint_path, filename):
+    """Find one local H5 beside a checkpoint or at its Hydra output root."""
+    checkpoint_path = os.path.realpath(
+        os.path.abspath(os.fspath(checkpoint_path))
+    )
+    filename = os.fspath(filename)
+    if (
+        not filename
+        or filename in (".", "..")
+        or os.path.basename(filename) != filename
+    ):
+        raise ValueError("Teacher replay filename must be a plain basename")
+
+    files_dir = os.path.dirname(checkpoint_path)
+    candidates = []
+    for root, _, files in os.walk(files_dir):
+        if filename in files:
+            candidates.append(os.path.realpath(os.path.join(root, filename)))
+    try:
+        output_candidate = os.path.join(
+            teacher_replay_storage_dir(files_dir), filename
+        )
+    except ValueError:
+        output_candidate = None
+    if output_candidate is not None and os.path.isfile(output_candidate):
+        candidates.append(os.path.realpath(output_candidate))
+
+    candidates = sorted(set(candidates))
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "Multiple teacher replay buffers were found for the checkpoint; "
+            f"set teacher_replay_buffer_path explicitly: {candidates}"
+        )
+    return candidates[0] if candidates else None
+
+
 def apply_fastsac_buffer_steps(cfg: DictConfig):
     """Derive the flat Stage-1 FastSAC FIFO size from an env-local horizon.
 
@@ -259,7 +394,10 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
 
     base_env = SimpleEnv(cfg.task)
 
-    replay_consumer = (
+    freeze_bc_dagger_teacher_replay = (
+        bool(cfg.get("_bc_dagger_model_only_resume", False))
+    )
+    replay_consumer = not freeze_bc_dagger_teacher_replay and (
         cfg.algo.get("phase", None) == "finetune"
         or bool(cfg.algo.get("save_teacher_buffer", False))
     )
@@ -279,22 +417,15 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         auto_resolve_replay
         and checkpoint_path is not None
     ):
-        # A relative basename such as ``checkpoint_final.pt`` has an empty
-        # dirname. Resolve it first so the adjacent H5 is still discovered.
-        search_root = os.path.dirname(os.path.abspath(checkpoint_path))
-        candidates = []
-        for root, _, files in os.walk(search_root):
-            if cfg.algo.teacher_buffer_filename in files:
-                candidates.append(os.path.join(root, cfg.algo.teacher_buffer_filename))
-        candidates.sort()
-        if len(candidates) > 1:
-            raise RuntimeError(
-                "Multiple teacher replay buffers were found beside the checkpoint; "
-                f"set algo.teacher_buffer_path explicitly: {candidates}"
-            )
-        if candidates:
-            cfg.algo.teacher_buffer_path = candidates[0]
-            print(colored(f"[Info]: Found teacher replay buffer: {candidates[0]}", "green"))
+        replay_path = find_local_teacher_replay(
+            checkpoint_path, cfg.algo.teacher_buffer_filename
+        )
+        if replay_path is not None:
+            cfg.algo.teacher_buffer_path = replay_path
+            print(colored(
+                f"[Info]: Found teacher replay buffer: {replay_path}",
+                "green",
+            ))
     if checkpoint_path is not None:
         state_dict = torch.load(checkpoint_path, weights_only=False)
     else:
@@ -313,10 +444,25 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         )
         detected_algorithm = policy_state.get("training_algorithm")
         detected_backend = policy_state.get("actor_backend")
+        current_dagger_adapter = "vaic_fastsac_bc_dagger_adapter_v2"
+        legacy_dagger_adapter = "vaic_fastsac_bc_dagger_adapter_v1"
+        if detected_algorithm == "vaic_ppo_bc_dagger_student_v1":
+            raise ValueError(
+                "This BC-DAgger checkpoint predates IQL critic training. "
+                "Create a new checkpoint with scripts/bc_dagger.py before "
+                "starting fastsac_vel_finetune."
+            )
+        if detected_backend == legacy_dagger_adapter:
+            raise ValueError(
+                "This Stage-2 BC-DAgger adapter checkpoint reused PPO's "
+                "untrained actor_std and used the old action/entropy "
+                "semantics. Restart Stage 2 from the original BC-DAgger "
+                "checkpoint; adapter_v1 resumes are intentionally rejected."
+            )
         if configured_source == "auto":
-            if detected_algorithm == "vaic_ppo_bc_dagger_student_v1":
+            if detected_algorithm == "vaic_ppo_bc_dagger_student_iql_v2":
                 configured_source = "bc_dagger"
-            elif detected_backend == "vaic_fastsac_bc_dagger_adapter_v1":
+            elif detected_backend == current_dagger_adapter:
                 configured_source = "bc_dagger"
             else:
                 configured_source = "fastsac"
@@ -328,68 +474,215 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         cfg.algo.finetune_checkpoint_source = configured_source
         if configured_source == "bc_dagger":
             direct_dagger_transfer = (
-                detected_algorithm == "vaic_ppo_bc_dagger_student_v1"
+                detected_algorithm == "vaic_ppo_bc_dagger_student_iql_v2"
             )
+            same_stage_resume = (
+                detected_backend == current_dagger_adapter
+                and policy_state.get("last_phase") == "finetune"
+            )
+            if not direct_dagger_transfer and not same_stage_resume:
+                raise ValueError(
+                    "The selected checkpoint is neither a current PPO-BC "
+                    "DAgger source nor a current Stage-2 BC adapter resume."
+                )
+            if same_stage_resume:
+                source_schedule = policy_state.get("stage2_schedule_config")
+                if not isinstance(source_schedule, dict):
+                    raise ValueError(
+                        "Stage-2 BC adapter checkpoint lacks its guarded "
+                        "schedule configuration"
+                    )
+                if "load_pretrained_q" not in source_schedule:
+                    raise ValueError(
+                        "Stage-2 BC adapter checkpoint predates explicit Q "
+                        "source provenance; restart from BC-DAgger"
+                    )
+                cfg.algo.load_pretrained_q = source_schedule[
+                    "load_pretrained_q"
+                ]
+
+            source_actor_backend = policy_state.get(
+                "dagger_backend_config" if direct_dagger_transfer
+                else "actor_backend_config"
+            )
+            if not isinstance(source_actor_backend, dict):
+                raise ValueError(
+                    "BC-DAgger transfer checkpoint is missing its actor/action "
+                    "backend configuration"
+                )
+            action_clip_key = (
+                "dagger_action_clip" if direct_dagger_transfer else "action_clip"
+            )
+            if action_clip_key not in source_actor_backend:
+                raise ValueError(
+                    "BC-DAgger transfer checkpoint lacks the saved action clip"
+                )
+            cfg.algo.sac_bc_action_clip = source_actor_backend[action_clip_key]
+            if same_stage_resume:
+                # These values define registered adapter tensors and its action
+                # distribution, so materialize them before policy construction.
+                adapter_fields = {
+                    "sac_bc_initial_action_std": "initial_action_std",
+                    "sac_bc_log_std_min": "log_std_min",
+                    "sac_bc_log_std_max": "log_std_max",
+                    "sac_deterministic_rollout": "rollout_behavior",
+                    "sac_freeze_perception": "perception_frozen",
+                }
+                for destination, source in adapter_fields.items():
+                    if source not in source_actor_backend:
+                        raise ValueError(
+                            "Stage-2 BC adapter checkpoint lacks required actor "
+                            f"field {source!r}"
+                        )
+                    value = source_actor_backend[source]
+                    if destination == "sac_deterministic_rollout":
+                        value = value == "deterministic_clipped_bc_mean"
+                    cfg.algo[destination] = value
+
+            # A direct actor-only transfer deliberately keeps the current,
+            # freshly initialized FastSAC Q topology. A pretrained Q transfer
+            # and every same-stage resume must reconstruct the saved Q exactly.
+            load_pretrained_q = cfg.algo.get("load_pretrained_q", True)
+            if not isinstance(load_pretrained_q, bool):
+                raise ValueError("algo.load_pretrained_q must be a boolean")
+            inherit_q = load_pretrained_q or same_stage_resume
             source_q_backend = policy_state.get(
                 "dagger_backend_config" if direct_dagger_transfer
                 else "q_backend_config"
             )
-            if not isinstance(source_q_backend, dict):
+            if inherit_q and not isinstance(source_q_backend, dict):
                 raise ValueError(
                     "BC-DAgger transfer checkpoint is missing its Q backend "
                     "configuration"
                 )
-            # Construct Q1/Q2 with the exact saved topology before loading.
-            # The dedicated DAgger path intentionally uses 101 C51 atoms while
-            # native FastSAC historically defaulted to 501.
-            q_fields = {
-                "q_hidden_dim": (
-                    "q_hidden_dim" if direct_dagger_transfer else "hidden_dim"
-                ),
-                "q_num_atoms": (
-                    "q_num_atoms" if direct_dagger_transfer else "num_atoms"
-                ),
-                "q_v_min": "q_v_min" if direct_dagger_transfer else "v_min",
-                "q_v_max": "q_v_max" if direct_dagger_transfer else "v_max",
-                "q_layer_norm": (
-                    "q_layer_norm" if direct_dagger_transfer else "layer_norm"
-                ),
-            }
-            for destination, source in q_fields.items():
-                if source not in source_q_backend:
+            if inherit_q:
+                # Construct Q1/Q2 with the exact saved topology before loading.
+                # The DAgger IQL path uses 101 C51 atoms while native FastSAC
+                # historically defaulted to 501.
+                q_fields = {
+                    "q_hidden_dim": (
+                        "q_hidden_dim" if direct_dagger_transfer else "hidden_dim"
+                    ),
+                    "q_num_atoms": (
+                        "q_num_atoms" if direct_dagger_transfer else "num_atoms"
+                    ),
+                    "q_v_min": (
+                        "q_v_min" if direct_dagger_transfer else "v_min"
+                    ),
+                    "q_v_max": (
+                        "q_v_max" if direct_dagger_transfer else "v_max"
+                    ),
+                    "q_layer_norm": (
+                        "q_layer_norm" if direct_dagger_transfer else "layer_norm"
+                    ),
+                }
+                for destination, source in q_fields.items():
+                    if source not in source_q_backend:
+                        raise ValueError(
+                            "BC-DAgger transfer checkpoint lacks required Q "
+                            f"field {source!r}"
+                        )
+                    cfg.algo[destination] = source_q_backend[source]
+
+            if direct_dagger_transfer and load_pretrained_q:
+                incompatible = {
+                    "q_action_coordinates": cfg.algo.get(
+                        "q_action_coordinates", "absolute"
+                    ) != "absolute",
+                    "q_action_fusion": cfg.algo.get(
+                        "q_action_fusion", "early"
+                    ) != "early",
+                    "q_reference_dueling": bool(cfg.algo.get(
+                        "q_reference_dueling", False
+                    )),
+                    "q_condition_on_actuator_state": bool(cfg.algo.get(
+                        "q_condition_on_actuator_state", False
+                    )),
+                    "sac_q_action_input_gain": not np.isclose(
+                        float(cfg.algo.get("sac_q_action_input_gain", 1.0)),
+                        1.0,
+                        rtol=0.0,
+                        atol=1e-12,
+                    ),
+                }
+                enabled = [
+                    name for name, invalid in incompatible.items() if invalid
+                ]
+                if enabled:
                     raise ValueError(
-                        "BC-DAgger transfer checkpoint lacks required Q field "
-                        f"{source!r}"
+                        "BC-DAgger FastSAC Q transfer requires its original "
+                        "direct, absolute-action topology; incompatible "
+                        f"settings: {enabled}"
                     )
-                cfg.algo[destination] = source_q_backend[source]
-            incompatible = {
-                "q_action_coordinates": cfg.algo.get(
-                    "q_action_coordinates", "absolute"
-                ) != "absolute",
-                "q_action_fusion": cfg.algo.get(
-                    "q_action_fusion", "early"
-                ) != "early",
-                "q_reference_dueling": bool(cfg.algo.get(
-                    "q_reference_dueling", False
-                )),
-                "q_condition_on_actuator_state": bool(cfg.algo.get(
-                    "q_condition_on_actuator_state", False
-                )),
-            }
-            enabled = [name for name, invalid in incompatible.items() if invalid]
-            if enabled:
-                raise ValueError(
-                    "BC-DAgger FastSAC transfer requires its original direct, "
-                    "absolute-action Q topology; incompatible settings: "
-                    f"{enabled}"
+                # The pretrained DAgger Q consumed raw executable actions.
+                cfg.algo.sac_q_normalize_actions = False
+            elif direct_dagger_transfer:
+                # The DAgger H5 stores absolute actor/Q observations and
+                # actions, but no framewise reference-action or actuator-state
+                # columns. Fresh Q may choose early/late fusion and optional
+                # normalization, but cannot request fields absent from replay.
+                replay_incompatible = {
+                    "q_action_coordinates": cfg.algo.get(
+                        "q_action_coordinates", "absolute"
+                    ) != "absolute",
+                    "q_reference_dueling": bool(cfg.algo.get(
+                        "q_reference_dueling", False
+                    )),
+                    "q_condition_on_actuator_state": bool(cfg.algo.get(
+                        "q_condition_on_actuator_state", False
+                    )),
+                }
+                enabled = [
+                    name
+                    for name, invalid in replay_incompatible.items()
+                    if invalid
+                ]
+                if enabled:
+                    raise ValueError(
+                        "Fresh-Q BC-DAgger Stage 2 cannot request fields absent "
+                        f"from its offline replay: {enabled}"
+                    )
+            elif same_stage_resume:
+                same_stage_q_fields = {
+                    "q_action_coordinates": "q_action_coordinates",
+                    "q_action_fusion": "q_action_fusion",
+                    "q_reference_dueling": "q_reference_dueling",
+                    "sac_q_normalize_actions": "q_action_normalized",
+                    "sac_q_action_input_gain": "q_action_input_gain",
+                    "sac_clipped_double_q": "clipped_double_q",
+                    "sac_use_autotune": "alpha_autotune",
+                }
+                for destination, source in same_stage_q_fields.items():
+                    if source not in source_q_backend:
+                        raise ValueError(
+                            "Stage-2 BC adapter checkpoint lacks required Q "
+                            f"field {source!r}"
+                        )
+                    cfg.algo[destination] = source_q_backend[source]
+                actuator_context = source_q_backend.get("q_actuator_context")
+                if not isinstance(actuator_context, dict):
+                    raise ValueError(
+                        "Stage-2 BC adapter checkpoint lacks Q actuator context"
+                    )
+                cfg.algo.q_condition_on_actuator_state = bool(
+                    actuator_context.get("enabled", False)
                 )
-            # The pretrained DAgger Q consumed absolute executable actions.
-            # Keep that exact coordinate system instead of silently feeding its
-            # weights FastSAC's optional affine-normalized action columns.
-            cfg.algo.sac_q_normalize_actions = False
+
+            if same_stage_resume:
+                source_detail = (
+                    "Stage-2 model/optimizer resume with online replay refill"
+                )
+            elif load_pretrained_q:
+                source_detail = "raw-action Q transfer"
+            else:
+                source_detail = (
+                    "fresh configured Q; checkpoint Q weights skipped"
+                )
             print(colored(
                 "[Info]: FastSAC finetune source: PPO-BC DAgger "
-                "(bounded actor adapter, raw-action Q transfer).",
+                "(bounded stochastic train behavior, deterministic clipped "
+                "evaluation mean, dedicated SAC std, exact executed-action "
+                f"replay, {source_detail}).",
                 "green",
             ))
     

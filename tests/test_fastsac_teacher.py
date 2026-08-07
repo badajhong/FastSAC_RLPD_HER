@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -787,7 +788,7 @@ def test_reference_awac_weights_validate_hyperparameters(
         )
 
 
-def test_target_entropy_matches_hoi_without_affine_scale_offset():
+def test_target_entropy_is_defined_in_normalized_action_coordinates():
     low = torch.tensor([-2.0, -4.0])
     high = torch.tensor([2.0, 4.0])
     ratio = 0.5
@@ -799,6 +800,19 @@ def test_target_entropy_matches_hoi_without_affine_scale_offset():
     assert _fastsac_target_entropy(
         shifted_low, shifted_high, ratio
     ) == pytest.approx(target)
+
+
+def test_physical_log_prob_is_converted_back_to_normalized_coordinates():
+    policy = FastSACVEL.__new__(FastSACVEL)
+    policy._fastsac_action_log_scale_sum = math.log(3.0) + math.log(7.0)
+    normalized_log_prob = torch.tensor([1.25, -0.75])
+    physical_log_prob = (
+        normalized_log_prob - policy._fastsac_action_log_scale_sum
+    )
+
+    converted = policy._normalized_action_log_prob(physical_log_prob)
+
+    assert torch.allclose(converted, normalized_log_prob)
 
 
 def test_target_entropy_matches_hoi_for_unit_bounds_and_rejects_invalid_input():

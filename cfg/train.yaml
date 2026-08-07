@@ -33,6 +33,9 @@ wandb:
   project: haic
   mode: online # set to 'disabled' when debugging locally
   tags: []
+  # Teacher replay files are commonly 20+ GiB. Keep them local unless an
+  # explicit one-off run opts into the large W&B upload.
+  upload_teacher_replay: false
 
 defaults:
   - task: G1/G1Track-walk

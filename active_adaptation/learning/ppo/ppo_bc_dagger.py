@@ -1,9 +1,10 @@
-"""PPO-teacher DAgger finetuning with VAIC student perception and C51 Qs.
+"""PPO-teacher DAgger finetuning with VAIC perception and an IQL critic.
 
 This stage deliberately does *not* run PPO or SAC actor optimization.  A
 frozen PPO residual policy is the privileged DAgger oracle, ``actor_adapt`` is
-trained only by behavior cloning, and Q1/Q2 are learned as diagnostics/future
-warm-start weights from the action that was actually sent to the environment.
+trained only by behavior cloning, and an IQL-style V plus C51 Q1/Q2 are learned
+as future FastSAC warm-start weights from actions actually sent to the
+environment. Q-derived advantage weighting is deliberately absent.
 The original VAIC observation, reward, termination, depth-supervision, and EMA
 paths remain owned by :class:`PPOVEL`.
 """
@@ -64,8 +65,18 @@ from .ppo_vel import (
 )
 
 
-PPO_BC_DAGGER_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
+PPO_BC_DAGGER_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_iql_v2"
+PPO_BC_DAGGER_LEGACY_TRAINING_ALGORITHM = (
+    "vaic_ppo_bc_dagger_student_v1"
+)
 PPO_BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_independent_normal_bc_dagger_v1"
+PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS = (
+    "dataset_action_target_twin_expected_c51_expectile_v_to_scalar_td_"
+    "c51_projection_v1"
+)
+PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS = (
+    "dagger_teacher_huber_bc_only_no_q_or_advantage_weighting_v1"
+)
 DAGGER_TEACHER_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
 DAGGER_TEACHER_REPLAY_FORMAT_VERSION = 2
 DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS = (
@@ -109,6 +120,129 @@ def _linear_teacher_probability(
         raise ValueError("dagger_beta_decay_rollouts must be positive")
     progress = min(max(int(rollout_count), 0) / int(decay_rollouts), 1.0)
     return float(start + (end - start) * progress)
+
+
+def _iql_expectile_loss(
+    difference: torch.Tensor, expectile: float, *, validate: bool = True
+) -> torch.Tensor:
+    """Elementwise IQL asymmetric squared loss.
+
+    ``difference`` follows the official IQL convention ``target_q - value``.
+    The function deliberately returns unreduced values so callers can log the
+    positive/negative sides without changing the optimization objective.
+    """
+    expectile = float(expectile)
+    if not math.isfinite(expectile) or not 0.0 < expectile < 1.0:
+        raise ValueError("IQL expectile must be finite and strictly in (0, 1)")
+    if validate and not torch.isfinite(difference).all():
+        raise ValueError("IQL expectile differences must be finite")
+    weight = torch.where(
+        difference > 0.0,
+        expectile,
+        1.0 - expectile,
+    )
+    return weight * difference.square()
+
+
+def _project_scalar_to_c51(
+    target: torch.Tensor,
+    support: torch.Tensor,
+    *,
+    validate: bool = True,
+) -> torch.Tensor:
+    """Project a scalar IQL TD target onto the existing FastSAC C51 support."""
+    if target.ndim != 1:
+        raise ValueError("IQL scalar C51 target must have shape [batch]")
+    if support.ndim != 1 or support.numel() < 2:
+        raise ValueError("IQL C51 support must be a one-dimensional atom vector")
+    deltas = support[1:] - support[:-1]
+    if validate:
+        if not torch.isfinite(target).all() or not torch.isfinite(support).all():
+            raise ValueError("IQL scalar targets and C51 support must be finite")
+        if not torch.all(deltas > 0.0) or not torch.allclose(
+            deltas, deltas[:1].expand_as(deltas), rtol=1e-5, atol=1e-7
+        ):
+            raise ValueError(
+                "IQL C51 support must be strictly increasing and uniform"
+            )
+
+    v_min = support[0]
+    v_max = support[-1]
+    delta = deltas[0]
+    clipped = target.clamp(v_min, v_max)
+    atom_position = ((clipped - v_min) / delta).clamp(
+        0.0, float(support.numel() - 1)
+    )
+    lower = atom_position.floor().long().clamp(0, support.numel() - 1)
+    upper = atom_position.ceil().long().clamp(0, support.numel() - 1)
+    same_atom = lower == upper
+    lower_weight = torch.where(
+        same_atom,
+        torch.ones_like(atom_position),
+        upper.to(atom_position.dtype) - atom_position,
+    )
+    upper_weight = torch.where(
+        same_atom,
+        torch.zeros_like(atom_position),
+        atom_position - lower.to(atom_position.dtype),
+    )
+    projection = torch.zeros(
+        target.shape[0],
+        support.numel(),
+        device=target.device,
+        dtype=target.dtype,
+    )
+    projection.scatter_add_(1, lower[:, None], lower_weight[:, None])
+    projection.scatter_add_(1, upper[:, None], upper_weight[:, None])
+    return projection
+
+
+class _IQLValueNetwork(nn.Module):
+    """Scalar V(s) used only to form in-dataset IQL critic targets."""
+
+    def __init__(self, obs_dim, hidden_dim, layer_norm=True):
+        super().__init__()
+        if int(hidden_dim) < 4:
+            raise ValueError("IQL value hidden dimension must be at least four")
+        layers: list[nn.Module] = [nn.Linear(obs_dim, hidden_dim)]
+        if layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.extend((nn.SiLU(), nn.Linear(hidden_dim, hidden_dim // 2)))
+        if layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim // 2))
+        layers.extend(
+            (nn.SiLU(), nn.Linear(hidden_dim // 2, hidden_dim // 4))
+        )
+        if layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim // 4))
+        layers.extend((nn.SiLU(), nn.Linear(hidden_dim // 4, 1)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, observations):
+        return self.net(observations).squeeze(-1)
+
+
+def _build_isolated_iql_value_network(
+    obs_dim, hidden_dim, layer_norm, device, seed
+):
+    """Initialize IQL V without advancing rollout/environment RNG streams."""
+    device = torch.device(device)
+    cuda_devices = []
+    if device.type == "cuda":
+        cuda_devices = [
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        ]
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.default_generator.manual_seed(int(seed))
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                torch.cuda.manual_seed(int(seed))
+        value = _IQLValueNetwork(
+            obs_dim, hidden_dim, layer_norm
+        ).to(device)
+    return value
 
 
 @dataclass
@@ -162,8 +296,16 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
     q_lr: float = 3e-4
     q_weight_decay: float = 1e-3
     q_seed: int = 0
-    q_tau: float = 0.05
+    # Official IQL uses a slowly moving target critic. This remains separate
+    # from Stage-2 FastSAC's sac_tau after the Q weights are transferred.
+    q_tau: float = 0.005
     q_max_grad_norm: float = 1.0
+    iql_expectile: float = 0.7
+    iql_value_lr: float = 3e-4
+    # BC keeps its large 4,096-row batch.  At 32 updates per rollout, 1,024
+    # IQL rows still gives UTD=2 with 512 envs x 32 control steps, while the
+    # additional V forward/backward does not dominate DAgger wall time.
+    iql_batch_size: int = 1024
 
     save_teacher_buffer: bool = True
     teacher_buffer_filename: str = "teacher_replay_buffer.h5"
@@ -330,7 +472,7 @@ class _DeviceReplay:
 class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
     """Teacher-executed FIFO with a DAgger-specific, truthful H5 manifest."""
 
-    def __init__(self, *args, vecnorm_fingerprint, **kwargs):
+    def __init__(self, *args, vecnorm_fingerprint, action_clip, **kwargs):
         super().__init__(*args, **kwargs)
         fingerprint = str(vecnorm_fingerprint or "")
         if not fingerprint.startswith("sha256:"):
@@ -338,6 +480,21 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                 "Raw DAgger replay requires a checkpoint VecNorm fingerprint"
             )
         self.vecnorm_fingerprint = fingerprint
+        self.action_clip = float(action_clip)
+        if not math.isfinite(self.action_clip) or self.action_clip <= 0.0:
+            raise ValueError("DAgger replay action_clip must be finite and positive")
+
+    def _validated_values(self, data):
+        count, values = super()._validated_values(data)
+        actions = values["actions"]
+        if not torch.isfinite(actions).all():
+            raise ValueError("DAgger replay actions must all be finite")
+        if (actions.abs() > self.action_clip).any():
+            raise ValueError(
+                "DAgger replay action lies outside the configured symmetric "
+                f"support [-{self.action_clip}, {self.action_clip}]"
+            )
+        return count, values
 
     def checkpoint_metadata(self):
         has_snapshot = self.last_snapshot_id is not None
@@ -357,6 +514,7 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
             "actor_obs_dim": self.actor_dim,
             "critic_obs_dim": self.critic_dim,
             "action_dim": self.action_dim,
+            "action_clip": self.action_clip,
             "capacity": self.capacity,
             "size": self.last_snapshot_size if has_snapshot else self.size,
             "seen": self.last_snapshot_seen if has_snapshot else self.seen,
@@ -420,6 +578,17 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                         f"DAgger replay {name}={actual!r} does not match "
                         f"{expected!r}"
                     )
+            replay_action_clip = replay.attrs.get("action_clip")
+            if (
+                replay_action_clip is not None
+                and not math.isclose(
+                    float(replay_action_clip),
+                    self.action_clip,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError("DAgger replay action clip mismatch")
             manifest = {
                 "actor_obs_keys": json.loads(
                     str(replay.attrs.get("actor_obs_keys", "[]"))
@@ -498,6 +667,16 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                     for start in range(0, size, self.snapshot_chunk_rows):
                         end = min(start + self.snapshot_chunk_rows, size)
                         host = torch.from_numpy(np.asarray(replay[name][start:end]))
+                        if name == "actions":
+                            if not torch.isfinite(host).all():
+                                raise ValueError(
+                                    "DAgger replay actions must all be finite"
+                                )
+                            if (host.abs() > self.action_clip).any():
+                                raise ValueError(
+                                    "DAgger replay action lies outside the "
+                                    "configured symmetric support"
+                                )
                         self.data[name][start:end].copy_(host)
             self.size = size
             self.seen = seen
@@ -562,6 +741,7 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                         "actor_obs_dim": self.actor_dim,
                         "critic_obs_dim": self.critic_dim,
                         "action_dim": self.action_dim,
+                        "action_clip": self.action_clip,
                         "buffer_capacity": self.capacity,
                         "num_transitions": snapshot_size,
                         "num_seen_transitions": snapshot_seen,
@@ -715,7 +895,7 @@ class _ClippedStudentRolloutPolicy(nn.Module):
 
 
 class PPOBCDaggerFinetune(PPOVEL):
-    """Depth student trained by DAgger BC plus independent distributional Qs."""
+    """Depth student with pure DAgger BC and an IQL-pretrained C51 critic."""
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         self._validate_config(cfg)
@@ -753,11 +933,24 @@ class PPOBCDaggerFinetune(PPOVEL):
             cfg.q_seed,
         )
         self.qnet_target = copy.deepcopy(self.qnet).requires_grad_(False)
+        self.iql_value = _build_isolated_iql_value_network(
+            self._q_critic_dim,
+            cfg.q_hidden_dim,
+            cfg.q_layer_norm,
+            device,
+            int(cfg.q_seed) + 1,
+        )
         self.opt_q = torch.optim.AdamW(
             self.qnet.parameters(),
             lr=cfg.q_lr,
             weight_decay=cfg.q_weight_decay,
             betas=(0.9, 0.95),
+            fused=str(device).startswith("cuda"),
+        )
+        self.opt_iql_value = torch.optim.Adam(
+            self.iql_value.parameters(),
+            lr=cfg.iql_value_lr,
+            betas=(0.9, 0.999),
             fused=str(device).startswith("cuda"),
         )
         self.bc_optimizer = torch.optim.AdamW(
@@ -798,6 +991,7 @@ class PPOBCDaggerFinetune(PPOVEL):
         self.dagger_environment_steps = 0
         self.bc_update_count = 0
         self.q_update_count = 0
+        self.iql_value_update_count = 0
 
     @staticmethod
     def _validate_config(cfg):
@@ -825,6 +1019,7 @@ class PPOBCDaggerFinetune(PPOVEL):
             "dagger_updates_per_rollout",
             "q_hidden_dim",
             "q_num_atoms",
+            "iql_batch_size",
             "teacher_buffer_capacity",
             "teacher_buffer_snapshot_chunk_rows",
         ):
@@ -834,6 +1029,7 @@ class PPOBCDaggerFinetune(PPOVEL):
             "dagger_bc_lr",
             "dagger_actor_huber_delta",
             "q_lr",
+            "iql_value_lr",
         ):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -851,6 +1047,8 @@ class PPOBCDaggerFinetune(PPOVEL):
             raise ValueError("distributional Q support is invalid")
         if not 0.0 <= float(cfg.q_tau) <= 1.0:
             raise ValueError("q_tau must be in [0, 1]")
+        if not 0.0 < float(cfg.iql_expectile) < 1.0:
+            raise ValueError("iql_expectile must be strictly in (0, 1)")
         if not math.isfinite(float(cfg.q_max_grad_norm)) or cfg.q_max_grad_norm < 0:
             raise ValueError("q_max_grad_norm must be finite and non-negative")
         if not math.isfinite(float(cfg.q_weight_decay)) or cfg.q_weight_decay < 0:
@@ -955,6 +1153,7 @@ class PPOBCDaggerFinetune(PPOVEL):
             actor_obs_keys=self.q_actor_keys,
             critic_obs_keys=self.q_critic_keys,
             vecnorm_fingerprint=self._replay_vecnorm_fingerprint,
+            action_clip=self.cfg.dagger_action_clip,
         )
         if (
             restore_path is not None
@@ -1236,32 +1435,56 @@ class PPOBCDaggerFinetune(PPOVEL):
         return loss.detach(), mae, grad.detach()
 
     def _q_update(self, batch):
+        """Update V then twin C51 Qs with dataset-action IQL targets.
+
+        The DAgger actor is intentionally absent from this method.  This follows
+        IQL's in-sample critic update while keeping the existing distributional
+        Q topology required for an exact Stage-2 FastSAC weight transfer.
+        """
+        critic_observations = batch["critic_observations"]
         with torch.no_grad():
-            next_action = self._actor_dist_from_flat(
-                batch["next_observations"]
-            ).mean
-            action_clip = float(getattr(self.cfg, "dagger_action_clip", 20.0))
-            next_action = torch.nan_to_num(
-                next_action,
-                nan=0.0,
-                posinf=action_clip,
-                neginf=-action_clip,
-            ).clamp(-action_clip, action_clip)
+            target_logits = self.qnet_target(
+                critic_observations, batch["actions"]
+            )
+            target_q_heads = self.qnet_target.values(target_logits)
+            target_q = target_q_heads.min(dim=0).values
+
+        value = self.iql_value(critic_observations)
+        advantage = target_q - value
+        value_loss = _iql_expectile_loss(
+            advantage, self.cfg.iql_expectile, validate=False
+        ).mean()
+        self.opt_iql_value.zero_grad(set_to_none=True)
+        value_loss.backward()
+        if float(self.cfg.q_max_grad_norm) > 0.0:
+            value_grad = nn.utils.clip_grad_norm_(
+                self.iql_value.parameters(),
+                float(self.cfg.q_max_grad_norm),
+            )
+        else:
+            value_grad = nn.utils.clip_grad_norm_(
+                self.iql_value.parameters(), float("inf")
+            )
+        self.opt_iql_value.step()
+        self.iql_value_update_count += 1
+
+        with torch.no_grad():
+            next_value = self.iql_value(batch["next_critic_observations"])
             bootstrap = _sac_bootstrap_mask(
                 batch["dones"], batch["truncations"]
             )
             discount = float(self.cfg.gamma) * batch["discounts"]
-            # Keep the two projected distributions independent.  This is the
-            # requested HOI C51 topology without SAC entropy/min target logic.
-            target = self.qnet_target.projection(
-                batch["next_critic_observations"],
-                next_action,
-                batch["rewards"],
-                bootstrap,
-                discount,
+            scalar_target = (
+                batch["rewards"]
+                + bootstrap * discount * next_value
             )
-        logits = self.qnet(batch["critic_observations"], batch["actions"])
-        per_q = -(target * F.log_softmax(logits, dim=-1)).sum(-1).mean(-1)
+            target = _project_scalar_to_c51(
+                scalar_target, self.qnet.support, validate=False
+            )
+        logits = self.qnet(critic_observations, batch["actions"])
+        per_q = -(
+            target.unsqueeze(0) * F.log_softmax(logits, dim=-1)
+        ).sum(-1).mean(-1)
         loss = per_q.sum()
         self.opt_q.zero_grad(set_to_none=True)
         loss.backward()
@@ -1278,7 +1501,39 @@ class PPOBCDaggerFinetune(PPOVEL):
                 self.qnet.parameters(), self.qnet_target.parameters()
             ):
                 target_parameter.lerp_(online, float(self.cfg.q_tau))
-        return loss.detach(), per_q.detach(), grad.detach()
+        with torch.no_grad():
+            online_q_heads = self.qnet.values(logits)
+            support_low = self.qnet.support[0]
+            support_high = self.qnet.support[-1]
+            metrics = {
+                "value_loss": value_loss.detach(),
+                "value_grad_norm": value_grad.detach(),
+                "value_mean": value.detach().mean(),
+                "value_std": value.detach().std(unbiased=False),
+                "target_q_mean": target_q.mean(),
+                "target_q_twin_disagreement": (
+                    target_q_heads[0] - target_q_heads[1]
+                ).abs().mean(),
+                "advantage_mean": advantage.detach().mean(),
+                "advantage_std": advantage.detach().std(unbiased=False),
+                "advantage_positive_fraction": (
+                    advantage.detach() > 0.0
+                ).float().mean(),
+                "td_target_mean": scalar_target.mean(),
+                "td_target_std": scalar_target.std(unbiased=False),
+                "td_target_support_low_fraction": (
+                    scalar_target < support_low
+                ).float().mean(),
+                "td_target_support_high_fraction": (
+                    scalar_target > support_high
+                ).float().mean(),
+                "q1_mean": online_q_heads[0].mean(),
+                "q2_mean": online_q_heads[1].mean(),
+                "q_twin_disagreement": (
+                    online_q_heads[0] - online_q_heads[1]
+                ).abs().mean(),
+            }
+        return loss.detach(), per_q.detach(), grad.detach(), metrics
 
     def train_op(self, tensordict):
         rollout = tensordict.exclude("stats")
@@ -1308,11 +1563,9 @@ class PPOBCDaggerFinetune(PPOVEL):
             valid_bc_rows = self.dagger_replay.valid_count(
                 DAGGER_TEACHER_ACTION_VALID_KEY
             )
-            # Match HOI DAgger's optimizer ordering: update the student first,
-            # then construct the Q target with that newly updated actor.  The
-            # VAIC-specific fixed teacher anchor is intentionally omitted: old
-            # rows contain PRIV_PRED from a changing depth/adaptation EMA, so a
-            # permanent latent-space anchor would eventually be inconsistent.
+            # DAgger BC remains the only actor objective. IQL then updates V/Q
+            # from a separate all-transition sample and never queries that actor,
+            # so the critic cannot feed back into the student action update.
             for _ in range(int(self.cfg.dagger_updates_per_rollout)):
                 if valid_bc_rows:
                     for _ in range(int(self.cfg.dagger_bc_epochs)):
@@ -1325,7 +1578,7 @@ class PPOBCDaggerFinetune(PPOVEL):
                         batch = self._prepare_dagger_learning_batch(batch)
                         bc_metrics.append(self._bc_update(batch))
                 batch = self.dagger_replay.sample(
-                    self.cfg.dagger_batch_size, self.device, self.q_rng
+                    self.cfg.iql_batch_size, self.device, self.q_rng
                 )
                 batch = self._prepare_dagger_learning_batch(batch)
                 q_metrics.append(self._q_update(batch))
@@ -1343,8 +1596,35 @@ class PPOBCDaggerFinetune(PPOVEL):
             q1_loss = torch.stack([item[1][0] for item in q_metrics]).mean().item()
             q2_loss = torch.stack([item[1][1] for item in q_metrics]).mean().item()
             q_grad = torch.stack([item[2] for item in q_metrics]).mean().item()
+            iql_metrics = {
+                key: torch.stack(
+                    [item[3][key] for item in q_metrics]
+                ).mean().item()
+                for key in q_metrics[0][3]
+            }
         else:
             q_loss = q1_loss = q2_loss = q_grad = 0.0
+            iql_metrics = {
+                key: 0.0
+                for key in (
+                    "value_loss",
+                    "value_grad_norm",
+                    "value_mean",
+                    "value_std",
+                    "target_q_mean",
+                    "target_q_twin_disagreement",
+                    "advantage_mean",
+                    "advantage_std",
+                    "advantage_positive_fraction",
+                    "td_target_mean",
+                    "td_target_std",
+                    "td_target_support_low_fraction",
+                    "td_target_support_high_fraction",
+                    "q1_mean",
+                    "q2_mean",
+                    "q_twin_disagreement",
+                )
+            }
         if bc_metrics:
             bc_loss = torch.stack([item[0] for item in bc_metrics]).mean().item()
             bc_mae = torch.stack([item[1] for item in bc_metrics]).mean().item()
@@ -1371,6 +1651,39 @@ class PPOBCDaggerFinetune(PPOVEL):
             "dagger/q2_loss": q2_loss,
             "dagger/q_grad_norm": q_grad,
             "dagger/q_update_count": self.q_update_count,
+            "dagger/iql_value_loss": iql_metrics["value_loss"],
+            "dagger/iql_value_grad_norm": iql_metrics[
+                "value_grad_norm"
+            ],
+            "dagger/iql_value_mean": iql_metrics["value_mean"],
+            "dagger/iql_value_std": iql_metrics["value_std"],
+            "dagger/iql_target_q_mean": iql_metrics["target_q_mean"],
+            "dagger/iql_target_q_twin_disagreement": iql_metrics[
+                "target_q_twin_disagreement"
+            ],
+            "dagger/iql_advantage_mean": iql_metrics[
+                "advantage_mean"
+            ],
+            "dagger/iql_advantage_std": iql_metrics["advantage_std"],
+            "dagger/iql_advantage_positive_fraction": iql_metrics[
+                "advantage_positive_fraction"
+            ],
+            "dagger/iql_td_target_mean": iql_metrics["td_target_mean"],
+            "dagger/iql_td_target_std": iql_metrics["td_target_std"],
+            "dagger/iql_td_target_support_low_fraction": iql_metrics[
+                "td_target_support_low_fraction"
+            ],
+            "dagger/iql_td_target_support_high_fraction": iql_metrics[
+                "td_target_support_high_fraction"
+            ],
+            "dagger/iql_q1_mean": iql_metrics["q1_mean"],
+            "dagger/iql_q2_mean": iql_metrics["q2_mean"],
+            "dagger/iql_q_twin_disagreement": iql_metrics[
+                "q_twin_disagreement"
+            ],
+            "dagger/iql_expectile": float(self.cfg.iql_expectile),
+            "dagger/iql_value_update_count": self.iql_value_update_count,
+            "dagger/actor_q_weighting_enabled": 0.0,
             "dagger/truncation_finals": self._last_truncation_finals_used,
             "dagger/replay_observation_raw_pre_vecnorm": 1.0,
             "dagger/fixed_actor_anchor_enabled": 0.0,
@@ -1403,6 +1716,9 @@ class PPOBCDaggerFinetune(PPOVEL):
             "q_seed",
             "q_tau",
             "q_max_grad_norm",
+            "iql_expectile",
+            "iql_value_lr",
+            "iql_batch_size",
             "teacher_buffer_capacity",
         )
         return {name: getattr(self.cfg, name) for name in names}
@@ -1413,6 +1729,12 @@ class PPOBCDaggerFinetune(PPOVEL):
             {
                 "training_algorithm": PPO_BC_DAGGER_TRAINING_ALGORITHM,
                 "actor_backend": PPO_BC_DAGGER_ACTOR_BACKEND,
+                "critic_learning_semantics": (
+                    PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS
+                ),
+                "actor_learning_semantics": (
+                    PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS
+                ),
                 "dagger_backend_config": self._checkpoint_config(),
                 "teacher_action_semantics": (
                     DAGGER_TEACHER_ACTION_SEMANTICS
@@ -1421,11 +1743,15 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "dagger_environment_steps": self.dagger_environment_steps,
                 "bc_update_count": self.bc_update_count,
                 "q_update_count": self.q_update_count,
+                "iql_value_update_count": self.iql_value_update_count,
                 "dagger_rng_state": self.dagger_rng.get_state(),
                 "q_rng_state": self.q_rng.get_state(),
                 "optimizer_resume_state": {
                     "bc_optimizer": self.bc_optimizer.state_dict(),
                     "q_optimizer": self.opt_q.state_dict(),
+                    "iql_value_optimizer": (
+                        self.opt_iql_value.state_dict()
+                    ),
                     "adapt_optimizer": self.opt_adapt.state_dict(),
                 },
                 "teacher_replay_id": self.teacher_replay_id,
@@ -1441,6 +1767,12 @@ class PPOBCDaggerFinetune(PPOVEL):
         )
         if self.teacher_replay is not None:
             state["teacher_replay_state"] = self.teacher_replay.checkpoint_metadata()
+        elif self._loaded_teacher_replay_metadata is not None:
+            # This is provenance only: model-only resume deliberately has no
+            # live/paired H5 and must not claim an exact replay snapshot.
+            state["frozen_teacher_replay_source_state"] = copy.deepcopy(
+                self._loaded_teacher_replay_metadata
+            )
         return state
 
     def load_state_dict(self, state_dict, strict=True):
@@ -1451,6 +1783,16 @@ class PPOBCDaggerFinetune(PPOVEL):
                 raise KeyError("same-stage checkpoint is missing qnet")
             if "qnet_target" not in state_dict:
                 raise KeyError("same-stage checkpoint is missing qnet_target")
+            if "iql_value" not in state_dict:
+                raise KeyError("same-stage checkpoint is missing iql_value")
+            if state_dict.get("critic_learning_semantics") != (
+                PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS
+            ):
+                raise ValueError("PPO-BC DAgger IQL critic semantics mismatch")
+            if state_dict.get("actor_learning_semantics") != (
+                PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS
+            ):
+                raise ValueError("PPO-BC DAgger actor learning semantics mismatch")
             if state_dict.get("actor_backend") != PPO_BC_DAGGER_ACTOR_BACKEND:
                 raise ValueError("PPO-BC DAgger actor backend mismatch")
             if state_dict.get("teacher_action_semantics") != (
@@ -1472,6 +1814,11 @@ class PPOBCDaggerFinetune(PPOVEL):
             if actual_config is not None and expected_config is not None:
                 if actual_config != expected_config:
                     raise ValueError("PPO-BC DAgger checkpoint config mismatch")
+        elif algorithm == PPO_BC_DAGGER_LEGACY_TRAINING_ALGORITHM:
+            raise ValueError(
+                "Legacy Bellman BC-DAgger checkpoints do not contain the IQL "
+                "value network; start a new scripts/bc_dagger.py run."
+            )
         elif algorithm is not None:
             raise ValueError(
                 f"Unsupported checkpoint training_algorithm={algorithm!r}"
@@ -1491,6 +1838,7 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "adapt_ema",
                 "qnet",
                 "qnet_target",
+                "iql_value",
             }
             if getattr(self.cfg, "use_object_adapt", False):
                 critical.update(("object_adapt", "object_adapt_ema"))
@@ -1508,6 +1856,13 @@ class PPOBCDaggerFinetune(PPOVEL):
                 raise ValueError("same-stage checkpoint lacks optimizer state")
             self.bc_optimizer.load_state_dict(optimizers["bc_optimizer"])
             self.opt_q.load_state_dict(optimizers["q_optimizer"])
+            if "iql_value_optimizer" not in optimizers:
+                raise ValueError(
+                    "same-stage checkpoint lacks IQL value optimizer state"
+                )
+            self.opt_iql_value.load_state_dict(
+                optimizers["iql_value_optimizer"]
+            )
             self.opt_adapt.load_state_dict(optimizers["adapt_optimizer"])
             self.dagger_rollout_count = int(
                 state_dict.get("dagger_rollout_count", 0)
@@ -1517,11 +1872,17 @@ class PPOBCDaggerFinetune(PPOVEL):
             )
             self.bc_update_count = int(state_dict.get("bc_update_count", 0))
             self.q_update_count = int(state_dict.get("q_update_count", 0))
+            self.iql_value_update_count = int(
+                state_dict.get("iql_value_update_count", 0)
+            )
             self.dagger_rng.set_state(state_dict["dagger_rng_state"])
             self.q_rng.set_state(state_dict["q_rng_state"])
             self.teacher_replay_id = str(state_dict.get("teacher_replay_id"))
             self._loaded_teacher_replay_metadata = copy.deepcopy(
-                state_dict.get("teacher_replay_state")
+                state_dict.get(
+                    "teacher_replay_state",
+                    state_dict.get("frozen_teacher_replay_source_state"),
+                )
             )
             if hasattr(self, "env"):
                 self.env.set_progress(
@@ -1545,6 +1906,7 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "temporal_depth_gru_ema",
                 "qnet",
                 "qnet_target",
+                "iql_value",
             }
             unexpected = set(failed).difference(allowed_fresh)
             if unexpected:
@@ -1555,6 +1917,7 @@ class PPOBCDaggerFinetune(PPOVEL):
             hard_copy_(self.qnet, self.qnet_target)
             self.qnet_target.requires_grad_(False)
             self.q_update_count = 0
+            self.iql_value_update_count = 0
             self.bc_update_count = 0
             self.dagger_rollout_count = 0
             self.dagger_environment_steps = 0

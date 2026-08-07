@@ -15,10 +15,33 @@ defaults:
 total_frames: 39_321_600
 save_interval: 100
 
+# Optional same-stage continuation checkpoint. Unlike checkpoint_path (which
+# normally bootstraps a fresh DAgger stage from the PPO teacher), this must be a
+# PPO-BC DAgger IQL-v2 checkpoint. It restores actor/perception/EMA, V, Q1/Q2,
+# target Q1/Q2, all training optimizers, the dedicated DAgger/Q RNG streams,
+# and stage counters while deliberately leaving the previously exported
+# teacher_replay_buffer.h5 immutable. total_frames remains the number of
+# *additional* frames to run.
+bc_dagger_checkpoint: null
+# Copy the compatible immutable H5 to the new Hydra output root, outside W&B's
+# watched files directory. This is a real independent copy (about 23 GiB for
+# the current skateboard replay), not a link. Disable it to avoid duplication.
+bc_dagger_copy_teacher_replay: true
+# Internal guard set only after scripts/bc_dagger.py validates the checkpoint.
+_bc_dagger_model_only_resume: false
+_bc_dagger_teacher_replay_copy_source: null
+_bc_dagger_teacher_replay_copy_path: null
+
 algo:
   dagger_beta_start: 1.0
   dagger_beta_end: 0.0
   dagger_beta_decay_rollouts: 1800
+  # The actor remains pure DAgger BC. These values train only the Stage-1
+  # IQL V/Q critic warm start; no advantage-weighted actor loss is enabled.
+  iql_expectile: 0.7
+  iql_value_lr: 3.0e-4
+  iql_batch_size: 1024
+  q_tau: 0.005
   # Teacher-executed raw pre-VecNorm FIFO for the later FastSAC stage (about
   # 22 GiB when full with the current skateboard observation dimensions).
   teacher_buffer_capacity: 1_048_576

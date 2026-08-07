@@ -69,8 +69,16 @@ TEACHER_REPLAY_INITIAL_TRANSITION_FILTER = "step_count_gt_1"
 TEACHER_REPLAY_MIN_STEP_COUNT = 1
 STUDENT_REPLAY_MIN_STEP_COUNT = 5
 FASTSAC_ACTOR_BACKEND = "vaic_fastsac_tanh_gaussian_v2"
-BC_DAGGER_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
+BC_DAGGER_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_iql_v2"
+BC_DAGGER_LEGACY_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
 BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_independent_normal_bc_dagger_v1"
+BC_DAGGER_IQL_CRITIC_SEMANTICS = (
+    "dataset_action_target_twin_expected_c51_expectile_v_to_scalar_td_"
+    "c51_projection_v1"
+)
+BC_DAGGER_ACTOR_LEARNING_SEMANTICS = (
+    "dagger_teacher_huber_bc_only_no_q_or_advantage_weighting_v1"
+)
 BC_DAGGER_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
 BC_DAGGER_REPLAY_FORMAT_VERSION = 2
 BC_DAGGER_LEGACY_REPLAY_FORMAT_VERSION = 1
@@ -78,13 +86,29 @@ BC_DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS = (
     "normalized_frozen_vecnorm_v1"
 )
 BC_DAGGER_REPLAY_OBSERVATION_SEMANTICS = REPLAY_OBSERVATION_SEMANTICS
-FASTSAC_BC_DAGGER_ACTOR_BACKEND = "vaic_fastsac_bc_dagger_adapter_v1"
+FASTSAC_BC_DAGGER_ACTOR_BACKEND = "vaic_fastsac_bc_dagger_adapter_v2"
+FASTSAC_BC_DAGGER_LEGACY_ACTOR_BACKEND = (
+    "vaic_fastsac_bc_dagger_adapter_v1"
+)
 PRE_NORMALIZED_REPLAY_KEY = "_fastsac_pre_normalized_replay"
+# Ephemeral minibatch provenance only. This marker is constructed after replay
+# sampling, never stored in either replay, and is intentionally independent of
+# whether a legacy H5 row was already VecNorm-normalized.
+STAGE2_OFFLINE_SOURCE_KEY = "_fastsac_stage2_offline_source"
+STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY = (
+    "_fastsac_stage2_behavior_mean_abs_deviation"
+)
+STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY = (
+    "_fastsac_stage2_behavior_max_abs_deviation"
+)
 FASTSAC_ACTION_PARAMETERIZATION = (
     "teacher_reference_centered_student_absolute_asymmetric_v2"
 )
 FASTSAC_TARGET_ENTROPY_SEMANTICS = (
-    "hoi_raw_target_without_affine_log_scale_v2"
+    "normalized_tanh_action_log_prob_target_v3"
+)
+FASTSAC_BC_DAGGER_TARGET_ENTROPY_SEMANTICS = (
+    "fixed_raw_action_reference_scale_log_prob_target_v1"
 )
 FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS = (
     "affine_executable_to_unit_box_then_fixed_gain_v2"
@@ -132,6 +156,11 @@ FASTSAC_STAGE1_REFERENCE_AWAC_SEMANTICS = (
 FASTSAC_STAGE1_BEHAVIOR_UNCERTAINTY_GATE_SEMANTICS = (
     "online_twin_sampled_policy_minus_same_row_replay_mean_improvement_"
     "greater_than_head_disagreement_q_only_entropy_ungated_v1"
+)
+FASTSAC_STAGE2_ACTOR_CONFIDENCE_GATE_SEMANTICS = (
+    "sampled_current_policy_pessimistic_q_minus_frozen_bc_pessimistic_q_"
+    "gain_gt_max_raw_actor_or_bc_twin_disagreement_row_mask_"
+    "minimum_batch_coverage_nonsticky_full_batch_denominator_v2"
 )
 FASTSAC_CLIPPED_DOUBLE_Q_SEMANTICS = (
     "lower_expected_projected_c51_head_common_twin_target_v1"
@@ -663,13 +692,12 @@ def _fastsac_target_entropy(
     action_high: torch.Tensor,
     target_entropy_ratio: float,
 ) -> float:
-    """Return the literal HOI FastSAC entropy target.
+    """Return a coordinate-invariant normalized-action entropy target.
 
-    HOI includes the affine action-scale Jacobian in the sampled action's log
-    probability, but deliberately keeps the target at ``-dim * ratio``.  Do
-    not add the affine log determinant here: doing so reverses the alpha update
-    direction for VAIC's wide joint-action bounds and is not HOI-equivalent.
-    The bounds remain arguments so malformed actor intervals fail early.
+    SAC objectives convert the distribution's physical-action log probability
+    back to the normalized tanh coordinate by adding the constant affine log
+    determinant. The corresponding target is therefore ``-dim * ratio`` and
+    is invariant to joint units or the chosen executable action support.
     """
     action_low = torch.as_tensor(action_low, dtype=torch.float64)
     action_high = torch.as_tensor(action_high, dtype=torch.float64)
@@ -2769,6 +2797,7 @@ class BCDaggerOfflineReplayH5:
         expected_actor_obs_keys=None,
         expected_critic_obs_keys=None,
         expected_vecnorm_fingerprint=None,
+        expected_action_clip=None,
     ):
         import h5py
 
@@ -2779,6 +2808,15 @@ class BCDaggerOfflineReplayH5:
         self.path = os.path.abspath(os.fspath(path))
         self.device = torch.device(device)
         self.rng = torch.Generator(device=self.device).manual_seed(int(seed))
+        if expected_action_clip is not None:
+            expected_action_clip = float(expected_action_clip)
+            if (
+                not math.isfinite(expected_action_clip)
+                or expected_action_clip <= 0.0
+            ):
+                raise ValueError(
+                    "expected_action_clip must be finite and positive"
+                )
         shapes = {
             "observations": (int(actor_dim),),
             "critic_observations": (int(critic_dim),),
@@ -2842,6 +2880,20 @@ class BCDaggerOfflineReplayH5:
                 BC_DAGGER_ACTOR_BACKEND
             ):
                 raise ValueError("BC-DAgger replay actor backend mismatch")
+            replay_action_clip = replay.attrs.get("action_clip")
+            if (
+                expected_action_clip is not None
+                and replay_action_clip is not None
+                and not math.isclose(
+                    float(replay_action_clip),
+                    expected_action_clip,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    "BC-DAgger replay action clip does not match Stage 2"
+                )
             actor_keys = json.loads(str(
                 replay.attrs.get("actor_obs_keys", "[]")
             ))
@@ -2898,6 +2950,10 @@ class BCDaggerOfflineReplayH5:
                 "observations_pre_normalized": (
                     self.observations_pre_normalized
                 ),
+                "action_clip": (
+                    None if replay_action_clip is None
+                    else float(replay_action_clip)
+                ),
             }
             self.data = {}
             try:
@@ -2927,6 +2983,15 @@ class BCDaggerOfflineReplayH5:
                         host = torch.from_numpy(np.asarray(
                             replay[name][source : source + count]
                         ))
+                        if name == "actions" and expected_action_clip is not None:
+                            if (
+                                not torch.isfinite(host).all()
+                                or (host.abs() > expected_action_clip).any()
+                            ):
+                                raise ValueError(
+                                    "BC-DAgger replay contains an action outside "
+                                    "the Stage-2 actor/Q support"
+                                )
                         self.data[name][
                             destination : destination + count
                         ].copy_(host)
@@ -2965,6 +3030,10 @@ class OnlineReplay:
         self.data = {}
         self.ptr = 0
         self.size = 0
+        # Total accepted rows, including rows later overwritten by the FIFO.
+        # Stage-2 warm-up is defined in transitions rather than ambiguous
+        # vector-environment control steps.
+        self.seen = 0
 
     def extend(self, transitions):
         values = {
@@ -2982,6 +3051,7 @@ class OnlineReplay:
                 f"{wrong_devices}"
             )
         n = next(iter(values.values())).shape[0]
+        self.seen += int(n)
         if not self.data:
             try:
                 self.data = {
@@ -3199,6 +3269,72 @@ class FastSACVelFinetuneConfig(FastSACVelConfig):
     # BC-DAgger source retains its PPO actor backbone behind a bounded SAC
     # distribution adapter and retains the pretrained Q action coordinates.
     finetune_checkpoint_source: str = "auto"
+    # Keep the historical warm-start by default.  Set this to false to load
+    # only the actor/perception/EMA student state and initialize Stage-2 Q1/Q2
+    # (and both targets) from the current FastSAC seed instead of Stage-1 IQL.
+    load_pretrained_q: bool = True
+    # Stage-2 counts accepted online transitions, not vector control steps,
+    # before beginning Q updates.  The actor and alpha have a second, longer
+    # Q-update gate below.
+    sac_learning_starts: int = 98_304
+    # Match one 512-row vector step with one replay minibatch while adapting the
+    # transferred IQL critic conservatively rather than repeatedly oversampling
+    # each newly accepted transition.
+    sac_batch_size: int = 512
+    sac_updates_per_env_step: int = 1
+    q_lr: float = 3e-5
+    sac_policy_frequency: int = 128
+    sac_actor_lr: float = 3e-7
+    sac_alpha_lr: float = 2e-5
+    # The BC/IQL critic was trained with a hard Bellman backup. Stage 2 starts
+    # from that exact objective and only introduces SAC temperature after the
+    # actor is actually released. The raw alpha is deliberately conservative;
+    # its effective value is linearly ramped over the configured Q updates.
+    sac_alpha_init: float = 1e-5
+    sac_alpha_ramp_q_updates: int = 20_000
+    # In the raw-action unit reference, the standard SAC target is -action_dim.
+    # The old ratio 4 compensated for the now-removed +log(20) clip offset.
+    sac_target_entropy_ratio: float = 1.0
+    sac_tau: float = 0.001
+    sac_max_grad_norm: float = 1.0
+    sac_actor_learning_starts_q_updates: int = 8_000
+    # The frozen BC policy is a detached critic-confidence reference, not a
+    # behavior-cloning loss. Every scheduled actor tick is independently
+    # accepted only when enough sampled actions improve over that reference in
+    # both Q heads by more than their disagreement about the action effect.
+    sac_actor_confidence_gate: bool = True
+    sac_actor_gate_disagreement_multiplier: float = 1.0
+    sac_actor_gate_min_accept_fraction: float = 0.10
+    sac_actor_gate_absolute_margin: float = 0.0
+    # A BC-DAgger source clips every executed teacher/student action to this
+    # symmetric raw-action support. scripts/helpers.py replaces the default
+    # with the exact checkpoint value before policy construction.
+    sac_bc_action_clip: float = 20.0
+    # Entropy density coordinates are independent of the DAgger safety clip.
+    # A value of one means log pi is measured per raw-action unit rather than
+    # in the artificial [-sac_bc_action_clip, sac_bc_action_clip] unit box.
+    sac_entropy_reference_scale: float = 1.0
+    # Dedicated Stage-2 exploration state. This is intentionally independent
+    # of PPO Actor.actor_std, which pure DAgger BC never optimized or sampled.
+    sac_bc_initial_action_std: float = 0.01
+    sac_bc_log_std_min: float = -8.0
+    sac_bc_log_std_max: float = -2.0
+    # Training collection samples the same bounded distribution used by SAC so
+    # online replay supports the actions queried by the critic and actor. Eval
+    # always executes the clipped BC/SAC mean. True is retained only as an
+    # explicit deterministic behavior ablation.
+    sac_deterministic_rollout: bool = False
+    # Confidence gating, not an auxiliary BC regression loss, guards actor
+    # release. Keep the legacy schedule fields as explicit zero-valued resume
+    # metadata so the default actor objective remains no-anchor SAC.
+    sac_bc_anchor_coef_start: float = 0.0
+    sac_bc_anchor_coef_end: float = 0.0
+    sac_bc_anchor_decay_q_updates: int = 100_000
+    sac_bc_anchor_huber_delta: float = 0.1
+    # Replay stores priv_pred rather than raw recurrent perception history, so
+    # Stage 2 cannot recompute historical latents after an encoder update. Keep
+    # the loaded perception fixed and prevent any additional coordinate drift.
+    sac_freeze_perception: bool = True
     teacher_buffer_ratio: float = 0.5
     online_buffer_capacity: int = 262_144
     # Accept the doubled BC-DAgger offline FIFO without silently truncating it.
@@ -3343,6 +3479,121 @@ def _validate_fastsac_finetune_config(cfg) -> None:
         raise ValueError(
             "FastSAC Stage 2 requires phase=finetune and vecnorm=eval so "
             "offline and online raw replay share the checkpoint normalizer"
+        )
+    if not isinstance(getattr(cfg, "load_pretrained_q", True), bool):
+        raise ValueError("load_pretrained_q must be a boolean")
+    for name in (
+        "sac_learning_starts",
+        "sac_actor_learning_starts_q_updates",
+    ):
+        value = getattr(cfg, name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or int(value) < 0
+        ):
+            raise ValueError(f"{name} must be a non-negative integer")
+    alpha_ramp_q_updates = getattr(cfg, "sac_alpha_ramp_q_updates")
+    if (
+        isinstance(alpha_ramp_q_updates, bool)
+        or not isinstance(alpha_ramp_q_updates, (int, np.integer))
+        or int(alpha_ramp_q_updates) < 1
+    ):
+        raise ValueError("sac_alpha_ramp_q_updates must be a positive integer")
+    anchor_decay = getattr(cfg, "sac_bc_anchor_decay_q_updates")
+    if (
+        isinstance(anchor_decay, bool)
+        or not isinstance(anchor_decay, (int, np.integer))
+        or int(anchor_decay) < 1
+    ):
+        raise ValueError(
+            "sac_bc_anchor_decay_q_updates must be a positive integer"
+        )
+    for name in (
+        "sac_deterministic_rollout",
+        "sac_freeze_perception",
+        "sac_actor_confidence_gate",
+    ):
+        if not isinstance(getattr(cfg, name), bool):
+            raise ValueError(f"{name} must be a boolean")
+    if not cfg.sac_freeze_perception:
+        raise ValueError(
+            "Stage-2 replay stores priv_pred, so sac_freeze_perception must "
+            "remain true until replay stores raw recurrent perception inputs"
+        )
+    gate_disagreement_multiplier = float(
+        cfg.sac_actor_gate_disagreement_multiplier
+    )
+    gate_min_accept_fraction = float(
+        cfg.sac_actor_gate_min_accept_fraction
+    )
+    gate_absolute_margin = float(cfg.sac_actor_gate_absolute_margin)
+    if (
+        not math.isfinite(gate_disagreement_multiplier)
+        or gate_disagreement_multiplier < 0.0
+    ):
+        raise ValueError(
+            "sac_actor_gate_disagreement_multiplier must be finite and "
+            "non-negative"
+        )
+    if (
+        not math.isfinite(gate_min_accept_fraction)
+        or not 0.0 < gate_min_accept_fraction <= 1.0
+    ):
+        raise ValueError(
+            "sac_actor_gate_min_accept_fraction must be finite and in (0, 1]"
+        )
+    if not math.isfinite(gate_absolute_margin) or gate_absolute_margin < 0.0:
+        raise ValueError(
+            "sac_actor_gate_absolute_margin must be finite and non-negative"
+        )
+    action_clip = float(cfg.sac_bc_action_clip)
+    entropy_reference_scale = float(cfg.sac_entropy_reference_scale)
+    initial_action_std = float(cfg.sac_bc_initial_action_std)
+    bc_log_std_min = float(cfg.sac_bc_log_std_min)
+    bc_log_std_max = float(cfg.sac_bc_log_std_max)
+    if not math.isfinite(action_clip) or action_clip <= 0.0:
+        raise ValueError("sac_bc_action_clip must be finite and positive")
+    if (
+        not math.isfinite(entropy_reference_scale)
+        or entropy_reference_scale <= 0.0
+    ):
+        raise ValueError(
+            "sac_entropy_reference_scale must be finite and positive"
+        )
+    if not math.isfinite(initial_action_std) or initial_action_std <= 0.0:
+        raise ValueError(
+            "sac_bc_initial_action_std must be finite and positive"
+        )
+    if (
+        not math.isfinite(bc_log_std_min)
+        or not math.isfinite(bc_log_std_max)
+        or not bc_log_std_min < bc_log_std_max
+    ):
+        raise ValueError(
+            "sac_bc_log_std_min and sac_bc_log_std_max must be finite and ordered"
+        )
+    initial_log_std = math.log(initial_action_std / action_clip)
+    if not bc_log_std_min <= initial_log_std <= bc_log_std_max:
+        raise ValueError(
+            "sac_bc_initial_action_std maps outside the dedicated BC-adapter "
+            "log-std bounds"
+        )
+    anchor_start = float(cfg.sac_bc_anchor_coef_start)
+    anchor_end = float(cfg.sac_bc_anchor_coef_end)
+    anchor_huber_delta = float(cfg.sac_bc_anchor_huber_delta)
+    if (
+        not math.isfinite(anchor_start)
+        or not math.isfinite(anchor_end)
+        or anchor_start < 0.0
+        or anchor_end < 0.0
+        or anchor_end > anchor_start
+        or not math.isfinite(anchor_huber_delta)
+        or anchor_huber_delta <= 0.0
+    ):
+        raise ValueError(
+            "BC anchor coefficients must be finite, non-negative, and decay "
+            "from start to end; Huber delta must be finite and positive"
         )
     if not isinstance(
         getattr(cfg, "q_condition_on_actuator_state", False), bool
@@ -3543,6 +3794,12 @@ class _FastSACVAICBase(PPOVEL):
         self.sac_action_rng = torch.Generator(device=device).manual_seed(
             int(cfg.q_seed) + 1
         )
+        # Environment behavior has its own stream: changing the number of SAC
+        # gradient samples must not change the action sequence collected into
+        # online replay, and collection must not advance environment/global RNG.
+        self.sac_rollout_rng = torch.Generator(device=device).manual_seed(
+            int(cfg.q_seed) + 2
+        )
         self.teacher_replay = None
         self.teacher_replay_id = str(uuid.uuid4())
         self.actor_backend = FASTSAC_ACTOR_BACKEND
@@ -3553,6 +3810,19 @@ class _FastSACVAICBase(PPOVEL):
         self._rollout_q_actuator_contexts = []
         self._last_truncation_finals_used = 0
         self.q_update_count = 0
+        # Shared lifecycle state must exist for every actor backend.  The
+        # BC-DAgger adapter returns early from _configure_actor_backend and
+        # therefore must not depend on the native Stage-1 setup below to make
+        # checkpoint serialization well-defined.
+        self._teacher_n_step_accumulator = None
+        self._rollout_final_batch = None
+        self._teacher_export_started = False
+        self._teacher_export_start_seen = None
+        self.sac_environment_steps = 0
+        self.sac_rollout_count = 0
+        self.sac_update_count = 0
+        self.sac_actor_update_count = 0
+        self.sac_alpha_update_count = 0
         self._configure_actor_backend()
 
     def _q_conditions_on_actuator_state(self) -> bool:
@@ -3969,6 +4239,20 @@ class _FastSACVAICBase(PPOVEL):
         # only remove PPO's equal-group averaging from the scalar SAC target.
         return reward.sum(dim=-1)
 
+    def _normalized_action_log_prob(self, physical_log_prob):
+        """Express log pi in the configured entropy reference coordinates.
+
+        Actor distributions always score executable physical actions.  The
+        entropy objective may use a different fixed unit, and therefore adds
+        only that reference coordinate's log determinant.  In particular, the
+        BC-DAgger safety clip is not implicitly an entropy normalization scale.
+        """
+        return physical_log_prob + float(getattr(
+            self,
+            "_fastsac_entropy_reference_log_scale_sum",
+            getattr(self, "_fastsac_action_log_scale_sum", 0.0),
+        ))
+
     def _configure_actor_backend(self):
         raise NotImplementedError
 
@@ -4128,6 +4412,10 @@ class _FastSACVAICBase(PPOVEL):
         if "sac_action_rng_state" in state_dict:
             self.sac_action_rng.set_state(
                 state_dict["sac_action_rng_state"].cpu()
+            )
+        if "sac_rollout_rng_state" in state_dict:
+            self.sac_rollout_rng.set_state(
+                state_dict["sac_rollout_rng_state"].cpu()
             )
         self.q_update_count = int(state_dict.get("q_update_count", 0))
         if "teacher_replay_id" in state_dict:
@@ -4325,23 +4613,70 @@ class FastSACVEL(_FastSACVAICBase):
 
     def _actor_backend_metadata(self):
         if self.actor_backend == FASTSAC_BC_DAGGER_ACTOR_BACKEND:
-            return {
+            deterministic_rollout = bool(self.cfg.sac_deterministic_rollout)
+            metadata = {
                 "action_parameterization": (
-                    "bc_dagger_absolute_mean_bounded_tanh_gaussian_v1"
+                    "bc_dagger_clipped_mean_deterministic_rollout_"
+                    "dedicated_tanh_gaussian_learning_v2"
+                    if deterministic_rollout
+                    else
+                    "bc_dagger_dedicated_tanh_gaussian_train_behavior_"
+                    "deterministic_clipped_mean_eval_v3"
                 ),
                 "source_actor_backend": BC_DAGGER_ACTOR_BACKEND,
                 "student_input_dim": self._q_actor_dim,
                 "action_dim": self.action_dim,
-                "log_std_parameter": "ppo_actor_std_reinterpreted_as_log_std",
-                "log_std_min": self.cfg.fastsac_log_std_min,
-                "log_std_max": self.cfg.fastsac_log_std_max,
+                "log_std_parameter": "bc_dagger_sac_adapter.log_std",
+                "initial_action_std": float(
+                    self.cfg.sac_bc_initial_action_std
+                ),
+                "initial_log_std": math.log(
+                    float(self.cfg.sac_bc_initial_action_std)
+                    / float(self.cfg.sac_bc_action_clip)
+                ),
+                "log_std_min": self.cfg.sac_bc_log_std_min,
+                "log_std_max": self.cfg.sac_bc_log_std_max,
+                "action_bound_source": "bc_dagger_action_clip",
+                "action_clip": float(self.cfg.sac_bc_action_clip),
+                "rollout_behavior": (
+                    "deterministic_clipped_bc_mean"
+                    if deterministic_rollout
+                    else
+                    "train_stochastic_dedicated_tanh_gaussian_"
+                    "eval_deterministic_clipped_bc_mean"
+                ),
+                "perception_frozen": bool(self.cfg.sac_freeze_perception),
                 "action_low": self._fastsac_action_low,
                 "action_high": self._fastsac_action_high,
                 "action_log_scale_sum": self._fastsac_action_log_scale_sum,
-                "joint_offset_low": self._fastsac_joint_offset_low,
-                "joint_offset_high": self._fastsac_joint_offset_high,
+                "entropy_reference_coordinates": (
+                    "raw_action_divide_fixed_reference_scale_v1"
+                ),
+                "entropy_reference_scale": float(
+                    self.cfg.sac_entropy_reference_scale
+                ),
+                "entropy_reference_log_scale_sum": float(
+                    self._fastsac_entropy_reference_log_scale_sum
+                ),
+                "q_only_target_policy": (
+                    "deterministic_behavior_mean_hard_target_v2"
+                    if deterministic_rollout
+                    else "frozen_stochastic_behavior_hard_target_v2"
+                ),
+                "q_only_alpha_semantics": (
+                    "effective_zero_until_actual_actor_release_then_linear_"
+                    "ramp_shared_by_q_actor_and_dual_v2"
+                ),
+                "alpha_ramp_q_updates": int(
+                    self.cfg.sac_alpha_ramp_q_updates
+                ),
                 "joint_names": list(self.joint_names),
             }
+            if not deterministic_rollout:
+                metadata["rollout_rng"] = (
+                    "dedicated_checkpointed_torch_generator_q_seed_plus_2_v1"
+                )
+            return metadata
         return {
             "action_parameterization": FASTSAC_ACTION_PARAMETERIZATION,
             "teacher_input_dim": self._fastsac_teacher_actor_dim,
@@ -4424,7 +4759,11 @@ class FastSACVEL(_FastSACVAICBase):
             "reward_scalarization": SAC_REWARD_SCALARIZATION,
             "reward_groups": list(self.reward_groups),
             "truncation_semantics": TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
-            "target_entropy_semantics": FASTSAC_TARGET_ENTROPY_SEMANTICS,
+            "target_entropy_semantics": (
+                FASTSAC_BC_DAGGER_TARGET_ENTROPY_SEMANTICS
+                if self._uses_bc_dagger_finetune_source()
+                else FASTSAC_TARGET_ENTROPY_SEMANTICS
+            ),
             "q_action_coordinates": q_action_coordinates,
             "q_action_normalized": q_action_normalized,
             "q_action_input_gain": float(
@@ -4704,12 +5043,65 @@ class FastSACVEL(_FastSACVAICBase):
         return cores[0]
 
     def _configure_bc_dagger_actor_backend(self):
-        """Retain the trained BC actor and expose a bounded SAC distribution."""
-        if bool(getattr(self.cfg, "sac_q_normalize_actions", True)):
+        """Retain exact BC behavior and add separate SAC stochastic state."""
+        replay_incompatible = {
+            "q_action_coordinates": str(getattr(
+                self.cfg, "q_action_coordinates", "absolute"
+            )) != "absolute",
+            "q_reference_dueling": bool(getattr(
+                self.cfg, "q_reference_dueling", False
+            )),
+            "q_condition_on_actuator_state": bool(getattr(
+                self.cfg, "q_condition_on_actuator_state", False
+            )),
+        }
+        unsupported = [
+            name for name, enabled in replay_incompatible.items() if enabled
+        ]
+        if unsupported:
+            raise ValueError(
+                "BC-DAgger offline replay stores absolute actions without "
+                "reference-action or actuator-context fields; incompatible "
+                f"Stage-2 Q settings: {unsupported}"
+            )
+        if (
+            bool(getattr(self.cfg, "load_pretrained_q", True))
+            and bool(getattr(self.cfg, "sac_q_normalize_actions", True))
+        ):
             raise ValueError(
                 "BC-DAgger Q transfer requires sac_q_normalize_actions=false"
             )
-        action_low, action_high = self._vaic_action_bounds()
+        if bool(getattr(self.cfg, "load_pretrained_q", True)):
+            pretrained_q_incompatible = {
+                "q_action_fusion": str(getattr(
+                    self.cfg, "q_action_fusion", "early"
+                )) != "early",
+                "sac_q_action_input_gain": not math.isclose(
+                    float(getattr(
+                        self.cfg, "sac_q_action_input_gain", 1.0
+                    )),
+                    1.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ),
+            }
+            incompatible = [
+                name
+                for name, enabled in pretrained_q_incompatible.items()
+                if enabled
+            ]
+            if incompatible:
+                raise ValueError(
+                    "Pretrained BC-DAgger Q requires its original early-fusion "
+                    "raw-action input with unit gain; incompatible settings: "
+                    f"{incompatible}"
+                )
+        action_clip = float(self.cfg.sac_bc_action_clip)
+        action_low = torch.full(
+            (self.action_dim,), -action_clip, device=self.device,
+            dtype=torch.float32,
+        )
+        action_high = torch.full_like(action_low, action_clip)
         self.dist_cls = functools.partial(
             FastSACTanhNormal,
             low=action_low,
@@ -4736,6 +5128,34 @@ class FastSACVEL(_FastSACVAICBase):
         self._fastsac_action_log_scale_sum = float(
             torch.log((action_high - action_low) * 0.5).sum().item()
         )
+        # The executable support is a DAgger safety guard, not an entropy
+        # coordinate choice. Score entropy in a fixed raw-action unit so a
+        # different safety clip cannot silently add action_dim * log(clip) to
+        # every SAC target and actor loss.
+        self._fastsac_entropy_reference_scale = float(
+            self.cfg.sac_entropy_reference_scale
+        )
+        self._fastsac_entropy_reference_log_scale_sum = float(
+            self.action_dim
+            * math.log(self._fastsac_entropy_reference_scale)
+        )
+        initial_log_std = math.log(
+            float(self.cfg.sac_bc_initial_action_std) / action_clip
+        )
+        self.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
+            self.action_dim, initial_log_std, self.device
+        )
+
+        # Pure DAgger optimized and executed only the mean. Keep PPO's unused
+        # positive standard-deviation tensor intact for checkpoint fidelity,
+        # but make it impossible for Stage-2 SAC to optimize or reinterpret it.
+        bc_actor_core = self._ppo_actor_core(self.actor_adapt)
+        bc_actor_core.actor_std.requires_grad_(False)
+        # Actor._load_from_state_dict optionally replaces checkpoint std with
+        # cfg.load_noise_scale. DAgger never used this tensor, but preserving
+        # it bit-for-bit keeps checkpoint provenance truthful and prevents any
+        # future code from confusing a constructor override with learned state.
+        bc_actor_core.load_noise_scale = None
 
         # Stage 2 uses neither PPO's value network nor its optimizers. Keep the
         # loaded BC actor modules themselves, because they are the requested
@@ -5638,6 +6058,7 @@ class FastSACVEL(_FastSACVAICBase):
             next_action, next_log_prob = next_dist.rsample_with_log_prob(
                 generator=self.sac_action_rng
             )
+            next_log_prob = self._normalized_action_log_prob(next_log_prob)
             bootstrap = _sac_bootstrap_mask(
                 batch["dones"], batch["truncations"]
             )
@@ -5835,6 +6256,9 @@ class FastSACVEL(_FastSACVAICBase):
             sampled_action, sampled_log_prob = dist.rsample_with_log_prob(
                 generator=self.sac_action_rng
             )
+            sampled_log_prob = self._normalized_action_log_prob(
+                sampled_log_prob
+            )
 
         if not hasattr(dist, "log_prob_for_action"):
             raise TypeError(
@@ -5843,6 +6267,7 @@ class FastSACVEL(_FastSACVAICBase):
         replay_log_prob = dist.log_prob_for_action(
             replay_action, detach_scale=True
         )
+        replay_log_prob = self._normalized_action_log_prob(replay_log_prob)
         actor_loss = -(
             awac_weights.detach() * replay_log_prob / float(self.action_dim)
         ).mean()
@@ -6009,6 +6434,7 @@ class FastSACVEL(_FastSACVAICBase):
         action, log_prob = dist.rsample_with_log_prob(
             generator=self.sac_action_rng
         )
+        log_prob = self._normalized_action_log_prob(log_prob)
         critic_obs = batch["critic_observations"]
         reference_action = minibatch[REF_JPOS_KEY].detach()
         uncertainty_gate_enabled = bool(getattr(
@@ -6592,7 +7018,11 @@ class FastSACVEL(_FastSACVAICBase):
             "fastsac/entropy": self._mean_metric(actor_metrics, "entropy", self.device).item(),
             "fastsac/normalized_action_entropy": (
                 self._mean_metric(actor_metrics, "entropy", self.device).item()
-                - self._fastsac_action_log_scale_sum
+                if actor_metrics else 0.0
+            ),
+            "fastsac/physical_action_entropy": (
+                self._mean_metric(actor_metrics, "entropy", self.device).item()
+                + self._fastsac_action_log_scale_sum
                 if actor_metrics else 0.0
             ),
             "fastsac/action_std": self._mean_metric(actor_metrics, "action_std", self.device).item(),
@@ -6850,6 +7280,7 @@ class FastSACVEL(_FastSACVAICBase):
         state["next_iter"] = int(self.env.current_iter) + 1
         state["q_rng_state"] = self.q_rng.get_state()
         state["sac_action_rng_state"] = self.sac_action_rng.get_state()
+        state["sac_rollout_rng_state"] = self.sac_rollout_rng.get_state()
         state["q_update_count"] = self.q_update_count
         state["actor_backend"] = self.actor_backend
         state["training_algorithm"] = (
@@ -6865,7 +7296,9 @@ class FastSACVEL(_FastSACVAICBase):
         state["sac_update_count"] = self.sac_update_count
         state["sac_actor_update_count"] = self.sac_actor_update_count
         state["sac_alpha_update_count"] = self.sac_alpha_update_count
-        state["teacher_export_started"] = self._teacher_export_started
+        state["teacher_export_started"] = bool(getattr(
+            self, "_teacher_export_started", False
+        ))
         if self.cfg.phase == "train":
             state["stage1_update_mode"] = dict(FASTSAC_STAGE1_UPDATE_MODE)
             state["stage1_seed_replay_config"] = {
@@ -7088,31 +7521,106 @@ class FastSACVEL(_FastSACVAICBase):
         return failed
 
 
+class _BCDaggerSACAdapter(nn.Module):
+    """Dedicated Stage-2 stochastic state for a deterministic BC actor."""
+
+    def __init__(self, action_dim: int, initial_log_std: float, device):
+        super().__init__()
+        self.log_std = nn.Parameter(torch.full(
+            (int(action_dim),),
+            float(initial_log_std),
+            device=device,
+            dtype=torch.float32,
+        ))
+
+
 class _BCDaggerSACRolloutActor(nn.Module):
-    """Execute the retained BC mean through Stage-2's bounded SAC adapter."""
+    """Execute the configured Stage-2 behavior and expose support diagnostics."""
 
     in_keys = [VEL_CMD_KEY, OBS_KEY, PRIV_PRED_KEY]
-    out_keys = [ACTION_KEY, "loc", "scale"]
+    out_keys = [
+        ACTION_KEY,
+        "loc",
+        "scale",
+        STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY,
+        STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY,
+    ]
 
-    def __init__(self, owner: "FastSACVelFinetune", deterministic: bool):
+    def __init__(
+        self, owner: "FastSACVelFinetune", deterministic: bool = True
+    ):
         super().__init__()
         object.__setattr__(self, "_owner", owner)
         self.deterministic = bool(deterministic)
 
+    @torch.no_grad()
     def forward(self, td: TensorDict):
-        dist = self._owner._bc_dagger_actor_dist_from_td(td)
+        mean_action, dist = self._owner._bc_dagger_behavior_action_and_dist(td)
         if self.deterministic:
-            action = dist.mean
+            action = mean_action
         else:
-            action, _ = dist.rsample_with_log_prob()
+            action, _ = dist.rsample_with_log_prob(
+                generator=self._owner.sac_rollout_rng
+            )
+        action_clip = float(self._owner.cfg.sac_bc_action_clip)
+        action_in_support = (
+            torch.isfinite(action) & (action.abs() <= action_clip)
+        ).all()
+        if not action_in_support:
+            raise RuntimeError(
+                "BC-DAgger Stage-2 behavior sampled an action outside its "
+                "finite actor/replay/Q support before environment execution"
+            )
+        absolute_deviation = (action - mean_action).abs()
         td[ACTION_KEY] = action
         td["loc"] = dist.loc
         td["scale"] = dist.scale
+        td[STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY] = (
+            absolute_deviation.mean(dim=-1)
+        )
+        td[STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY] = (
+            absolute_deviation.amax(dim=-1)
+        )
         return td
 
 
 class FastSACVelFinetune(FastSACVEL):
     """VAIC student actor + HOI-style distributional FastSAC with RLPD replay."""
+
+    def _freeze_stage2_perception(self):
+        """Keep latent replay coordinates fixed for the full Stage-2 run."""
+        module_names = (
+            "encoder_priv",
+            "adapt_module",
+            "adapt_ema",
+            "object_adapt",
+            "object_adapt_ema",
+            "depth_cnn",
+            "temporal_depth_gru",
+            "temporal_depth_gru_ema",
+            "dr_estimator",
+        )
+        for name in module_names:
+            module = getattr(self, name, None)
+            if isinstance(module, nn.Module):
+                module.requires_grad_(False)
+        # These optimizers belong to the mutable PPO perception path. Keeping
+        # them out of the Stage-2 registry also makes resume manifests honest.
+        self.opt_adapt = None
+        if hasattr(self, "opt_dr_estimator"):
+            self.opt_dr_estimator = None
+
+    def _stage2_actor_parameters(self):
+        if not self._uses_bc_dagger_finetune_source():
+            return tuple(self.actor_adapt.parameters())
+        unused_ppo_std = self._ppo_actor_core(self.actor_adapt).actor_std
+        parameters = [
+            parameter
+            for parameter in self.actor_adapt.parameters()
+            if parameter is not unused_ppo_std
+        ]
+        parameters.extend(self.bc_dagger_sac_adapter.parameters())
+        return tuple(parameters)
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         if cfg.enable_residual_distillation:
@@ -7123,10 +7631,19 @@ class FastSACVelFinetune(FastSACVEL):
             )
         _validate_fastsac_finetune_config(cfg)
         super().__init__(cfg, observation_spec, action_spec, reward_spec, device, env)
+        if bool(cfg.sac_freeze_perception):
+            self._freeze_stage2_perception()
+        if self._uses_bc_dagger_finetune_source():
+            self.bc_dagger_actor_anchor = copy.deepcopy(
+                self.actor_adapt
+            ).requires_grad_(False)
+        self._stage2_trainable_actor_parameters = (
+            self._stage2_actor_parameters()
+        )
         self.online_replay = OnlineReplay(cfg.online_buffer_capacity, device=self.device)
         self.offline_replay = None
         self.sac_actor_optimizer = torch.optim.AdamW(
-            self.actor_adapt.parameters(), lr=cfg.sac_actor_lr,
+            self._stage2_trainable_actor_parameters, lr=cfg.sac_actor_lr,
             weight_decay=cfg.q_weight_decay, betas=(0.9, 0.95),
         )
         self.opt_q = torch.optim.AdamW(
@@ -7143,6 +7660,10 @@ class FastSACVelFinetune(FastSACVEL):
             cfg.sac_target_entropy_ratio,
         )
         self.sac_update_count = 0
+        # None means no actor optimizer step has yet passed every release gate.
+        # The first applied actor update records its numbered Q update and is
+        # the zero point of the effective-alpha ramp.
+        self._stage2_actor_release_q_update = None
 
     def configure_offline_replay(self, path):
         if getattr(self, "_replay_vecnorm", None) is None:
@@ -7178,6 +7699,7 @@ class FastSACVelFinetune(FastSACVEL):
                 expected_vecnorm_fingerprint=(
                     self._replay_vecnorm_fingerprint
                 ),
+                expected_action_clip=float(self.cfg.sac_bc_action_clip),
             )
         else:
             self.offline_replay = OfflineReplayH5(
@@ -7213,17 +7735,136 @@ class FastSACVelFinetune(FastSACVEL):
     def get_offline_replay_path(self):
         return getattr(self, "offline_replay_source_path", None)
 
+    def _uses_pretrained_q(self) -> bool:
+        return bool(getattr(self.cfg, "load_pretrained_q", True))
+
+    def _stage2_schedule_config(self):
+        names = (
+            "load_pretrained_q",
+            "sac_learning_starts",
+            "sac_batch_size",
+            "sac_updates_per_env_step",
+            "sac_policy_frequency",
+            "q_lr",
+            "sac_actor_lr",
+            "sac_alpha_lr",
+            "sac_alpha_init",
+            "sac_alpha_ramp_q_updates",
+            "sac_target_entropy_ratio",
+            "sac_tau",
+            "sac_max_grad_norm",
+            "sac_actor_learning_starts_q_updates",
+            "sac_actor_confidence_gate",
+            "sac_actor_gate_disagreement_multiplier",
+            "sac_actor_gate_min_accept_fraction",
+            "sac_actor_gate_absolute_margin",
+            "sac_bc_action_clip",
+            "sac_entropy_reference_scale",
+            "sac_bc_initial_action_std",
+            "sac_bc_log_std_min",
+            "sac_bc_log_std_max",
+            "sac_deterministic_rollout",
+            "sac_bc_anchor_coef_start",
+            "sac_bc_anchor_coef_end",
+            "sac_bc_anchor_decay_q_updates",
+            "sac_bc_anchor_huber_delta",
+            "sac_freeze_perception",
+            "teacher_buffer_ratio",
+        )
+        return {
+            "version": 4,
+            "entropy_semantics": (
+                "fixed_reference_action_density_hard_q_bridge_then_"
+                "post_release_linear_effective_alpha_v1"
+            ),
+            "actor_confidence_gate_semantics": (
+                FASTSAC_STAGE2_ACTOR_CONFIDENCE_GATE_SEMANTICS
+            ),
+            **{name: getattr(self.cfg, name) for name in names},
+        }
+
+    def _checkpoint_for_q_transfer(self, state_dict, *, load_q=None):
+        """Return checkpoint modules with Q entries selected by configuration.
+
+        PPOVEL's compatibility loader visits every registered child.  Supplying
+        the constructor-created Q states here avoids both loading Stage-1 Q
+        tensors and treating intentionally fresh Q modules as missing.
+        """
+        if load_q is None:
+            load_q = self._uses_pretrained_q()
+        if load_q:
+            return state_dict
+        load_state = dict(state_dict)
+        load_state["qnet"] = self.qnet.state_dict()
+        load_state["qnet_target"] = self.qnet_target.state_dict()
+        load_state["q_update_count"] = 0
+        return load_state
+
+    def _finalize_fresh_q_initialization(self):
+        """Make fresh target critics and optimizer state match fresh online Q."""
+        hard_copy_(self.qnet, self.qnet_target)
+        self.qnet_target.requires_grad_(False)
+        # A same-process test or a future loader refactor may have populated
+        # Adam moments before reaching this point.  Never pair them with a
+        # newly initialized critic.
+        if hasattr(self, "opt_q"):
+            self.opt_q.state.clear()
+        self.q_update_count = 0
+
     def load_state_dict(self, state_dict, strict=True):
-        if "qnet" not in state_dict:
+        load_pretrained_q = self._uses_pretrained_q()
+        same_stage_resume = state_dict.get("last_phase") == "finetune"
+        load_q = load_pretrained_q or same_stage_resume
+        if load_q and "qnet" not in state_dict:
             raise KeyError(
                 "Checkpoint has no transferable Q1/Q2. Use a checkpoint trained "
                 "with scripts/bc_dagger.py or algo=fastsac_vel_train."
             )
         if state_dict.get("training_algorithm") == BC_DAGGER_TRAINING_ALGORITHM:
             return self._load_bc_dagger_state_dict(state_dict, strict)
-        failed = super().load_state_dict(state_dict, strict)
-        if "qnet" in failed or "qnet_target" in failed:
+        if state_dict.get("training_algorithm") == (
+            BC_DAGGER_LEGACY_TRAINING_ALGORITHM
+        ):
+            raise ValueError(
+                "Legacy BC-DAgger Q checkpoints predate IQL critic training. "
+                "Run scripts/bc_dagger.py again before Stage-2 FastSAC."
+            )
+        if (
+            same_stage_resume
+            and self._uses_bc_dagger_finetune_source()
+            and not bool(self.cfg.sac_deterministic_rollout)
+            and "sac_rollout_rng_state" not in state_dict
+        ):
+            raise ValueError(
+                "Stochastic BC-DAgger Stage-2 resume requires the checkpointed "
+                "rollout RNG state"
+            )
+        if same_stage_resume:
+            actual_schedule = state_dict.get("stage2_schedule_config")
+            expected_schedule = self._stage2_schedule_config()
+            if actual_schedule != expected_schedule:
+                raise ValueError(
+                    "Stage-2 checkpoint schedule/anchor/perception config does "
+                    f"not match: checkpoint={actual_schedule!r}, "
+                    f"current={expected_schedule!r}"
+                )
+            if "stage2_actor_release_q_update" not in state_dict:
+                raise ValueError(
+                    "Stage-2 checkpoint is missing the actor-release alpha-ramp "
+                    "origin"
+                )
+        load_state = self._checkpoint_for_q_transfer(state_dict, load_q=load_q)
+        failed = super().load_state_dict(load_state, strict)
+        if load_q and (
+            "qnet" in failed or "qnet_target" in failed
+        ):
             raise RuntimeError("Failed to load teacher FastSAC Q1/Q2 from checkpoint")
+        if not load_q:
+            self._finalize_fresh_q_initialization()
+            failed = [
+                name for name in failed
+                if name not in {"qnet", "qnet_target"}
+            ]
         source_phase = state_dict.get("last_phase")
         if source_phase == "finetune":
             perception_modules = {"encoder_priv", "adapt_module", "adapt_ema"}
@@ -7239,7 +7880,11 @@ class FastSACVelFinetune(FastSACVEL):
                     "Failed to restore student perception/EMA modules: "
                     f"{sorted(missing_perception)}"
                 )
-        if self.q_update_count < 1:
+        if (
+            load_pretrained_q
+            and not same_stage_resume
+            and self.q_update_count < 1
+        ):
             raise RuntimeError(
                 "Checkpoint Q1/Q2 have not been trained by FastSAC yet."
             )
@@ -7254,15 +7899,53 @@ class FastSACVelFinetune(FastSACVEL):
             # streams or silently ignore the Stage-2 q_seed.
             self.q_rng.manual_seed(int(self.cfg.q_seed))
             self.sac_action_rng.manual_seed(int(self.cfg.q_seed) + 1)
+            self.sac_rollout_rng.manual_seed(int(self.cfg.q_seed) + 2)
+            self._stage2_actor_release_q_update = None
         elif source_phase == "finetune":
+            release_q_update = state_dict["stage2_actor_release_q_update"]
+            if release_q_update is not None:
+                if (
+                    isinstance(release_q_update, bool)
+                    or not isinstance(release_q_update, (int, np.integer))
+                    or int(release_q_update) < 1
+                    or int(release_q_update) > int(self.q_update_count)
+                ):
+                    raise ValueError(
+                        "Stage-2 checkpoint actor-release alpha-ramp origin is "
+                        "invalid"
+                    )
+                release_q_update = int(release_q_update)
+            if (
+                (release_q_update is None)
+                != (int(getattr(self, "sac_actor_update_count", 0)) == 0)
+            ):
+                raise ValueError(
+                    "Stage-2 checkpoint actor-update count and alpha-ramp "
+                    "release origin are inconsistent"
+                )
+            self._stage2_actor_release_q_update = release_q_update
+            if self._uses_bc_dagger_finetune_source():
+                missing_bridge = {
+                    "bc_dagger_sac_adapter",
+                    "bc_dagger_actor_anchor",
+                }.intersection(failed)
+                if missing_bridge:
+                    raise RuntimeError(
+                        "Failed to restore Stage-2 BC bridge modules: "
+                        f"{sorted(missing_bridge)}"
+                    )
             replay_state = state_dict.get("offline_teacher_replay_state")
             if replay_state is not None:
                 # Retain provenance for checkpoint logging, but do not require
                 # the next stage-2 invocation to select the identical dataset.
                 self._loaded_teacher_replay_metadata = copy.deepcopy(replay_state)
+            iql_source = state_dict.get("bc_dagger_iql_source")
+            if isinstance(iql_source, dict):
+                self._bc_dagger_iql_source = copy.deepcopy(iql_source)
         return failed
 
     def _load_bc_dagger_state_dict(self, state_dict, strict=True):
+        load_pretrained_q = self._uses_pretrained_q()
         if not self._uses_bc_dagger_finetune_source():
             raise ValueError(
                 "A BC-DAgger checkpoint requires "
@@ -7270,6 +7953,18 @@ class FastSACVelFinetune(FastSACVEL):
             )
         if state_dict.get("actor_backend") != BC_DAGGER_ACTOR_BACKEND:
             raise ValueError("BC-DAgger checkpoint actor backend mismatch")
+        if load_pretrained_q and state_dict.get(
+            "critic_learning_semantics"
+        ) != BC_DAGGER_IQL_CRITIC_SEMANTICS:
+            raise ValueError("BC-DAgger checkpoint IQL critic semantics mismatch")
+        if state_dict.get("actor_learning_semantics") != (
+            BC_DAGGER_ACTOR_LEARNING_SEMANTICS
+        ):
+            raise ValueError(
+                "BC-DAgger checkpoint actor was not trained by pure DAgger BC"
+            )
+        if load_pretrained_q and "iql_value" not in state_dict:
+            raise KeyError("BC-DAgger checkpoint is missing its IQL value network")
         checkpoint_fingerprint = state_dict.get("vecnorm_fingerprint")
         if (
             checkpoint_fingerprint is not None
@@ -7283,6 +7978,24 @@ class FastSACVelFinetune(FastSACVEL):
         backend_cfg = state_dict.get("dagger_backend_config")
         if not isinstance(backend_cfg, dict):
             raise ValueError("BC-DAgger checkpoint lacks backend configuration")
+        source_action_clip = backend_cfg.get("dagger_action_clip")
+        if (
+            source_action_clip is None
+            or not math.isclose(
+                float(source_action_clip),
+                float(self.cfg.sac_bc_action_clip),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "BC-DAgger checkpoint action clip does not match the Stage-2 "
+                "actor/replay/Q support"
+            )
+        if load_pretrained_q and "iql_expectile" not in backend_cfg:
+            raise ValueError(
+                "BC-DAgger checkpoint lacks its IQL expectile configuration"
+            )
         expected_q = {
             "q_hidden_dim": int(self.cfg.q_hidden_dim),
             "q_num_atoms": int(self.cfg.q_num_atoms),
@@ -7291,19 +8004,36 @@ class FastSACVelFinetune(FastSACVEL):
             "q_layer_norm": bool(self.cfg.q_layer_norm),
         }
         actual_q = {name: backend_cfg.get(name) for name in expected_q}
-        if actual_q != expected_q:
+        if load_pretrained_q and actual_q != expected_q:
             raise ValueError(
                 f"BC-DAgger Q configuration {actual_q} does not match "
                 f"Stage 2 {expected_q}"
             )
         source_q_updates = int(state_dict.get("q_update_count", 0))
-        if source_q_updates < 1:
+        if load_pretrained_q and source_q_updates < 1:
             raise RuntimeError("BC-DAgger checkpoint Q1/Q2 were never updated")
+        source_value_updates = int(
+            state_dict.get("iql_value_update_count", 0)
+        )
+        if load_pretrained_q and source_value_updates < 1:
+            raise RuntimeError("BC-DAgger checkpoint IQL V was never updated")
 
         # The compatibility backend deliberately retained PPOVEL's actor tree,
-        # so this loads the exact BC actor, depth/EMA modules, Q1/Q2 and target
-        # Q1/Q2 without shape translation or partial-copy heuristics.
-        failed = PPOVEL.load_state_dict(self, state_dict, strict)
+        # so the BC actor and depth/EMA modules load without shape translation.
+        # Q entries below are either the exact checkpoint weights or the
+        # constructor-created states selected by load_pretrained_q.
+        load_state = self._checkpoint_for_q_transfer(state_dict)
+        load_state = dict(load_state)
+        # A BC-Dagger checkpoint predates the learning-only SAC adapter and
+        # frozen anchor. Seed those registered Stage-2 children locally, then
+        # capture the transferred actor into the anchor immediately after load.
+        load_state["bc_dagger_sac_adapter"] = (
+            self.bc_dagger_sac_adapter.state_dict()
+        )
+        load_state["bc_dagger_actor_anchor"] = (
+            self.bc_dagger_actor_anchor.state_dict()
+        )
+        failed = PPOVEL.load_state_dict(self, load_state, strict)
         critical = {
             "actor_adapt",
             "qnet",
@@ -7326,18 +8056,26 @@ class FastSACVelFinetune(FastSACVEL):
                 "Failed to transfer critical BC-DAgger modules: "
                 f"{sorted(missing)}"
             )
+        if not load_pretrained_q:
+            self._finalize_fresh_q_initialization()
+            failed = [
+                name for name in failed
+                if name not in {"qnet", "qnet_target"}
+            ]
 
-        # In PPO this parameter represented a positive Normal standard
-        # deviation. Stage 2 reuses the same registered parameter as log-std so
-        # it remains checkpointable/optimizable without changing actor topology.
-        actor_core = self._ppo_actor_core(self.actor_adapt)
-        with torch.no_grad():
-            actor_core.actor_std.copy_(
-                actor_core.actor_std.clamp_min(1e-6).log().clamp(
-                    float(self.cfg.fastsac_log_std_min),
-                    float(self.cfg.fastsac_log_std_max),
-                )
-            )
+        # Preserve the complete BC actor bit-for-bit, including its unused
+        # positive PPO std, and snapshot the transferred mean policy as the
+        # fixed behavior anchor for gradual Stage-2 release.
+        hard_copy_(self.actor_adapt, self.bc_dagger_actor_anchor)
+        self.bc_dagger_actor_anchor.requires_grad_(False)
+        self._ppo_actor_core(self.actor_adapt).actor_std.requires_grad_(False)
+        failed = [
+            name for name in failed
+            if name not in {
+                "bc_dagger_sac_adapter",
+                "bc_dagger_actor_anchor",
+            }
+        ]
         self.qnet_target.requires_grad_(False)
         self.q_update_count = 0
         self.sac_update_count = 0
@@ -7347,7 +8085,9 @@ class FastSACVelFinetune(FastSACVEL):
         self.sac_rollout_count = 0
         self.q_rng.manual_seed(int(self.cfg.q_seed))
         self.sac_action_rng.manual_seed(int(self.cfg.q_seed) + 1)
+        self.sac_rollout_rng.manual_seed(int(self.cfg.q_seed) + 2)
         self.log_alpha.data.fill_(float(np.log(self.cfg.sac_alpha_init)))
+        self._stage2_actor_release_q_update = None
         self.teacher_replay_id = str(
             state_dict.get("teacher_replay_id", self.teacher_replay_id)
         )
@@ -7355,17 +8095,55 @@ class FastSACVelFinetune(FastSACVEL):
         self._loaded_teacher_replay_metadata = copy.deepcopy(
             state_dict.get("teacher_replay_state")
         )
-        logging.info(
-            "Transferred BC-DAgger actor/perception and pretrained Q1/Q2 + "
-            "targets into a fresh Stage-2 SAC optimizer/entropy process."
-        )
+        if load_pretrained_q:
+            self._bc_dagger_iql_source = {
+                "critic_learning_semantics": BC_DAGGER_IQL_CRITIC_SEMANTICS,
+                "actor_learning_semantics": BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
+                "source_q_updates": source_q_updates,
+                "source_value_updates": source_value_updates,
+                "expectile": float(backend_cfg["iql_expectile"]),
+                "value_network_stage2_usage": "discarded_stage1_bootstrap_only",
+            }
+            logging.info(
+                "Transferred pure-BC DAgger actor/perception and IQL-pretrained "
+                "Q1/Q2 + targets into a fresh Stage-2 SAC optimizer/entropy "
+                "process; the Stage-1-only V network was intentionally discarded."
+            )
+        else:
+            self._bc_dagger_iql_source = {
+                "critic_learning_semantics": state_dict.get(
+                    "critic_learning_semantics"
+                ),
+                "actor_learning_semantics": BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
+                "source_q_updates": source_q_updates,
+                "source_value_updates": source_value_updates,
+                "expectile": backend_cfg.get("iql_expectile"),
+                "value_network_stage2_usage": "not_loaded",
+                "q_weights_stage2_usage": "discarded_fresh_q_seed",
+                "q_seed": int(self.cfg.q_seed),
+            }
+            logging.info(
+                "Transferred the pure-BC DAgger actor/perception modules but "
+                "intentionally skipped Stage-1 IQL Q/V weights; Stage-2 Q1/Q2 "
+                "are fresh q_seed=%d initializations and both target critics "
+                "are frozen exact copies.",
+                int(self.cfg.q_seed),
+            )
         return failed
 
     def state_dict(self):
         state = super().state_dict()
+        state["stage2_schedule_config"] = self._stage2_schedule_config()
+        state["stage2_actor_release_q_update"] = getattr(
+            self, "_stage2_actor_release_q_update", None
+        )
         if self.offline_replay is not None:
             state["offline_teacher_replay_state"] = copy.deepcopy(
                 self.offline_replay.snapshot_metadata
+            )
+        if hasattr(self, "_bc_dagger_iql_source"):
+            state["bc_dagger_iql_source"] = copy.deepcopy(
+                self._bc_dagger_iql_source
             )
         return state
 
@@ -7519,25 +8297,38 @@ class FastSACVelFinetune(FastSACVEL):
             )
             yield transitions
 
-    def _actor_dist_from_flat(self, actor_obs):
+    def _actor_td_from_flat(self, actor_obs):
         vel_dim = self.observation_spec[VEL_CMD_KEY].shape[-1]
         policy_dim = self.observation_spec[OBS_KEY].shape[-1]
-        td = TensorDict({
+        return TensorDict({
             VEL_CMD_KEY: actor_obs[..., :vel_dim],
             OBS_KEY: actor_obs[..., vel_dim:vel_dim + policy_dim],
             PRIV_PRED_KEY: actor_obs[..., vel_dim + policy_dim:],
         }, batch_size=actor_obs.shape[:-1], device=actor_obs.device)
+
+    def _actor_dist_from_flat(self, actor_obs):
+        td = self._actor_td_from_flat(actor_obs)
         if self._uses_bc_dagger_finetune_source():
             return self._bc_dagger_actor_dist_from_td(td)
         return self.actor_adapt.get_dist(td)
 
-    def _bc_dagger_actor_dist_from_td(self, td: TensorDict):
-        # actor_adapt retains the exact trained BC network. Its loc is already
-        # an absolute executable-action target; map that target into the latent
-        # of a bounded tanh Gaussian so deterministic Stage-2 rollout begins at
-        # the BC policy while SAC obtains valid rsample/log_prob semantics.
-        bc_dist = self.actor_adapt.get_dist(td)
-        mean_action = bc_dist.mean
+    def _bc_dagger_behavior_action(self, td: TensorDict, actor=None):
+        """Apply the exact finite-value guard and clamp used by DAgger."""
+        actor = self.actor_adapt if actor is None else actor
+        mean_action = actor.get_dist(td).mean
+        action_clip = float(self.cfg.sac_bc_action_clip)
+        return torch.nan_to_num(
+            mean_action,
+            nan=0.0,
+            posinf=action_clip,
+            neginf=-action_clip,
+        ).clamp(-action_clip, action_clip)
+
+    def _bc_dagger_behavior_action_and_dist(self, td: TensorDict):
+        # Center the dedicated Stage-2 distribution on the exact clipped DAgger
+        # behavior. The same object is used by train collection and SAC learning;
+        # PPO actor_std remains untouched and unused.
+        mean_action = self._bc_dagger_behavior_action(td)
         action_low = torch.as_tensor(
             self._fastsac_action_low,
             device=mean_action.device,
@@ -7555,14 +8346,15 @@ class FastSACVelFinetune(FastSACVEL):
             1.0 - FASTSAC_REFERENCE_EPS,
         )
         loc = torch.atanh(normalized)
-        log_std = self._ppo_actor_core(
-            self.actor_adapt
-        ).actor_std.clamp(
-            float(self.cfg.fastsac_log_std_min),
-            float(self.cfg.fastsac_log_std_max),
+        log_std = self.bc_dagger_sac_adapter.log_std.clamp(
+            float(self.cfg.sac_bc_log_std_min),
+            float(self.cfg.sac_bc_log_std_max),
         )
         scale = log_std.exp().expand_as(loc)
-        return self.dist_cls(loc, scale)
+        return mean_action, self.dist_cls(loc, scale)
+
+    def _bc_dagger_actor_dist_from_td(self, td: TensorDict):
+        return self._bc_dagger_behavior_action_and_dist(td)[1]
 
     def get_rollout_policy(self, mode="train"):
         if not self._uses_bc_dagger_finetune_source():
@@ -7577,10 +8369,18 @@ class FastSACVelFinetune(FastSACVEL):
             modules.append(self.object_adapt_ema)
             modules.append(self.object_pred_transform)
         modules.append(self.adapt_ema)
+        deterministic = (
+            mode != "train" or bool(self.cfg.sac_deterministic_rollout)
+        )
         modules.append(_BCDaggerSACRolloutActor(
-            self, deterministic=mode != "train"
+            self, deterministic=deterministic
         ))
-        out_keys = [ACTION_KEY, PRIV_PRED_KEY]
+        out_keys = [
+            ACTION_KEY,
+            PRIV_PRED_KEY,
+            STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY,
+            STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY,
+        ]
         if self.cfg.adapt_module == "gru":
             out_keys.append(("next", "adapt_hx"))
         if has_depth:
@@ -7636,22 +8436,61 @@ class FastSACVelFinetune(FastSACVEL):
             ))
         return tuple(fields)
 
+    def _stage2_replay_mix_counts(self):
+        """Return the exact total/online/offline row counts for one Q draw."""
+        total = int(self.cfg.sac_batch_size)
+        offline = round(total * float(self.cfg.teacher_buffer_ratio))
+        return {
+            "total": total,
+            "online": total - offline,
+            "offline": offline,
+        }
+
+    @staticmethod
+    def _stage2_replay_source_masks(batch):
+        """Return offline/online masks and whether batch provenance is known."""
+        rewards = batch["rewards"]
+        row_count = int(rewards.shape[0])
+        marker = batch.get(STAGE2_OFFLINE_SOURCE_KEY)
+        if marker is None:
+            empty = torch.zeros(
+                row_count, dtype=torch.bool, device=rewards.device
+            )
+            return empty, empty, False
+        if (
+            not isinstance(marker, torch.Tensor)
+            or marker.dtype != torch.bool
+            or marker.ndim != 1
+            or marker.shape[0] != row_count
+            or marker.device != rewards.device
+        ):
+            raise ValueError(
+                "Stage-2 replay source marker must be a same-device boolean "
+                "vector with one entry per reward row"
+            )
+        return marker, ~marker, True
+
     def _mix_batch(self):
         # Sampling is with replacement, matching HOI's global 8192-row batch
         # even before the online FIFO itself contains 8192 distinct rows.
-        total = int(self.cfg.sac_batch_size)
-        offline_count = round(total * self.cfg.teacher_buffer_ratio)
-        online_count = total - offline_count
+        mix_counts = self._stage2_replay_mix_counts()
+        total = mix_counts["total"]
+        online_count = mix_counts["online"]
+        offline_count = mix_counts["offline"]
         if online_count and self.online_replay.size < 1:
             raise RuntimeError("Cannot train student FastSAC from empty online replay")
         parts = []
         pre_normalized_parts = []
+        offline_source_parts = []
         if online_count:
             online = self.online_replay.sample(
                 online_count, self.device, generator=self.q_rng
             )
             parts.append(online)
             pre_normalized_parts.append(torch.zeros(
+                online_count, dtype=torch.bool, device=self.device
+            ))
+            offline_source_parts.append(torch.zeros(
                 online_count, dtype=torch.bool, device=self.device
             ))
         if offline_count:
@@ -7669,23 +8508,316 @@ class FastSACVelFinetune(FastSACVEL):
                 dtype=torch.bool,
                 device=self.device,
             ))
+            offline_source_parts.append(torch.ones(
+                offline_count, dtype=torch.bool, device=self.device
+            ))
         keys = self._student_replay_fields()
         mixed = {key: torch.cat([part[key] for part in parts], dim=0) for key in keys}
         pre_normalized = torch.cat(pre_normalized_parts, dim=0)
         if pre_normalized.any():
             mixed[PRE_NORMALIZED_REPLAY_KEY] = pre_normalized
+        mixed[STAGE2_OFFLINE_SOURCE_KEY] = torch.cat(offline_source_parts)
         permutation = torch.randperm(
             total, device=self.device, generator=self.q_rng
         )
         return {key: value[permutation] for key, value in mixed.items()}
 
+    def _stage2_actor_is_active(self, q_updates=None) -> bool:
+        if q_updates is None:
+            q_updates = self.q_update_count
+        return int(q_updates) > int(
+            getattr(self.cfg, "sac_actor_learning_starts_q_updates", 0)
+        )
+
+    def _mark_stage2_actor_released(self, q_update: int) -> int:
+        """Persist the first numbered Q update that applied an actor step."""
+        if (
+            isinstance(q_update, bool)
+            or not isinstance(q_update, (int, np.integer))
+            or int(q_update) < 1
+        ):
+            raise ValueError("Stage-2 actor release Q update must be positive")
+        q_update = int(q_update)
+        current = getattr(self, "_stage2_actor_release_q_update", None)
+        if current is None:
+            self._stage2_actor_release_q_update = q_update
+            return q_update
+        current = int(current)
+        if q_update < current:
+            raise RuntimeError(
+                "Stage-2 actor release marker cannot move backward: "
+                f"current={current}, requested={q_update}"
+            )
+        return current
+
+    def _stage2_alpha_ramp_progress(self, q_updates=None) -> float:
+        """Return the post-release effective-alpha multiplier in [0, 1]."""
+        release = getattr(self, "_stage2_actor_release_q_update", None)
+        if release is None:
+            return 0.0
+        if q_updates is None:
+            q_updates = self.q_update_count
+        elapsed = max(0, int(q_updates) - int(release))
+        ramp_updates = int(getattr(
+            self.cfg, "sac_alpha_ramp_q_updates", 20_000
+        ))
+        if ramp_updates < 1:
+            raise ValueError("sac_alpha_ramp_q_updates must be positive")
+        return min(elapsed / float(ramp_updates), 1.0)
+
+    def _stage2_effective_alpha(self, q_updates=None) -> torch.Tensor:
+        """Use one ramped temperature for Q backup, actor, and alpha dual."""
+        return self.log_alpha.exp() * self._stage2_alpha_ramp_progress(q_updates)
+
+    def _stage2_q_target_uses_stochastic_policy(self, q_updates=None) -> bool:
+        """Match Q policy evaluation to the configured behavior support."""
+        if q_updates is None:
+            q_updates = self.q_update_count
+        return (
+            self._stage2_actor_is_active(q_updates)
+            or (
+                self._uses_bc_dagger_finetune_source()
+                and not bool(self.cfg.sac_deterministic_rollout)
+            )
+        )
+
+    def _sac_actor_update_is_due(
+        self, update_index: int, logical_step: int, updates_per_step: int
+    ) -> bool:
+        """Release actor and alpha only after the Stage-2 Q-only bridge."""
+        next_q_update = self.q_update_count + 1
+        return (
+            self._stage2_actor_is_active(next_q_update)
+            and next_q_update % int(self.cfg.sac_policy_frequency) == 0
+        )
+
+    def _stage2_bc_anchor_coefficient(self, q_updates=None) -> float:
+        if not self._uses_bc_dagger_finetune_source():
+            return 0.0
+        if q_updates is None:
+            q_updates = self.q_update_count
+        actor_start = int(self.cfg.sac_actor_learning_starts_q_updates)
+        elapsed = max(0, int(q_updates) - actor_start)
+        progress = min(
+            elapsed / float(self.cfg.sac_bc_anchor_decay_q_updates), 1.0
+        )
+        start = float(self.cfg.sac_bc_anchor_coef_start)
+        end = float(self.cfg.sac_bc_anchor_coef_end)
+        return start + progress * (end - start)
+
+    def _stage2_bc_anchor_loss(self, actor_obs):
+        zero = actor_obs.new_zeros(())
+        if not self._uses_bc_dagger_finetune_source():
+            return zero, zero
+        td = self._actor_td_from_flat(actor_obs)
+        current_action = self._bc_dagger_behavior_action(td)
+        with torch.no_grad():
+            anchor_action = self._bc_dagger_behavior_action(
+                td, actor=self.bc_dagger_actor_anchor
+            )
+        loss = F.smooth_l1_loss(
+            current_action,
+            anchor_action,
+            beta=float(self.cfg.sac_bc_anchor_huber_delta),
+        )
+        deviation = (current_action.detach() - anchor_action).abs().mean()
+        return loss, deviation
+
+    def _stage2_deterministic_action(self, actor_obs, dist=None):
+        if self._uses_bc_dagger_finetune_source():
+            return self._bc_dagger_behavior_action(
+                self._actor_td_from_flat(actor_obs)
+            )
+        if dist is None:
+            dist = self._actor_dist_from_flat(actor_obs)
+        return dist.mean
+
+    def _stage2_actor_confidence_gate_enabled(self) -> bool:
+        """Use the frozen BC mean only as a detached confidence reference."""
+        return (
+            self._uses_bc_dagger_finetune_source()
+            and bool(getattr(self.cfg, "sac_actor_confidence_gate", True))
+        )
+
+    def _stage2_actor_confidence_gate(
+        self,
+        batch,
+        sampled_action,
+        sampled_twin_q_values,
+    ):
+        """Return a non-sticky row mask and batch decision for one actor tick.
+
+        Gain is pessimistic Q(actor)-Q(BC). Confidence uses the larger raw
+        Q1/Q2 gap at the actor or BC action, so a shared action ranking cannot
+        hide critics whose absolute values still disagree. The sampled action
+        is the exact candidate later used by the actor loss; this method never
+        previews and then resamples an action.
+        """
+        batch_size = int(sampled_action.shape[0])
+        if tuple(sampled_twin_q_values.shape) != (2, batch_size):
+            raise ValueError(
+                "Stage-2 actor confidence gate requires two scalar-Q heads "
+                f"with shape (2, {batch_size}), got "
+                f"{tuple(sampled_twin_q_values.shape)}"
+            )
+        metric_zero = sampled_twin_q_values.detach().new_zeros(())
+        if not self._stage2_actor_confidence_gate_enabled():
+            return (
+                True,
+                torch.ones(
+                    batch_size,
+                    dtype=sampled_twin_q_values.dtype,
+                    device=sampled_twin_q_values.device,
+                ),
+                {
+                    "enabled": metric_zero,
+                    "attempted": metric_zero,
+                    "passed": metric_zero,
+                    "skipped": metric_zero,
+                    "acceptance_fraction": metric_zero,
+                    "clipped_q_gain": metric_zero,
+                    "twin_disagreement": metric_zero,
+                    "sampled_policy_twin_disagreement": metric_zero,
+                    "frozen_bc_twin_disagreement": metric_zero,
+                    "confidence_margin": metric_zero,
+                    "accepted_confidence_margin": metric_zero,
+                    "sampled_policy_q": metric_zero,
+                    "frozen_bc_q": metric_zero,
+                    "row_count": metric_zero,
+                },
+            )
+
+        with torch.no_grad():
+            actor_td = self._actor_td_from_flat(batch["observations"])
+            frozen_bc_action = self._bc_dagger_behavior_action(
+                actor_td, actor=self.bc_dagger_actor_anchor
+            )
+            frozen_bc_twin_q_values = self.qnet.values(
+                self._q_forward(
+                    self.qnet,
+                    batch["critic_observations"],
+                    frozen_bc_action,
+                    batch.get(TEACHER_REF_ACTION_FIELD),
+                    batch.get(TEACHER_ACTUATOR_CONTEXT_FIELD),
+                )
+            )
+            if tuple(frozen_bc_twin_q_values.shape) != (2, batch_size):
+                raise ValueError(
+                    "Stage-2 frozen-BC confidence reference requires two "
+                    f"scalar-Q heads with shape (2, {batch_size}), got "
+                    f"{tuple(frozen_bc_twin_q_values.shape)}"
+                )
+
+            sampled_pessimistic_q = sampled_twin_q_values.detach().min(
+                dim=0
+            ).values
+            frozen_bc_pessimistic_q = frozen_bc_twin_q_values.min(
+                dim=0
+            ).values
+            clipped_q_gain = (
+                sampled_pessimistic_q - frozen_bc_pessimistic_q
+            )
+            sampled_policy_twin_disagreement = (
+                sampled_twin_q_values.detach()[0]
+                - sampled_twin_q_values.detach()[1]
+            ).abs()
+            frozen_bc_twin_disagreement = (
+                frozen_bc_twin_q_values[0] - frozen_bc_twin_q_values[1]
+            ).abs()
+            twin_disagreement = torch.maximum(
+                sampled_policy_twin_disagreement,
+                frozen_bc_twin_disagreement,
+            )
+            confidence_margin = (
+                clipped_q_gain
+                - float(getattr(
+                    self.cfg,
+                    "sac_actor_gate_disagreement_multiplier",
+                    1.0,
+                ))
+                * twin_disagreement
+                - float(getattr(
+                    self.cfg, "sac_actor_gate_absolute_margin", 0.0
+                ))
+            )
+            row_mask = (confidence_margin > 0.0).to(
+                sampled_twin_q_values.dtype
+            )
+            acceptance_fraction = row_mask.mean()
+            accepted_count = row_mask.sum()
+            batch_passed = bool(
+                accepted_count.item() > 0.0
+                and acceptance_fraction.item()
+                >= float(getattr(
+                    self.cfg,
+                    "sac_actor_gate_min_accept_fraction",
+                    0.10,
+                ))
+            )
+            accepted_confidence_margin = (
+                (confidence_margin * row_mask).sum()
+                / accepted_count.clamp_min(1.0)
+            )
+            sampled_policy_q = sampled_pessimistic_q.mean()
+            frozen_bc_q = frozen_bc_pessimistic_q.mean()
+            diagnostics = {
+                "enabled": metric_zero.new_ones(()),
+                "attempted": metric_zero.new_ones(()),
+                "passed": metric_zero.new_tensor(float(batch_passed)),
+                "skipped": metric_zero.new_tensor(float(not batch_passed)),
+                "acceptance_fraction": acceptance_fraction,
+                "clipped_q_gain": clipped_q_gain.mean(),
+                "twin_disagreement": twin_disagreement.mean(),
+                "sampled_policy_twin_disagreement": (
+                    sampled_policy_twin_disagreement.mean()
+                ),
+                "frozen_bc_twin_disagreement": (
+                    frozen_bc_twin_disagreement.mean()
+                ),
+                "confidence_margin": confidence_margin.mean(),
+                "accepted_confidence_margin": accepted_confidence_margin,
+                "sampled_policy_q": sampled_policy_q,
+                "frozen_bc_q": frozen_bc_q,
+                "row_count": metric_zero.new_tensor(float(batch_size)),
+            }
+        return batch_passed, row_mask.detach(), diagnostics
+
     def _sac_update(self, batch, update_actor):
         batch = self._prepare_student_learning_batch(batch)
+        offline_source_mask, online_source_mask, source_marker_valid = (
+            self._stage2_replay_source_masks(batch)
+        )
+        q_update_index = self.q_update_count + 1
+        actor_active_for_update = self._stage2_actor_is_active(
+            q_update_index
+        )
+        if update_actor and not actor_active_for_update:
+            raise RuntimeError(
+                "Stage-2 actor update was requested during Q-only warm-up"
+            )
+        alpha_ramp_progress = self._stage2_alpha_ramp_progress(q_update_index)
+        effective_alpha = self._stage2_effective_alpha(q_update_index)
+        stochastic_q_target = self._stage2_q_target_uses_stochastic_policy(
+            q_update_index
+        )
         with torch.no_grad():
             next_dist = self._actor_dist_from_flat(batch["next_observations"])
-            next_action, next_log_prob = next_dist.rsample_with_log_prob(
-                generator=self.sac_action_rng
-            )
+            if stochastic_q_target:
+                next_action, next_log_prob = next_dist.rsample_with_log_prob(
+                    generator=self.sac_action_rng
+                )
+                next_log_prob = self._normalized_action_log_prob(
+                    next_log_prob
+                )
+            else:
+                # The explicit deterministic-rollout ablation evaluates its
+                # exact mean and omits entropy until the SAC actor is released.
+                next_action = self._stage2_deterministic_action(
+                    batch["next_observations"], next_dist
+                )
+                next_log_prob = batch["rewards"].new_zeros(
+                    batch["rewards"].shape
+                )
             discount = self.cfg.gamma * batch["discounts"]
             # Match VAIC PPO reset semantics: episode-limit and command-finished
             # truncations bootstrap; true termination does not. Entropy belongs
@@ -7693,10 +8825,16 @@ class FastSACVelFinetune(FastSACVEL):
             bootstrap = _sac_bootstrap_mask(
                 batch["dones"], batch["truncations"]
             )
-            soft_reward = (
-                batch["rewards"]
-                - discount * bootstrap * self.log_alpha.exp() * next_log_prob
+            # Keep the stochastic behavior sample during the IQL-to-SAC bridge,
+            # but preserve IQL's hard Bellman target until a real actor update
+            # starts the effective-alpha ramp.
+            entropy_tax = (
+                discount
+                * bootstrap
+                * effective_alpha.detach()
+                * next_log_prob
             )
+            soft_reward = batch["rewards"] - entropy_tax
             target = self._q_projection(
                 self.qnet_target,
                 batch["next_critic_observations"], next_action, soft_reward,
@@ -7716,6 +8854,60 @@ class FastSACVelFinetune(FastSACVEL):
             batch.get(TEACHER_REF_ACTION_FIELD),
             batch.get(TEACHER_ACTUATOR_CONTEXT_FIELD),
         )
+        with torch.no_grad():
+            if hasattr(self.qnet, "values"):
+                data_twin_q_values = self.qnet.values(logits.detach())
+            else:
+                # Lightweight tests and compatible C51 wrappers may expose
+                # only logits; the target critic carries the identical support.
+                support = getattr(
+                    self.qnet, "support", self.qnet_target.support
+                )
+                data_twin_q_values = (
+                    F.softmax(logits.detach(), dim=-1) * support
+                ).sum(dim=-1)
+            data_q_per_row = _reduce_actor_q_values(
+                data_twin_q_values,
+                bool(getattr(self.cfg, "sac_clipped_double_q", True)),
+            )
+            data_metric_zero = data_q_per_row.new_zeros(())
+
+            def data_q_source_metrics(mask, valid):
+                count = int(mask.sum().item()) if valid else 0
+                return (
+                    data_q_per_row[mask].mean()
+                    if count
+                    else data_metric_zero,
+                    data_metric_zero.new_tensor(float(count)),
+                    data_metric_zero.new_tensor(float(count > 0)),
+                )
+
+            offline_data_q, offline_data_rows, offline_data_valid = (
+                data_q_source_metrics(
+                    offline_source_mask, source_marker_valid
+                )
+            )
+            online_data_q, online_data_rows, online_data_valid = (
+                data_q_source_metrics(
+                    online_source_mask, source_marker_valid
+                )
+            )
+            q_diagnostics = {
+                "data_q": data_q_per_row.mean().detach(),
+                "data_rows": data_metric_zero.new_tensor(
+                    float(data_q_per_row.numel())
+                ),
+                "data_valid": data_metric_zero.new_ones(()),
+                "source_marker_valid": data_metric_zero.new_tensor(
+                    float(source_marker_valid)
+                ),
+                "offline_data_q": offline_data_q.detach(),
+                "offline_data_rows": offline_data_rows,
+                "offline_data_valid": offline_data_valid,
+                "online_data_q": online_data_q.detach(),
+                "online_data_rows": online_data_rows,
+                "online_data_valid": online_data_valid,
+            }
         per_q = -(target * F.log_softmax(logits, dim=-1)).sum(-1).mean(-1)
         q_loss = per_q.sum()
         self.opt_q.zero_grad(set_to_none=True)
@@ -7726,86 +8918,329 @@ class FastSACVelFinetune(FastSACVEL):
         self.opt_q.step()
         self.q_update_count += 1
 
-        # Autotuned SAC updates temperature on every Q update, independently of
-        # the lower-frequency actor update. Fixed-alpha SAC retains the same
-        # entropy term but leaves the checkpointed coefficient unchanged.
         alpha_loss = torch.zeros((), device=self.device)
-        if bool(getattr(self.cfg, "sac_use_autotune", True)):
+        actor_loss = torch.zeros((), device=self.device)
+        entropy = torch.zeros((), device=self.device)
+        anchor_loss = torch.zeros((), device=self.device)
+        anchor_deviation = torch.zeros((), device=self.device)
+        anchor_coefficient = 0.0
+        actor_grad = torch.zeros((), device=self.device)
+        metric_zero = batch["rewards"].new_zeros(())
+        actor_update_applied = False
+        actor_gate_diagnostics = {
+            "enabled": metric_zero,
+            "attempted": metric_zero,
+            "passed": metric_zero,
+            "skipped": metric_zero,
+            "acceptance_fraction": metric_zero,
+            "clipped_q_gain": metric_zero,
+            "twin_disagreement": metric_zero,
+            "sampled_policy_twin_disagreement": metric_zero,
+            "frozen_bc_twin_disagreement": metric_zero,
+            "confidence_margin": metric_zero,
+            "accepted_confidence_margin": metric_zero,
+            "sampled_policy_q": metric_zero,
+            "frozen_bc_q": metric_zero,
+            "row_count": metric_zero,
+        }
+        if update_actor:
+            dist = self._actor_dist_from_flat(batch["observations"])
+            action, log_prob = dist.rsample_with_log_prob(
+                generator=self.sac_action_rng
+            )
+            log_prob = self._normalized_action_log_prob(log_prob)
+            q_requires_grad = [
+                parameter.requires_grad for parameter in self.qnet.parameters()
+            ]
+            for parameter in self.qnet.parameters():
+                parameter.requires_grad_(False)
+            try:
+                twin_q_values = self.qnet.values(
+                    self._q_forward(
+                        self.qnet,
+                        batch["critic_observations"],
+                        action,
+                        batch.get(TEACHER_REF_ACTION_FIELD),
+                        batch.get(TEACHER_ACTUATOR_CONTEXT_FIELD),
+                    )
+                )
+                q_values = _reduce_actor_q_values(
+                    twin_q_values,
+                    bool(getattr(self.cfg, "sac_clipped_double_q", True)),
+                )
+                (
+                    actor_gate_passed,
+                    trusted_q_rows,
+                    actor_gate_diagnostics,
+                ) = self._stage2_actor_confidence_gate(
+                    batch, action, twin_q_values
+                )
+                if actor_gate_passed:
+                    # The mask was computed from this exact sampled action.
+                    # Its detached frozen-BC reference selects trustworthy Q
+                    # gradients but contributes no BC regression gradient.
+                    trusted_q_values = trusted_q_rows * q_values
+                    sac_actor_loss = (
+                        effective_alpha.detach() * log_prob
+                        - trusted_q_values
+                    ).mean()
+                    anchor_coefficient = self._stage2_bc_anchor_coefficient()
+                    if anchor_coefficient > 0.0:
+                        anchor_loss, anchor_deviation = (
+                            self._stage2_bc_anchor_loss(batch["observations"])
+                        )
+                    actor_loss = (
+                        sac_actor_loss + anchor_coefficient * anchor_loss
+                    )
+                    self.sac_actor_optimizer.zero_grad(set_to_none=True)
+                    actor_loss.backward()
+                    trainable_actor_parameters = getattr(
+                        self,
+                        "_stage2_trainable_actor_parameters",
+                        tuple(self.actor_adapt.parameters()),
+                    )
+                    actor_grad = _measure_or_clip_grad_norm(
+                        trainable_actor_parameters,
+                        float(self.cfg.sac_max_grad_norm),
+                    )
+                    self.sac_actor_optimizer.step()
+                    actor_update_applied = True
+            finally:
+                for parameter, requires_grad in zip(
+                    self.qnet.parameters(), q_requires_grad
+                ):
+                    parameter.requires_grad_(requires_grad)
+            if actor_update_applied:
+                self.sac_actor_update_count += 1
+                # Set the alpha-ramp origin only after the actor optimizer step
+                # has actually succeeded. Later gate failures never erase it.
+                self._mark_stage2_actor_released(q_update_index)
+                entropy = -log_prob.mean().detach()
+
+        # Couple the entropy dual to the confidence-approved actor cadence.
+        # A scheduled-but-rejected tick changes Q only, leaving both actor and
+        # alpha parameters/counters untouched.
+        if (
+            actor_update_applied
+            and alpha_ramp_progress > 0.0
+            and bool(getattr(self.cfg, "sac_use_autotune", True))
+        ):
             alpha_loss = -(
-                self.log_alpha.exp()
+                effective_alpha
                 * (next_log_prob.detach() + self.target_entropy)
             ).mean()
             self.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss.backward()
             self.alpha_optimizer.step()
             self.sac_alpha_update_count += 1
+        actor_gate_diagnostics["actor_update_applied"] = (
+            metric_zero.new_tensor(float(actor_update_applied))
+        )
 
-        actor_loss = torch.zeros((), device=self.device)
-        entropy = torch.zeros((), device=self.device)
-        if update_actor:
-            dist = self._actor_dist_from_flat(batch["observations"])
-            action, log_prob = dist.rsample_with_log_prob(
-                generator=self.sac_action_rng
-            )
-            twin_q_values = self.qnet.values(
-                self._q_forward(
-                    self.qnet,
-                    batch["critic_observations"],
-                    action,
-                    batch.get(TEACHER_REF_ACTION_FIELD),
-                    batch.get(TEACHER_ACTUATOR_CONTEXT_FIELD),
-                )
-            )
-            q_values = _reduce_actor_q_values(
-                twin_q_values,
-                bool(getattr(self.cfg, "sac_clipped_double_q", True)),
-            )
-            actor_loss = (self.log_alpha.exp().detach() * log_prob - q_values).mean()
-            self.sac_actor_optimizer.zero_grad(set_to_none=True)
-            actor_loss.backward()
-            if self.cfg.sac_max_grad_norm > 0:
-                nn.utils.clip_grad_norm_(
-                    self.actor_adapt.parameters(), self.cfg.sac_max_grad_norm
-                )
-            self.sac_actor_optimizer.step()
-            self.sac_actor_update_count += 1
+        with torch.no_grad():
+            reward_mean = batch["rewards"].mean()
+            reward_abs_mean = batch["rewards"].abs().mean()
+            entropy_tax_abs_mean = entropy_tax.abs().mean()
+            entropy_metric_zero = reward_mean.new_zeros(())
 
-            entropy = -log_prob.mean().detach()
+            def entropy_source_metrics(mask, valid):
+                count = int(mask.sum().item()) if valid else 0
+                if not count:
+                    return {
+                        "rows": entropy_metric_zero,
+                        "valid": entropy_metric_zero,
+                        "ratio_valid": entropy_metric_zero,
+                        "reward_mean": entropy_metric_zero,
+                        "reward_abs_mean": entropy_metric_zero,
+                        "entropy_tax_abs_mean": entropy_metric_zero,
+                        "entropy_tax_reward_abs_ratio": entropy_metric_zero,
+                    }
+                source_reward = batch["rewards"][mask]
+                source_tax = entropy_tax[mask]
+                source_reward_abs_mean = source_reward.abs().mean()
+                source_tax_abs_mean = source_tax.abs().mean()
+                ratio_valid = bool(
+                    source_reward_abs_mean.item()
+                    > torch.finfo(source_reward.dtype).eps
+                )
+                ratio = (
+                    source_tax_abs_mean / source_reward_abs_mean
+                    if ratio_valid
+                    else entropy_metric_zero
+                )
+                return {
+                    "rows": entropy_metric_zero.new_tensor(float(count)),
+                    "valid": entropy_metric_zero.new_ones(()),
+                    "ratio_valid": entropy_metric_zero.new_tensor(
+                        float(ratio_valid)
+                    ),
+                    "reward_mean": source_reward.mean(),
+                    "reward_abs_mean": source_reward_abs_mean,
+                    "entropy_tax_abs_mean": source_tax_abs_mean,
+                    "entropy_tax_reward_abs_ratio": ratio,
+                }
+
+            offline_entropy = entropy_source_metrics(
+                offline_source_mask, source_marker_valid
+            )
+            online_entropy = entropy_source_metrics(
+                online_source_mask, source_marker_valid
+            )
+            entropy_diagnostics = {
+                "effective_alpha": effective_alpha.detach(),
+                "alpha_ramp_progress": batch["rewards"].new_tensor(
+                    alpha_ramp_progress
+                ),
+                "q_target_log_pi_mean": next_log_prob.mean().detach(),
+                "entropy_tax_mean": entropy_tax.mean().detach(),
+                "entropy_tax_abs_mean": entropy_tax_abs_mean.detach(),
+                "reward_mean": reward_mean.detach(),
+                "reward_abs_mean": reward_abs_mean.detach(),
+                "entropy_tax_reward_abs_ratio": (
+                    entropy_tax_abs_mean
+                    / reward_abs_mean.clamp_min(
+                        torch.finfo(batch["rewards"].dtype).eps
+                    )
+                ).detach(),
+                "source_marker_valid": reward_mean.new_tensor(
+                    float(source_marker_valid)
+                ),
+            }
+            for source_name, source_metrics in (
+                ("offline", offline_entropy),
+                ("online", online_entropy),
+            ):
+                entropy_diagnostics.update({
+                    f"{source_name}_{name}": value.detach()
+                    for name, value in source_metrics.items()
+                })
 
         with torch.no_grad():
             for source, target_param in zip(self.qnet.parameters(), self.qnet_target.parameters()):
                 target_param.lerp_(source, self.cfg.sac_tau)
-        return q_loss.detach(), per_q.detach(), q_grad.detach(), actor_loss.detach(), alpha_loss.detach(), entropy
+        return (
+            q_loss.detach(),
+            per_q.detach(),
+            q_grad.detach(),
+            actor_loss.detach(),
+            alpha_loss.detach(),
+            entropy,
+            anchor_loss.detach(),
+            float(anchor_coefficient),
+            anchor_deviation.detach(),
+            actor_grad.detach(),
+            entropy_diagnostics,
+            actor_gate_diagnostics,
+            q_diagnostics,
+        )
 
     def train_op(self, tensordict):
         rollout_td = tensordict.exclude("stats")
+        start_actor_update_count = self.sac_actor_update_count
+        start_alpha_update_count = self.sac_alpha_update_count
+        rollout_action_mean_abs_deviation = 0.0
+        rollout_action_max_abs_deviation = 0.0
+        rollout_behavior_support_rows = 0
+        if self._uses_bc_dagger_finetune_source():
+            required_diagnostics = (
+                STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY,
+                STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY,
+            )
+            missing = [
+                key for key in required_diagnostics
+                if key not in rollout_td.keys(True, True)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "BC-DAgger Stage-2 rollout is missing behavior-support "
+                    f"diagnostics: {missing}"
+                )
+            valid_behavior_rows = (
+                rollout_td["step_count"].reshape(-1)
+                > STUDENT_REPLAY_MIN_STEP_COUNT
+            )
+            rollout_behavior_support_rows = int(
+                valid_behavior_rows.sum().item()
+            )
+            if rollout_behavior_support_rows:
+                mean_deviation = rollout_td[
+                    STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY
+                ].detach().reshape(-1)[valid_behavior_rows]
+                max_deviation = rollout_td[
+                    STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY
+                ].detach().reshape(-1)[valid_behavior_rows]
+                rollout_action_mean_abs_deviation = (
+                    mean_deviation.float().mean().item()
+                )
+                rollout_action_max_abs_deviation = (
+                    max_deviation.float().amax().item()
+                )
         start_environment_step = self.sac_environment_steps
         updates_per_step = self._sac_updates_per_env_step()
-        total_batch_size = int(self.cfg.sac_batch_size)
-        online_batch_count = total_batch_size - round(
-            total_batch_size * self.cfg.teacher_buffer_ratio
-        )
+        replay_mix_counts = self._stage2_replay_mix_counts()
+        online_batch_count = replay_mix_counts["online"]
+        new_online_rows = 0
+        sampled_total_draws = 0
+        sampled_online_draws = 0
+        sampled_offline_draws = 0
         metrics = []
         actor_metrics = []
+        actor_gate_metrics = []
+        actor_update_scheduled_count = 0
         for local_step, online in enumerate(
             self._student_transition_chunks(rollout_td)
         ):
+            new_online_rows += int(online["rewards"].shape[0])
+            if self._uses_bc_dagger_finetune_source():
+                online_actions = online["actions"]
+                action_clip = float(self.cfg.sac_bc_action_clip)
+                if (
+                    not torch.isfinite(online_actions).all()
+                    or (online_actions.abs() > action_clip).any()
+                ):
+                    raise RuntimeError(
+                        "BC-DAgger Stage-2 rollout produced an action outside "
+                        "the actor/replay/Q support"
+                    )
             self.online_replay.extend(online)
             logical_step = start_environment_step + local_step
             if (
-                logical_step <= int(self.cfg.sac_learning_starts)
+                int(getattr(
+                    self.online_replay,
+                    "seen",
+                    self.online_replay.size,
+                )) < int(self.cfg.sac_learning_starts)
                 or (online_batch_count and self.online_replay.size < 1)
             ):
                 continue
             for update_index in range(updates_per_step):
                 batch = self._mix_batch()
+                sampled_total_draws += replay_mix_counts["total"]
+                sampled_online_draws += replay_mix_counts["online"]
+                sampled_offline_draws += replay_mix_counts["offline"]
                 update_actor = self._sac_actor_update_is_due(
                     update_index, logical_step, updates_per_step
                 )
+                actor_update_scheduled_count += int(update_actor)
                 update_metrics = self._sac_update(batch, update_actor)
                 metrics.append(update_metrics)
-                if update_actor:
-                    actor_metrics.append((update_metrics[3], update_metrics[5]))
+                gate_diagnostics = (
+                    update_metrics[11]
+                    if len(update_metrics) > 11
+                    else None
+                )
+                if (
+                    gate_diagnostics is not None
+                    and gate_diagnostics["attempted"].item() > 0.0
+                ):
+                    actor_gate_metrics.append(gate_diagnostics)
+                actor_applied = (
+                    bool(gate_diagnostics["actor_update_applied"].item())
+                    if gate_diagnostics is not None
+                    else bool(update_actor)
+                )
+                if actor_applied:
+                    actor_metrics.append(update_metrics)
                 self.sac_update_count += 1
 
         self.sac_environment_steps = (
@@ -7813,12 +9248,9 @@ class FastSACVelFinetune(FastSACVEL):
         )
         self.sac_rollout_count += 1
 
-        # Keep the original VAIC student-perception learning path.  SAC owns
-        # actor_adapt/Q/alpha, while train_adapt owns the depth GRU, object
-        # estimator, and privileged-latent estimator and then soft-updates their
-        # rollout EMA copies.  The FastSAC config disables actor distillation, so
-        # these optimizers have no trainable parameters in common.
-        adapt_info = self.train_adapt(rollout_td.copy())
+        # Actor replay contains priv_pred rather than reconstructable raw
+        # recurrent perception inputs. Keep its coordinate system immutable.
+        adapt_info = {"fastsac/perception_frozen": 1.0}
         self.num_updates += 1
 
         if metrics:
@@ -7828,18 +9260,294 @@ class FastSACVelFinetune(FastSACVEL):
             q2_loss = torch.stack([x[1] for x in stacked[1]]).mean().item()
             q_grad_norm = torch.stack(stacked[2]).mean().item()
             alpha_loss = torch.stack(stacked[4]).mean().item()
+            entropy_diagnostics = [
+                metric[10] for metric in metrics if len(metric) > 10
+            ]
+            if entropy_diagnostics:
+                def mean_entropy_diagnostic(name):
+                    return torch.stack([
+                        diagnostic[name]
+                        for diagnostic in entropy_diagnostics
+                    ]).mean().item()
+
+                effective_alpha = mean_entropy_diagnostic("effective_alpha")
+                alpha_ramp_progress = mean_entropy_diagnostic(
+                    "alpha_ramp_progress"
+                )
+                q_target_log_pi_mean = mean_entropy_diagnostic(
+                    "q_target_log_pi_mean"
+                )
+                entropy_tax_mean = mean_entropy_diagnostic(
+                    "entropy_tax_mean"
+                )
+                entropy_tax_abs_mean = mean_entropy_diagnostic(
+                    "entropy_tax_abs_mean"
+                )
+                reward_mean = mean_entropy_diagnostic("reward_mean")
+                reward_abs_mean = mean_entropy_diagnostic("reward_abs_mean")
+                entropy_tax_reward_abs_ratio = mean_entropy_diagnostic(
+                    "entropy_tax_reward_abs_ratio"
+                )
+                entropy_source_marker_valid = float(all(
+                    diagnostic["source_marker_valid"].item() > 0.0
+                    for diagnostic in entropy_diagnostics
+                ))
+
+                def aggregate_entropy_source(source_name):
+                    rows = sum(
+                        diagnostic[f"{source_name}_rows"].item()
+                        for diagnostic in entropy_diagnostics
+                    )
+                    if rows <= 0.0:
+                        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+                    def weighted(field):
+                        return sum(
+                            diagnostic[f"{source_name}_{field}"].item()
+                            * diagnostic[f"{source_name}_rows"].item()
+                            for diagnostic in entropy_diagnostics
+                        ) / rows
+
+                    source_reward_mean = weighted("reward_mean")
+                    source_reward_abs_mean = weighted("reward_abs_mean")
+                    source_tax_abs_mean = weighted("entropy_tax_abs_mean")
+                    ratio_valid = float(
+                        entropy_source_marker_valid > 0.0
+                        and source_reward_abs_mean
+                        > torch.finfo(torch.float32).eps
+                    )
+                    ratio = (
+                        source_tax_abs_mean / source_reward_abs_mean
+                        if ratio_valid
+                        else 0.0
+                    )
+                    return (
+                        rows,
+                        float(entropy_source_marker_valid > 0.0),
+                        ratio_valid,
+                        source_reward_mean,
+                        source_reward_abs_mean,
+                        source_tax_abs_mean,
+                        ratio,
+                    )
+
+                (
+                    offline_entropy_rows,
+                    offline_entropy_valid,
+                    offline_entropy_ratio_valid,
+                    offline_reward_mean,
+                    offline_reward_abs_mean,
+                    offline_entropy_tax_abs_mean,
+                    offline_entropy_tax_reward_abs_ratio,
+                ) = aggregate_entropy_source("offline")
+                (
+                    online_entropy_rows,
+                    online_entropy_valid,
+                    online_entropy_ratio_valid,
+                    online_reward_mean,
+                    online_reward_abs_mean,
+                    online_entropy_tax_abs_mean,
+                    online_entropy_tax_reward_abs_ratio,
+                ) = aggregate_entropy_source("online")
+            else:
+                effective_alpha = self._stage2_effective_alpha().item()
+                alpha_ramp_progress = self._stage2_alpha_ramp_progress()
+                q_target_log_pi_mean = 0.0
+                entropy_tax_mean = entropy_tax_abs_mean = 0.0
+                reward_mean = reward_abs_mean = 0.0
+                entropy_tax_reward_abs_ratio = 0.0
+                entropy_source_marker_valid = 0.0
+                offline_entropy_rows = online_entropy_rows = 0.0
+                offline_entropy_valid = online_entropy_valid = 0.0
+                offline_entropy_ratio_valid = online_entropy_ratio_valid = 0.0
+                offline_reward_mean = online_reward_mean = 0.0
+                offline_reward_abs_mean = online_reward_abs_mean = 0.0
+                offline_entropy_tax_abs_mean = online_entropy_tax_abs_mean = 0.0
+                offline_entropy_tax_reward_abs_ratio = 0.0
+                online_entropy_tax_reward_abs_ratio = 0.0
             if actor_metrics:
                 actor_loss = torch.stack([
-                    metric[0] for metric in actor_metrics
+                    metric[3] for metric in actor_metrics
                 ]).mean().item()
                 entropy = torch.stack([
-                    metric[1] for metric in actor_metrics
+                    metric[5] for metric in actor_metrics
+                ]).mean().item()
+                anchor_loss = torch.stack([
+                    metric[6] for metric in actor_metrics
+                ]).mean().item()
+                anchor_coefficient = sum(
+                    metric[7] for metric in actor_metrics
+                ) / len(actor_metrics)
+                anchor_deviation = torch.stack([
+                    metric[8] for metric in actor_metrics
+                ]).mean().item()
+                actor_grad_norm = torch.stack([
+                    metric[9] for metric in actor_metrics
                 ]).mean().item()
             else:
                 actor_loss = entropy = 0.0
+                anchor_loss = anchor_coefficient = 0.0
+                anchor_deviation = actor_grad_norm = 0.0
         else:
             q_loss = q1_loss = q2_loss = q_grad_norm = 0.0
             actor_loss = alpha_loss = entropy = 0.0
+            anchor_loss = anchor_coefficient = 0.0
+            anchor_deviation = actor_grad_norm = 0.0
+            effective_alpha = self._stage2_effective_alpha().item()
+            alpha_ramp_progress = self._stage2_alpha_ramp_progress()
+            q_target_log_pi_mean = 0.0
+            entropy_tax_mean = entropy_tax_abs_mean = 0.0
+            reward_mean = reward_abs_mean = 0.0
+            entropy_tax_reward_abs_ratio = 0.0
+            entropy_source_marker_valid = 0.0
+            offline_entropy_rows = online_entropy_rows = 0.0
+            offline_entropy_valid = online_entropy_valid = 0.0
+            offline_entropy_ratio_valid = online_entropy_ratio_valid = 0.0
+            offline_reward_mean = online_reward_mean = 0.0
+            offline_reward_abs_mean = online_reward_abs_mean = 0.0
+            offline_entropy_tax_abs_mean = online_entropy_tax_abs_mean = 0.0
+            offline_entropy_tax_reward_abs_ratio = 0.0
+            online_entropy_tax_reward_abs_ratio = 0.0
+
+        q_diagnostics = [
+            metric[12] for metric in metrics if len(metric) > 12
+        ]
+        if q_diagnostics:
+            q_data_rows = sum(
+                diagnostic["data_rows"].item()
+                for diagnostic in q_diagnostics
+            )
+            q_data = sum(
+                diagnostic["data_q"].item()
+                * diagnostic["data_rows"].item()
+                for diagnostic in q_diagnostics
+            ) / q_data_rows
+            q_data_valid = float(q_data_rows > 0.0)
+            q_source_marker_valid = float(all(
+                diagnostic["source_marker_valid"].item() > 0.0
+                for diagnostic in q_diagnostics
+            ))
+
+            def aggregate_source_data_q(source_name):
+                rows = sum(
+                    diagnostic[f"{source_name}_data_rows"].item()
+                    for diagnostic in q_diagnostics
+                )
+                if rows <= 0.0:
+                    return 0.0, 0.0, 0.0
+                value = sum(
+                    diagnostic[f"{source_name}_data_q"].item()
+                    * diagnostic[f"{source_name}_data_rows"].item()
+                    for diagnostic in q_diagnostics
+                ) / rows
+                return value, rows, float(q_source_marker_valid > 0.0)
+
+            (
+                q_data_offline,
+                q_data_offline_rows,
+                q_data_offline_valid,
+            ) = aggregate_source_data_q("offline")
+            (
+                q_data_online,
+                q_data_online_rows,
+                q_data_online_valid,
+            ) = aggregate_source_data_q("online")
+            q_data_update_count = len(q_diagnostics)
+        else:
+            q_data = q_data_rows = q_data_valid = 0.0
+            q_source_marker_valid = 0.0
+            q_data_offline = q_data_online = 0.0
+            q_data_offline_rows = q_data_online_rows = 0.0
+            q_data_offline_valid = q_data_online_valid = 0.0
+            q_data_update_count = 0
+
+        if actor_gate_metrics:
+            def mean_actor_gate_diagnostic(name):
+                return torch.stack([
+                    diagnostic[name]
+                    for diagnostic in actor_gate_metrics
+                ]).mean().item()
+
+            actor_gate_attempts = len(actor_gate_metrics)
+            actor_gate_passes = int(round(sum(
+                diagnostic["passed"].item()
+                for diagnostic in actor_gate_metrics
+            )))
+            actor_gate_skips = int(round(sum(
+                diagnostic["skipped"].item()
+                for diagnostic in actor_gate_metrics
+            )))
+            actor_gate_acceptance_fraction = mean_actor_gate_diagnostic(
+                "acceptance_fraction"
+            )
+            actor_gate_clipped_q_gain = mean_actor_gate_diagnostic(
+                "clipped_q_gain"
+            )
+            actor_gate_twin_disagreement = mean_actor_gate_diagnostic(
+                "twin_disagreement"
+            )
+            actor_gate_sampled_policy_twin_disagreement = (
+                mean_actor_gate_diagnostic(
+                    "sampled_policy_twin_disagreement"
+                )
+            )
+            actor_gate_frozen_bc_twin_disagreement = (
+                mean_actor_gate_diagnostic(
+                    "frozen_bc_twin_disagreement"
+                )
+            )
+            actor_gate_confidence_margin = mean_actor_gate_diagnostic(
+                "confidence_margin"
+            )
+            actor_gate_accepted_confidence_margin = (
+                mean_actor_gate_diagnostic("accepted_confidence_margin")
+            )
+            actor_gate_sampled_policy_q = mean_actor_gate_diagnostic(
+                "sampled_policy_q"
+            )
+            actor_gate_frozen_bc_q = mean_actor_gate_diagnostic(
+                "frozen_bc_q"
+            )
+            actor_gate_q_rows = int(round(sum(
+                diagnostic["row_count"].item()
+                for diagnostic in actor_gate_metrics
+            )))
+        else:
+            actor_gate_attempts = actor_gate_passes = actor_gate_skips = 0
+            actor_gate_acceptance_fraction = 0.0
+            actor_gate_clipped_q_gain = 0.0
+            actor_gate_twin_disagreement = 0.0
+            actor_gate_sampled_policy_twin_disagreement = 0.0
+            actor_gate_frozen_bc_twin_disagreement = 0.0
+            actor_gate_confidence_margin = 0.0
+            actor_gate_accepted_confidence_margin = 0.0
+            actor_gate_sampled_policy_q = actor_gate_frozen_bc_q = 0.0
+            actor_gate_q_rows = 0
+
+        actor_updates_applied = (
+            self.sac_actor_update_count - start_actor_update_count
+        )
+        alpha_updates_applied = (
+            self.sac_alpha_update_count - start_alpha_update_count
+        )
+        actor_ever_released = (
+            getattr(self, "_stage2_actor_release_q_update", None) is not None
+        )
+        sampled_draws_per_new_row_valid = new_online_rows > 0
+        if sampled_draws_per_new_row_valid:
+            sampled_total_draws_per_new_row = (
+                sampled_total_draws / float(new_online_rows)
+            )
+            sampled_online_draws_per_new_row = (
+                sampled_online_draws / float(new_online_rows)
+            )
+            sampled_offline_draws_per_new_row = (
+                sampled_offline_draws / float(new_online_rows)
+            )
+        else:
+            sampled_total_draws_per_new_row = 0.0
+            sampled_online_draws_per_new_row = 0.0
+            sampled_offline_draws_per_new_row = 0.0
 
         info = {
             "fastsac/q_active": float(bool(metrics)),
@@ -7847,27 +9555,184 @@ class FastSACVelFinetune(FastSACVEL):
             "fastsac/q1_loss": q1_loss,
             "fastsac/q2_loss": q2_loss,
             "fastsac/q_grad_norm": q_grad_norm,
+            "fastsac/q_data": q_data,
+            "fastsac/q_data_valid": q_data_valid,
+            "fastsac/q_data_rows": q_data_rows,
+            "fastsac/q_data_update_count": q_data_update_count,
+            "fastsac/q_data_source_marker_valid": q_source_marker_valid,
+            "fastsac/q_data_online": q_data_online,
+            "fastsac/q_data_online_valid": q_data_online_valid,
+            "fastsac/q_data_online_rows": q_data_online_rows,
+            "fastsac/q_data_offline": q_data_offline,
+            "fastsac/q_data_offline_valid": q_data_offline_valid,
+            "fastsac/q_data_offline_rows": q_data_offline_rows,
+            "fastsac/new_online_rows": new_online_rows,
+            "fastsac/sampled_total_draws": sampled_total_draws,
+            "fastsac/sampled_online_draws": sampled_online_draws,
+            "fastsac/sampled_offline_draws": sampled_offline_draws,
+            "fastsac/sampled_draws_per_new_row_valid": float(
+                sampled_draws_per_new_row_valid
+            ),
+            "fastsac/sampled_total_draws_per_new_row": (
+                sampled_total_draws_per_new_row
+            ),
+            "fastsac/sampled_online_draws_per_new_row": (
+                sampled_online_draws_per_new_row
+            ),
+            "fastsac/sampled_offline_draws_per_new_row": (
+                sampled_offline_draws_per_new_row
+            ),
             "fastsac/actor_loss": actor_loss,
+            "fastsac/actor_grad_norm": actor_grad_norm,
+            "fastsac/actor_active": float(actor_ever_released),
+            "fastsac/q_only_warmup": float(not actor_ever_released),
+            "fastsac/actor_schedule_eligible": float(
+                self._stage2_actor_is_active()
+            ),
+            "fastsac/actor_update_scheduled_count": (
+                actor_update_scheduled_count
+            ),
+            "fastsac/actor_update_applied_count": actor_updates_applied,
+            "fastsac/actor_confidence_gate_enabled": float(
+                self._stage2_actor_confidence_gate_enabled()
+            ),
+            "fastsac/actor_confidence_gate_attempts": actor_gate_attempts,
+            "fastsac/actor_confidence_gate_passes": actor_gate_passes,
+            "fastsac/actor_confidence_gate_skips": actor_gate_skips,
+            "fastsac/actor_confidence_gate_acceptance_fraction": (
+                actor_gate_acceptance_fraction
+            ),
+            "fastsac/actor_confidence_gate_clipped_q_gain": (
+                actor_gate_clipped_q_gain
+            ),
+            "fastsac/actor_confidence_gate_twin_disagreement": (
+                actor_gate_twin_disagreement
+            ),
+            "fastsac/actor_confidence_gate_sampled_policy_twin_disagreement": (
+                actor_gate_sampled_policy_twin_disagreement
+            ),
+            "fastsac/actor_confidence_gate_frozen_bc_twin_disagreement": (
+                actor_gate_frozen_bc_twin_disagreement
+            ),
+            "fastsac/actor_confidence_gate_confidence_margin": (
+                actor_gate_confidence_margin
+            ),
+            "fastsac/actor_confidence_gate_accepted_confidence_margin": (
+                actor_gate_accepted_confidence_margin
+            ),
+            "fastsac/actor_confidence_gate_sampled_policy_q": (
+                actor_gate_sampled_policy_q
+            ),
+            "fastsac/actor_confidence_gate_frozen_bc_q": (
+                actor_gate_frozen_bc_q
+            ),
+            "fastsac/q_actor": actor_gate_sampled_policy_q,
+            "fastsac/q_actor_valid": float(actor_gate_attempts > 0),
+            "fastsac/q_actor_rows": actor_gate_q_rows,
+            "fastsac/q_frozen_bc": actor_gate_frozen_bc_q,
+            "fastsac/q_frozen_bc_valid": float(actor_gate_attempts > 0),
+            "fastsac/q_frozen_bc_rows": actor_gate_q_rows,
+            "fastsac/q_target_stochastic_policy": float(
+                self._stage2_q_target_uses_stochastic_policy(
+                    self.q_update_count + 1
+                )
+            ),
+            "fastsac/bc_anchor_loss": anchor_loss,
+            "fastsac/bc_anchor_coefficient": anchor_coefficient,
+            "fastsac/bc_anchor_mean_action_deviation": anchor_deviation,
             "fastsac/alpha_loss": alpha_loss,
             "fastsac/entropy": entropy,
-            "fastsac/normalized_action_entropy": (
-                entropy - self._fastsac_action_log_scale_sum
+            "fastsac/entropy_reference_action_entropy": entropy,
+            # Retained for dashboard compatibility; the explicit coordinate
+            # flags below identify that BC Stage 2 now uses raw-action units.
+            "fastsac/normalized_action_entropy": entropy,
+            "fastsac/physical_action_entropy": (
+                entropy + float(getattr(
+                    self,
+                    "_fastsac_entropy_reference_log_scale_sum",
+                    self._fastsac_action_log_scale_sum,
+                ))
                 if actor_metrics else 0.0
             ),
             "fastsac/alpha": self.log_alpha.exp().item(),
+            "fastsac/effective_alpha": effective_alpha,
+            "fastsac/alpha_ramp_progress": alpha_ramp_progress,
+            "fastsac/actor_release_q_update": int(
+                getattr(self, "_stage2_actor_release_q_update", None) or -1
+            ),
+            "fastsac/q_target_log_pi_mean": q_target_log_pi_mean,
+            "fastsac/entropy_tax_mean": entropy_tax_mean,
+            "fastsac/entropy_tax_abs_mean": entropy_tax_abs_mean,
+            "fastsac/reward_mean": reward_mean,
+            "fastsac/reward_abs_mean": reward_abs_mean,
+            "fastsac/entropy_tax_reward_abs_ratio": (
+                entropy_tax_reward_abs_ratio
+            ),
+            "fastsac/entropy_source_marker_valid": (
+                entropy_source_marker_valid
+            ),
+            "fastsac/offline_entropy_rows": offline_entropy_rows,
+            "fastsac/offline_entropy_valid": offline_entropy_valid,
+            "fastsac/offline_entropy_ratio_valid": (
+                offline_entropy_ratio_valid
+            ),
+            "fastsac/offline_reward_mean": offline_reward_mean,
+            "fastsac/offline_reward_abs_mean": offline_reward_abs_mean,
+            "fastsac/offline_entropy_tax_abs_mean": (
+                offline_entropy_tax_abs_mean
+            ),
+            "fastsac/offline_entropy_tax_reward_abs_ratio": (
+                offline_entropy_tax_reward_abs_ratio
+            ),
+            "fastsac/online_entropy_rows": online_entropy_rows,
+            "fastsac/online_entropy_valid": online_entropy_valid,
+            "fastsac/online_entropy_ratio_valid": (
+                online_entropy_ratio_valid
+            ),
+            "fastsac/online_reward_mean": online_reward_mean,
+            "fastsac/online_reward_abs_mean": online_reward_abs_mean,
+            "fastsac/online_entropy_tax_abs_mean": (
+                online_entropy_tax_abs_mean
+            ),
+            "fastsac/online_entropy_tax_reward_abs_ratio": (
+                online_entropy_tax_reward_abs_ratio
+            ),
             "fastsac/alpha_active": float(
                 bool(getattr(self.cfg, "sac_use_autotune", True))
-                and bool(metrics)
+                and alpha_updates_applied > 0
             ),
             "fastsac/alpha_autotune": float(bool(
                 getattr(self.cfg, "sac_use_autotune", True)
             )),
             "fastsac/target_entropy": self.target_entropy,
+            "fastsac/target_entropy_normalized_coordinates": float(
+                not self._uses_bc_dagger_finetune_source()
+            ),
+            "fastsac/target_entropy_reference_coordinates": 1.0,
+            "fastsac/target_entropy_raw_action_unit_coordinates": float(
+                self._uses_bc_dagger_finetune_source()
+            ),
             "fastsac/action_log_scale_sum": self._fastsac_action_log_scale_sum,
+            "fastsac/entropy_reference_scale": float(getattr(
+                self.cfg, "sac_entropy_reference_scale", 1.0
+            )),
+            "fastsac/entropy_reference_log_scale_sum": float(getattr(
+                self,
+                "_fastsac_entropy_reference_log_scale_sum",
+                self._fastsac_action_log_scale_sum,
+            )),
             "fastsac/q_update_count": self.q_update_count,
             "fastsac/actor_update_count": self.sac_actor_update_count,
             "fastsac/alpha_update_count": self.sac_alpha_update_count,
             "fastsac/online_replay_size": self.online_replay.size,
+            "fastsac/online_replay_seen": int(getattr(
+                self.online_replay, "seen", self.online_replay.size
+            )),
+            "fastsac/replay_warmup_ready": float(
+                int(getattr(
+                    self.online_replay, "seen", self.online_replay.size
+                )) >= int(self.cfg.sac_learning_starts)
+            ),
             "fastsac/offline_ratio": self.cfg.teacher_buffer_ratio,
             "fastsac/truncation_finals": self._last_truncation_finals_used,
             "fastsac/environment_steps": self.sac_environment_steps,
@@ -7885,5 +9750,31 @@ class FastSACVelFinetune(FastSACVEL):
                 getattr(self.cfg, "sac_clipped_double_q", True)
             )),
         }
+        if self._uses_bc_dagger_finetune_source():
+            clipped_log_std = self.bc_dagger_sac_adapter.log_std.detach().clamp(
+                float(self.cfg.sac_bc_log_std_min),
+                float(self.cfg.sac_bc_log_std_max),
+            )
+            info.update({
+                "fastsac/bc_sac_log_std_mean": clipped_log_std.mean().item(),
+                "fastsac/bc_sac_center_action_std_mean": (
+                    clipped_log_std.exp() * float(self.cfg.sac_bc_action_clip)
+                ).mean().item(),
+                "fastsac/rollout_deterministic_bc_mean": float(
+                    bool(self.cfg.sac_deterministic_rollout)
+                ),
+                "fastsac/rollout_stochastic_exact_learning_distribution": float(
+                    not bool(self.cfg.sac_deterministic_rollout)
+                ),
+                "fastsac/rollout_executed_action_mean_abs_deviation": (
+                    rollout_action_mean_abs_deviation
+                ),
+                "fastsac/rollout_executed_action_max_abs_deviation": (
+                    rollout_action_max_abs_deviation
+                ),
+                "fastsac/rollout_behavior_support_rows": (
+                    rollout_behavior_support_rows
+                ),
+            })
         info.update(adapt_info)
         return info
