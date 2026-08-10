@@ -215,10 +215,10 @@ First compose the requested Hydra configuration without starting a training
 run:
 
 ```bash
-python scripts/train.py \
+nohup python scripts/train.py \
   algo=fastsac_vel_train \
   task=G1/vaic/skateboard_tea \
-  --cfg job
+  > sac_skateboard_tea.log 2>&1 &
 ```
 
 Run one bounded training iteration with W&B networking disabled. Eight
