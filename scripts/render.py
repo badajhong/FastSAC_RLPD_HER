@@ -7,7 +7,10 @@ import sys
 from tqdm import tqdm
 from omegaconf import OmegaConf
 
-from isaaclab.app import AppLauncher
+try:
+    from ._isaaclab_bootstrap import AppLauncher
+except ImportError:
+    from _isaaclab_bootstrap import AppLauncher
 
 import wandb
 import logging
@@ -41,4 +44,3 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
-

@@ -15,8 +15,12 @@ from collections import OrderedDict
 from tqdm import tqdm
 from setproctitle import setproctitle
 
+try:
+    from ._isaaclab_bootstrap import AppLauncher
+except ImportError:
+    from _isaaclab_bootstrap import AppLauncher
+
 import active_adaptation as aa
-from isaaclab.app import AppLauncher
 # from active_adaptation.utils.torchrl import SyncDataCollector
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict.nn import TensorDictModuleBase

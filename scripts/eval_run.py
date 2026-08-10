@@ -6,7 +6,10 @@ import hydra
 import argparse
 
 from omegaconf import OmegaConf
-from isaaclab.app import AppLauncher
+try:
+    from ._isaaclab_bootstrap import AppLauncher
+except ImportError:
+    from _isaaclab_bootstrap import AppLauncher
 from play import main as play_main
 from eval import main as eval_main
 

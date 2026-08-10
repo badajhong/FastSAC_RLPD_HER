@@ -8,7 +8,10 @@ import datetime
 import re
 from omegaconf import OmegaConf
 
-from isaaclab.app import AppLauncher
+try:
+    from ._isaaclab_bootstrap import AppLauncher
+except ImportError:
+    from _isaaclab_bootstrap import AppLauncher
 
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict.nn import TensorDictSequential

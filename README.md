@@ -20,6 +20,9 @@ This repository hosts the open-source release for the paper VAIC: Vision-Guided 
 
 ## 🚀 Quick Start
 
+For NVIDIA DGX Spark / ARM (`aarch64`) setup notes, see
+[DGX_SPARK_SETUP.md](DGX_SPARK_SETUP.md).
+
 ```bash
 # setup conda environment
 conda create -n vaic python=3.11 -y

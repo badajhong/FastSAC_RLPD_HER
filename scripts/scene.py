@@ -1,7 +1,10 @@
 from typing import Sequence
 import torch
 
-from isaaclab.app import AppLauncher
+try:
+    from ._isaaclab_bootstrap import AppLauncher
+except ImportError:
+    from _isaaclab_bootstrap import AppLauncher
 
 def main():
 
