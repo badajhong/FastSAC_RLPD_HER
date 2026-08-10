@@ -16,6 +16,7 @@ REPLAY_LINEAGE = {
     "format": "vaic_bc_dagger_teacher_replay",
     "format_version": 2,
     "replay_id": "frozen-replay-id",
+    "dagger_control_semantics": bc_dagger.EXPECTED_CONTROL_SEMANTICS,
     "replay_observation_semantics": "raw_pre_vecnorm_v1",
     "vecnorm_fingerprint": "sha256:" + "a" * 64,
     "action_clip": 20.0,
@@ -29,18 +30,21 @@ def _write_resume_checkpoint(path: Path) -> Path:
     }
     policy = {
         "training_algorithm": bc_dagger.EXPECTED_TRAINING_ALGORITHM,
+        "critic_learning_semantics": bc_dagger.EXPECTED_CRITIC_SEMANTICS,
+        "dagger_control_semantics": bc_dagger.EXPECTED_CONTROL_SEMANTICS,
+        "q_backend_config": {},
         "actor_adapt": {},
+        "bc_dagger_sac_adapter": {},
         "qnet": {},
         "qnet_target": {},
-        "iql_value": {},
         "optimizer_resume_state": optimizer_state,
         "dagger_rollout_count": 801,
         "dagger_environment_steps": 25_632,
         "bc_update_count": 25_632,
         "q_update_count": 25_632,
-        "iql_value_update_count": 25_632,
         "dagger_rng_state": torch.Generator().get_state(),
         "q_rng_state": torch.Generator().get_state(),
+        "sac_action_rng_state": torch.Generator().get_state(),
         "next_iter": 6_801,
         "teacher_replay_state": dict(REPLAY_LINEAGE),
     }
@@ -242,16 +246,17 @@ def test_enabled_resume_copy_rejects_replay_with_different_action_clip(
         bc_dagger.prepare_bc_dagger_checkpoint(cfg)
 
 
-def test_disabled_resume_copy_allows_missing_source_and_copy_is_noop(tmp_path):
+def test_disabled_resume_copy_still_requires_local_source_and_copy_is_noop(tmp_path):
     checkpoint = _write_resume_checkpoint(tmp_path / "checkpoint_800.pt")
+    source = _write_teacher_replay(tmp_path / "teacher_replay_buffer.h5")
     cfg = _resume_cfg(checkpoint, copy_teacher_replay=False)
 
     resume = bc_dagger.prepare_bc_dagger_checkpoint(cfg)
     output_dir = tmp_path / "new-run"
     output_dir.mkdir()
 
-    assert resume["teacher_replay_source"] is None
-    assert cfg._bc_dagger_teacher_replay_copy_source is None
+    assert resume["teacher_replay_source"] == str(source.resolve())
+    assert cfg._bc_dagger_teacher_replay_copy_source == str(source.resolve())
     assert not (output_dir / "teacher_replay_buffer.h5").exists()
 
 
@@ -268,8 +273,9 @@ def test_run_resume_downloads_replay_only_when_copy_requested(
     cache_dir = tmp_path / "wandb-cache" / "files"
     cache_dir.mkdir(parents=True)
     checkpoint = _write_resume_checkpoint(cache_dir / "checkpoint_final.pt")
-    if copy_teacher_replay:
-        _write_teacher_replay(cache_dir / "teacher_replay_buffer.h5")
+    # Opting out suppresses the remote download request, but a cached local
+    # replay is still mandatory to refill the persistent 50% teacher partition.
+    _write_teacher_replay(cache_dir / "teacher_replay_buffer.h5")
     calls = []
 
     def resolve(path, **kwargs):

@@ -135,6 +135,7 @@ def run_training(cfg: DictConfig):
     if (
         freeze_bc_dagger_teacher_replay
         and replay_copy_source is not None
+        and bool(cfg.get("bc_dagger_copy_teacher_replay", True))
         and aa.is_main_process()
     ):
         print(
@@ -175,6 +176,18 @@ def run_training(cfg: DictConfig):
     simulation_app = app_launcher.app
 
     env, policy, vecnorm = make_env_policy(cfg, configure_replay=True)
+
+    if freeze_bc_dagger_teacher_replay and hasattr(
+        policy, "restore_q_teacher_replay"
+    ):
+        replay_refill_source = replay_copy_source
+        if replay_refill_source is None:
+            raise FileNotFoundError(
+                "SAC-critic BC-DAgger resume requires its paired immutable "
+                "teacher_replay_buffer.h5 to restore the fixed 50% teacher "
+                "critic partition."
+            )
+        policy.restore_q_teacher_replay(replay_refill_source)
 
     # Replay-producing algorithms need their live FIFO on every training rank.
     # H5 itself is written only by the rank-0 checkpoint hook below.  Capability

@@ -1,0 +1,42 @@
+# Finalize an already-trained PPO-BC DAgger student without rerunning joint
+# actor/perception/Q training.  The entrypoint replaces the task and algorithm
+# blocks below with the exact blocks saved in checkpoint_path before policy
+# construction, then adds only the runtime finalization controls.
+defaults:
+  - train
+  - override /algo: ppo_bc_dagger_finetune
+  - _self_
+
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-${task.name}-bc_dagger_finalize
+
+exp_name: ${oc.select:task.name,test}-bc_dagger_finalize
+save_interval: -1
+
+# Phase 2: freeze actor/Q/oracle and continue the three student perception
+# modules on fresh, pure-student rollouts.
+perception_consolidation_iterations: 25
+# Phase 3: optionally freeze perception/Q and realign actor_adapt to teacher
+# labels. Zero deliberately skips this phase.
+actor_realignment_iterations: 0
+# If actor realignment changed the visited-state distribution, optionally give
+# perception another short frozen-actor pass. Zero deliberately skips it.
+perception_recheck_iterations: 0
+# Phase 4: freeze actor/perception, clear both learning replay partitions,
+# collect a new paired H5, and update only Q/Q-target.
+replay_q_calibration_iterations: 128
+calibration_control_mode: beta
+calibration_teacher_probability: 0.5
+
+# Internal contract consumed by helpers/train.py.  It prevents checkpoint_path
+# from auto-discovering, copying, or restoring the stale H5 paired with the
+# joint BC-DAgger checkpoint. The finalization run creates a fresh replay in
+# its own Hydra output root.
+_bc_dagger_finalization_source: true
+_bc_dagger_finalize: true
+_bc_dagger_model_only_resume: false
+
+wandb:
+  job_type: bc_dagger_finalize
+  project: vaic_dagger

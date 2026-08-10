@@ -1,4 +1,5 @@
 import functools
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ from hydra.core.config_store import ConfigStore
 from hydra.plugins.config_source import ConfigLoadError
 
 from active_adaptation.learning.ppo.fastsac_vel import (
+    FASTSAC_BC_DAGGER_ACTOR_BACKEND,
     FastSACVelFinetuneConfig,
     FastSACVelFinetune,
     FastSACVEL,
@@ -18,6 +20,7 @@ from active_adaptation.learning.ppo.fastsac_vel import (
     TEACHER_REPLAY_FIELDS,
     TEACHER_REF_ACTION_FIELD,
     TeacherReplayBuffer,
+    _official_awac_weights,
     _validate_fastsac_finetune_config,
 )
 from active_adaptation.learning.modules.distributions import IndependentNormal
@@ -80,11 +83,17 @@ def test_student_keeps_ppo_vel_inputs_and_uses_guarded_stage2_defaults():
     assert fastsac.q_lr == 3e-5
     assert fastsac.sac_policy_frequency == 128
     assert fastsac.sac_actor_learning_starts_q_updates == 8_000
+    assert fastsac.sac_finetune_actor_objective == "sac"
+    assert fastsac.sac_awac_beta == 1.0
+    assert fastsac.sac_awac_v_samples == 1
+    assert fastsac.sac_awac_score_clip is None
+    assert fastsac.sac_actor_learning_starts_finetune_iteration is None
     assert fastsac.sac_actor_confidence_gate is True
     assert fastsac.sac_actor_gate_disagreement_multiplier == 1.0
     assert fastsac.sac_actor_gate_min_accept_fraction == 0.10
     assert fastsac.sac_actor_gate_absolute_margin == 0.0
     assert fastsac.sac_actor_lr == 3e-7
+    assert fastsac.sac_actor_log_std_lr is None
     assert fastsac.sac_alpha_lr == 2e-5
     assert fastsac.sac_alpha_init == 1e-5
     assert fastsac.sac_alpha_ramp_q_updates == 20_000
@@ -96,6 +105,7 @@ def test_student_keeps_ppo_vel_inputs_and_uses_guarded_stage2_defaults():
     assert fastsac.sac_bc_action_clip == 20.0
     assert fastsac.sac_entropy_reference_scale == 1.0
     assert fastsac.sac_bc_initial_action_std == 0.01
+    assert fastsac.sac_stage2_initial_action_std is None
     assert fastsac.sac_bc_log_std_min == -8.0
     assert fastsac.sac_bc_log_std_max == -2.0
     assert fastsac.sac_bc_anchor_coef_start == 0.0
@@ -429,6 +439,12 @@ def test_stage2_train_op_uses_seen_gate_and_keeps_perception_frozen():
     assert info["fastsac/perception_frozen"] == 1.0
     assert info["fastsac/q_only_warmup"] == 1.0
     assert info["fastsac/actor_active"] == 0.0
+    assert info["fastsac/actor_schedule_eligible"] == 0.0
+    assert info["fastsac/actor_start_uses_finetune_iteration"] == 0.0
+    assert info["fastsac/actor_start_finetune_iteration_config"] == -1
+    assert info["fastsac/actor_start_q_updates_config"] == 8_000
+    assert info["fastsac/finetune_iteration"] == 0
+    assert info["fastsac/finetune_iterations_completed"] == 1
     assert info["fastsac/online_replay_seen"] == 6
     assert info["fastsac/replay_warmup_ready"] == 1.0
     assert info["fastsac/truncation_finals"] == 3
@@ -470,6 +486,230 @@ def test_stage2_actor_first_eligible_cadence_is_q_update_8064():
     assert policy._sac_actor_update_is_due(0, 0, 1) is False
     policy.q_update_count = 8_063
     assert policy._sac_actor_update_is_due(0, 0, 1) is True
+
+
+def test_stage2_actor_can_start_from_local_finetune_iteration():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    policy.cfg = SimpleNamespace(
+        sac_actor_learning_starts_q_updates=8_000,
+        sac_actor_learning_starts_finetune_iteration=250,
+        sac_policy_frequency=128,
+    )
+
+    # Iterations 0..249 remain frozen even after an arbitrarily large number
+    # of Q updates. The configured local iteration replaces the Q start gate.
+    policy.sac_rollout_count = 249
+    assert policy._stage2_actor_is_active(100_000) is False
+    policy.q_update_count = 8_063
+    assert policy._sac_actor_update_is_due(0, 0, 1) is False
+
+    # Iteration 250 opens the start gate, while the existing Q-frequency
+    # cadence still selects the exact optimizer tick.
+    policy.sac_rollout_count = 250
+    assert policy._stage2_actor_is_active(1) is True
+    policy.q_update_count = 8_062
+    assert policy._sac_actor_update_is_due(0, 0, 1) is False
+    policy.q_update_count = 8_063
+    assert policy._sac_actor_update_is_due(0, 0, 1) is True
+
+
+def test_stage2_iteration_actor_start_uses_versioned_resume_schedule():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    policy.cfg = FastSACVelFinetuneConfig()
+
+    legacy = policy._stage2_schedule_config()
+    assert legacy["version"] == 4
+    assert "sac_actor_learning_starts_finetune_iteration" not in legacy
+
+    policy.cfg.sac_actor_learning_starts_finetune_iteration = 250
+    iteration_schedule = policy._stage2_schedule_config()
+    assert iteration_schedule["version"] == 5
+    assert (
+        iteration_schedule["sac_actor_learning_starts_finetune_iteration"]
+        == 250
+    )
+    assert iteration_schedule["actor_start_train_every"] == 32
+    assert "zero_based_cumulative_stage2" in iteration_schedule[
+        "actor_start_semantics"
+    ]
+
+
+def test_stage2_transfer_std_is_opt_in_resume_schedule_metadata():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    policy.cfg = FastSACVelFinetuneConfig()
+
+    default_schedule = policy._stage2_schedule_config()
+    assert "sac_stage2_initial_action_std" not in default_schedule
+
+    policy.cfg.sac_stage2_initial_action_std = 0.2
+    reset_schedule = policy._stage2_schedule_config()
+    assert reset_schedule["version"] == 8
+    assert reset_schedule["sac_stage2_initial_action_std"] == pytest.approx(0.2)
+    assert "fresh_bc_dagger_transfer_reset_once" in reset_schedule[
+        "stage2_initial_action_std_semantics"
+    ]
+
+
+def test_stage2_actor_log_std_lr_is_opt_in_resume_schedule_metadata():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    policy.cfg = FastSACVelFinetuneConfig()
+
+    # None must preserve the exact legacy schedule so old Stage-2 checkpoints
+    # remain resumable with their original single actor optimizer group.
+    legacy_schedule = policy._stage2_schedule_config()
+    assert legacy_schedule["version"] == 4
+    assert "sac_actor_log_std_lr" not in legacy_schedule
+
+    policy.cfg.sac_actor_log_std_lr = 3e-5
+    split_schedule = policy._stage2_schedule_config()
+    assert split_schedule["version"] == 9
+    assert split_schedule["sac_actor_log_std_lr"] == pytest.approx(3e-5)
+
+    # The strict same-stage schedule guard must distinguish an explicitly
+    # split optimizer from a legacy/default optimizer.
+    with pytest.raises(ValueError, match="schedule/anchor/perception config"):
+        policy.load_state_dict({
+            "qnet": {},
+            "last_phase": "finetune",
+            "stage2_schedule_config": legacy_schedule,
+        })
+
+
+def test_stage2_transfer_std_is_conditional_actor_backend_metadata():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    policy.cfg = FastSACVelFinetuneConfig()
+    policy.actor_backend = FASTSAC_BC_DAGGER_ACTOR_BACKEND
+    policy._q_actor_dim = 3
+    policy.action_dim = 1
+    policy._fastsac_action_low = [-20.0]
+    policy._fastsac_action_high = [20.0]
+    policy._fastsac_action_log_scale_sum = math.log(20.0)
+    policy._fastsac_entropy_reference_log_scale_sum = 0.0
+    policy.joint_names = ["joint"]
+
+    default_metadata = policy._actor_backend_metadata()
+    assert "stage2_initial_action_std" not in default_metadata
+    assert "stage2_initial_log_std" not in default_metadata
+
+    policy.cfg.sac_stage2_initial_action_std = 0.2
+    reset_metadata = policy._actor_backend_metadata()
+    assert reset_metadata["stage2_initial_action_std"] == pytest.approx(0.2)
+    assert reset_metadata["stage2_initial_log_std"] == pytest.approx(
+        math.log(0.2 / 20.0)
+    )
+    assert "fresh_bc_dagger_transfer_reset_once" in reset_metadata[
+        "stage2_initial_action_std_semantics"
+    ]
+
+
+def test_stage2_actor_log_std_lr_does_not_change_actor_backend_metadata():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    policy.cfg = FastSACVelFinetuneConfig()
+    policy.actor_backend = FASTSAC_BC_DAGGER_ACTOR_BACKEND
+    policy._q_actor_dim = 3
+    policy.action_dim = 1
+    policy._fastsac_action_low = [-20.0]
+    policy._fastsac_action_high = [20.0]
+    policy._fastsac_action_log_scale_sum = math.log(20.0)
+    policy._fastsac_entropy_reference_log_scale_sum = 0.0
+    policy.joint_names = ["joint"]
+
+    legacy_metadata = policy._actor_backend_metadata()
+    assert "sac_actor_log_std_lr" not in legacy_metadata
+    assert "sac_actor_mean_lr" not in legacy_metadata
+    assert "actor_optimizer_semantics" not in legacy_metadata
+
+    policy.cfg.sac_actor_log_std_lr = 3e-5
+    split_metadata = policy._actor_backend_metadata()
+    assert split_metadata == legacy_metadata
+    assert "sac_actor_log_std_lr" not in split_metadata
+    assert "sac_actor_mean_lr" not in split_metadata
+    assert "actor_optimizer_semantics" not in split_metadata
+
+
+def test_stage2_official_awac_uses_versioned_resume_schedule():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    policy.cfg = FastSACVelFinetuneConfig(
+        sac_finetune_actor_objective="awac",
+        sac_awac_beta=2.0,
+        sac_awac_v_samples=3,
+        sac_awac_score_clip=0.5,
+    )
+
+    schedule = policy._stage2_schedule_config()
+    assert schedule["version"] == 6
+    assert schedule["sac_finetune_actor_objective"] == "awac"
+    assert schedule["sac_awac_beta"] == 2.0
+    assert schedule["sac_awac_v_samples"] == 3
+    assert schedule["sac_awac_score_clip"] == 0.5
+    assert "batch_softmax_mean_one" in schedule["actor_objective_semantics"]
+    assert "weighted_replay_log_likelihood" in schedule[
+        "actor_objective_semantics"
+    ]
+
+    policy.cfg.sac_actor_learning_starts_finetune_iteration = 250
+    iteration_schedule = policy._stage2_schedule_config()
+    assert iteration_schedule["version"] == 7
+    assert (
+        iteration_schedule["sac_actor_learning_starts_finetune_iteration"]
+        == 250
+    )
+
+
+def test_official_awac_weights_match_batch_softmax_and_mean_one():
+    advantages = torch.tensor([-2.0, 0.0, 2.0])
+
+    weights = _official_awac_weights(advantages, beta=2.0)
+
+    expected = torch.softmax(advantages / 2.0, dim=0) * 3.0
+    assert torch.allclose(weights, expected)
+    assert weights.mean().item() == pytest.approx(1.0)
+    # The batch softmax is invariant to a common Q-value offset.
+    assert torch.allclose(
+        weights,
+        _official_awac_weights(advantages + 10_000.0, beta=2.0),
+        atol=1e-4,
+    )
+
+
+def test_official_awac_weights_apply_raw_advantage_upper_clip():
+    advantages = torch.tensor([-1.0, 0.0, 10.0])
+
+    weights = _official_awac_weights(
+        advantages,
+        beta=0.5,
+        score_clip=0.5,
+    )
+
+    clipped = advantages.clamp(max=0.5)
+    expected = torch.softmax(clipped / 0.5, dim=0) * 3.0
+    assert torch.allclose(weights, expected)
+    assert weights.mean().item() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("advantages", "beta", "score_clip", "error"),
+    [
+        (torch.empty(0), 1.0, None, "non-empty one-dimensional"),
+        (torch.zeros(2, 1), 1.0, None, "one-dimensional"),
+        (torch.zeros(2), 0.0, None, "beta"),
+        (torch.zeros(2), float("nan"), None, "beta"),
+        (torch.zeros(2), 1.0, 0.0, "score clip"),
+        (torch.tensor([0.0, float("inf")]), 1.0, None, "non-finite"),
+    ],
+)
+def test_official_awac_weights_reject_invalid_inputs(
+    advantages,
+    beta,
+    score_clip,
+    error,
+):
+    with pytest.raises((ValueError, RuntimeError), match=error):
+        _official_awac_weights(
+            advantages,
+            beta=beta,
+            score_clip=score_clip,
+        )
 
 
 def _stage2_confidence_gate_policy(frozen_bc_q, min_accept_fraction=0.10):
@@ -596,6 +836,27 @@ def test_stage2_effective_alpha_starts_at_actual_release_and_ramps_linearly():
     assert policy._mark_stage2_actor_released(40_000) == 20_000
     with pytest.raises(RuntimeError, match="cannot move backward"):
         policy._mark_stage2_actor_released(19_999)
+
+
+def test_stage2_iteration_start_decays_bc_anchor_from_actual_actor_release():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    policy.cfg = SimpleNamespace(
+        sac_actor_learning_starts_q_updates=8_000,
+        sac_actor_learning_starts_finetune_iteration=250,
+        sac_bc_anchor_coef_start=1.0,
+        sac_bc_anchor_coef_end=0.0,
+        sac_bc_anchor_decay_q_updates=20_000,
+    )
+    policy._uses_bc_dagger_finetune_source = lambda: True
+    policy.q_update_count = 100_000
+    policy._stage2_actor_release_q_update = None
+
+    # A large ignored legacy Q count must not expire the anchor before the
+    # iteration-scheduled actor has actually taken its first step.
+    assert policy._stage2_bc_anchor_coefficient() == pytest.approx(1.0)
+
+    policy._stage2_actor_release_q_update = 90_000
+    assert policy._stage2_bc_anchor_coefficient() == pytest.approx(0.5)
 
 
 def test_stage2_entropy_reference_scale_is_independent_of_safety_clip():
@@ -937,6 +1198,190 @@ def test_bc_dagger_actor_adapter_preserves_mean_and_has_sac_gradients():
     )
 
 
+def _make_stage2_actor_optimizer_policy(monkeypatch, *, actor_lr, log_std_lr):
+    class _BCActor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.core = Actor(2, init_noise_scale=0.5)
+            self.core(torch.zeros(1, 3))
+
+    def fake_fastsac_init(
+        policy,
+        cfg,
+        observation_spec,
+        action_spec,
+        reward_spec,
+        device,
+        env,
+    ):
+        torch.nn.Module.__init__(policy)
+        policy.cfg = cfg
+        policy.device = torch.device(device)
+        policy.actor_backend = FASTSAC_BC_DAGGER_ACTOR_BACKEND
+        policy.actor_adapt = _BCActor()
+        policy.bc_dagger_sac_adapter = torch.nn.Module()
+        policy.bc_dagger_sac_adapter.log_std = torch.nn.Parameter(
+            torch.full((2,), -2.0)
+        )
+        policy.qnet = torch.nn.Linear(3, 2)
+        policy.qnet_target = torch.nn.Linear(3, 2)
+        policy._fastsac_action_low = torch.full((2,), -1.0)
+        policy._fastsac_action_high = torch.full((2,), 1.0)
+        policy.num_updates = 0
+
+    monkeypatch.setattr(FastSACVEL, "__init__", fake_fastsac_init)
+    cfg = FastSACVelFinetuneConfig(
+        finetune_checkpoint_source="bc_dagger",
+        sac_actor_lr=actor_lr,
+        sac_actor_log_std_lr=log_std_lr,
+        q_weight_decay=0.0,
+    )
+    return FastSACVelFinetune(cfg, None, None, None, "cpu", None)
+
+
+def test_stage2_actor_log_std_lr_preserves_legacy_group_when_unset(monkeypatch):
+    policy = _make_stage2_actor_optimizer_policy(
+        monkeypatch,
+        actor_lr=1e-3,
+        log_std_lr=None,
+    )
+    optimizer = policy.sac_actor_optimizer
+
+    assert len(optimizer.param_groups) == 1
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-3)
+    optimized = optimizer.param_groups[0]["params"]
+    assert {id(parameter) for parameter in optimized} == {
+        id(parameter)
+        for parameter in policy._stage2_trainable_actor_parameters
+    }
+    assert len(optimized) == len({id(parameter) for parameter in optimized})
+
+    resume = policy._optimizer_resume_state()
+    actor_manifest = resume["parameter_manifests"]["sac_actor_optimizer"]
+    assert len(actor_manifest) == 1
+    actor_state_groups = resume["optimizer_states"][
+        "sac_actor_optimizer"
+    ]["param_groups"]
+    assert len(actor_state_groups) == 1
+    assert actor_state_groups[0]["lr"] == pytest.approx(1e-3)
+
+
+def test_stage2_actor_log_std_lr_creates_disjoint_explicit_groups(monkeypatch):
+    policy = _make_stage2_actor_optimizer_policy(
+        monkeypatch,
+        actor_lr=1e-3,
+        log_std_lr=1e-2,
+    )
+    optimizer = policy.sac_actor_optimizer
+    log_std = policy.bc_dagger_sac_adapter.log_std
+
+    assert len(optimizer.param_groups) == 2
+    log_std_groups = [
+        group
+        for group in optimizer.param_groups
+        if any(parameter is log_std for parameter in group["params"])
+    ]
+    assert len(log_std_groups) == 1
+    assert log_std_groups[0]["params"] == [log_std]
+    assert log_std_groups[0]["lr"] == pytest.approx(1e-2)
+
+    mean_groups = [
+        group for group in optimizer.param_groups if group is not log_std_groups[0]
+    ]
+    assert len(mean_groups) == 1
+    assert mean_groups[0]["lr"] == pytest.approx(1e-3)
+    flattened = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    assert len(flattened) == len({id(parameter) for parameter in flattened})
+    assert {id(parameter) for parameter in flattened} == {
+        id(parameter)
+        for parameter in policy._stage2_trainable_actor_parameters
+    }
+
+    resume = policy._optimizer_resume_state()
+    actor_manifest = resume["parameter_manifests"]["sac_actor_optimizer"]
+    assert len(actor_manifest) == 2
+    assert actor_manifest[1] == ["bc_dagger_sac_adapter.log_std"]
+    actor_state_groups = resume["optimizer_states"][
+        "sac_actor_optimizer"
+    ]["param_groups"]
+    assert [group["lr"] for group in actor_state_groups] == pytest.approx(
+        [1e-3, 1e-2]
+    )
+
+
+def test_stage2_actor_log_std_lr_scales_equal_gradient_optimizer_steps(
+    monkeypatch,
+):
+    policy = _make_stage2_actor_optimizer_policy(
+        monkeypatch,
+        actor_lr=1e-3,
+        log_std_lr=1e-2,
+    )
+    mean = policy.actor_adapt.core.actor_mean.bias
+    log_std = policy.bc_dagger_sac_adapter.log_std
+    mean_before = mean.detach().clone()
+    log_std_before = log_std.detach().clone()
+
+    # Equal unit gradients isolate the optimizer-group learning-rate ratio.
+    (mean.sum() + log_std.sum()).backward()
+    assert torch.equal(mean.grad, torch.ones_like(mean))
+    assert torch.equal(log_std.grad, torch.ones_like(log_std))
+    policy.sac_actor_optimizer.step()
+
+    mean_step = (mean_before - mean.detach()).abs().mean()
+    log_std_step = (log_std_before - log_std.detach()).abs().mean()
+    assert mean_step.item() == pytest.approx(1e-3, rel=1e-4)
+    assert log_std_step.item() == pytest.approx(1e-2, rel=1e-4)
+    assert (log_std_step / mean_step).item() == pytest.approx(10.0, rel=1e-3)
+
+
+def test_stage2_actor_log_std_lr_restores_two_group_optimizer_state(
+    monkeypatch,
+):
+    source = _make_stage2_actor_optimizer_policy(
+        monkeypatch,
+        actor_lr=1e-3,
+        log_std_lr=1e-2,
+    )
+    source.sac_actor_optimizer.zero_grad(set_to_none=True)
+    sum(
+        parameter.sum()
+        for parameter in source._stage2_trainable_actor_parameters
+    ).backward()
+    source.sac_actor_optimizer.step()
+    source.num_updates = 17
+    resume_state = source._optimizer_resume_state()
+
+    restored = _make_stage2_actor_optimizer_policy(
+        monkeypatch,
+        actor_lr=1e-3,
+        log_std_lr=1e-2,
+    )
+    assert restored._restore_optimizer_resume_state({
+        "last_phase": "finetune",
+        "optimizer_resume_state": resume_state,
+    }) is True
+    assert restored.num_updates == 17
+
+    expected = source.sac_actor_optimizer.state_dict()
+    actual = restored.sac_actor_optimizer.state_dict()
+    assert actual["param_groups"] == expected["param_groups"]
+    assert set(actual["state"]) == set(expected["state"])
+    for parameter_id, expected_state in expected["state"].items():
+        actual_state = actual["state"][parameter_id]
+        assert set(actual_state) == set(expected_state)
+        for name, expected_value in expected_state.items():
+            actual_value = actual_state[name]
+            if torch.is_tensor(expected_value):
+                assert torch.equal(actual_value, expected_value)
+            else:
+                assert actual_value == expected_value
+
+
 def test_fastsac_rejects_second_actor_optimizer_from_distillation():
     assert FastSACVelFinetuneConfig().enable_residual_distillation is False
     cfg = SimpleNamespace(enable_residual_distillation=True)
@@ -948,8 +1393,20 @@ def test_fastsac_rejects_second_actor_optimizer_from_distillation():
     ("field", "value"),
     [
         ("load_pretrained_q", "true"),
+        ("sac_finetune_actor_objective", "reference_awac"),
+        ("sac_awac_beta", 0.0),
+        ("sac_awac_beta", float("nan")),
+        ("sac_awac_v_samples", 0),
+        ("sac_awac_v_samples", True),
+        ("sac_awac_v_samples", 1.5),
+        ("sac_awac_score_clip", 0.0),
+        ("sac_awac_score_clip", float("inf")),
         ("sac_learning_starts", -1),
         ("sac_actor_learning_starts_q_updates", -1),
+        ("sac_actor_learning_starts_finetune_iteration", -1),
+        ("sac_actor_learning_starts_finetune_iteration", True),
+        ("sac_actor_learning_starts_finetune_iteration", 1.5),
+        ("sac_actor_learning_starts_finetune_iteration", "100"),
         ("sac_alpha_ramp_q_updates", 0),
         ("sac_actor_confidence_gate", "true"),
         ("sac_actor_gate_min_accept_fraction", 0.0),
@@ -962,9 +1419,22 @@ def test_fastsac_rejects_second_actor_optimizer_from_distillation():
         ("sac_bc_action_clip", 0.0),
         ("sac_entropy_reference_scale", 0.0),
         ("sac_bc_initial_action_std", 0.0),
+        ("sac_stage2_initial_action_std", 0.0),
+        ("sac_stage2_initial_action_std", True),
+        ("sac_stage2_initial_action_std", float("nan")),
+        ("sac_stage2_initial_action_std", float("inf")),
+        ("sac_stage2_initial_action_std", 1e-4),
+        # With action_clip=20 and log_std_max=-2, this maps above the
+        # executable BC-adapter log-standard-deviation support.
+        ("sac_stage2_initial_action_std", 3.0),
         ("sac_bc_log_std_min", -1.0),
         ("sac_updates_per_env_step", 0),
         ("sac_policy_frequency", 0),
+        ("sac_actor_log_std_lr", 0.0),
+        ("sac_actor_log_std_lr", -1.0),
+        ("sac_actor_log_std_lr", True),
+        ("sac_actor_log_std_lr", float("nan")),
+        ("sac_actor_log_std_lr", float("inf")),
         ("sac_tau", 1.1),
         ("sac_max_grad_norm", float("nan")),
         ("sac_alpha_init", 0.0),
@@ -987,6 +1457,44 @@ def test_stage2_rejects_invalid_sac_config(field, value):
     setattr(cfg, field, value)
     with pytest.raises(ValueError, match=field):
         _validate_fastsac_finetune_config(cfg)
+
+
+def test_stage2_official_awac_rejects_sac_hybrid_options_and_forces_alpha_zero():
+    cfg = FastSACVelFinetuneConfig(
+        sac_finetune_actor_objective="awac",
+        sac_actor_confidence_gate=False,
+        sac_use_autotune=False,
+    )
+    _validate_fastsac_finetune_config(cfg)
+
+    for field, value in (
+        ("sac_use_autotune", True),
+        ("sac_actor_confidence_gate", True),
+        ("sac_bc_anchor_coef_start", 0.1),
+        ("sac_deterministic_rollout", True),
+        ("sac_clipped_double_q", False),
+    ):
+        invalid = FastSACVelFinetuneConfig(
+            sac_finetune_actor_objective="awac",
+            sac_actor_confidence_gate=False,
+            sac_use_autotune=False,
+        )
+        setattr(invalid, field, value)
+        with pytest.raises(ValueError, match=field):
+            _validate_fastsac_finetune_config(invalid)
+
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    policy.cfg = cfg
+    policy.log_alpha = torch.nn.Parameter(torch.log(torch.tensor(0.5)))
+    policy._stage2_actor_release_q_update = 1
+    policy.q_update_count = 100_000
+    assert policy._stage2_alpha_ramp_progress() == 0.0
+    assert policy._stage2_effective_alpha().item() == 0.0
+    assert policy._stage2_alpha_autotune_enabled() is False
+    assert policy._stage2_actor_confidence_gate_enabled() is False
+    assert policy._stage2_bc_anchor_coefficient() == 0.0
+    assert policy._stage2_q_target_uses_stochastic_policy() is True
 
 
 class _Stage2QSpy(torch.nn.Module):
@@ -1058,6 +1566,25 @@ class _Stage2DisagreeingQ(torch.nn.Module):
         return (torch.softmax(logits, dim=-1) * self.support).sum(-1)
 
 
+class _Stage2AWACQ(torch.nn.Module):
+    """Monotonic twin C51 critic used to inspect official AWAC weighting."""
+
+    def __init__(self):
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(()))
+        self.register_buffer("support", torch.tensor([-1.0, 1.0]))
+        self.forward_actions = []
+
+    def forward(self, observations, actions):
+        self.forward_actions.append(actions.detach().clone())
+        score = actions[:, :1] + self.dummy * 0.0
+        logits = torch.cat((-score, score), dim=-1)
+        return logits.unsqueeze(0).expand(2, -1, -1)
+
+    def values(self, logits):
+        return (torch.softmax(logits, dim=-1) * self.support).sum(-1)
+
+
 class _Stage2Actor(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -1073,6 +1600,189 @@ class _Stage2Actor(torch.nn.Module):
                 return sampled, sampled[:, 0] * 0.0 - 2.0
 
         return _Dist()
+
+
+class _Stage2AWACActor(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.loc = torch.nn.Parameter(torch.zeros(1))
+        self.log_scale = torch.nn.Parameter(torch.full((1,), -0.5))
+
+    def get_dist(self, td):
+        count = td.batch_size[0]
+        return FastSACTanhNormal(
+            loc=self.loc.expand(count, 1),
+            scale=self.log_scale.exp().expand(count, 1),
+            low=-1.0,
+            high=1.0,
+            event_dims=1,
+        )
+
+
+def test_stage2_official_awac_actor_uses_online_q_and_trains_distribution_scale():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        sac_awac_beta=0.5,
+        sac_awac_v_samples=2,
+        sac_awac_score_clip=None,
+    )
+    policy.sac_action_rng = torch.Generator().manual_seed(7)
+    policy.qnet = _Stage2AWACQ()
+    policy._q_forward = (
+        lambda qnet, observations, actions, *unused: qnet(
+            observations, actions
+        )
+    )
+
+    loc = torch.nn.Parameter(torch.zeros(3, 1))
+    log_scale = torch.nn.Parameter(torch.full((3, 1), -0.5))
+    dist = FastSACTanhNormal(
+        loc=loc,
+        scale=log_scale.exp(),
+        low=-1.0,
+        high=1.0,
+        event_dims=1,
+    )
+    batch = {
+        "observations": torch.zeros(3, 1),
+        "critic_observations": torch.zeros(3, 1),
+        "actions": torch.tensor([[-0.8], [0.0], [0.8]]),
+        "rewards": torch.zeros(3),
+        STAGE2_OFFLINE_SOURCE_KEY: torch.tensor([True, False, False]),
+    }
+
+    actor_loss, entropy, diagnostics = (
+        policy._stage2_official_awac_actor_loss(batch, dist)
+    )
+
+    # One online replay-Q evaluation plus exactly K current-policy samples.
+    assert len(policy.qnet.forward_actions) == 3
+    replay_q = torch.tanh(batch["actions"][:, 0])
+    policy_v = torch.stack([
+        torch.tanh(action[:, 0])
+        for action in policy.qnet.forward_actions[1:]
+    ]).mean(dim=0)
+    expected_advantage = replay_q - policy_v
+    expected_weights = _official_awac_weights(
+        expected_advantage,
+        beta=0.5,
+    )
+    assert diagnostics["advantage_mean"].item() == pytest.approx(
+        expected_advantage.mean().item()
+    )
+    assert diagnostics["weight_min"].item() == pytest.approx(
+        expected_weights.min().item()
+    )
+    assert diagnostics["weight_max"].item() == pytest.approx(
+        expected_weights.max().item()
+    )
+    assert diagnostics["weight_mean"].item() == pytest.approx(1.0)
+    assert diagnostics["offline_rows"].item() == 1.0
+    assert diagnostics["online_rows"].item() == 2.0
+    assert torch.isfinite(actor_loss)
+    assert torch.isfinite(entropy)
+
+    actor_loss.backward()
+    assert loc.grad is not None and torch.isfinite(loc.grad).all()
+    # Official AWAC scores replay actions under the complete Gaussian policy;
+    # unlike the Stage-1 custom objective, log-standard-deviation is not
+    # detached from the weighted maximum-likelihood update.
+    assert log_scale.grad is not None
+    assert torch.isfinite(log_scale.grad).all()
+    assert log_scale.grad.abs().sum().item() > 0.0
+
+
+def test_stage2_official_awac_update_uses_hard_backup_without_gate_anchor_or_alpha():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    policy.device = torch.device("cpu")
+    policy.cfg = SimpleNamespace(
+        phase="finetune",
+        finetune_checkpoint_source="bc_dagger",
+        sac_finetune_actor_objective="awac",
+        sac_awac_beta=1.0,
+        sac_awac_v_samples=1,
+        sac_awac_score_clip=None,
+        sac_deterministic_rollout=False,
+        sac_actor_learning_starts_q_updates=0,
+        sac_actor_confidence_gate=False,
+        sac_alpha_ramp_q_updates=20_000,
+        sac_use_autotune=False,
+        gamma=0.99,
+        sac_max_grad_norm=0.0,
+        sac_tau=0.05,
+        q_action_coordinates="absolute",
+        q_reference_dueling=False,
+        q_condition_on_actuator_state=False,
+        sac_q_normalize_actions=False,
+        sac_q_action_input_gain=1.0,
+        sac_clipped_double_q=True,
+    )
+    policy.sac_action_rng = torch.Generator().manual_seed(3)
+    policy.actor_adapt = _Stage2AWACActor()
+    policy._actor_dist_from_flat = lambda obs: policy.actor_adapt.get_dist(
+        TensorDict({}, batch_size=obs.shape[:-1])
+    )
+    policy.qnet = _Stage2AWACQ()
+    policy.qnet_target = _Stage2QSpy()
+    policy.opt_q = torch.optim.SGD(policy.qnet.parameters(), lr=0.0)
+    policy.sac_actor_optimizer = torch.optim.SGD(
+        policy.actor_adapt.parameters(), lr=0.1
+    )
+    policy.log_alpha = torch.nn.Parameter(torch.log(torch.tensor(0.5)))
+    policy.alpha_optimizer = torch.optim.SGD([policy.log_alpha], lr=1.0)
+    policy.target_entropy = -1.0
+    policy.q_update_count = 0
+    policy._stage2_actor_release_q_update = None
+    policy.sac_actor_update_count = 0
+    policy.sac_alpha_update_count = 0
+    policy._fastsac_action_log_scale_sum = 0.0
+    policy._prepare_student_learning_batch = lambda batch: batch
+    policy._stage2_actor_confidence_gate = lambda *args, **kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("official AWAC must not call the SAC gate"))
+    policy._stage2_bc_anchor_loss = lambda *args, **kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("official AWAC must not call the BC anchor"))
+    batch = {
+        "observations": torch.zeros(4, 1),
+        "next_observations": torch.zeros(4, 1),
+        "critic_observations": torch.zeros(4, 1),
+        "next_critic_observations": torch.zeros(4, 1),
+        "actions": torch.tensor([[-0.8], [-0.2], [0.2], [0.8]]),
+        "rewards": torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        "dones": torch.zeros(4, dtype=torch.bool),
+        "truncations": torch.zeros(4, dtype=torch.bool),
+        "discounts": torch.ones(4),
+        STAGE2_OFFLINE_SOURCE_KEY: torch.tensor(
+            [True, True, False, False]
+        ),
+    }
+    actor_before = tuple(
+        parameter.detach().clone()
+        for parameter in policy.actor_adapt.parameters()
+    )
+    alpha_before = policy.log_alpha.detach().clone()
+
+    result = policy._sac_update(batch, update_actor=True)
+
+    assert torch.equal(policy.qnet_target.projection_reward, batch["rewards"])
+    assert result[10]["effective_alpha"].item() == 0.0
+    assert result[10]["entropy_tax_abs_mean"].item() == 0.0
+    assert result[11]["attempted"].item() == 0.0
+    assert result[11]["actor_update_applied"].item() == 1.0
+    assert result[13]["active"].item() == 1.0
+    assert result[13]["weight_mean"].item() == pytest.approx(1.0)
+    assert policy.q_update_count == 1
+    assert policy.sac_actor_update_count == 1
+    assert policy.sac_alpha_update_count == 0
+    assert policy._stage2_actor_release_q_update == 1
+    assert torch.equal(policy.log_alpha, alpha_before)
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(actor_before, policy.actor_adapt.parameters())
+    )
 
 
 def test_stage2_q_only_hard_target_matches_pretrained_iql_semantics():

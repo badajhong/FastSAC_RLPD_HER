@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import h5py
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
@@ -7,6 +8,17 @@ from omegaconf import OmegaConf
 
 from scripts import bc_dagger
 from scripts.train import run_training as shared_run_training
+
+
+REPLAY_LINEAGE = {
+    "format": "vaic_bc_dagger_teacher_replay",
+    "format_version": 2,
+    "replay_id": "frozen-replay-id",
+    "dagger_control_semantics": bc_dagger.EXPECTED_CONTROL_SEMANTICS,
+    "replay_observation_semantics": "raw_pre_vecnorm_v1",
+    "vecnorm_fingerprint": "sha256:" + "a" * 64,
+    "action_clip": 20.0,
+}
 
 
 def _cfg(
@@ -20,11 +32,18 @@ def _cfg(
     vecnorm="eval",
     checkpoint="run:x/y/z",
     total_frames=39_321_600,
+    iterations=None,
     num_envs=512,
     train_every=32,
     beta_start=1.0,
     beta_end=0.0,
     beta_decay=1800,
+    beta_zero_iteration=None,
+    control_mode="safe",
+    safe_takeover=0.006,
+    safe_release=0.004,
+    safe_hold=8,
+    safe_zero_iteration=None,
     raw_replay=True,
     bc_dagger_checkpoint=None,
     copy_teacher_replay=False,
@@ -40,12 +59,19 @@ def _cfg(
             "dagger_beta_start": beta_start,
             "dagger_beta_end": beta_end,
             "dagger_beta_decay_rollouts": beta_decay,
+            "dagger_beta_zero_iteration": beta_zero_iteration,
+            "dagger_control_mode": control_mode,
+            "dagger_safe_takeover_rms": safe_takeover,
+            "dagger_safe_release_rms": safe_release,
+            "dagger_safe_min_teacher_steps": safe_hold,
+            "dagger_safe_zero_iteration": safe_zero_iteration,
             "dagger_replay_raw_observations": raw_replay,
             "save_teacher_buffer": True,
             "teacher_buffer_path": None,
         },
         "task": {"num_envs": num_envs},
         "total_frames": total_frames,
+        "bc_dagger_iterations": iterations,
         "checkpoint_path": checkpoint,
         "bc_dagger_checkpoint": bc_dagger_checkpoint,
         "bc_dagger_copy_teacher_replay": copy_teacher_replay,
@@ -71,19 +97,23 @@ def _write_resume_checkpoint(
     }
     policy = {
         "training_algorithm": algorithm,
+        "critic_learning_semantics": bc_dagger.EXPECTED_CRITIC_SEMANTICS,
+        "dagger_control_semantics": bc_dagger.EXPECTED_CONTROL_SEMANTICS,
+        "q_backend_config": {},
         "actor_adapt": {},
+        "bc_dagger_sac_adapter": {},
         "qnet": {},
         "qnet_target": {},
-        "iql_value": {},
         "optimizer_resume_state": optimizer_state,
         "dagger_rollout_count": rollout_count,
         "dagger_environment_steps": environment_steps,
         "bc_update_count": 25_632,
         "q_update_count": 25_632,
-        "iql_value_update_count": 25_632,
         "dagger_rng_state": torch.Generator().get_state(),
         "q_rng_state": torch.Generator().get_state(),
+        "sac_action_rng_state": torch.Generator().get_state(),
         "next_iter": 6_801,
+        "teacher_replay_state": dict(REPLAY_LINEAGE),
     }
     if missing_module is not None:
         policy.pop(missing_module)
@@ -93,6 +123,9 @@ def _write_resume_checkpoint(
     if include_vecnorm:
         checkpoint["vecnorm"] = {}
     torch.save(checkpoint, path)
+    with h5py.File(path.with_name("teacher_replay_buffer.h5"), "w") as replay:
+        for key, value in REPLAY_LINEAGE.items():
+            replay.attrs[key] = value
     return path
 
 
@@ -112,12 +145,19 @@ def test_bc_dagger_config_inherits_train_and_selects_dedicated_defaults():
     assert cfg.wandb.project == "vaic_dagger"
     assert cfg.task.enable_cameras is True
     assert cfg.total_frames == 39_321_600
+    assert cfg.bc_dagger_iterations is None
     assert cfg.save_interval == 100
     assert cfg.bc_dagger_checkpoint is None
     assert cfg.bc_dagger_copy_teacher_replay is True
     assert cfg.algo.dagger_beta_start == pytest.approx(1.0)
     assert cfg.algo.dagger_beta_end == pytest.approx(0.0)
     assert cfg.algo.dagger_beta_decay_rollouts == 1800
+    assert cfg.algo.dagger_beta_zero_iteration is None
+    assert cfg.algo.dagger_control_mode == "safe"
+    assert cfg.algo.dagger_safe_takeover_rms == pytest.approx(0.006)
+    assert cfg.algo.dagger_safe_release_rms == pytest.approx(0.004)
+    assert cfg.algo.dagger_safe_min_teacher_steps == 8
+    assert cfg.algo.dagger_safe_zero_iteration is None
     assert cfg.algo.dagger_replay_raw_observations is True
     assert cfg.algo.teacher_buffer_capacity == 1_048_576
 
@@ -129,21 +169,48 @@ def test_bc_dagger_config_inherits_train_and_selects_dedicated_defaults():
         "end_rollout": 2400,
         "decay_rollouts": 1800,
         "beta_zero_rollouts": 600,
+        "safe_zero_rollouts": 0,
     }
 
 
-def test_resume_checkpoint_is_model_only_and_total_frames_are_additional(
+def test_hydra_accepts_iteration_and_teacher_zero_overrides_without_plus_prefix():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(
+        config_dir=str(config_dir), version_base=None
+    ):
+        cfg = compose(
+            config_name="bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "bc_dagger_iterations=1200",
+                "algo.dagger_control_mode=hybrid",
+                "algo.dagger_beta_zero_iteration=900",
+                "algo.dagger_safe_zero_iteration=1000",
+            ],
+        )
+
+    schedule = bc_dagger.bc_dagger_rollout_schedule(cfg)
+
+    assert cfg.total_frames == 19_660_800
+    assert cfg.algo.dagger_beta_decay_rollouts == 900
+    assert schedule["total_rollouts"] == 1200
+    assert schedule["beta_zero_rollouts"] == 300
+    assert schedule["safe_zero_rollouts"] == 200
+
+
+def test_resume_checkpoint_iterations_are_additional(
     tmp_path, capsys
 ):
     checkpoint = _write_resume_checkpoint(tmp_path / "checkpoint_800.pt")
     frozen_h5 = tmp_path / "teacher_replay_buffer.h5"
-    frozen_h5.write_bytes(b"must remain untouched")
     before = frozen_h5.read_bytes()
     cfg = _cfg(
         checkpoint="/old/ppo/checkpoint_6000.pt",
         bc_dagger_checkpoint=str(checkpoint),
-        total_frames=399 * 16_384,
-        beta_decay=1000,
+        total_frames=1,
+        iterations=399,
+        beta_zero_iteration=1000,
+        safe_zero_iteration=1000,
     )
 
     resume = bc_dagger.prepare_bc_dagger_checkpoint(cfg)
@@ -154,18 +221,21 @@ def test_resume_checkpoint_is_model_only_and_total_frames_are_additional(
         "path": str(checkpoint.resolve()),
         "rollout_count": 801,
         "environment_steps": 25_632,
-        "teacher_replay_source": None,
+        "teacher_replay_source": str(frozen_h5.resolve()),
     }
     assert cfg.checkpoint_path == str(checkpoint.resolve())
     assert cfg.bc_dagger_checkpoint == str(checkpoint.resolve())
     assert cfg.bc_dagger_resume_rollout_count == 801
     assert cfg.bc_dagger_resume_environment_steps == 25_632
     assert cfg._bc_dagger_model_only_resume is True
-    assert cfg._bc_dagger_teacher_replay_copy_source is None
+    assert cfg._bc_dagger_teacher_replay_copy_source == str(
+        frozen_h5.resolve()
+    )
     assert cfg._bc_dagger_teacher_replay_copy_path is None
     assert cfg.algo.save_teacher_buffer is False
     assert cfg.algo.teacher_buffer_path is None
     assert cfg.teacher_replay_buffer_path is None
+    assert cfg.total_frames == 399 * 16_384
     assert schedule == {
         "frames_per_rollout": 16_384,
         "total_rollouts": 399,
@@ -173,6 +243,7 @@ def test_resume_checkpoint_is_model_only_and_total_frames_are_additional(
         "end_rollout": 1200,
         "decay_rollouts": 1000,
         "beta_zero_rollouts": 200,
+        "safe_zero_rollouts": 200,
     }
     # The checkpoint alias supersedes the original PPO bootstrap source, but
     # never discovers, opens, truncates, or snapshots the adjacent H5.
@@ -224,17 +295,17 @@ def test_resume_rejects_any_mutable_teacher_replay_path(
     else:
         cfg.algo.teacher_buffer_path = str(tmp_path / "teacher.h5")
 
-    with pytest.raises(ValueError, match="without teacher replay"):
+    with pytest.raises(ValueError, match="paired immutable teacher replay"):
         bc_dagger.prepare_bc_dagger_checkpoint(cfg)
 
 
 @pytest.mark.parametrize(
     ("checkpoint_kwargs", "message"),
     (
-        ({"algorithm": "old-dagger"}, "IQL-v2"),
+        ({"algorithm": "old-dagger"}, "SAC-critic-v3"),
         ({"include_vecnorm": False}, "VecNorm"),
         ({"missing_optimizer": "q_optimizer"}, "optimizer state"),
-        ({"missing_module": "iql_value"}, "trained modules"),
+        ({"missing_module": "bc_dagger_sac_adapter"}, "trained modules"),
         ({"missing_state": "q_rng_state"}, "continuation state"),
     ),
 )
@@ -266,6 +337,48 @@ def test_bc_dagger_entrypoint_reuses_shared_training_engine(monkeypatch):
     assert received == [cfg]
 
 
+def test_iteration_controls_override_frames_and_name_beta_zero_index():
+    cfg = _cfg(
+        total_frames=1,
+        iterations=1200,
+        control_mode="hybrid",
+        beta_decay=1800,
+        beta_zero_iteration=900,
+        safe_zero_iteration=1000,
+    )
+
+    schedule = bc_dagger.bc_dagger_rollout_schedule(cfg)
+    bc_dagger.validate_bc_dagger_config(cfg)
+
+    assert cfg.total_frames == 1200 * 512 * 32
+    assert cfg.algo.dagger_beta_decay_rollouts == 900
+    assert schedule == {
+        "frames_per_rollout": 16_384,
+        "total_rollouts": 1200,
+        "start_rollout": 0,
+        "end_rollout": 1200,
+        "decay_rollouts": 900,
+        "beta_zero_rollouts": 300,
+        "safe_zero_rollouts": 200,
+    }
+
+
+def test_iteration_budget_matches_shared_trainer_on_multiple_ranks(monkeypatch):
+    monkeypatch.setattr(bc_dagger.aa, "get_world_size", lambda: 2)
+    cfg = _cfg(
+        total_frames=1,
+        iterations=10,
+        num_envs=4,
+        train_every=3,
+    )
+
+    schedule = bc_dagger.bc_dagger_rollout_schedule(cfg)
+
+    assert cfg.total_frames == 10 * 4 * 3 * 2
+    assert schedule["frames_per_rollout"] == 12
+    assert schedule["total_rollouts"] == 10
+
+
 @pytest.mark.parametrize(
     ("cfg", "message"),
     (
@@ -279,11 +392,48 @@ def test_bc_dagger_entrypoint_reuses_shared_training_engine(monkeypatch):
         ),
         (_cfg(checkpoint=None), "requires checkpoint_path"),
         (
-            _cfg(total_frames=16_384 * 1800),
+            _cfg(control_mode="beta", total_frames=16_384 * 1800),
             "cumulative end rollout",
+        ),
+        (_cfg(control_mode="unknown"), "control_mode"),
+        (_cfg(safe_release=0.007), "release_rms"),
+        (_cfg(safe_hold=0), "positive integer"),
+        (_cfg(iterations=0), "bc_dagger_iterations"),
+        (_cfg(iterations=True), "bc_dagger_iterations"),
+        (_cfg(iterations=1.5), "bc_dagger_iterations"),
+        (_cfg(iterations="12"), "bc_dagger_iterations"),
+        (_cfg(beta_zero_iteration=0), "dagger_beta_zero_iteration"),
+        (_cfg(beta_zero_iteration=True), "dagger_beta_zero_iteration"),
+        (_cfg(beta_zero_iteration=1.5), "dagger_beta_zero_iteration"),
+        (_cfg(beta_zero_iteration="12"), "dagger_beta_zero_iteration"),
+        (_cfg(safe_zero_iteration=0), "dagger_safe_zero_iteration"),
+        (_cfg(safe_zero_iteration=True), "dagger_safe_zero_iteration"),
+        (_cfg(safe_zero_iteration=1.5), "dagger_safe_zero_iteration"),
+        (_cfg(safe_zero_iteration="12"), "dagger_safe_zero_iteration"),
+        (
+            _cfg(control_mode="beta", safe_zero_iteration=900),
+            "requires safe or hybrid",
+        ),
+        (
+            _cfg(iterations=900, safe_zero_iteration=900),
+            "cumulative end rollout",
+        ),
+        (
+            _cfg(
+                control_mode="hybrid",
+                beta_end=0.1,
+                beta_zero_iteration=900,
+            ),
+            "requires dagger_beta_end=0",
         ),
     ),
 )
 def test_bc_dagger_entrypoint_rejects_invalid_stage_before_training(cfg, message):
     with pytest.raises(ValueError, match=message):
         bc_dagger.validate_bc_dagger_config(cfg)
+
+
+def test_safe_mode_does_not_require_a_beta_zero_training_phase():
+    cfg = _cfg(control_mode="safe", total_frames=16_384 * 1800)
+
+    bc_dagger.validate_bc_dagger_config(cfg)

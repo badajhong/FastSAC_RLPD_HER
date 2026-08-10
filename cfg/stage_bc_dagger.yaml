@@ -1,0 +1,61 @@
+# Staged PPO-BC DAgger schedule.  The environment, actor/Q backend, replay,
+# checkpointing, and W&B implementation are inherited from bc_dagger.yaml;
+# scripts/stage_bc_dagger.py only validates the fresh PPO source and installs
+# the staged update schedule before calling the shared trainer.
+defaults:
+  - bc_dagger
+  - _self_
+
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}-${task.name}-stage_bc_dagger
+
+exp_name: ${oc.select:task.name,test}-stage_bc_dagger
+save_interval: 100
+
+# The default phases add up to exactly 3,000 rollouts:
+#   500 + 7 * (100 + 200) + 100 + 172 + 128 = 3,000.
+# If bc_dagger_iterations is null, the entrypoint derives it from this sum.  A
+# user-supplied value must equal the sum so frame and phase schedules cannot
+# silently diverge.
+joint_warmup_iterations: 500
+stage_cycles: 7
+perception_iterations_per_cycle: 100
+actor_iterations_per_cycle: 200
+final_perception_iterations: 100
+final_actor_iterations: 172
+replay_q_calibration_iterations: 128
+calibration_control_mode: beta
+calibration_teacher_probability: 0.5
+
+# Staged resume is intentionally unsupported until its ephemeral actor/Q rings
+# and fresh final-calibration H5 have an explicit continuation contract.
+bc_dagger_checkpoint: null
+bc_dagger_copy_teacher_replay: false
+
+# Entrypoint/backend guards.  The script writes these again only after the PPO
+# checkpoint and complete phase schedule pass their fail-fast validation.
+_bc_dagger_staging_source: true
+_bc_dagger_stage: true
+
+algo:
+  # The joint warmup ends at the same boundary at which beta reaches zero.
+  dagger_control_mode: beta
+  dagger_beta_start: 1.0
+  dagger_beta_end: 0.0
+  dagger_beta_zero_iteration: 500
+
+  dagger_staging_enabled: true
+  dagger_stage_joint_warmup_iterations: 500
+  dagger_stage_cycles: 7
+  dagger_stage_perception_iterations: 100
+  dagger_stage_actor_iterations: 200
+  dagger_stage_final_perception_iterations: 100
+  dagger_stage_final_actor_iterations: 172
+  dagger_stage_calibration_iterations: 128
+  dagger_stage_calibration_control_mode: beta
+  dagger_stage_calibration_teacher_probability: 0.5
+
+wandb:
+  job_type: stage_bc_dagger
+  project: vaic_dagger

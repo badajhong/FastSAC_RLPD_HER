@@ -69,15 +69,29 @@ TEACHER_REPLAY_INITIAL_TRANSITION_FILTER = "step_count_gt_1"
 TEACHER_REPLAY_MIN_STEP_COUNT = 1
 STUDENT_REPLAY_MIN_STEP_COUNT = 5
 FASTSAC_ACTOR_BACKEND = "vaic_fastsac_tanh_gaussian_v2"
-BC_DAGGER_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_iql_v2"
+BC_DAGGER_TRAINING_ALGORITHM = (
+    "vaic_ppo_bc_dagger_student_sac_critic_v3"
+)
+BC_DAGGER_IQL_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_iql_v2"
 BC_DAGGER_LEGACY_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
 BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_independent_normal_bc_dagger_v1"
 BC_DAGGER_IQL_CRITIC_SEMANTICS = (
     "dataset_action_target_twin_expected_c51_expectile_v_to_scalar_td_"
     "c51_projection_v1"
 )
+BC_DAGGER_SAC_CRITIC_SEMANTICS = (
+    "beta_independent_half_teacher_half_student_executed_action_"
+    "stochastic_student_q_only_c51_clipped_double_q_v1"
+)
 BC_DAGGER_ACTOR_LEARNING_SEMANTICS = (
     "dagger_teacher_huber_bc_only_no_q_or_advantage_weighting_v1"
+)
+BC_DAGGER_STAGING_SEMANTICS = (
+    "joint_then_cyclic_perception_actor_then_final_perception_actor_"
+    "then_fresh_replay_q_v1"
+)
+BC_DAGGER_STAGING_REPLAY_SEMANTICS = (
+    "h5_disabled_until_final_q_calibration_v1"
 )
 BC_DAGGER_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
 BC_DAGGER_REPLAY_FORMAT_VERSION = 2
@@ -101,6 +115,172 @@ STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY = (
 STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY = (
     "_fastsac_stage2_behavior_max_abs_deviation"
 )
+
+
+def _validate_complete_bc_dagger_staging_source(state_dict) -> None:
+    """Reject incomplete or internally inconsistent staged BC sources.
+
+    Staged checkpoints deliberately retain the ordinary v3 BC-DAgger
+    training-algorithm marker so their final actor/Q contract remains directly
+    transferable.  The explicit staging state is therefore the only reliable
+    boundary between an evaluation-only intermediate checkpoint and the final
+    checkpoint paired with the fresh calibration H5.
+    """
+    staging = state_dict.get("bc_dagger_staging_state")
+    if staging is None:
+        return
+    if not isinstance(staging, dict):
+        raise ValueError("BC-DAgger staging state must be a mapping")
+    if staging.get("semantics") != BC_DAGGER_STAGING_SEMANTICS:
+        raise ValueError("BC-DAgger staging semantics mismatch")
+    if staging.get("persistent_replay_semantics") != (
+        BC_DAGGER_STAGING_REPLAY_SEMANTICS
+    ):
+        raise ValueError("BC-DAgger staged replay semantics mismatch")
+
+    config = staging.get("config")
+    if not isinstance(config, dict):
+        raise ValueError("BC-DAgger staging state lacks its phase schedule")
+    if config.get("semantics") != BC_DAGGER_STAGING_SEMANTICS:
+        raise ValueError("BC-DAgger staging schedule semantics mismatch")
+
+    def _count(name, *, positive):
+        value = config.get(name)
+        lower = 1 if positive else 0
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or int(value) < lower
+        ):
+            requirement = "positive" if positive else "non-negative"
+            raise ValueError(
+                f"BC-DAgger staging {name} must be a {requirement} integer"
+            )
+        return int(value)
+
+    joint = _count("joint_warmup_iterations", positive=True)
+    cycles = _count("cycles", positive=True)
+    perception = _count("perception_iterations", positive=True)
+    actor = _count("actor_iterations", positive=True)
+    final_perception = _count(
+        "final_perception_iterations", positive=False
+    )
+    final_actor = _count("final_actor_iterations", positive=False)
+    calibration = _count(
+        "replay_q_calibration_iterations", positive=True
+    )
+    if config.get("calibration_control_mode") != "beta":
+        raise ValueError(
+            "BC-DAgger staged calibration control mode must be beta"
+        )
+    calibration_probability = config.get(
+        "calibration_teacher_probability"
+    )
+    if (
+        isinstance(calibration_probability, bool)
+        or not isinstance(calibration_probability, (int, float, np.number))
+        or not math.isfinite(float(calibration_probability))
+        or not 0.0 < float(calibration_probability) < 1.0
+    ):
+        raise ValueError(
+            "BC-DAgger staged calibration teacher probability must be "
+            "finite and strictly between zero and one"
+        )
+    expected_rollouts = (
+        joint
+        + cycles * (perception + actor)
+        + final_perception
+        + final_actor
+        + calibration
+    )
+    rollout_count = staging.get("rollout_count")
+    if (
+        isinstance(rollout_count, bool)
+        or not isinstance(rollout_count, (int, np.integer))
+        or int(rollout_count) != expected_rollouts
+    ):
+        raise ValueError(
+            "Stage 2 requires the exact completed staged rollout budget: "
+            f"checkpoint={rollout_count!r}, expected={expected_rollouts}"
+        )
+    if (
+        staging.get("complete") is not True
+        or staging.get("phase") != "complete"
+        or staging.get("last_phase") != "replay_q_calibration"
+    ):
+        raise ValueError(
+            "Stage 2 requires a complete staged BC-DAgger checkpoint after "
+            "the final replay/Q calibration phase"
+        )
+
+    dagger_rollout_count = state_dict.get("dagger_rollout_count")
+    if (
+        isinstance(dagger_rollout_count, bool)
+        or not isinstance(dagger_rollout_count, (int, np.integer))
+        or int(dagger_rollout_count) != expected_rollouts
+    ):
+        raise ValueError(
+            "BC-DAgger staged/global rollout counters are inconsistent"
+        )
+    calibration_start_q_updates = staging.get(
+        "calibration_start_q_update_count"
+    )
+    calibration_q_updates = staging.get("calibration_q_updates")
+    total_q_updates = state_dict.get("q_update_count")
+    for name, value, lower in (
+        (
+            "calibration_start_q_update_count",
+            calibration_start_q_updates,
+            0,
+        ),
+        ("calibration_q_updates", calibration_q_updates, 1),
+        ("q_update_count", total_q_updates, 1),
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or int(value) < lower
+        ):
+            raise ValueError(
+                f"BC-DAgger staged {name} must be an integer >= {lower}"
+            )
+    if int(total_q_updates) != (
+        int(calibration_start_q_updates) + int(calibration_q_updates)
+    ):
+        raise ValueError(
+            "BC-DAgger staged terminal Q-update accounting is inconsistent"
+        )
+
+    fresh_replay_id = staging.get("fresh_replay_id")
+    checkpoint_replay_id = state_dict.get("teacher_replay_id")
+    if (
+        not isinstance(fresh_replay_id, str)
+        or not fresh_replay_id
+        or fresh_replay_id != checkpoint_replay_id
+    ):
+        raise ValueError("BC-DAgger staged replay lineage mismatch")
+    replay_state = state_dict.get("teacher_replay_state")
+    if not isinstance(replay_state, dict):
+        raise ValueError(
+            "Completed staged BC-DAgger checkpoint lacks final replay metadata"
+        )
+    replay_size = replay_state.get("size")
+    replay_seen = replay_state.get("seen")
+    if (
+        replay_state.get("replay_id") != fresh_replay_id
+        or not isinstance(replay_state.get("snapshot_id"), str)
+        or not replay_state.get("snapshot_id")
+        or isinstance(replay_size, bool)
+        or not isinstance(replay_size, (int, np.integer))
+        or int(replay_size) < 1
+        or isinstance(replay_seen, bool)
+        or not isinstance(replay_seen, (int, np.integer))
+        or int(replay_seen) < int(replay_size)
+    ):
+        raise ValueError(
+            "Completed staged BC-DAgger replay metadata is incomplete or "
+            "has the wrong lineage"
+        )
 FASTSAC_ACTION_PARAMETERIZATION = (
     "teacher_reference_centered_student_absolute_asymmetric_v2"
 )
@@ -152,6 +332,12 @@ FASTSAC_STAGE1_ACTOR_OBJECTIVES = ("sac", "reference_awac")
 FASTSAC_STAGE1_REFERENCE_AWAC_SEMANTICS = (
     "target_twin_replay_minus_reference_pessimistic_normalized_exp_"
     "detached_scale_v1"
+)
+FASTSAC_STAGE2_ACTOR_OBJECTIVES = ("sac", "awac")
+FASTSAC_STAGE2_OFFICIAL_AWAC_SEMANTICS = (
+    "online_twin_min_replay_minus_current_policy_sampled_min_q_"
+    "batch_softmax_mean_one_weighted_replay_log_likelihood_"
+    "hard_policy_evaluation_backup_no_entropy_gate_or_anchor_v1"
 )
 FASTSAC_STAGE1_BEHAVIOR_UNCERTAINTY_GATE_SEMANTICS = (
     "online_twin_sampled_policy_minus_same_row_replay_mean_improvement_"
@@ -555,6 +741,39 @@ def _reference_awac_weights(
         torch.finfo(unnormalized.dtype).tiny
     )
     return unnormalized / denominator, advantages
+
+
+def _official_awac_weights(
+    advantages: torch.Tensor,
+    beta: float,
+    score_clip: float | None = None,
+) -> torch.Tensor:
+    """Return the authors' batch-normalized AWAC replay weights.
+
+    Berkeley's public AWAC trainer applies an optional upper clamp to the
+    advantage, takes a softmax over the minibatch, and multiplies by the batch
+    size.  The last step makes the detached weights average to one while
+    retaining the exact relative exponential weighting from the paper.
+    """
+    if advantages.ndim != 1 or advantages.numel() < 1:
+        raise ValueError(
+            "Official AWAC advantages must be a non-empty one-dimensional "
+            "minibatch"
+        )
+    beta = float(beta)
+    if not math.isfinite(beta) or beta <= 0.0:
+        raise ValueError("Official AWAC beta must be finite and positive")
+    if score_clip is not None:
+        score_clip = float(score_clip)
+        if not math.isfinite(score_clip) or score_clip <= 0.0:
+            raise ValueError(
+                "Official AWAC score clip must be finite and positive or None"
+            )
+        advantages = advantages.clamp(max=score_clip)
+    if not torch.isfinite(advantages).all():
+        raise RuntimeError("Official AWAC advantages contain non-finite values")
+    probabilities = F.softmax(advantages / beta, dim=0)
+    return probabilities * advantages.new_tensor(float(advantages.numel()))
 
 
 class FastSACTanhNormal(TanhNormal):
@@ -2798,6 +3017,7 @@ class BCDaggerOfflineReplayH5:
         expected_critic_obs_keys=None,
         expected_vecnorm_fingerprint=None,
         expected_action_clip=None,
+        expected_replay_metadata=None,
     ):
         import h5py
 
@@ -2808,6 +3028,10 @@ class BCDaggerOfflineReplayH5:
         self.path = os.path.abspath(os.fspath(path))
         self.device = torch.device(device)
         self.rng = torch.Generator(device=self.device).manual_seed(int(seed))
+        if expected_replay_metadata is not None and not isinstance(
+            expected_replay_metadata, dict
+        ):
+            raise ValueError("expected_replay_metadata must be a mapping")
         if expected_action_clip is not None:
             expected_action_clip = float(expected_action_clip)
             if (
@@ -2928,6 +3152,43 @@ class BCDaggerOfflineReplayH5:
             file_size = int(replay.attrs.get("num_transitions", -1))
             if file_size < 1:
                 raise ValueError(f"BC-DAgger replay is empty: {self.path}")
+            actual_replay_metadata = {
+                "replay_id": str(replay.attrs.get("replay_id", "")),
+                "snapshot_id": str(replay.attrs.get("snapshot_id", "")),
+                "snapshot_iteration": int(
+                    replay.attrs.get("snapshot_iteration", -1)
+                ),
+                "checkpoint_name": str(
+                    replay.attrs.get("checkpoint_name", "")
+                ),
+                "size": file_size,
+                "seen": int(
+                    replay.attrs.get("num_seen_transitions", -1)
+                ),
+            }
+            if expected_replay_metadata is not None:
+                lineage_fields = (
+                    "replay_id",
+                    "snapshot_id",
+                    "snapshot_iteration",
+                    "checkpoint_name",
+                    "size",
+                    "seen",
+                )
+                mismatched_lineage = {
+                    name: (
+                        actual_replay_metadata[name],
+                        expected_replay_metadata.get(name),
+                    )
+                    for name in lineage_fields
+                    if actual_replay_metadata[name]
+                    != expected_replay_metadata.get(name)
+                }
+                if mismatched_lineage:
+                    raise ValueError(
+                        "BC-DAgger replay does not match the completed staged "
+                        f"checkpoint snapshot: {mismatched_lineage}"
+                    )
             self.size = (
                 file_size if max_size is None else min(file_size, int(max_size))
             )
@@ -2954,6 +3215,7 @@ class BCDaggerOfflineReplayH5:
                     None if replay_action_clip is None
                     else float(replay_action_clip)
                 ),
+                "replay_id": actual_replay_metadata["replay_id"],
             }
             self.data = {}
             try:
@@ -3271,25 +3533,27 @@ class FastSACVelFinetuneConfig(FastSACVelConfig):
     finetune_checkpoint_source: str = "auto"
     # Keep the historical warm-start by default.  Set this to false to load
     # only the actor/perception/EMA student state and initialize Stage-2 Q1/Q2
-    # (and both targets) from the current FastSAC seed instead of Stage-1 IQL.
+    # (and both targets) from the current FastSAC seed instead of Stage-1 Q.
     load_pretrained_q: bool = True
     # Stage-2 counts accepted online transitions, not vector control steps,
     # before beginning Q updates.  The actor and alpha have a second, longer
     # Q-update gate below.
     sac_learning_starts: int = 98_304
-    # Match one 512-row vector step with one replay minibatch while adapting the
-    # transferred IQL critic conservatively rather than repeatedly oversampling
-    # each newly accepted transition.
+    # Match one 512-row vector step with one replay minibatch by default.
     sac_batch_size: int = 512
     sac_updates_per_env_step: int = 1
     q_lr: float = 3e-5
     sac_policy_frequency: int = 128
     sac_actor_lr: float = 3e-7
+    # Optional BC-adapter-only learning rate for its global log standard
+    # deviation. ``None`` preserves the legacy single AdamW parameter group,
+    # including its exact checkpoint/resume topology. An explicit value keeps
+    # the actor mean at ``sac_actor_lr`` and gives only
+    # ``bc_dagger_sac_adapter.log_std`` a separate optimizer group.
+    sac_actor_log_std_lr: float | None = None
     sac_alpha_lr: float = 2e-5
-    # The BC/IQL critic was trained with a hard Bellman backup. Stage 2 starts
-    # from that exact objective and only introduces SAC temperature after the
-    # actor is actually released. The raw alpha is deliberately conservative;
-    # its effective value is linearly ramped over the configured Q updates.
+    # The raw alpha is deliberately conservative; Stage 2 ramps its effective
+    # value after actor release even when Q came from SAC-compatible DAgger.
     sac_alpha_init: float = 1e-5
     sac_alpha_ramp_q_updates: int = 20_000
     # In the raw-action unit reference, the standard SAC target is -action_dim.
@@ -3298,6 +3562,26 @@ class FastSACVelFinetuneConfig(FastSACVelConfig):
     sac_tau: float = 0.001
     sac_max_grad_norm: float = 1.0
     sac_actor_learning_starts_q_updates: int = 8_000
+    # Stage-2 actor objective. ``awac`` is the paper/authors' implementation:
+    # replay-action weighted maximum likelihood from Q(s, a_data)-V^pi(s),
+    # with a hard (alpha=0) policy-evaluation backup. It is distinct from the
+    # Stage-1-only custom ``reference_awac`` objective above.
+    sac_finetune_actor_objective: str = "sac"
+    # Official AWAC calls this lambda/beta. The published MuJoCo default is 1;
+    # its appropriate scale depends on the reward and learned Q magnitude.
+    sac_awac_beta: float = 1.0
+    # Number of current-policy action samples used to estimate V^pi(s). The
+    # authors' default implementation uses one sample.
+    sac_awac_v_samples: int = 1
+    # Optional upper clamp on A before A/beta and batch softmax. None matches
+    # the official default; some published manipulation configs use 0.5.
+    sac_awac_score_clip: float | None = None
+    # Optional human-readable Stage-2-local start gate. When configured, this
+    # zero-based finetune iteration replaces the Q-update threshold above:
+    # iterations [0, N) remain actor-frozen and iteration N is first eligible.
+    # The cumulative counter is checkpointed, so same-stage resumes do not
+    # restart the wait. None preserves the historical Q-update schedule.
+    sac_actor_learning_starts_finetune_iteration: int | None = None
     # The frozen BC policy is a detached critic-confidence reference, not a
     # behavior-cloning loss. Every scheduled actor tick is independently
     # accepted only when enough sampled actions improve over that reference in
@@ -3317,6 +3601,13 @@ class FastSACVelFinetuneConfig(FastSACVelConfig):
     # Dedicated Stage-2 exploration state. This is intentionally independent
     # of PPO Actor.actor_std, which pure DAgger BC never optimized or sampled.
     sac_bc_initial_action_std: float = 0.01
+    # Optional physical-action exploration reset applied exactly once when a
+    # BC-DAgger checkpoint is first transferred into Stage 2. ``None`` retains
+    # the checkpointed stochastic adapter bit-for-bit. A positive value lets an
+    # offline-to-online run deliberately start with broader support without
+    # mutating the BC-DAgger checkpoint contract; same-stage resumes restore the
+    # learned adapter and never reapply this reset.
+    sac_stage2_initial_action_std: float | None = None
     sac_bc_log_std_min: float = -8.0
     sac_bc_log_std_max: float = -2.0
     # Training collection samples the same bounded distribution used by SAC so
@@ -3482,6 +3773,31 @@ def _validate_fastsac_finetune_config(cfg) -> None:
         )
     if not isinstance(getattr(cfg, "load_pretrained_q", True), bool):
         raise ValueError("load_pretrained_q must be a boolean")
+    actor_objective = str(getattr(
+        cfg, "sac_finetune_actor_objective", "sac"
+    ))
+    if actor_objective not in FASTSAC_STAGE2_ACTOR_OBJECTIVES:
+        raise ValueError(
+            "sac_finetune_actor_objective must be one of "
+            f"{FASTSAC_STAGE2_ACTOR_OBJECTIVES}, got {actor_objective!r}"
+        )
+    awac_beta = float(getattr(cfg, "sac_awac_beta", 1.0))
+    if not math.isfinite(awac_beta) or awac_beta <= 0.0:
+        raise ValueError("sac_awac_beta must be finite and positive")
+    awac_v_samples = getattr(cfg, "sac_awac_v_samples", 1)
+    if (
+        isinstance(awac_v_samples, bool)
+        or not isinstance(awac_v_samples, (int, np.integer))
+        or int(awac_v_samples) < 1
+    ):
+        raise ValueError("sac_awac_v_samples must be a positive integer")
+    awac_score_clip = getattr(cfg, "sac_awac_score_clip", None)
+    if awac_score_clip is not None:
+        awac_score_clip = float(awac_score_clip)
+        if not math.isfinite(awac_score_clip) or awac_score_clip <= 0.0:
+            raise ValueError(
+                "sac_awac_score_clip must be finite and positive or null"
+            )
     for name in (
         "sac_learning_starts",
         "sac_actor_learning_starts_q_updates",
@@ -3493,6 +3809,18 @@ def _validate_fastsac_finetune_config(cfg) -> None:
             or int(value) < 0
         ):
             raise ValueError(f"{name} must be a non-negative integer")
+    actor_start_iteration = getattr(
+        cfg, "sac_actor_learning_starts_finetune_iteration", None
+    )
+    if actor_start_iteration is not None and (
+        isinstance(actor_start_iteration, bool)
+        or not isinstance(actor_start_iteration, (int, np.integer))
+        or int(actor_start_iteration) < 0
+    ):
+        raise ValueError(
+            "sac_actor_learning_starts_finetune_iteration must be null or a "
+            "non-negative integer"
+        )
     alpha_ramp_q_updates = getattr(cfg, "sac_alpha_ramp_q_updates")
     if (
         isinstance(alpha_ramp_q_updates, bool)
@@ -3579,6 +3907,38 @@ def _validate_fastsac_finetune_config(cfg) -> None:
             "sac_bc_initial_action_std maps outside the dedicated BC-adapter "
             "log-std bounds"
         )
+    stage2_initial_action_std = getattr(
+        cfg, "sac_stage2_initial_action_std", None
+    )
+    if stage2_initial_action_std is not None:
+        if isinstance(stage2_initial_action_std, bool):
+            raise ValueError(
+                "sac_stage2_initial_action_std must be a finite positive "
+                "physical-action standard deviation or null"
+            )
+        try:
+            stage2_initial_action_std = float(stage2_initial_action_std)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "sac_stage2_initial_action_std must be a finite positive "
+                "physical-action standard deviation or null"
+            ) from exc
+        if (
+            not math.isfinite(stage2_initial_action_std)
+            or stage2_initial_action_std <= 0.0
+        ):
+            raise ValueError(
+                "sac_stage2_initial_action_std must be a finite positive "
+                "physical-action standard deviation or null"
+            )
+        stage2_initial_log_std = math.log(
+            stage2_initial_action_std / action_clip
+        )
+        if not bc_log_std_min <= stage2_initial_log_std <= bc_log_std_max:
+            raise ValueError(
+                "sac_stage2_initial_action_std maps outside the dedicated "
+                "BC-adapter log-std bounds"
+            )
     anchor_start = float(cfg.sac_bc_anchor_coef_start)
     anchor_end = float(cfg.sac_bc_anchor_coef_end)
     anchor_huber_delta = float(cfg.sac_bc_anchor_huber_delta)
@@ -3613,6 +3973,22 @@ def _validate_fastsac_finetune_config(cfg) -> None:
         value = float(getattr(cfg, name))
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError(f"{name} must be finite and positive")
+    actor_log_std_lr = getattr(cfg, "sac_actor_log_std_lr", None)
+    if actor_log_std_lr is not None:
+        if isinstance(actor_log_std_lr, bool):
+            raise ValueError(
+                "sac_actor_log_std_lr must be finite and positive or null"
+            )
+        try:
+            actor_log_std_lr = float(actor_log_std_lr)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                "sac_actor_log_std_lr must be finite and positive or null"
+            ) from None
+        if not math.isfinite(actor_log_std_lr) or actor_log_std_lr <= 0.0:
+            raise ValueError(
+                "sac_actor_log_std_lr must be finite and positive or null"
+            )
     tau = float(cfg.sac_tau)
     if not math.isfinite(tau) or not 0.0 <= tau <= 1.0:
         raise ValueError("sac_tau must be finite and in [0, 1]")
@@ -3646,6 +4022,27 @@ def _validate_fastsac_finetune_config(cfg) -> None:
         raise ValueError("sac_clipped_double_q must be a boolean")
     if not isinstance(cfg.sac_use_autotune, bool):
         raise ValueError("sac_use_autotune must be a boolean")
+    if actor_objective == "awac":
+        incompatible = []
+        if bool(cfg.sac_use_autotune):
+            incompatible.append("sac_use_autotune")
+        if bool(cfg.sac_actor_confidence_gate):
+            incompatible.append("sac_actor_confidence_gate")
+        if anchor_start != 0.0 or anchor_end != 0.0:
+            incompatible.extend((
+                "sac_bc_anchor_coef_start",
+                "sac_bc_anchor_coef_end",
+            ))
+        if bool(cfg.sac_deterministic_rollout):
+            incompatible.append("sac_deterministic_rollout")
+        if not bool(cfg.sac_clipped_double_q):
+            incompatible.append("sac_clipped_double_q")
+        if incompatible:
+            raise ValueError(
+                "Official Stage-2 AWAC uses stochastic policy evaluation, "
+                "alpha=0, and no SAC confidence gate or BC anchor; set "
+                f"{sorted(set(incompatible))} to their AWAC-compatible values"
+            )
 
 
 _in_keys: List[str] = (
@@ -4614,6 +5011,9 @@ class FastSACVEL(_FastSACVAICBase):
     def _actor_backend_metadata(self):
         if self.actor_backend == FASTSAC_BC_DAGGER_ACTOR_BACKEND:
             deterministic_rollout = bool(self.cfg.sac_deterministic_rollout)
+            official_awac = str(getattr(
+                self.cfg, "sac_finetune_actor_objective", "sac"
+            )) == "awac"
             metadata = {
                 "action_parameterization": (
                     "bc_dagger_clipped_mean_deterministic_rollout_"
@@ -4664,14 +5064,39 @@ class FastSACVEL(_FastSACVAICBase):
                     else "frozen_stochastic_behavior_hard_target_v2"
                 ),
                 "q_only_alpha_semantics": (
+                    "hard_policy_evaluation_effective_alpha_zero_no_dual_v1"
+                    if official_awac
+                    else
                     "effective_zero_until_actual_actor_release_then_linear_"
                     "ramp_shared_by_q_actor_and_dual_v2"
                 ),
-                "alpha_ramp_q_updates": int(
-                    self.cfg.sac_alpha_ramp_q_updates
+                "alpha_ramp_q_updates": (
+                    0
+                    if official_awac
+                    else int(self.cfg.sac_alpha_ramp_q_updates)
                 ),
                 "joint_names": list(self.joint_names),
             }
+            stage2_initial_action_std = getattr(
+                self.cfg, "sac_stage2_initial_action_std", None
+            )
+            if stage2_initial_action_std is not None:
+                stage2_initial_action_std = float(stage2_initial_action_std)
+                metadata.update({
+                    "stage2_initial_action_std": stage2_initial_action_std,
+                    "stage2_initial_log_std": math.log(
+                        stage2_initial_action_std
+                        / float(self.cfg.sac_bc_action_clip)
+                    ),
+                    "stage2_initial_action_std_semantics": (
+                        "fresh_bc_dagger_transfer_reset_once_v1"
+                    ),
+                })
+            if official_awac:
+                metadata.update({
+                    "finetune_actor_objective": "awac",
+                    "alpha_ramp_active": False,
+                })
             if not deterministic_rollout:
                 metadata["rollout_rng"] = (
                     "dedicated_checkpointed_torch_generator_q_seed_plus_2_v1"
@@ -5066,10 +5491,11 @@ class FastSACVEL(_FastSACVAICBase):
             )
         if (
             bool(getattr(self.cfg, "load_pretrained_q", True))
-            and bool(getattr(self.cfg, "sac_q_normalize_actions", True))
+            and not bool(getattr(self.cfg, "sac_q_normalize_actions", True))
         ):
             raise ValueError(
-                "BC-DAgger Q transfer requires sac_q_normalize_actions=false"
+                "SAC-critic BC-DAgger Q transfer requires "
+                "sac_q_normalize_actions=true"
             )
         if bool(getattr(self.cfg, "load_pretrained_q", True)):
             pretrained_q_incompatible = {
@@ -5084,6 +5510,9 @@ class FastSACVEL(_FastSACVAICBase):
                     rel_tol=0.0,
                     abs_tol=1e-12,
                 ),
+                "sac_clipped_double_q": not bool(getattr(
+                    self.cfg, "sac_clipped_double_q", True
+                )),
             }
             incompatible = [
                 name
@@ -5092,8 +5521,9 @@ class FastSACVEL(_FastSACVAICBase):
             ]
             if incompatible:
                 raise ValueError(
-                    "Pretrained BC-DAgger Q requires its original early-fusion "
-                    "raw-action input with unit gain; incompatible settings: "
+                    "Pretrained BC-DAgger Q requires early-fusion normalized "
+                    "absolute actions, unit gain and clipped double Q; "
+                    "incompatible settings: "
                     f"{incompatible}"
                 )
         action_clip = float(self.cfg.sac_bc_action_clip)
@@ -7610,17 +8040,33 @@ class FastSACVelFinetune(FastSACVEL):
         if hasattr(self, "opt_dr_estimator"):
             self.opt_dr_estimator = None
 
-    def _stage2_actor_parameters(self):
-        if not self._uses_bc_dagger_finetune_source():
-            return tuple(self.actor_adapt.parameters())
+    def _stage2_bc_actor_mean_parameters(self):
+        """Return the BC actor parameters excluding both Gaussian std paths."""
         unused_ppo_std = self._ppo_actor_core(self.actor_adapt).actor_std
-        parameters = [
+        return tuple(
             parameter
             for parameter in self.actor_adapt.parameters()
             if parameter is not unused_ppo_std
-        ]
-        parameters.extend(self.bc_dagger_sac_adapter.parameters())
-        return tuple(parameters)
+        )
+
+    def _stage2_actor_parameters(self):
+        if not self._uses_bc_dagger_finetune_source():
+            return tuple(self.actor_adapt.parameters())
+        return (
+            *self._stage2_bc_actor_mean_parameters(),
+            *tuple(self.bc_dagger_sac_adapter.parameters()),
+        )
+
+    def _reset_bc_dagger_transfer_action_std(self):
+        """Apply the opt-in exploration reset for a fresh Stage-2 transfer."""
+        action_std = getattr(self.cfg, "sac_stage2_initial_action_std", None)
+        if action_std is None:
+            return
+        initial_log_std = math.log(
+            float(action_std) / float(self.cfg.sac_bc_action_clip)
+        )
+        with torch.no_grad():
+            self.bc_dagger_sac_adapter.log_std.fill_(initial_log_std)
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         if cfg.enable_residual_distillation:
@@ -7633,6 +8079,15 @@ class FastSACVelFinetune(FastSACVEL):
         super().__init__(cfg, observation_spec, action_spec, reward_spec, device, env)
         if bool(cfg.sac_freeze_perception):
             self._freeze_stage2_perception()
+        actor_log_std_lr = getattr(cfg, "sac_actor_log_std_lr", None)
+        if (
+            actor_log_std_lr is not None
+            and not self._uses_bc_dagger_finetune_source()
+        ):
+            raise ValueError(
+                "sac_actor_log_std_lr is supported only for a Stage-2 "
+                "BC-DAgger actor adapter"
+            )
         if self._uses_bc_dagger_finetune_source():
             self.bc_dagger_actor_anchor = copy.deepcopy(
                 self.actor_adapt
@@ -7642,10 +8097,66 @@ class FastSACVelFinetune(FastSACVEL):
         )
         self.online_replay = OnlineReplay(cfg.online_buffer_capacity, device=self.device)
         self.offline_replay = None
-        self.sac_actor_optimizer = torch.optim.AdamW(
-            self._stage2_trainable_actor_parameters, lr=cfg.sac_actor_lr,
-            weight_decay=cfg.q_weight_decay, betas=(0.9, 0.95),
-        )
+        if actor_log_std_lr is None:
+            # Keep this constructor byte-for-byte equivalent to the historical
+            # topology so default checkpoints retain one group and resume their
+            # AdamW moments without any migration.
+            self.sac_actor_optimizer = torch.optim.AdamW(
+                self._stage2_trainable_actor_parameters, lr=cfg.sac_actor_lr,
+                weight_decay=cfg.q_weight_decay, betas=(0.9, 0.95),
+            )
+        else:
+            mean_parameters = self._stage2_bc_actor_mean_parameters()
+            log_std_parameters = tuple(
+                self.bc_dagger_sac_adapter.parameters()
+            )
+            if not mean_parameters or len(log_std_parameters) != 1:
+                raise RuntimeError(
+                    "Stage-2 BC actor optimizer requires non-empty mean "
+                    "parameters and one dedicated log-std parameter"
+                )
+            mean_parameter_ids = tuple(map(id, mean_parameters))
+            log_std_parameter_ids = tuple(map(id, log_std_parameters))
+            trainable_parameter_ids = tuple(map(
+                id, self._stage2_trainable_actor_parameters
+            ))
+            if (
+                len(set(mean_parameter_ids)) != len(mean_parameter_ids)
+                or len(set(log_std_parameter_ids))
+                != len(log_std_parameter_ids)
+                or set(mean_parameter_ids) & set(log_std_parameter_ids)
+            ):
+                raise RuntimeError(
+                    "Stage-2 BC actor mean and log-std optimizer groups must "
+                    "be internally unique and disjoint"
+                )
+            grouped_parameter_ids = (
+                set(mean_parameter_ids) | set(log_std_parameter_ids)
+            )
+            if (
+                len(set(trainable_parameter_ids))
+                != len(trainable_parameter_ids)
+                or grouped_parameter_ids != set(trainable_parameter_ids)
+            ):
+                raise RuntimeError(
+                    "Stage-2 BC actor optimizer groups must exactly cover "
+                    "the trainable actor parameters"
+                )
+            self.sac_actor_optimizer = torch.optim.AdamW(
+                (
+                    {
+                        "params": mean_parameters,
+                        "lr": float(cfg.sac_actor_lr),
+                    },
+                    {
+                        "params": log_std_parameters,
+                        "lr": float(actor_log_std_lr),
+                    },
+                ),
+                lr=cfg.sac_actor_lr,
+                weight_decay=cfg.q_weight_decay,
+                betas=(0.9, 0.95),
+            )
         self.opt_q = torch.optim.AdamW(
             self.qnet.parameters(), lr=cfg.q_lr, weight_decay=cfg.q_weight_decay,
             betas=(0.9, 0.95), fused=str(device).startswith("cuda"),
@@ -7683,6 +8194,15 @@ class FastSACVelFinetune(FastSACVEL):
         # semantic/schema checks below, but intentionally do not pass the
         # checkpoint replay id or snapshot manifest to OfflineReplayH5.
         if self._uses_bc_dagger_finetune_source():
+            expected_replay_metadata = (
+                self._loaded_teacher_replay_metadata
+                if getattr(
+                    self,
+                    "_requires_exact_bc_dagger_replay_snapshot",
+                    False,
+                )
+                else None
+            )
             self.offline_replay = BCDaggerOfflineReplayH5(
                 path,
                 self._q_actor_dim,
@@ -7700,6 +8220,7 @@ class FastSACVelFinetune(FastSACVEL):
                     self._replay_vecnorm_fingerprint
                 ),
                 expected_action_clip=float(self.cfg.sac_bc_action_clip),
+                expected_replay_metadata=expected_replay_metadata,
             )
         else:
             self.offline_replay = OfflineReplayH5(
@@ -7738,6 +8259,20 @@ class FastSACVelFinetune(FastSACVEL):
     def _uses_pretrained_q(self) -> bool:
         return bool(getattr(self.cfg, "load_pretrained_q", True))
 
+    def _stage2_actor_objective(self) -> str:
+        objective = str(getattr(
+            self.cfg, "sac_finetune_actor_objective", "sac"
+        ))
+        if objective not in FASTSAC_STAGE2_ACTOR_OBJECTIVES:
+            raise ValueError(
+                "sac_finetune_actor_objective must be one of "
+                f"{FASTSAC_STAGE2_ACTOR_OBJECTIVES}, got {objective!r}"
+            )
+        return objective
+
+    def _stage2_uses_awac(self) -> bool:
+        return self._stage2_actor_objective() == "awac"
+
     def _stage2_schedule_config(self):
         names = (
             "load_pretrained_q",
@@ -7771,7 +8306,7 @@ class FastSACVelFinetune(FastSACVEL):
             "sac_freeze_perception",
             "teacher_buffer_ratio",
         )
-        return {
+        schedule = {
             "version": 4,
             "entropy_semantics": (
                 "fixed_reference_action_density_hard_q_bridge_then_"
@@ -7782,6 +8317,71 @@ class FastSACVelFinetune(FastSACVEL):
             ),
             **{name: getattr(self.cfg, name) for name in names},
         }
+        if self._stage2_uses_awac():
+            schedule.update({
+                "version": 6,
+                "sac_finetune_actor_objective": "awac",
+                "sac_awac_beta": float(self.cfg.sac_awac_beta),
+                "sac_awac_v_samples": int(self.cfg.sac_awac_v_samples),
+                "sac_awac_score_clip": (
+                    None
+                    if self.cfg.sac_awac_score_clip is None
+                    else float(self.cfg.sac_awac_score_clip)
+                ),
+                "actor_objective_semantics": (
+                    FASTSAC_STAGE2_OFFICIAL_AWAC_SEMANTICS
+                ),
+                "entropy_semantics": "official_awac_effective_alpha_zero_v1",
+                "actor_confidence_gate_semantics": (
+                    "disabled_for_official_awac"
+                ),
+            })
+        actor_start_iteration = getattr(
+            self.cfg,
+            "sac_actor_learning_starts_finetune_iteration",
+            None,
+        )
+        if actor_start_iteration is not None:
+            schedule.update({
+                "version": 7 if self._stage2_uses_awac() else 5,
+                "actor_start_semantics": (
+                    "zero_based_cumulative_stage2_finetune_iteration_gte_"
+                    "then_q_frequency_v1"
+                ),
+                "sac_actor_learning_starts_finetune_iteration": int(
+                    actor_start_iteration
+                ),
+                # One iteration contains train_every vector-control steps.
+                # Locking it prevents a resume from silently changing how much
+                # experience the human-readable threshold represents.
+                "actor_start_train_every": int(self.cfg.train_every),
+            })
+        stage2_initial_action_std = getattr(
+            self.cfg, "sac_stage2_initial_action_std", None
+        )
+        if stage2_initial_action_std is not None:
+            schedule.update({
+                "version": 8,
+                "sac_stage2_initial_action_std": float(
+                    stage2_initial_action_std
+                ),
+                "stage2_initial_action_std_semantics": (
+                    "fresh_bc_dagger_transfer_reset_once_then_resume_state_v1"
+                ),
+            })
+        actor_log_std_lr = getattr(
+            self.cfg, "sac_actor_log_std_lr", None
+        )
+        if actor_log_std_lr is not None:
+            schedule.update({
+                "version": 9,
+                "sac_actor_log_std_lr": float(actor_log_std_lr),
+                "actor_optimizer_semantics": (
+                    "bc_dagger_actor_mean_and_adapter_log_std_separate_"
+                    "adamw_parameter_groups_v1"
+                ),
+            })
+        return schedule
 
     def _checkpoint_for_q_transfer(self, state_dict, *, load_q=None):
         """Return checkpoint modules with Q entries selected by configuration.
@@ -7820,13 +8420,16 @@ class FastSACVelFinetune(FastSACVEL):
                 "Checkpoint has no transferable Q1/Q2. Use a checkpoint trained "
                 "with scripts/bc_dagger.py or algo=fastsac_vel_train."
             )
-        if state_dict.get("training_algorithm") == BC_DAGGER_TRAINING_ALGORITHM:
+        if state_dict.get("training_algorithm") in (
+            BC_DAGGER_TRAINING_ALGORITHM,
+            BC_DAGGER_IQL_TRAINING_ALGORITHM,
+        ):
             return self._load_bc_dagger_state_dict(state_dict, strict)
         if state_dict.get("training_algorithm") == (
             BC_DAGGER_LEGACY_TRAINING_ALGORITHM
         ):
             raise ValueError(
-                "Legacy BC-DAgger Q checkpoints predate IQL critic training. "
+                "Legacy BC-DAgger checkpoints predate compatible critic training. "
                 "Run scripts/bc_dagger.py again before Stage-2 FastSAC."
             )
         if (
@@ -7894,6 +8497,10 @@ class FastSACVelFinetune(FastSACVEL):
             self.log_alpha.data.fill_(float(np.log(self.cfg.sac_alpha_init)))
             self.q_update_count = 0
             self.sac_update_count = 0
+            self.sac_environment_steps = 0
+            self.sac_rollout_count = 0
+            self.sac_actor_update_count = 0
+            self.sac_alpha_update_count = 0
             # Stage 2 is a new learning process, just like its fresh alpha and
             # optimizer state.  Do not inherit the teacher's advanced sampling
             # streams or silently ignore the Stage-2 q_seed.
@@ -7939,32 +8546,55 @@ class FastSACVelFinetune(FastSACVEL):
                 # Retain provenance for checkpoint logging, but do not require
                 # the next stage-2 invocation to select the identical dataset.
                 self._loaded_teacher_replay_metadata = copy.deepcopy(replay_state)
-            iql_source = state_dict.get("bc_dagger_iql_source")
-            if isinstance(iql_source, dict):
-                self._bc_dagger_iql_source = copy.deepcopy(iql_source)
+            critic_source = state_dict.get(
+                "bc_dagger_critic_source",
+                state_dict.get("bc_dagger_iql_source"),
+            )
+            if isinstance(critic_source, dict):
+                self._bc_dagger_critic_source = copy.deepcopy(critic_source)
         return failed
 
     def _load_bc_dagger_state_dict(self, state_dict, strict=True):
         load_pretrained_q = self._uses_pretrained_q()
+        source_algorithm = state_dict.get("training_algorithm")
+        sac_critic_source = source_algorithm == BC_DAGGER_TRAINING_ALGORITHM
+        if source_algorithm not in (
+            BC_DAGGER_TRAINING_ALGORITHM,
+            BC_DAGGER_IQL_TRAINING_ALGORITHM,
+        ):
+            raise ValueError("Unsupported BC-DAgger checkpoint generation")
         if not self._uses_bc_dagger_finetune_source():
             raise ValueError(
                 "A BC-DAgger checkpoint requires "
                 "algo.finetune_checkpoint_source=bc_dagger (or auto detection)"
             )
+        _validate_complete_bc_dagger_staging_source(state_dict)
+        self._requires_exact_bc_dagger_replay_snapshot = (
+            state_dict.get("bc_dagger_staging_state") is not None
+        )
         if state_dict.get("actor_backend") != BC_DAGGER_ACTOR_BACKEND:
             raise ValueError("BC-DAgger checkpoint actor backend mismatch")
+        if load_pretrained_q and not sac_critic_source:
+            raise ValueError(
+                "IQL-v2 BC-DAgger Q does not match the current Stage-2 "
+                "SAC/AWAC critic topology or policy-evaluation backup. Use "
+                "algo.load_pretrained_q=false or train a v3 SAC critic."
+            )
+        if sac_critic_source and "bc_dagger_sac_adapter" not in state_dict:
+            raise KeyError(
+                "SAC-critic BC-DAgger checkpoint is missing its dedicated "
+                "stochastic-policy adapter"
+            )
         if load_pretrained_q and state_dict.get(
             "critic_learning_semantics"
-        ) != BC_DAGGER_IQL_CRITIC_SEMANTICS:
-            raise ValueError("BC-DAgger checkpoint IQL critic semantics mismatch")
+        ) != BC_DAGGER_SAC_CRITIC_SEMANTICS:
+            raise ValueError("BC-DAgger SAC critic semantics mismatch")
         if state_dict.get("actor_learning_semantics") != (
             BC_DAGGER_ACTOR_LEARNING_SEMANTICS
         ):
             raise ValueError(
                 "BC-DAgger checkpoint actor was not trained by pure DAgger BC"
             )
-        if load_pretrained_q and "iql_value" not in state_dict:
-            raise KeyError("BC-DAgger checkpoint is missing its IQL value network")
         checkpoint_fingerprint = state_dict.get("vecnorm_fingerprint")
         if (
             checkpoint_fingerprint is not None
@@ -7992,10 +8622,6 @@ class FastSACVelFinetune(FastSACVEL):
                 "BC-DAgger checkpoint action clip does not match the Stage-2 "
                 "actor/replay/Q support"
             )
-        if load_pretrained_q and "iql_expectile" not in backend_cfg:
-            raise ValueError(
-                "BC-DAgger checkpoint lacks its IQL expectile configuration"
-            )
         expected_q = {
             "q_hidden_dim": int(self.cfg.q_hidden_dim),
             "q_num_atoms": int(self.cfg.q_num_atoms),
@@ -8009,14 +8635,114 @@ class FastSACVelFinetune(FastSACVEL):
                 f"BC-DAgger Q configuration {actual_q} does not match "
                 f"Stage 2 {expected_q}"
             )
+        if load_pretrained_q:
+            expected_optimization = {
+                "q_lr": float(self.cfg.q_lr),
+                "q_weight_decay": float(self.cfg.q_weight_decay),
+                "q_tau": float(self.cfg.sac_tau),
+                "q_max_grad_norm": float(self.cfg.sac_max_grad_norm),
+            }
+            actual_optimization = {
+                name: backend_cfg.get(name)
+                for name in expected_optimization
+            }
+            if actual_optimization != expected_optimization:
+                raise ValueError(
+                    "BC-DAgger and Stage-2 critic optimization contracts "
+                    f"differ: source={actual_optimization}, "
+                    f"stage2={expected_optimization}"
+                )
+        if load_pretrained_q:
+            source_q_backend = state_dict.get("q_backend_config")
+            if not isinstance(source_q_backend, dict):
+                raise ValueError(
+                    "SAC-critic BC-DAgger checkpoint lacks q_backend_config"
+                )
+            expected_contract = {
+                "q_action_fusion": "early",
+                "q_action_coordinates": "absolute",
+                "q_action_normalized": True,
+                "q_action_input_gain": 1.0,
+                "clipped_double_q": True,
+                "num_atoms": 501,
+                "layer_norm": True,
+                "reward_scalarization": SAC_REWARD_SCALARIZATION,
+                "truncation_semantics": (
+                    TRUNCATION_NEXT_OBSERVATION_SEMANTICS
+                ),
+                "replay_mix_semantics": (
+                    "beta_independent_teacher_executed_0.5_"
+                    "student_executed_0.5_v1"
+                ),
+                "pretrain_effective_alpha": 0.0,
+                "pretrain_backup_semantics": (
+                    "stochastic_next_action_q_only_effective_alpha_zero_v1"
+                ),
+                "pretrain_target_policy": (
+                    "dedicated_small_noise_stochastic_current_bc_student_v1"
+                ),
+                "alpha_autotune": False,
+                "stage2_alpha_init": float(self.cfg.sac_alpha_init),
+            }
+            mismatched_contract = {
+                name: (source_q_backend.get(name), expected)
+                for name, expected in expected_contract.items()
+                if source_q_backend.get(name) != expected
+            }
+            if mismatched_contract:
+                raise ValueError(
+                    "BC-DAgger Q backend is not Stage-2 compatible: "
+                    f"{mismatched_contract}"
+                )
+            stage2_q_backend = self._q_backend_metadata()
+            exact_fields = (
+                "actor_obs_keys",
+                "critic_obs_keys",
+                "actor_obs_dim",
+                "critic_obs_dim",
+                "q_input_dim",
+                "q_actuator_context",
+                "action_dim",
+                "hidden_dim",
+                "q_action_fusion",
+                "q_action_hidden_dim",
+                "q_action_fusion_semantics",
+                "q_reference_dueling",
+                "q_architecture_semantics",
+                "num_atoms",
+                "v_min",
+                "v_max",
+                "layer_norm",
+                "gamma",
+                "replay_observation_semantics",
+                "reward_scalarization",
+                "reward_groups",
+                "truncation_semantics",
+                "target_entropy_semantics",
+                "q_action_coordinates",
+                "q_action_normalized",
+                "q_action_input_gain",
+                "q_action_semantics",
+                "clipped_double_q",
+                "q_backup_semantics",
+                "actor_q_reduction",
+            )
+            exact_mismatches = {
+                name: (
+                    source_q_backend.get(name),
+                    stage2_q_backend.get(name),
+                )
+                for name in exact_fields
+                if source_q_backend.get(name) != stage2_q_backend.get(name)
+            }
+            if exact_mismatches:
+                raise ValueError(
+                    "BC-DAgger and Stage-2 Q contracts differ: "
+                    f"{exact_mismatches}"
+                )
         source_q_updates = int(state_dict.get("q_update_count", 0))
         if load_pretrained_q and source_q_updates < 1:
             raise RuntimeError("BC-DAgger checkpoint Q1/Q2 were never updated")
-        source_value_updates = int(
-            state_dict.get("iql_value_update_count", 0)
-        )
-        if load_pretrained_q and source_value_updates < 1:
-            raise RuntimeError("BC-DAgger checkpoint IQL V was never updated")
 
         # The compatibility backend deliberately retained PPOVEL's actor tree,
         # so the BC actor and depth/EMA modules load without shape translation.
@@ -8024,12 +8750,12 @@ class FastSACVelFinetune(FastSACVEL):
         # constructor-created states selected by load_pretrained_q.
         load_state = self._checkpoint_for_q_transfer(state_dict)
         load_state = dict(load_state)
-        # A BC-Dagger checkpoint predates the learning-only SAC adapter and
-        # frozen anchor. Seed those registered Stage-2 children locally, then
-        # capture the transferred actor into the anchor immediately after load.
-        load_state["bc_dagger_sac_adapter"] = (
-            self.bc_dagger_sac_adapter.state_dict()
-        )
+        # v3 already owns the exact dedicated stochastic target-policy state.
+        # IQL-v2 predates it and is allowed only for actor-only/fresh-Q transfer.
+        if not sac_critic_source:
+            load_state["bc_dagger_sac_adapter"] = (
+                self.bc_dagger_sac_adapter.state_dict()
+            )
         load_state["bc_dagger_actor_anchor"] = (
             self.bc_dagger_actor_anchor.state_dict()
         )
@@ -8042,6 +8768,8 @@ class FastSACVelFinetune(FastSACVEL):
             "adapt_module",
             "adapt_ema",
         }
+        if sac_critic_source:
+            critical.add("bc_dagger_sac_adapter")
         if self.cfg.use_object_adapt:
             critical.update(("object_adapt", "object_adapt_ema"))
         if hasattr(self, "temporal_depth_gru"):
@@ -8062,6 +8790,13 @@ class FastSACVelFinetune(FastSACVEL):
                 name for name in failed
                 if name not in {"qnet", "qnet_target"}
             ]
+
+        # A v3 BC-DAgger checkpoint owns the exact small-noise adapter used by
+        # its critic target. Preserve it by default, but allow an explicit
+        # offline-to-online experiment to broaden behavior support exactly once
+        # at the fresh Stage-2 boundary. Same-stage resumes use the ordinary
+        # loader above and therefore restore the learned adapter without reset.
+        self._reset_bc_dagger_transfer_action_std()
 
         # Preserve the complete BC actor bit-for-bit, including its unused
         # positive PPO std, and snapshot the transferred mean policy as the
@@ -8096,35 +8831,36 @@ class FastSACVelFinetune(FastSACVEL):
             state_dict.get("teacher_replay_state")
         )
         if load_pretrained_q:
-            self._bc_dagger_iql_source = {
-                "critic_learning_semantics": BC_DAGGER_IQL_CRITIC_SEMANTICS,
+            self._bc_dagger_critic_source = {
+                "critic_learning_semantics": BC_DAGGER_SAC_CRITIC_SEMANTICS,
                 "actor_learning_semantics": BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
                 "source_q_updates": source_q_updates,
-                "source_value_updates": source_value_updates,
-                "expectile": float(backend_cfg["iql_expectile"]),
-                "value_network_stage2_usage": "discarded_stage1_bootstrap_only",
+                "q_backend_config": copy.deepcopy(
+                    state_dict["q_backend_config"]
+                ),
+                "q_weights_stage2_usage": "transferred_exact_sac_contract",
+                "q_optimizer_stage2_usage": (
+                    "fresh_adamw_moments_same_lr_weight_decay"
+                ),
+                "q_update_counter_stage2_usage": "reset_for_stage2_schedule",
             }
             logging.info(
-                "Transferred pure-BC DAgger actor/perception and IQL-pretrained "
-                "Q1/Q2 + targets into a fresh Stage-2 SAC optimizer/entropy "
-                "process; the Stage-1-only V network was intentionally discarded."
+                "Transferred pure-BC DAgger actor/perception, dedicated SAC "
+                "std, and SAC-compatible Q1/Q2 + targets into Stage 2."
             )
         else:
-            self._bc_dagger_iql_source = {
+            self._bc_dagger_critic_source = {
                 "critic_learning_semantics": state_dict.get(
                     "critic_learning_semantics"
                 ),
                 "actor_learning_semantics": BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
                 "source_q_updates": source_q_updates,
-                "source_value_updates": source_value_updates,
-                "expectile": backend_cfg.get("iql_expectile"),
-                "value_network_stage2_usage": "not_loaded",
                 "q_weights_stage2_usage": "discarded_fresh_q_seed",
                 "q_seed": int(self.cfg.q_seed),
             }
             logging.info(
                 "Transferred the pure-BC DAgger actor/perception modules but "
-                "intentionally skipped Stage-1 IQL Q/V weights; Stage-2 Q1/Q2 "
+                "intentionally skipped Stage-1 critic weights; Stage-2 Q1/Q2 "
                 "are fresh q_seed=%d initializations and both target critics "
                 "are frozen exact copies.",
                 int(self.cfg.q_seed),
@@ -8141,9 +8877,9 @@ class FastSACVelFinetune(FastSACVEL):
             state["offline_teacher_replay_state"] = copy.deepcopy(
                 self.offline_replay.snapshot_metadata
             )
-        if hasattr(self, "_bc_dagger_iql_source"):
-            state["bc_dagger_iql_source"] = copy.deepcopy(
-                self._bc_dagger_iql_source
+        if hasattr(self, "_bc_dagger_critic_source"):
+            state["bc_dagger_critic_source"] = copy.deepcopy(
+                self._bc_dagger_critic_source
             )
         return state
 
@@ -8522,7 +9258,24 @@ class FastSACVelFinetune(FastSACVEL):
         )
         return {key: value[permutation] for key, value in mixed.items()}
 
-    def _stage2_actor_is_active(self, q_updates=None) -> bool:
+    def _stage2_actor_start_finetune_iteration(self):
+        value = getattr(
+            self.cfg,
+            "sac_actor_learning_starts_finetune_iteration",
+            None,
+        )
+        return None if value is None else int(value)
+
+    def _stage2_actor_is_active(
+        self, q_updates=None, finetune_iteration=None
+    ) -> bool:
+        actor_start_iteration = (
+            self._stage2_actor_start_finetune_iteration()
+        )
+        if actor_start_iteration is not None:
+            if finetune_iteration is None:
+                finetune_iteration = self.sac_rollout_count
+            return int(finetune_iteration) >= actor_start_iteration
         if q_updates is None:
             q_updates = self.q_update_count
         return int(q_updates) > int(
@@ -8552,6 +9305,8 @@ class FastSACVelFinetune(FastSACVEL):
 
     def _stage2_alpha_ramp_progress(self, q_updates=None) -> float:
         """Return the post-release effective-alpha multiplier in [0, 1]."""
+        if self._stage2_uses_awac():
+            return 0.0
         release = getattr(self, "_stage2_actor_release_q_update", None)
         if release is None:
             return 0.0
@@ -8567,14 +9322,26 @@ class FastSACVelFinetune(FastSACVEL):
 
     def _stage2_effective_alpha(self, q_updates=None) -> torch.Tensor:
         """Use one ramped temperature for Q backup, actor, and alpha dual."""
+        if self._stage2_uses_awac():
+            return self.log_alpha.new_zeros(())
         return self.log_alpha.exp() * self._stage2_alpha_ramp_progress(q_updates)
 
-    def _stage2_q_target_uses_stochastic_policy(self, q_updates=None) -> bool:
+    def _stage2_alpha_autotune_enabled(self) -> bool:
+        return (
+            not self._stage2_uses_awac()
+            and bool(getattr(self.cfg, "sac_use_autotune", True))
+        )
+
+    def _stage2_q_target_uses_stochastic_policy(
+        self, q_updates=None, finetune_iteration=None
+    ) -> bool:
         """Match Q policy evaluation to the configured behavior support."""
         if q_updates is None:
             q_updates = self.q_update_count
+        if self._stage2_uses_awac():
+            return not bool(self.cfg.sac_deterministic_rollout)
         return (
-            self._stage2_actor_is_active(q_updates)
+            self._stage2_actor_is_active(q_updates, finetune_iteration)
             or (
                 self._uses_bc_dagger_finetune_source()
                 and not bool(self.cfg.sac_deterministic_rollout)
@@ -8592,12 +9359,23 @@ class FastSACVelFinetune(FastSACVEL):
         )
 
     def _stage2_bc_anchor_coefficient(self, q_updates=None) -> float:
+        if self._stage2_uses_awac():
+            return 0.0
         if not self._uses_bc_dagger_finetune_source():
             return 0.0
         if q_updates is None:
             q_updates = self.q_update_count
-        actor_start = int(self.cfg.sac_actor_learning_starts_q_updates)
-        elapsed = max(0, int(q_updates) - actor_start)
+        if self._stage2_actor_start_finetune_iteration() is not None:
+            # Iteration scheduling deliberately ignores the legacy Q threshold.
+            # Anchor decay therefore begins at the first actor step that really
+            # passed the confidence gate, like the effective-alpha ramp.
+            release = getattr(self, "_stage2_actor_release_q_update", None)
+            elapsed = (
+                0 if release is None else max(0, int(q_updates) - int(release))
+            )
+        else:
+            actor_start = int(self.cfg.sac_actor_learning_starts_q_updates)
+            elapsed = max(0, int(q_updates) - actor_start)
         progress = min(
             elapsed / float(self.cfg.sac_bc_anchor_decay_q_updates), 1.0
         )
@@ -8635,7 +9413,8 @@ class FastSACVelFinetune(FastSACVEL):
     def _stage2_actor_confidence_gate_enabled(self) -> bool:
         """Use the frozen BC mean only as a detached confidence reference."""
         return (
-            self._uses_bc_dagger_finetune_source()
+            not self._stage2_uses_awac()
+            and self._uses_bc_dagger_finetune_source()
             and bool(getattr(self.cfg, "sac_actor_confidence_gate", True))
         )
 
@@ -8782,6 +9561,183 @@ class FastSACVelFinetune(FastSACVEL):
             }
         return batch_passed, row_mask.detach(), diagnostics
 
+    @staticmethod
+    def _empty_stage2_awac_diagnostics(metric_zero):
+        return {
+            "active": metric_zero,
+            "beta": metric_zero,
+            "v_samples": metric_zero,
+            "score_clip": metric_zero,
+            "score_clip_enabled": metric_zero,
+            "replay_q": metric_zero,
+            "policy_v": metric_zero,
+            "advantage_mean": metric_zero,
+            "advantage_std": metric_zero,
+            "advantage_min": metric_zero,
+            "advantage_max": metric_zero,
+            "advantage_positive_fraction": metric_zero,
+            "weight_mean": metric_zero,
+            "weight_min": metric_zero,
+            "weight_max": metric_zero,
+            "weight_ess": metric_zero,
+            "weight_ess_fraction": metric_zero,
+            "weight_entropy": metric_zero,
+            "replay_log_prob": metric_zero,
+            "policy_sample_entropy": metric_zero,
+            "row_count": metric_zero,
+            "source_marker_valid": metric_zero,
+            "offline_rows": metric_zero,
+            "offline_advantage": metric_zero,
+            "offline_weight": metric_zero,
+            "online_rows": metric_zero,
+            "online_advantage": metric_zero,
+            "online_weight": metric_zero,
+        }
+
+    def _stage2_official_awac_actor_loss(self, batch, dist):
+        """Compute the authors' online-Q AWAC weighted replay likelihood.
+
+        Target critics remain exclusive to the Bellman backup.  AWAC evaluates
+        both the dataset action and sampled current-policy actions with the
+        online twin critics, takes the pessimistic minimum independently, and
+        detaches the resulting batch-normalized exponential weights.
+        """
+        replay_actions = batch["actions"]
+        batch_size = int(replay_actions.shape[0])
+        if batch_size < 1:
+            raise ValueError("Official AWAC requires a non-empty replay batch")
+        value_samples = int(self.cfg.sac_awac_v_samples)
+        sampled_log_prob = None
+        with torch.no_grad():
+            replay_twin_q = self.qnet.values(self._q_forward(
+                self.qnet,
+                batch["critic_observations"],
+                replay_actions,
+                batch.get(TEACHER_REF_ACTION_FIELD),
+                batch.get(TEACHER_ACTUATOR_CONTEXT_FIELD),
+            ))
+            if tuple(replay_twin_q.shape) != (2, batch_size):
+                raise ValueError(
+                    "Official AWAC requires two online replay-Q heads with "
+                    f"shape (2, {batch_size}), got "
+                    f"{tuple(replay_twin_q.shape)}"
+                )
+            replay_q = replay_twin_q.min(dim=0).values
+            policy_q_samples = []
+            for _ in range(value_samples):
+                policy_action, policy_log_prob = dist.rsample_with_log_prob(
+                    generator=self.sac_action_rng
+                )
+                if sampled_log_prob is None:
+                    sampled_log_prob = self._normalized_action_log_prob(
+                        policy_log_prob
+                    )
+                policy_twin_q = self.qnet.values(self._q_forward(
+                    self.qnet,
+                    batch["critic_observations"],
+                    policy_action,
+                    batch.get(TEACHER_REF_ACTION_FIELD),
+                    batch.get(TEACHER_ACTUATOR_CONTEXT_FIELD),
+                ))
+                if tuple(policy_twin_q.shape) != (2, batch_size):
+                    raise ValueError(
+                        "Official AWAC requires two online policy-Q heads with "
+                        f"shape (2, {batch_size}), got "
+                        f"{tuple(policy_twin_q.shape)}"
+                    )
+                policy_q_samples.append(
+                    policy_twin_q.min(dim=0).values
+                )
+            policy_v = torch.stack(policy_q_samples, dim=0).mean(dim=0)
+            advantages = replay_q - policy_v
+            weights = _official_awac_weights(
+                advantages,
+                beta=float(self.cfg.sac_awac_beta),
+                score_clip=self.cfg.sac_awac_score_clip,
+            )
+
+        replay_log_prob = self._normalized_action_log_prob(
+            dist.log_prob_for_action(replay_actions, detach_scale=False)
+        )
+        if replay_log_prob.shape != advantages.shape:
+            raise ValueError(
+                "Official AWAC replay log-probability must have one value per "
+                f"row, got {tuple(replay_log_prob.shape)} for "
+                f"{tuple(advantages.shape)} advantages"
+            )
+        actor_loss = -(weights.detach() * replay_log_prob).mean()
+
+        with torch.no_grad():
+            probability = weights / float(batch_size)
+            weight_ess = weights.sum().square() / weights.square().sum().clamp_min(
+                torch.finfo(weights.dtype).tiny
+            )
+            metric_zero = advantages.new_zeros(())
+            offline_mask, online_mask, source_marker_valid = (
+                self._stage2_replay_source_masks(batch)
+            )
+
+            def source_metrics(mask):
+                count = int(mask.sum().item()) if source_marker_valid else 0
+                if not count:
+                    return metric_zero, metric_zero, metric_zero
+                return (
+                    metric_zero.new_tensor(float(count)),
+                    advantages[mask].mean(),
+                    weights[mask].mean(),
+                )
+
+            offline_rows, offline_advantage, offline_weight = source_metrics(
+                offline_mask
+            )
+            online_rows, online_advantage, online_weight = source_metrics(
+                online_mask
+            )
+            diagnostics = {
+                "active": metric_zero.new_ones(()),
+                "beta": metric_zero.new_tensor(float(self.cfg.sac_awac_beta)),
+                "v_samples": metric_zero.new_tensor(float(value_samples)),
+                "score_clip": metric_zero.new_tensor(
+                    -1.0
+                    if self.cfg.sac_awac_score_clip is None
+                    else float(self.cfg.sac_awac_score_clip)
+                ),
+                "score_clip_enabled": metric_zero.new_tensor(float(
+                    self.cfg.sac_awac_score_clip is not None
+                )),
+                "replay_q": replay_q.mean(),
+                "policy_v": policy_v.mean(),
+                "advantage_mean": advantages.mean(),
+                "advantage_std": advantages.std(unbiased=False),
+                "advantage_min": advantages.amin(),
+                "advantage_max": advantages.amax(),
+                "advantage_positive_fraction": (advantages > 0.0).float().mean(),
+                "weight_mean": weights.mean(),
+                "weight_min": weights.amin(),
+                "weight_max": weights.amax(),
+                "weight_ess": weight_ess,
+                "weight_ess_fraction": weight_ess / float(batch_size),
+                "weight_entropy": -(
+                    probability
+                    * probability.clamp_min(
+                        torch.finfo(probability.dtype).tiny
+                    ).log()
+                ).sum(),
+                "replay_log_prob": replay_log_prob.mean().detach(),
+                "policy_sample_entropy": -sampled_log_prob.mean(),
+                "row_count": metric_zero.new_tensor(float(batch_size)),
+                "source_marker_valid": metric_zero.new_tensor(float(
+                    source_marker_valid
+                )),
+                "offline_rows": offline_rows,
+                "offline_advantage": offline_advantage,
+                "offline_weight": offline_weight,
+                "online_rows": online_rows,
+                "online_advantage": online_advantage,
+                "online_weight": online_weight,
+            }
+        return actor_loss, -sampled_log_prob.mean(), diagnostics
+
     def _sac_update(self, batch, update_actor):
         batch = self._prepare_student_learning_batch(batch)
         offline_source_mask, online_source_mask, source_marker_valid = (
@@ -8825,9 +9781,8 @@ class FastSACVelFinetune(FastSACVEL):
             bootstrap = _sac_bootstrap_mask(
                 batch["dones"], batch["truncations"]
             )
-            # Keep the stochastic behavior sample during the IQL-to-SAC bridge,
-            # but preserve IQL's hard Bellman target until a real actor update
-            # starts the effective-alpha ramp.
+            # Keep the stochastic behavior sample during the actor burn-in;
+            # effective alpha follows the checkpointed Stage-2 release ramp.
             entropy_tax = (
                 discount
                 * bootstrap
@@ -8845,7 +9800,12 @@ class FastSACVelFinetune(FastSACVEL):
             target, _ = _select_c51_twin_target(
                 target,
                 self.qnet_target.support,
-                bool(getattr(self.cfg, "sac_clipped_double_q", True)),
+                (
+                    self._stage2_uses_awac()
+                    or bool(getattr(
+                        self.cfg, "sac_clipped_double_q", True
+                    ))
+                ),
             )
         logits = self._q_forward(
             self.qnet,
@@ -8868,7 +9828,12 @@ class FastSACVelFinetune(FastSACVEL):
                 ).sum(dim=-1)
             data_q_per_row = _reduce_actor_q_values(
                 data_twin_q_values,
-                bool(getattr(self.cfg, "sac_clipped_double_q", True)),
+                (
+                    self._stage2_uses_awac()
+                    or bool(getattr(
+                        self.cfg, "sac_clipped_double_q", True
+                    ))
+                ),
             )
             data_metric_zero = data_q_per_row.new_zeros(())
 
@@ -8943,79 +9908,107 @@ class FastSACVelFinetune(FastSACVEL):
             "frozen_bc_q": metric_zero,
             "row_count": metric_zero,
         }
+        awac_diagnostics = self._empty_stage2_awac_diagnostics(metric_zero)
         if update_actor:
             dist = self._actor_dist_from_flat(batch["observations"])
-            action, log_prob = dist.rsample_with_log_prob(
-                generator=self.sac_action_rng
-            )
-            log_prob = self._normalized_action_log_prob(log_prob)
-            q_requires_grad = [
-                parameter.requires_grad for parameter in self.qnet.parameters()
-            ]
-            for parameter in self.qnet.parameters():
-                parameter.requires_grad_(False)
-            try:
-                twin_q_values = self.qnet.values(
-                    self._q_forward(
-                        self.qnet,
-                        batch["critic_observations"],
-                        action,
-                        batch.get(TEACHER_REF_ACTION_FIELD),
-                        batch.get(TEACHER_ACTUATOR_CONTEXT_FIELD),
-                    )
+            if self._stage2_uses_awac():
+                actor_loss, entropy, awac_diagnostics = (
+                    self._stage2_official_awac_actor_loss(batch, dist)
                 )
-                q_values = _reduce_actor_q_values(
-                    twin_q_values,
-                    bool(getattr(self.cfg, "sac_clipped_double_q", True)),
+                self.sac_actor_optimizer.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                trainable_actor_parameters = getattr(
+                    self,
+                    "_stage2_trainable_actor_parameters",
+                    tuple(self.actor_adapt.parameters()),
                 )
-                (
-                    actor_gate_passed,
-                    trusted_q_rows,
-                    actor_gate_diagnostics,
-                ) = self._stage2_actor_confidence_gate(
-                    batch, action, twin_q_values
+                actor_grad = _measure_or_clip_grad_norm(
+                    trainable_actor_parameters,
+                    float(self.cfg.sac_max_grad_norm),
                 )
-                if actor_gate_passed:
-                    # The mask was computed from this exact sampled action.
-                    # Its detached frozen-BC reference selects trustworthy Q
-                    # gradients but contributes no BC regression gradient.
-                    trusted_q_values = trusted_q_rows * q_values
-                    sac_actor_loss = (
-                        effective_alpha.detach() * log_prob
-                        - trusted_q_values
-                    ).mean()
-                    anchor_coefficient = self._stage2_bc_anchor_coefficient()
-                    if anchor_coefficient > 0.0:
-                        anchor_loss, anchor_deviation = (
-                            self._stage2_bc_anchor_loss(batch["observations"])
+                self.sac_actor_optimizer.step()
+                actor_update_applied = True
+            else:
+                action, log_prob = dist.rsample_with_log_prob(
+                    generator=self.sac_action_rng
+                )
+                log_prob = self._normalized_action_log_prob(log_prob)
+                q_requires_grad = [
+                    parameter.requires_grad
+                    for parameter in self.qnet.parameters()
+                ]
+                for parameter in self.qnet.parameters():
+                    parameter.requires_grad_(False)
+                try:
+                    twin_q_values = self.qnet.values(
+                        self._q_forward(
+                            self.qnet,
+                            batch["critic_observations"],
+                            action,
+                            batch.get(TEACHER_REF_ACTION_FIELD),
+                            batch.get(TEACHER_ACTUATOR_CONTEXT_FIELD),
                         )
-                    actor_loss = (
-                        sac_actor_loss + anchor_coefficient * anchor_loss
                     )
-                    self.sac_actor_optimizer.zero_grad(set_to_none=True)
-                    actor_loss.backward()
-                    trainable_actor_parameters = getattr(
-                        self,
-                        "_stage2_trainable_actor_parameters",
-                        tuple(self.actor_adapt.parameters()),
+                    q_values = _reduce_actor_q_values(
+                        twin_q_values,
+                        bool(getattr(
+                            self.cfg, "sac_clipped_double_q", True
+                        )),
                     )
-                    actor_grad = _measure_or_clip_grad_norm(
-                        trainable_actor_parameters,
-                        float(self.cfg.sac_max_grad_norm),
+                    (
+                        actor_gate_passed,
+                        trusted_q_rows,
+                        actor_gate_diagnostics,
+                    ) = self._stage2_actor_confidence_gate(
+                        batch, action, twin_q_values
                     )
-                    self.sac_actor_optimizer.step()
-                    actor_update_applied = True
-            finally:
-                for parameter, requires_grad in zip(
-                    self.qnet.parameters(), q_requires_grad
-                ):
-                    parameter.requires_grad_(requires_grad)
+                    if actor_gate_passed:
+                        # The mask was computed from this exact sampled action.
+                        # Its detached frozen-BC reference selects trustworthy Q
+                        # gradients but contributes no BC regression gradient.
+                        trusted_q_values = trusted_q_rows * q_values
+                        sac_actor_loss = (
+                            effective_alpha.detach() * log_prob
+                            - trusted_q_values
+                        ).mean()
+                        anchor_coefficient = (
+                            self._stage2_bc_anchor_coefficient()
+                        )
+                        if anchor_coefficient > 0.0:
+                            anchor_loss, anchor_deviation = (
+                                self._stage2_bc_anchor_loss(
+                                    batch["observations"]
+                                )
+                            )
+                        actor_loss = (
+                            sac_actor_loss
+                            + anchor_coefficient * anchor_loss
+                        )
+                        self.sac_actor_optimizer.zero_grad(set_to_none=True)
+                        actor_loss.backward()
+                        trainable_actor_parameters = getattr(
+                            self,
+                            "_stage2_trainable_actor_parameters",
+                            tuple(self.actor_adapt.parameters()),
+                        )
+                        actor_grad = _measure_or_clip_grad_norm(
+                            trainable_actor_parameters,
+                            float(self.cfg.sac_max_grad_norm),
+                        )
+                        self.sac_actor_optimizer.step()
+                        actor_update_applied = True
+                finally:
+                    for parameter, requires_grad in zip(
+                        self.qnet.parameters(), q_requires_grad
+                    ):
+                        parameter.requires_grad_(requires_grad)
             if actor_update_applied:
                 self.sac_actor_update_count += 1
                 # Set the alpha-ramp origin only after the actor optimizer step
                 # has actually succeeded. Later gate failures never erase it.
                 self._mark_stage2_actor_released(q_update_index)
-                entropy = -log_prob.mean().detach()
+                if not self._stage2_uses_awac():
+                    entropy = -log_prob.mean().detach()
 
         # Couple the entropy dual to the confidence-approved actor cadence.
         # A scheduled-but-rejected tick changes Q only, leaving both actor and
@@ -9023,7 +10016,7 @@ class FastSACVelFinetune(FastSACVEL):
         if (
             actor_update_applied
             and alpha_ramp_progress > 0.0
-            and bool(getattr(self.cfg, "sac_use_autotune", True))
+            and self._stage2_alpha_autotune_enabled()
         ):
             alpha_loss = -(
                 effective_alpha
@@ -9132,10 +10125,15 @@ class FastSACVelFinetune(FastSACVEL):
             entropy_diagnostics,
             actor_gate_diagnostics,
             q_diagnostics,
+            awac_diagnostics,
         )
 
     def train_op(self, tensordict):
         rollout_td = tensordict.exclude("stats")
+        # This is the zero-based Stage-2-local iteration currently being
+        # trained. Keep it fixed throughout the rollout; sac_rollout_count is
+        # incremented only after every chunk has been processed.
+        finetune_iteration = int(self.sac_rollout_count)
         start_actor_update_count = self.sac_actor_update_count
         start_alpha_update_count = self.sac_alpha_update_count
         rollout_action_mean_abs_deviation = 0.0
@@ -9461,6 +10459,101 @@ class FastSACVelFinetune(FastSACVEL):
             q_data_offline_valid = q_data_online_valid = 0.0
             q_data_update_count = 0
 
+        awac_update_diagnostics = [
+            metric[13]
+            for metric in actor_metrics
+            if len(metric) > 13 and metric[13]["active"].item() > 0.0
+        ]
+        if awac_update_diagnostics:
+            def mean_awac_diagnostic(name):
+                return torch.stack([
+                    diagnostic[name]
+                    for diagnostic in awac_update_diagnostics
+                ]).mean().item()
+
+            awac_update_count = len(awac_update_diagnostics)
+            awac_replay_q = mean_awac_diagnostic("replay_q")
+            awac_policy_v = mean_awac_diagnostic("policy_v")
+            awac_advantage_mean = mean_awac_diagnostic("advantage_mean")
+            awac_advantage_std = mean_awac_diagnostic("advantage_std")
+            awac_advantage_min = min(
+                diagnostic["advantage_min"].item()
+                for diagnostic in awac_update_diagnostics
+            )
+            awac_advantage_max = max(
+                diagnostic["advantage_max"].item()
+                for diagnostic in awac_update_diagnostics
+            )
+            awac_advantage_positive_fraction = mean_awac_diagnostic(
+                "advantage_positive_fraction"
+            )
+            awac_weight_mean = mean_awac_diagnostic("weight_mean")
+            awac_weight_min = min(
+                diagnostic["weight_min"].item()
+                for diagnostic in awac_update_diagnostics
+            )
+            awac_weight_max = max(
+                diagnostic["weight_max"].item()
+                for diagnostic in awac_update_diagnostics
+            )
+            awac_weight_ess = mean_awac_diagnostic("weight_ess")
+            awac_weight_ess_fraction = mean_awac_diagnostic(
+                "weight_ess_fraction"
+            )
+            awac_weight_entropy = mean_awac_diagnostic("weight_entropy")
+            awac_replay_log_prob = mean_awac_diagnostic("replay_log_prob")
+            awac_policy_sample_entropy = mean_awac_diagnostic(
+                "policy_sample_entropy"
+            )
+            awac_source_marker_valid = float(all(
+                diagnostic["source_marker_valid"].item() > 0.0
+                for diagnostic in awac_update_diagnostics
+            ))
+
+            def aggregate_awac_source(source_name):
+                rows = sum(
+                    diagnostic[f"{source_name}_rows"].item()
+                    for diagnostic in awac_update_diagnostics
+                )
+                if rows <= 0.0:
+                    return 0.0, 0.0, 0.0
+                advantage = sum(
+                    diagnostic[f"{source_name}_advantage"].item()
+                    * diagnostic[f"{source_name}_rows"].item()
+                    for diagnostic in awac_update_diagnostics
+                ) / rows
+                weight = sum(
+                    diagnostic[f"{source_name}_weight"].item()
+                    * diagnostic[f"{source_name}_rows"].item()
+                    for diagnostic in awac_update_diagnostics
+                ) / rows
+                return rows, advantage, weight
+
+            (
+                awac_offline_rows,
+                awac_offline_advantage,
+                awac_offline_weight,
+            ) = aggregate_awac_source("offline")
+            (
+                awac_online_rows,
+                awac_online_advantage,
+                awac_online_weight,
+            ) = aggregate_awac_source("online")
+        else:
+            awac_update_count = 0
+            awac_replay_q = awac_policy_v = 0.0
+            awac_advantage_mean = awac_advantage_std = 0.0
+            awac_advantage_min = awac_advantage_max = 0.0
+            awac_advantage_positive_fraction = 0.0
+            awac_weight_mean = awac_weight_min = awac_weight_max = 0.0
+            awac_weight_ess = awac_weight_ess_fraction = 0.0
+            awac_weight_entropy = awac_replay_log_prob = 0.0
+            awac_policy_sample_entropy = 0.0
+            awac_source_marker_valid = 0.0
+            awac_offline_rows = awac_online_rows = 0.0
+            awac_offline_advantage = awac_online_advantage = 0.0
+            awac_offline_weight = awac_online_weight = 0.0
+
         if actor_gate_metrics:
             def mean_actor_gate_diagnostic(name):
                 return torch.stack([
@@ -9549,6 +10642,15 @@ class FastSACVelFinetune(FastSACVEL):
             sampled_online_draws_per_new_row = 0.0
             sampled_offline_draws_per_new_row = 0.0
 
+        actor_mean_lr_config = float(getattr(
+            self.cfg, "sac_actor_lr", 0.0
+        ))
+        actor_optimizer = getattr(self, "sac_actor_optimizer", None)
+        actor_optimizer_group_lrs = (
+            tuple(float(group["lr"]) for group in actor_optimizer.param_groups)
+            if actor_optimizer is not None
+            else (actor_mean_lr_config,)
+        )
         info = {
             "fastsac/q_active": float(bool(metrics)),
             "fastsac/q_loss": q_loss,
@@ -9584,10 +10686,75 @@ class FastSACVelFinetune(FastSACVEL):
             ),
             "fastsac/actor_loss": actor_loss,
             "fastsac/actor_grad_norm": actor_grad_norm,
+            "fastsac/actor_objective_sac": float(
+                not self._stage2_uses_awac()
+            ),
+            "fastsac/actor_objective_awac": float(
+                self._stage2_uses_awac()
+            ),
+            "fastsac/awac_update_active": float(awac_update_count > 0),
+            "fastsac/awac_update_count": awac_update_count,
+            "fastsac/awac_beta": float(getattr(
+                self.cfg, "sac_awac_beta", 1.0
+            )),
+            "fastsac/awac_v_samples": int(getattr(
+                self.cfg, "sac_awac_v_samples", 1
+            )),
+            "fastsac/awac_score_clip": (
+                -1.0
+                if getattr(self.cfg, "sac_awac_score_clip", None) is None
+                else float(self.cfg.sac_awac_score_clip)
+            ),
+            "fastsac/awac_score_clip_enabled": float(
+                getattr(self.cfg, "sac_awac_score_clip", None) is not None
+            ),
+            "fastsac/awac_replay_q": awac_replay_q,
+            "fastsac/awac_policy_v": awac_policy_v,
+            "fastsac/awac_advantage_mean": awac_advantage_mean,
+            "fastsac/awac_advantage_std": awac_advantage_std,
+            "fastsac/awac_advantage_min": awac_advantage_min,
+            "fastsac/awac_advantage_max": awac_advantage_max,
+            "fastsac/awac_advantage_positive_fraction": (
+                awac_advantage_positive_fraction
+            ),
+            "fastsac/awac_weight_mean": awac_weight_mean,
+            "fastsac/awac_weight_min": awac_weight_min,
+            "fastsac/awac_weight_max": awac_weight_max,
+            "fastsac/awac_weight_ess": awac_weight_ess,
+            "fastsac/awac_weight_ess_fraction": awac_weight_ess_fraction,
+            "fastsac/awac_weight_entropy": awac_weight_entropy,
+            "fastsac/awac_replay_log_prob": awac_replay_log_prob,
+            "fastsac/awac_policy_sample_entropy": (
+                awac_policy_sample_entropy
+            ),
+            "fastsac/awac_source_marker_valid": awac_source_marker_valid,
+            "fastsac/awac_offline_rows": awac_offline_rows,
+            "fastsac/awac_offline_advantage": awac_offline_advantage,
+            "fastsac/awac_offline_weight": awac_offline_weight,
+            "fastsac/awac_online_rows": awac_online_rows,
+            "fastsac/awac_online_advantage": awac_online_advantage,
+            "fastsac/awac_online_weight": awac_online_weight,
             "fastsac/actor_active": float(actor_ever_released),
             "fastsac/q_only_warmup": float(not actor_ever_released),
             "fastsac/actor_schedule_eligible": float(
-                self._stage2_actor_is_active()
+                self._stage2_actor_is_active(
+                    self.q_update_count, finetune_iteration
+                )
+            ),
+            "fastsac/actor_start_uses_finetune_iteration": float(
+                self._stage2_actor_start_finetune_iteration() is not None
+            ),
+            "fastsac/actor_start_finetune_iteration_config": int(
+                self._stage2_actor_start_finetune_iteration()
+                if self._stage2_actor_start_finetune_iteration() is not None
+                else -1
+            ),
+            "fastsac/actor_start_q_updates_config": int(
+                self.cfg.sac_actor_learning_starts_q_updates
+            ),
+            "fastsac/finetune_iteration": finetune_iteration,
+            "fastsac/finetune_iterations_completed": int(
+                self.sac_rollout_count
             ),
             "fastsac/actor_update_scheduled_count": (
                 actor_update_scheduled_count
@@ -9634,7 +10801,7 @@ class FastSACVelFinetune(FastSACVEL):
             "fastsac/q_frozen_bc_rows": actor_gate_q_rows,
             "fastsac/q_target_stochastic_policy": float(
                 self._stage2_q_target_uses_stochastic_policy(
-                    self.q_update_count + 1
+                    self.q_update_count + 1, finetune_iteration
                 )
             ),
             "fastsac/bc_anchor_loss": anchor_loss,
@@ -9655,6 +10822,9 @@ class FastSACVelFinetune(FastSACVEL):
                 if actor_metrics else 0.0
             ),
             "fastsac/alpha": self.log_alpha.exp().item(),
+            "fastsac/alpha_parameter_inactive": float(
+                self._stage2_uses_awac()
+            ),
             "fastsac/effective_alpha": effective_alpha,
             "fastsac/alpha_ramp_progress": alpha_ramp_progress,
             "fastsac/actor_release_q_update": int(
@@ -9698,13 +10868,16 @@ class FastSACVelFinetune(FastSACVEL):
                 online_entropy_tax_reward_abs_ratio
             ),
             "fastsac/alpha_active": float(
-                bool(getattr(self.cfg, "sac_use_autotune", True))
+                self._stage2_alpha_autotune_enabled()
                 and alpha_updates_applied > 0
             ),
-            "fastsac/alpha_autotune": float(bool(
-                getattr(self.cfg, "sac_use_autotune", True)
-            )),
+            "fastsac/alpha_autotune": float(
+                self._stage2_alpha_autotune_enabled()
+            ),
             "fastsac/target_entropy": self.target_entropy,
+            "fastsac/target_entropy_active": float(
+                not self._stage2_uses_awac()
+            ),
             "fastsac/target_entropy_normalized_coordinates": float(
                 not self._uses_bc_dagger_finetune_source()
             ),
@@ -9723,6 +10896,8 @@ class FastSACVelFinetune(FastSACVEL):
             )),
             "fastsac/q_update_count": self.q_update_count,
             "fastsac/actor_update_count": self.sac_actor_update_count,
+            "fastsac/actor_mean_lr_config": actor_mean_lr_config,
+            "fastsac/actor_mean_lr_effective": actor_optimizer_group_lrs[0],
             "fastsac/alpha_update_count": self.sac_alpha_update_count,
             "fastsac/online_replay_size": self.online_replay.size,
             "fastsac/online_replay_seen": int(getattr(
@@ -9734,6 +10909,13 @@ class FastSACVelFinetune(FastSACVEL):
                 )) >= int(self.cfg.sac_learning_starts)
             ),
             "fastsac/offline_ratio": self.cfg.teacher_buffer_ratio,
+            "fastsac/stage2_initial_action_std_config": (
+                -1.0
+                if getattr(
+                    self.cfg, "sac_stage2_initial_action_std", None
+                ) is None
+                else float(self.cfg.sac_stage2_initial_action_std)
+            ),
             "fastsac/truncation_finals": self._last_truncation_finals_used,
             "fastsac/environment_steps": self.sac_environment_steps,
             "fastsac/effective_updates_per_env_step": (
@@ -9751,6 +10933,10 @@ class FastSACVelFinetune(FastSACVEL):
             )),
         }
         if self._uses_bc_dagger_finetune_source():
+            actor_log_std_lr = getattr(
+                self.cfg, "sac_actor_log_std_lr", None
+            )
+            separate_log_std_group = actor_log_std_lr is not None
             clipped_log_std = self.bc_dagger_sac_adapter.log_std.detach().clamp(
                 float(self.cfg.sac_bc_log_std_min),
                 float(self.cfg.sac_bc_log_std_max),
@@ -9760,6 +10946,19 @@ class FastSACVelFinetune(FastSACVEL):
                 "fastsac/bc_sac_center_action_std_mean": (
                     clipped_log_std.exp() * float(self.cfg.sac_bc_action_clip)
                 ).mean().item(),
+                "fastsac/bc_sac_log_std_lr_config": (
+                    -1.0
+                    if actor_log_std_lr is None
+                    else float(actor_log_std_lr)
+                ),
+                "fastsac/bc_sac_log_std_lr_effective": (
+                    actor_optimizer_group_lrs[
+                        1 if separate_log_std_group else 0
+                    ]
+                ),
+                "fastsac/bc_sac_log_std_separate_optimizer_group": float(
+                    separate_log_std_group
+                ),
                 "fastsac/rollout_deterministic_bc_mean": float(
                     bool(self.cfg.sac_deterministic_rollout)
                 ),

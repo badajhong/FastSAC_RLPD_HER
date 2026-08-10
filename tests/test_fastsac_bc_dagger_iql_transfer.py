@@ -10,18 +10,20 @@ from tensordict import TensorDict
 from active_adaptation.learning.ppo.fastsac_vel import (
     BC_DAGGER_ACTOR_BACKEND,
     BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
-    BC_DAGGER_IQL_CRITIC_SEMANTICS,
+    BC_DAGGER_SAC_CRITIC_SEMANTICS,
     BC_DAGGER_LEGACY_TRAINING_ALGORITHM,
     BC_DAGGER_TRAINING_ALGORITHM,
     FASTSAC_BC_DAGGER_ACTOR_BACKEND,
     STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY,
     STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY,
     FastSACTanhNormal,
+    FastSACVEL,
     FastSACVelFinetune,
     FastSACVelFinetuneConfig,
     OnlineReplay,
     _BCDaggerSACAdapter,
     _BCDaggerSACRolloutActor,
+    _validate_complete_bc_dagger_staging_source,
     _validate_fastsac_finetune_config,
 )
 from active_adaptation.learning.ppo.common import ACTION_KEY
@@ -34,24 +36,114 @@ from active_adaptation.learning.ppo.ppo_vel import PPOVEL
 _DELETE = object()
 
 
+def _complete_staging_source_state():
+    replay_id = "fresh-staged-replay"
+    semantics = (
+        "joint_then_cyclic_perception_actor_then_final_perception_actor_"
+        "then_fresh_replay_q_v1"
+    )
+    return {
+        "teacher_replay_id": replay_id,
+        "dagger_rollout_count": 3000,
+        "q_update_count": 101,
+        "teacher_replay_state": {
+            "replay_id": replay_id,
+            "snapshot_id": "staged-final-snapshot",
+            "snapshot_iteration": 8999,
+            "checkpoint_name": "checkpoint_final",
+            "size": 1024,
+            "seen": 1024,
+        },
+        "bc_dagger_staging_state": {
+            "semantics": semantics,
+            "config": {
+                "semantics": semantics,
+                "joint_warmup_iterations": 500,
+                "cycles": 7,
+                "perception_iterations": 100,
+                "actor_iterations": 200,
+                "final_perception_iterations": 100,
+                "final_actor_iterations": 172,
+                "replay_q_calibration_iterations": 128,
+                "calibration_control_mode": "beta",
+                "calibration_teacher_probability": 0.5,
+            },
+            "rollout_count": 3000,
+            "phase": "complete",
+            "last_phase": "replay_q_calibration",
+            "complete": True,
+            "fresh_replay_id": replay_id,
+            "persistent_replay_semantics": (
+                "h5_disabled_until_final_q_calibration_v1"
+            ),
+            "calibration_start_q_update_count": 100,
+            "calibration_q_updates": 1,
+        },
+    }
+
+
+def test_stage2_accepts_only_complete_staged_bc_dagger_source():
+    state = _complete_staging_source_state()
+
+    _validate_complete_bc_dagger_staging_source(state)
+
+    state["bc_dagger_staging_state"]["complete"] = False
+    state["bc_dagger_staging_state"]["phase"] = "final_actor"
+    state["bc_dagger_staging_state"]["rollout_count"] = 2872
+    with pytest.raises(ValueError, match="completed staged rollout budget"):
+        _validate_complete_bc_dagger_staging_source(state)
+
+
+def test_stage2_rejects_staged_source_with_wrong_replay_lineage():
+    state = _complete_staging_source_state()
+    state["teacher_replay_id"] = "wrong-replay"
+
+    with pytest.raises(ValueError, match="replay lineage"):
+        _validate_complete_bc_dagger_staging_source(state)
+
+
+def test_stage2_rejects_staged_source_without_terminal_q_updates():
+    state = _complete_staging_source_state()
+    state["bc_dagger_staging_state"]["calibration_q_updates"] = 0
+    state["q_update_count"] = 100
+
+    with pytest.raises(ValueError, match="calibration_q_updates"):
+        _validate_complete_bc_dagger_staging_source(state)
+
+
 def _stage2_policy(*, load_pretrained_q=True):
     policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
     torch.nn.Module.__init__(policy)
+    policy.device = torch.device("cpu")
     policy.cfg = SimpleNamespace(
         phase="finetune",
         finetune_checkpoint_source="bc_dagger",
         load_pretrained_q=load_pretrained_q,
         q_hidden_dim=8,
-        q_num_atoms=11,
+        q_num_atoms=501,
         q_v_min=-2.0,
         q_v_max=2.0,
-        q_layer_norm=False,
+        q_layer_norm=True,
+        q_action_coordinates="absolute",
+        q_action_fusion="early",
+        q_reference_dueling=False,
+        q_condition_on_actuator_state=False,
+        sac_q_normalize_actions=True,
+        sac_q_action_input_gain=1.0,
+        sac_clipped_double_q=True,
         use_object_adapt=False,
         sac_bc_action_clip=20.0,
         sac_bc_initial_action_std=0.05,
+        sac_stage2_initial_action_std=None,
         sac_bc_log_std_min=-8.0,
         sac_bc_log_std_max=-2.0,
+        sac_entropy_reference_scale=1.0,
+        latent_dim=1,
         q_seed=17,
+        q_lr=3e-5,
+        q_weight_decay=1e-3,
+        sac_tau=0.001,
+        sac_max_grad_norm=1.0,
         sac_alpha_init=0.01,
     )
     policy.actor_adapt = torch.nn.Linear(1, 1, bias=False)
@@ -77,6 +169,20 @@ def _stage2_policy(*, load_pretrained_q=True):
     policy.sac_rollout_rng = torch.Generator().manual_seed(3)
     policy.teacher_replay_id = "stage2-replay"
     policy._replay_vecnorm_fingerprint = "frozen-vecnorm"
+    policy.q_actor_keys = ["actor_obs"]
+    policy.q_critic_keys = ["critic_obs"]
+    policy._q_actor_dim = 1
+    policy._q_critic_dim = 1
+    policy._q_input_dim = 1
+    policy.action_dim = 1
+    policy.reward_groups = ["task"]
+    policy.cfg.gamma = 0.99
+    policy.observation_spec = {
+        "actor_obs": torch.zeros(1),
+        "critic_obs": torch.zeros(1),
+        "vel_command": torch.zeros(1),
+        "policy": torch.zeros(1),
+    }
     return policy
 
 
@@ -143,7 +249,7 @@ def test_stochastic_stage2_resume_requires_checkpointed_rollout_rng():
         ({"q_condition_on_actuator_state": True}, False, "fields"),
         ({"q_action_fusion": "late"}, True, "early-fusion"),
         ({"sac_q_action_input_gain": 2.0}, True, "unit gain"),
-        ({"sac_q_normalize_actions": True}, True, "normalize_actions=false"),
+        ({"sac_q_normalize_actions": False}, True, "normalize_actions"),
     ],
 )
 def test_bc_dagger_q_coordinates_must_match_checkpoint_and_replay_schema(
@@ -157,7 +263,7 @@ def test_bc_dagger_q_coordinates_must_match_checkpoint_and_replay_schema(
         "q_condition_on_actuator_state": False,
         "q_action_fusion": "early",
         "sac_q_action_input_gain": 1.0,
-        "sac_q_normalize_actions": False,
+        "sac_q_normalize_actions": True,
         "load_pretrained_q": load_pretrained_q,
     }
     values.update(override)
@@ -167,32 +273,147 @@ def test_bc_dagger_q_coordinates_must_match_checkpoint_and_replay_schema(
         policy._configure_bc_dagger_actor_backend()
 
 
-def _iql_checkpoint():
+def test_bc_pretrained_q_backend_accepts_normalized_early_unit_gain(
+    monkeypatch,
+):
+    policy = _stage2_policy()
+    actor_core = SimpleNamespace(
+        actor_std=torch.nn.Parameter(torch.tensor([0.25])),
+        load_noise_scale=123.0,
+    )
+    monkeypatch.setattr(
+        FastSACVelFinetune,
+        "_ppo_actor_core",
+        staticmethod(lambda actor: actor_core),
+    )
+
+    policy._configure_bc_dagger_actor_backend()
+
+    assert policy.actor_backend == FASTSAC_BC_DAGGER_ACTOR_BACKEND
+    assert policy.cfg.q_num_atoms == 501
+    assert policy.cfg.q_layer_norm is True
+    assert policy.cfg.q_action_fusion == "early"
+    assert policy.cfg.sac_q_normalize_actions is True
+    assert policy.cfg.sac_q_action_input_gain == pytest.approx(1.0)
+    assert policy.cfg.sac_clipped_double_q is True
+    assert torch.equal(policy._fastsac_q_action_low, torch.tensor([-20.0]))
+    assert torch.equal(policy._fastsac_q_action_scale, torch.tensor([20.0]))
+    assert actor_core.load_noise_scale is None
+
+
+def _v3_bc_critic_checkpoint(policy):
+    q_backend = policy._q_backend_metadata()
+    q_backend.update({
+        "alpha_autotune": False,
+        "pretrain_effective_alpha": 0.0,
+        "stage2_alpha_init": float(policy.cfg.sac_alpha_init),
+        "pretrain_backup_semantics": (
+            "stochastic_next_action_q_only_effective_alpha_zero_v1"
+        ),
+        "pretrain_target_policy": (
+            "dedicated_small_noise_stochastic_current_bc_student_v1"
+        ),
+        "replay_mix_semantics": (
+            "beta_independent_teacher_executed_0.5_"
+            "student_executed_0.5_v1"
+        ),
+    })
     return {
         "training_algorithm": BC_DAGGER_TRAINING_ALGORITHM,
         "actor_backend": BC_DAGGER_ACTOR_BACKEND,
-        "critic_learning_semantics": BC_DAGGER_IQL_CRITIC_SEMANTICS,
+        "critic_learning_semantics": BC_DAGGER_SAC_CRITIC_SEMANTICS,
         "actor_learning_semantics": BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
         "vecnorm_fingerprint": "frozen-vecnorm",
         "dagger_backend_config": {
             "dagger_action_clip": 20.0,
             "q_hidden_dim": 8,
-            "q_num_atoms": 11,
+            "q_num_atoms": 501,
             "q_v_min": -2.0,
             "q_v_max": 2.0,
-            "q_layer_norm": False,
-            "iql_expectile": 0.7,
+            "q_layer_norm": True,
+            "q_action_fusion": "early",
+            "q_action_coordinates": "absolute",
+            "sac_q_normalize_actions": True,
+            "sac_q_action_input_gain": 1.0,
+            "sac_clipped_double_q": True,
+            "q_lr": 3e-5,
+            "q_weight_decay": 1e-3,
+            "q_tau": 0.001,
+            "q_max_grad_norm": 1.0,
         },
+        # BC pretraining must expose the same complete Q contract consumed by
+        # FastSAC checkpoints, rather than relying on a few coincidentally equal
+        # tensor shapes in dagger_backend_config.
+        "q_backend_config": q_backend,
         "qnet": {"weight": torch.tensor([[3.0]])},
         "qnet_target": {"weight": torch.tensor([[-4.0]])},
-        # Stage 2 requires proof that Stage 1 really trained V, but it does not
-        # instantiate or transfer this IQL-only bootstrap network.
-        "iql_value": {"net.0.weight": torch.tensor([[9.0]])},
+        "bc_dagger_sac_adapter": {"log_std": torch.tensor([-6.0])},
         "q_update_count": 123,
-        "iql_value_update_count": 119,
         "teacher_replay_id": "dagger-replay",
         "teacher_replay_state": {"snapshot_id": "dagger-snapshot"},
     }
+
+
+def test_stage2_accepts_full_fastsac_501_normalized_early_ln_bc_q_metadata(
+    monkeypatch,
+):
+    policy = _stage2_policy()
+    copied = []
+    actor_core = SimpleNamespace(
+        actor_std=torch.nn.Parameter(torch.tensor([0.25]))
+    )
+
+    def copy_modules(self, state_dict, strict=True):
+        copied.append(strict)
+        return []
+
+    monkeypatch.setattr(PPOVEL, "load_state_dict", copy_modules)
+    monkeypatch.setattr(
+        FastSACVelFinetune,
+        "_ppo_actor_core",
+        staticmethod(lambda actor: actor_core),
+    )
+    state = _v3_bc_critic_checkpoint(policy)
+
+    assert "iql_value" not in state
+    assert state["q_backend_config"]["num_atoms"] == 501
+    assert state["q_backend_config"]["q_action_normalized"] is True
+    assert state["q_backend_config"]["q_action_fusion"] == "early"
+    assert state["q_backend_config"]["layer_norm"] is True
+    assert state["q_backend_config"]["q_action_input_gain"] == pytest.approx(1.0)
+    assert state["q_backend_config"]["clipped_double_q"] is True
+
+    failed = policy.load_state_dict(state)
+
+    assert failed == []
+    assert copied == [True]
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    (
+        ("num_atoms", 101),
+        ("q_action_normalized", False),
+        ("q_action_fusion", "late"),
+        ("layer_norm", False),
+        ("q_action_input_gain", 2.0),
+        ("clipped_double_q", False),
+    ),
+)
+def test_stage2_rejects_bc_q_backend_metadata_mismatch_before_copy(
+    monkeypatch, field, bad_value,
+):
+    policy = _stage2_policy()
+
+    def unexpected_copy(*args, **kwargs):
+        raise AssertionError("Q metadata mismatch reached module-copy path")
+
+    monkeypatch.setattr(PPOVEL, "load_state_dict", unexpected_copy)
+    state = _v3_bc_critic_checkpoint(policy)
+    state["q_backend_config"][field] = bad_value
+
+    with pytest.raises(ValueError, match="Q.*(config|metadata)|backend"):
+        policy.load_state_dict(state)
 
 
 def test_stage2_rejects_legacy_bc_dagger_checkpoint_before_module_copy(
@@ -204,10 +425,10 @@ def test_stage2_rejects_legacy_bc_dagger_checkpoint_before_module_copy(
         raise AssertionError("legacy checkpoint reached module-copy path")
 
     monkeypatch.setattr(PPOVEL, "load_state_dict", unexpected_copy)
-    state = _iql_checkpoint()
+    state = _v3_bc_critic_checkpoint(policy)
     state["training_algorithm"] = BC_DAGGER_LEGACY_TRAINING_ALGORITHM
 
-    with pytest.raises(ValueError, match="predate IQL critic training"):
+    with pytest.raises(ValueError, match="Legacy|predate"):
         policy.load_state_dict(state)
 
 
@@ -218,7 +439,7 @@ def test_stage2_rejects_legacy_bc_dagger_checkpoint_before_module_copy(
             "critic_learning_semantics",
             "plain-bellman-q",
             ValueError,
-            "IQL critic semantics mismatch",
+            "critic semantics mismatch",
         ),
         (
             "actor_learning_semantics",
@@ -227,26 +448,14 @@ def test_stage2_rejects_legacy_bc_dagger_checkpoint_before_module_copy(
             "not trained by pure DAgger BC",
         ),
         (
-            "iql_value",
-            _DELETE,
-            KeyError,
-            "missing its IQL value network",
-        ),
-        (
             "q_update_count",
             0,
             RuntimeError,
             "Q1/Q2 were never updated",
         ),
-        (
-            "iql_value_update_count",
-            0,
-            RuntimeError,
-            "IQL V was never updated",
-        ),
     ],
 )
-def test_stage2_requires_complete_iql_v2_training_provenance(
+def test_stage2_requires_complete_sac_critic_v3_training_provenance(
     monkeypatch, field, value, exception, message,
 ):
     policy = _stage2_policy()
@@ -255,7 +464,7 @@ def test_stage2_requires_complete_iql_v2_training_provenance(
         raise AssertionError("invalid provenance reached module-copy path")
 
     monkeypatch.setattr(PPOVEL, "load_state_dict", unexpected_copy)
-    state = _iql_checkpoint()
+    state = _v3_bc_critic_checkpoint(policy)
     if value is _DELETE:
         del state[field]
     else:
@@ -265,7 +474,7 @@ def test_stage2_requires_complete_iql_v2_training_provenance(
         policy.load_state_dict(state)
 
 
-def test_stage2_transfers_iql_q_twins_and_targets_but_discards_stage1_v(
+def test_stage2_transfers_sac_critic_q_twins_targets_and_dedicated_std(
     monkeypatch,
 ):
     policy = _stage2_policy()
@@ -280,6 +489,9 @@ def test_stage2_transfers_iql_q_twins_and_targets_but_discards_stage1_v(
         copied.append(strict)
         self.qnet.load_state_dict(state_dict["qnet"])
         self.qnet_target.load_state_dict(state_dict["qnet_target"])
+        self.bc_dagger_sac_adapter.load_state_dict(
+            state_dict["bc_dagger_sac_adapter"]
+        )
         return []
 
     monkeypatch.setattr(PPOVEL, "load_state_dict", copy_ppo_modules)
@@ -289,7 +501,9 @@ def test_stage2_transfers_iql_q_twins_and_targets_but_discards_stage1_v(
         staticmethod(lambda actor: actor_core),
     )
 
-    failed = policy.load_state_dict(_iql_checkpoint())
+    checkpoint = _v3_bc_critic_checkpoint(policy)
+    assert policy.cfg.sac_stage2_initial_action_std is None
+    failed = policy.load_state_dict(checkpoint)
 
     assert failed == []
     assert copied == [True]
@@ -298,36 +512,116 @@ def test_stage2_transfers_iql_q_twins_and_targets_but_discards_stage1_v(
     assert not policy.qnet_target.weight.requires_grad
     assert torch.equal(actor_core.actor_std, ppo_std_before)
     assert not actor_core.actor_std.requires_grad
-    assert torch.equal(
+    assert not torch.equal(
         policy.bc_dagger_sac_adapter.log_std,
         initial_sac_log_std,
     )
-    assert policy.bc_dagger_sac_adapter.log_std.item() == pytest.approx(
-        math.log(
-            policy.cfg.sac_bc_initial_action_std
-            / policy.cfg.sac_bc_action_clip
-        )
-    )
+    assert policy.bc_dagger_sac_adapter.log_std.item() == pytest.approx(-6.0)
     assert torch.equal(
         policy.bc_dagger_actor_anchor.weight,
         policy.actor_adapt.weight,
     )
     assert not policy.bc_dagger_actor_anchor.weight.requires_grad
-    assert not hasattr(policy, "iql_value")
+    assert "iql_value" not in checkpoint
     assert policy.q_update_count == 0
     assert policy.sac_update_count == 0
     assert policy.teacher_replay_id == "dagger-replay"
     assert policy._loaded_teacher_replay_metadata == {
         "snapshot_id": "dagger-snapshot"
     }
-    assert policy._bc_dagger_iql_source == {
-        "critic_learning_semantics": BC_DAGGER_IQL_CRITIC_SEMANTICS,
+    assert policy._bc_dagger_critic_source == {
+        "critic_learning_semantics": BC_DAGGER_SAC_CRITIC_SEMANTICS,
         "actor_learning_semantics": BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
         "source_q_updates": 123,
-        "source_value_updates": 119,
-        "expectile": 0.7,
-        "value_network_stage2_usage": "discarded_stage1_bootstrap_only",
+        "q_backend_config": checkpoint["q_backend_config"],
+        "q_weights_stage2_usage": "transferred_exact_sac_contract",
+        "q_optimizer_stage2_usage": (
+            "fresh_adamw_moments_same_lr_weight_decay"
+        ),
+        "q_update_counter_stage2_usage": "reset_for_stage2_schedule",
     }
+
+
+def test_stage2_direct_v3_transfer_can_reset_dedicated_action_std(
+    monkeypatch,
+):
+    policy = _stage2_policy()
+    policy.cfg.sac_stage2_initial_action_std = 0.2
+    actor_core = SimpleNamespace(
+        actor_std=torch.nn.Parameter(torch.tensor([0.25]))
+    )
+    adapter_values_during_copy = []
+
+    def copy_ppo_modules(self, state_dict, strict=True):
+        self.qnet.load_state_dict(state_dict["qnet"])
+        self.qnet_target.load_state_dict(state_dict["qnet_target"])
+        self.bc_dagger_sac_adapter.load_state_dict(
+            state_dict["bc_dagger_sac_adapter"]
+        )
+        adapter_values_during_copy.append(
+            self.bc_dagger_sac_adapter.log_std.item()
+        )
+        return []
+
+    monkeypatch.setattr(PPOVEL, "load_state_dict", copy_ppo_modules)
+    monkeypatch.setattr(
+        FastSACVelFinetune,
+        "_ppo_actor_core",
+        staticmethod(lambda actor: actor_core),
+    )
+    checkpoint = _v3_bc_critic_checkpoint(policy)
+
+    failed = policy.load_state_dict(checkpoint)
+
+    assert failed == []
+    # Loading first proves this is an explicit transfer reset, not an ignored
+    # checkpoint tensor or a constructor-only initial value.
+    assert adapter_values_during_copy == [pytest.approx(-6.0)]
+    assert policy.bc_dagger_sac_adapter.log_std.item() == pytest.approx(
+        math.log(0.2 / policy.cfg.sac_bc_action_clip)
+    )
+    assert checkpoint["bc_dagger_sac_adapter"]["log_std"].item() == (
+        pytest.approx(-6.0)
+    )
+
+
+def test_stage2_resume_restores_learned_adapter_without_reapplying_std_reset(
+    monkeypatch,
+):
+    policy = _stage2_policy()
+    policy.cfg = FastSACVelFinetuneConfig(
+        finetune_checkpoint_source="bc_dagger",
+        sac_stage2_initial_action_std=0.2,
+    )
+    policy.log_alpha = torch.nn.Parameter(torch.tensor(0.0))
+
+    learned_log_std = torch.tensor([-5.5])
+
+    def load_student(self, state_dict, strict=True):
+        self.bc_dagger_sac_adapter.load_state_dict(
+            state_dict["bc_dagger_sac_adapter"]
+        )
+        self.q_update_count = 77
+        self.sac_actor_update_count = 0
+        return []
+
+    monkeypatch.setattr(FastSACVEL, "load_state_dict", load_student)
+    checkpoint = {
+        "qnet": {},
+        "last_phase": "finetune",
+        "stage2_schedule_config": policy._stage2_schedule_config(),
+        "stage2_actor_release_q_update": None,
+        "sac_rollout_rng_state": torch.Generator().manual_seed(9).get_state(),
+        "bc_dagger_sac_adapter": {"log_std": learned_log_std.clone()},
+    }
+
+    failed = policy.load_state_dict(checkpoint)
+
+    assert failed == []
+    assert policy.bc_dagger_sac_adapter.log_std.item() == pytest.approx(-5.5)
+    assert policy.bc_dagger_sac_adapter.log_std.item() != pytest.approx(
+        math.log(0.2 / policy.cfg.sac_bc_action_clip)
+    )
 
 
 def test_stage2_can_transfer_bc_student_but_start_q_and_targets_fresh(
@@ -393,16 +687,13 @@ def test_stage2_can_transfer_bc_student_but_start_q_and_targets_fresh(
         staticmethod(lambda actor: actor_core),
     )
 
-    state = _iql_checkpoint()
-    # Opting out of Q transfer must make the Stage-1-only IQL networks and
-    # update provenance irrelevant. This also permits actor-only BC-DAgger
-    # checkpoints rather than pretending that an untrained Q is useful.
+    state = _v3_bc_critic_checkpoint(policy)
+    # Opting out of Q transfer makes critic tensors/update provenance
+    # irrelevant while preserving the pure-BC actor and dedicated SAC std.
     for field in (
         "qnet",
         "qnet_target",
-        "iql_value",
         "q_update_count",
-        "iql_value_update_count",
     ):
         state.pop(field)
     state["optimizers"] = {
@@ -438,16 +729,16 @@ def test_stage2_can_transfer_bc_student_but_start_q_and_targets_fresh(
     assert not policy.qnet_target.weight.requires_grad
     assert torch.equal(actor_core.actor_std, ppo_std_before)
     assert not actor_core.actor_std.requires_grad
-    assert torch.equal(
+    assert not torch.equal(
         policy.bc_dagger_sac_adapter.log_std,
         initial_sac_log_std,
     )
+    assert policy.bc_dagger_sac_adapter.log_std.item() == pytest.approx(-6.0)
     assert torch.equal(
         policy.bc_dagger_actor_anchor.weight,
         policy.actor_adapt.weight,
     )
     assert not policy.bc_dagger_actor_anchor.weight.requires_grad
-    assert not hasattr(policy, "iql_value")
     assert policy.opt_q.state == {}
     assert policy.q_update_count == 0
     assert policy.sac_update_count == 0
@@ -455,13 +746,10 @@ def test_stage2_can_transfer_bc_student_but_start_q_and_targets_fresh(
     assert policy.sac_alpha_update_count == 0
     assert policy.sac_environment_steps == 0
     assert policy.sac_rollout_count == 0
-    assert policy._bc_dagger_iql_source == {
-        "critic_learning_semantics": BC_DAGGER_IQL_CRITIC_SEMANTICS,
+    assert policy._bc_dagger_critic_source == {
+        "critic_learning_semantics": BC_DAGGER_SAC_CRITIC_SEMANTICS,
         "actor_learning_semantics": BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
         "source_q_updates": 0,
-        "source_value_updates": 0,
-        "expectile": 0.7,
-        "value_network_stage2_usage": "not_loaded",
         "q_weights_stage2_usage": "discarded_fresh_q_seed",
         "q_seed": 17,
     }
@@ -474,14 +762,12 @@ def test_fresh_q_option_still_requires_pure_bc_actor_provenance(monkeypatch):
         raise AssertionError("invalid actor provenance reached module copy")
 
     monkeypatch.setattr(PPOVEL, "load_state_dict", unexpected_copy)
-    state = _iql_checkpoint()
+    state = _v3_bc_critic_checkpoint(policy)
     state["actor_learning_semantics"] = "q-weighted-actor"
     for field in (
         "qnet",
         "qnet_target",
-        "iql_value",
         "q_update_count",
-        "iql_value_update_count",
     ):
         state.pop(field)
 
@@ -498,7 +784,7 @@ def test_stage2_rejects_dagger_action_support_mismatch_before_module_copy(
         raise AssertionError("action-support mismatch reached module copy")
 
     monkeypatch.setattr(PPOVEL, "load_state_dict", unexpected_copy)
-    state = _iql_checkpoint()
+    state = _v3_bc_critic_checkpoint(policy)
     state["dagger_backend_config"]["dagger_action_clip"] = 10.0
 
     with pytest.raises(ValueError, match="action clip does not match"):

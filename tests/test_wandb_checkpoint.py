@@ -389,6 +389,55 @@ def test_bc_dagger_resume_skips_shared_helper_h5_auto_download(
     ]
 
 
+def test_staged_bc_dagger_source_skips_shared_helper_h5_auto_download(
+    monkeypatch,
+):
+    class StopAfterCheckpointResolution(Exception):
+        pass
+
+    calls = []
+
+    def resolve(path, **kwargs):
+        calls.append((path, kwargs))
+        raise StopAfterCheckpointResolution
+
+    # The fresh staged source intentionally ignores any H5 adjacent to the PPO
+    # teacher. Stop before simulator/policy construction to isolate that guard.
+    monkeypatch.setitem(
+        sys.modules,
+        "active_adaptation.envs",
+        SimpleNamespace(SimpleEnv=lambda task: SimpleNamespace()),
+    )
+    monkeypatch.setattr(helpers_module, "parse_checkpoint_path", resolve)
+    cfg = OmegaConf.create({
+        "seed": 0,
+        "checkpoint_path": "/models/checkpoint_6000.pt",
+        "_bc_dagger_staging_source": True,
+        "teacher_replay_buffer_path": None,
+        "task": {"observation": {}},
+        "algo": {
+            "in_keys": [],
+            "phase": "finetune",
+            "save_teacher_buffer": True,
+            "teacher_buffer_path": None,
+            "teacher_buffer_filename": "teacher_replay_buffer.h5",
+        },
+    })
+
+    with pytest.raises(StopAfterCheckpointResolution):
+        helpers_module.make_env_policy(cfg, configure_replay=True)
+
+    assert calls == [
+        (
+            "/models/checkpoint_6000.pt",
+            {
+                "download_replay": False,
+                "replay_filename": "teacher_replay_buffer.h5",
+            },
+        )
+    ]
+
+
 def test_explicit_teacher_replay_requires_checkpoint_and_existing_file(tmp_path):
     replay = tmp_path / "teacher_replay_buffer.h5"
     replay.touch()

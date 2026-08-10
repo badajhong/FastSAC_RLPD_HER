@@ -1,10 +1,10 @@
-"""PPO-teacher DAgger finetuning with VAIC perception and an IQL critic.
+"""PPO-teacher DAgger finetuning with a Stage-2-compatible SAC critic.
 
 This stage deliberately does *not* run PPO or SAC actor optimization.  A
 frozen PPO residual policy is the privileged DAgger oracle, ``actor_adapt`` is
-trained only by behavior cloning, and an IQL-style V plus C51 Q1/Q2 are learned
-as future FastSAC warm-start weights from actions actually sent to the
-environment. Q-derived advantage weighting is deliberately absent.
+trained only by behavior cloning, while the exact FastSAC C51 Q1/Q2 topology
+is trained from a beta-independent 50/50 mixture of teacher-executed and
+student-executed transitions. Q-derived actor weighting is deliberately absent.
 The original VAIC observation, reward, termination, depth-supervision, and EMA
 paths remain owned by :class:`PPOVEL`.
 """
@@ -12,6 +12,7 @@ paths remain owned by :class:`PPOVEL`.
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import logging
 import math
@@ -38,15 +39,26 @@ from .common import (
     hard_copy_,
 )
 from .fastsac_vel import (
+    FASTSAC_BC_DAGGER_TARGET_ENTROPY_SEMANTICS,
+    FASTSAC_CLIPPED_DOUBLE_Q_SEMANTICS,
+    FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS,
+    FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
+    FASTSAC_Q_EARLY_FUSION_SEMANTICS,
+    FASTSAC_REFERENCE_EPS,
     FASTSAC_RAW_OBSERVATION_ROOT,
+    FastSACTanhNormal,
     REPLAY_OBSERVATION_SEMANTICS,
     SAC_REWARD_SCALARIZATION,
     TEACHER_REPLAY_FIELDS,
     TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
     TeacherReplayBuffer,
+    _BCDaggerSACAdapter,
     _build_isolated_q_network,
     _filter_replay_rows,
+    _measure_or_clip_grad_norm,
+    _q_action_hidden_dim,
     _sac_bootstrap_mask,
+    _select_c51_twin_target,
     _vaic_truncation_mask,
     _vecnorm_state_fingerprint,
 )
@@ -65,11 +77,22 @@ from .ppo_vel import (
 )
 
 
-PPO_BC_DAGGER_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_iql_v2"
+PPO_BC_DAGGER_TRAINING_ALGORITHM = (
+    "vaic_ppo_bc_dagger_student_sac_critic_v3"
+)
+PPO_BC_DAGGER_IQL_TRAINING_ALGORITHM = (
+    "vaic_ppo_bc_dagger_student_iql_v2"
+)
 PPO_BC_DAGGER_LEGACY_TRAINING_ALGORITHM = (
     "vaic_ppo_bc_dagger_student_v1"
 )
 PPO_BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_independent_normal_bc_dagger_v1"
+PPO_BC_DAGGER_SAC_CRITIC_SEMANTICS = (
+    "beta_independent_half_teacher_half_student_executed_action_"
+    "stochastic_student_q_only_c51_clipped_double_q_v1"
+)
+# Kept only as a checkpoint/version sentinel. The production path below no
+# longer constructs or optimizes an IQL value network.
 PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS = (
     "dataset_action_target_twin_expected_c51_expectile_v_to_scalar_td_"
     "c51_projection_v1"
@@ -85,14 +108,48 @@ DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS = (
 DAGGER_REPLAY_OBSERVATION_SEMANTICS = REPLAY_OBSERVATION_SEMANTICS
 DAGGER_INITIAL_TRANSITION_FILTER = "step_count_gt_5"
 DAGGER_ACTION_PARAMETERIZATION = (
-    "absolute_executable_bernoulli_teacher_or_student_v1"
+    "absolute_executable_safe_hysteresis_or_beta_teacher_or_student_v2"
 )
 DAGGER_TEACHER_ACTION_SEMANTICS = "ppo_reference_plus_residual_v1"
+DAGGER_CONTROL_SEMANTICS = (
+    "clipped_deterministic_mean_normalized_rms_safe_hysteresis_or_beta_v1"
+)
+DAGGER_FINALIZATION_SEMANTICS = (
+    "perception_then_actor_then_perception_then_fresh_replay_q_v1"
+)
+DAGGER_FINALIZATION_PHASES = (
+    "perception_consolidation",
+    "actor_realignment",
+    "perception_recheck",
+    "replay_q_calibration",
+)
+DAGGER_STAGING_SEMANTICS = (
+    "joint_then_cyclic_perception_actor_then_final_perception_actor_"
+    "then_fresh_replay_q_v1"
+)
+DAGGER_STAGING_PHASES = (
+    "joint_warmup",
+    "cycle_perception",
+    "cycle_actor",
+    "final_perception",
+    "final_actor",
+    "replay_q_calibration",
+)
 DAGGER_TEACHER_ACTION_KEY = "teacher_action"
 DAGGER_TEACHER_ACTION_VALID_KEY = "teacher_action_valid"
 DAGGER_IS_STUDENT_ACTION_KEY = "is_student_action"
+DAGGER_ACTION_DISCREPANCY_RMS_KEY = "dagger_action_discrepancy_rms"
+DAGGER_ACTION_DISCREPANCY_MAX_KEY = "dagger_action_discrepancy_max"
+DAGGER_SAFE_UNSAFE_KEY = "dagger_safe_unsafe"
+DAGGER_SAFE_TEACHER_KEY = "dagger_safe_teacher"
+DAGGER_SAFE_TAKEOVER_KEY = "dagger_safe_takeover"
+DAGGER_SAFE_RELEASE_KEY = "dagger_safe_release"
+DAGGER_BETA_TEACHER_KEY = "dagger_beta_teacher"
+DAGGER_STUDENT_ACTION_VALID_KEY = "dagger_student_action_valid"
 DAGGER_REPLAY_TEACHER_ACTIONS = "teacher_actions"
+DAGGER_Q_TEACHER_SOURCE_KEY = "_dagger_q_teacher_source"
 DAGGER_REPLAY_MIN_STEP_COUNT = 5
+DAGGER_CONTROL_MODES = ("beta", "safe", "hybrid")
 
 
 def _valid_teacher_action_rows(
@@ -106,6 +163,29 @@ def _valid_teacher_action_rows(
         raise ValueError("teacher actions must contain an action dimension")
     return torch.isfinite(actions).all(dim=-1) & (actions.abs() <= threshold).all(
         dim=-1
+    )
+
+
+def _normalized_action_discrepancy(
+    student_action: torch.Tensor,
+    teacher_mean_action: torch.Tensor,
+    action_clip: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-row RMS and max error in the critic's unit action box."""
+    if student_action.shape != teacher_mean_action.shape:
+        raise ValueError(
+            "SafeDAgger student/teacher action shapes must match, got "
+            f"{tuple(student_action.shape)} and {tuple(teacher_mean_action.shape)}"
+        )
+    if student_action.ndim < 1 or student_action.shape[-1] < 1:
+        raise ValueError("SafeDAgger actions must contain an action dimension")
+    action_clip = float(action_clip)
+    if not math.isfinite(action_clip) or action_clip <= 0.0:
+        raise ValueError("SafeDAgger action_clip must be finite and positive")
+    normalized_error = (student_action - teacher_mean_action).abs() / action_clip
+    return (
+        normalized_error.square().mean(dim=-1).sqrt(),
+        normalized_error.amax(dim=-1),
     )
 
 
@@ -256,14 +336,55 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
     vecnorm: str = "eval"
     enable_residual_distillation: bool = False
 
-    # beta is a per-environment Bernoulli teacher-execution probability.  It is
-    # local to this new stage and never derives from the inherited PPO iteration.
+    # SafeDAgger is the default controller. ``beta`` remains as a reproducible
+    # ablation, while ``hybrid`` takes over unsafe rows and also applies beta on
+    # otherwise safe rows. All comparisons use clipped deterministic means.
+    dagger_control_mode: str = "safe"
+    dagger_safe_takeover_rms: float = 0.006
+    dagger_safe_release_rms: float = 0.004
+    dagger_safe_min_teacher_steps: int = 8
+    # Optional cumulative rollout boundary for a deliberate student-only tail.
+    # Indices below K retain SafeDAgger; index K onward disables only the safe
+    # controller (hybrid beta selection, if configured, remains independent).
+    dagger_safe_zero_iteration: int | None = None
+    # beta is stage-local and is used only by beta/hybrid control modes.
     dagger_beta_start: float = 1.0
     dagger_beta_end: float = 0.0
     dagger_beta_decay_rollouts: int = 4000
+    # Dedicated scripts/bc_dagger.py CLI alias. The entrypoint resolves this
+    # completed-rollout boundary into dagger_beta_decay_rollouts before
+    # constructing the policy; None preserves the legacy setting above.
+    dagger_beta_zero_iteration: int | None = None
     dagger_seed: int = 0
     dagger_teacher_action_threshold: float = 20.0
     dagger_action_clip: float = 20.0
+
+    # Optional post-DAgger consolidation pipeline.  These fields are internal
+    # controls populated by scripts/bc_dagger_finalize.py; keeping them out of
+    # ``dagger_backend_config`` lets the source checkpoint retain its exact
+    # controller/Q contract while finalization supplies a runtime-only policy.
+    dagger_finalization_enabled: bool = False
+    dagger_finalize_perception_iterations: int = 0
+    dagger_finalize_actor_iterations: int = 0
+    dagger_finalize_recheck_iterations: int = 0
+    dagger_finalize_calibration_iterations: int = 0
+    dagger_finalize_calibration_control_mode: str = "beta"
+    dagger_finalize_calibration_teacher_probability: float = 0.5
+
+    # Optional block-coordinate BC-DAgger schedule for a fresh PPO teacher.
+    # Unlike finalization, the joint warmup may train all three optimizer
+    # owners.  Cyclic/final perception and actor blocks isolate their owner,
+    # and only the terminal Q block is allowed to persist teacher rows to H5.
+    dagger_staging_enabled: bool = False
+    dagger_stage_joint_warmup_iterations: int = 0
+    dagger_stage_cycles: int = 0
+    dagger_stage_perception_iterations: int = 0
+    dagger_stage_actor_iterations: int = 0
+    dagger_stage_final_perception_iterations: int = 0
+    dagger_stage_final_actor_iterations: int = 0
+    dagger_stage_calibration_iterations: int = 0
+    dagger_stage_calibration_control_mode: str = "beta"
+    dagger_stage_calibration_teacher_probability: float = 0.5
 
     dagger_bc_lr: float = 3e-4
     dagger_bc_epochs: int = 1
@@ -289,23 +410,41 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
     )
 
     q_hidden_dim: int = 768
-    q_num_atoms: int = 101
+    q_num_atoms: int = 501
     q_v_min: float = -20.0
     q_v_max: float = 20.0
     q_layer_norm: bool = True
-    q_lr: float = 3e-4
+    q_action_fusion: str = "early"
+    q_action_coordinates: str = "absolute"
+    sac_q_normalize_actions: bool = True
+    sac_q_action_input_gain: float = 1.0
+    sac_clipped_double_q: bool = True
+    q_lr: float = 3e-5
     q_weight_decay: float = 1e-3
     q_seed: int = 0
-    # Official IQL uses a slowly moving target critic. This remains separate
-    # from Stage-2 FastSAC's sac_tau after the Q weights are transferred.
-    q_tau: float = 0.005
+    # These are intentionally identical to FastSACVelFinetune defaults.
+    q_tau: float = 0.001
     q_max_grad_norm: float = 1.0
-    iql_expectile: float = 0.7
-    iql_value_lr: float = 3e-4
-    # BC keeps its large 4,096-row batch.  At 32 updates per rollout, 1,024
-    # IQL rows still gives UTD=2 with 512 envs x 32 control steps, while the
-    # additional V forward/backward does not dominate DAgger wall time.
-    iql_batch_size: int = 1024
+    # 128 x 512 samples for each 512-env x 32-step rollout is UTD=4, matching
+    # the validated Stage-2 experiment. Each draw is exactly 256/256.
+    q_batch_size: int = 512
+    q_updates_per_rollout: int = 128
+    q_teacher_replay_ratio: float = 0.5
+    q_teacher_buffer_capacity: int = 131_072
+    # Ordinary replay warm-up, not a critic-confidence gate. It prevents the
+    # first handful of rare student rows at beta~=1 from being oversampled by
+    # the full UTD-4 update burst.
+    q_learning_starts_per_source: int = 8_192
+
+    # DAgger control remains deterministic. Only the SAC Bellman next action
+    # uses this dedicated small-noise distribution; PPO actor_std is unused.
+    sac_bc_initial_action_std: float = 0.01
+    sac_bc_log_std_min: float = -8.0
+    sac_bc_log_std_max: float = -2.0
+    # Initialized here and transferred for Stage 2; BC's Q-only target keeps
+    # effective alpha at zero exactly like the Stage-2 actor burn-in.
+    sac_alpha_init: float = 1e-5
+    sac_entropy_reference_scale: float = 1.0
 
     save_teacher_buffer: bool = True
     teacher_buffer_filename: str = "teacher_replay_buffer.h5"
@@ -360,6 +499,20 @@ class _DeviceReplay:
         self.ptr = 0
         self.size = 0
         self.seen = 0
+        # Boolean validity fields change only when the FIFO is extended.  BC and
+        # balanced-Q sampling otherwise asked ``nonzero`` to rescan the full
+        # 131k-row ring for every optimizer update (160 scans per rollout at the
+        # dedicated defaults).  Cache the same ascending physical indices until
+        # the next write; this does not change the sampling population or RNG.
+        self._valid_index_cache: dict[str, torch.Tensor] = {}
+
+    def clear(self) -> None:
+        """Drop every row and allocation from this ephemeral learning FIFO."""
+        self.data.clear()
+        self.ptr = 0
+        self.size = 0
+        self.seen = 0
+        self._valid_index_cache.clear()
 
     @torch.no_grad()
     def extend(self, transitions: dict[str, torch.Tensor]) -> int:
@@ -374,6 +527,7 @@ class _DeviceReplay:
             values[key] = value.to(self.device)
         if count == 0:
             return 0
+        self._valid_index_cache.clear()
         if not self.data:
             self.data = {
                 key: torch.empty(
@@ -403,9 +557,9 @@ class _DeviceReplay:
         self.size = min(self.size + count, self.capacity)
         return count
 
-    def valid_count(self, key: str) -> int:
+    def _valid_indices(self, key: str) -> torch.Tensor:
         if self.size < 1:
-            return 0
+            return torch.empty(0, dtype=torch.long, device=self.device)
         if key not in self.data:
             raise KeyError(f"Unknown DAgger replay validity field {key!r}")
         value = self.data[key][: self.size]
@@ -413,7 +567,14 @@ class _DeviceReplay:
             raise TypeError(
                 f"DAgger replay validity field {key!r} must be one-dimensional bool"
             )
-        return int(value.sum().item())
+        indices = self._valid_index_cache.get(key)
+        if indices is None:
+            indices = value.nonzero(as_tuple=False).squeeze(-1)
+            self._valid_index_cache[key] = indices
+        return indices
+
+    def valid_count(self, key: str) -> int:
+        return int(self._valid_indices(key).numel())
 
     def sample(
         self,
@@ -421,6 +582,7 @@ class _DeviceReplay:
         output_device,
         generator=None,
         valid_key: str | None = None,
+        fields=None,
     ):
         if self.size < 1:
             raise RuntimeError("Cannot sample an empty DAgger replay")
@@ -437,17 +599,7 @@ class _DeviceReplay:
                 generator=generator,
             )
         else:
-            if valid_key not in self.data:
-                raise KeyError(
-                    f"Unknown DAgger replay validity field {valid_key!r}"
-                )
-            valid = self.data[valid_key][: self.size]
-            if valid.dtype is not torch.bool or valid.ndim != 1:
-                raise TypeError(
-                    "DAgger replay validity sampling requires a one-dimensional "
-                    "boolean field"
-                )
-            valid_indices = valid.nonzero(as_tuple=False).squeeze(-1)
+            valid_indices = self._valid_indices(valid_key)
             if valid_indices.numel() == 0:
                 raise RuntimeError("Cannot sample DAgger BC without valid labels")
             positions = torch.randint(
@@ -462,10 +614,21 @@ class _DeviceReplay:
             indices = valid_indices[positions]
         if indices.device != self.device:
             indices = indices.to(self.device)
+        fields = tuple(self.data) if fields is None else tuple(fields)
+        unknown = set(fields).difference(self.data)
+        if unknown:
+            raise KeyError(
+                f"Unknown DAgger replay sample fields: {sorted(unknown)}"
+            )
         output_device = torch.device(output_device)
         return {
-            key: value[indices].to(output_device)
-            for key, value in self.data.items()
+            key: (
+                sampled
+                if sampled.device == output_device
+                else sampled.to(output_device)
+            )
+            for key in fields
+            for sampled in (self.data[key][indices],)
         }
 
 
@@ -503,6 +666,7 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
             "format_version": DAGGER_TEACHER_REPLAY_FORMAT_VERSION,
             "initial_transition_filter": DAGGER_INITIAL_TRANSITION_FILTER,
             "action_parameterization": DAGGER_ACTION_PARAMETERIZATION,
+            "dagger_control_semantics": DAGGER_CONTROL_SEMANTICS,
             "replay_observation_semantics": DAGGER_REPLAY_OBSERVATION_SEMANTICS,
             "vecnorm_fingerprint": self.vecnorm_fingerprint,
             "reward_scalarization": SAC_REWARD_SCALARIZATION,
@@ -561,6 +725,7 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                 "storage_order": "oldest_to_newest",
                 "initial_transition_filter": DAGGER_INITIAL_TRANSITION_FILTER,
                 "action_parameterization": DAGGER_ACTION_PARAMETERIZATION,
+                "dagger_control_semantics": DAGGER_CONTROL_SEMANTICS,
                 "reward_scalarization": SAC_REWARD_SCALARIZATION,
                 "truncation_next_observation": (
                     TRUNCATION_NEXT_OBSERVATION_SEMANTICS
@@ -702,6 +867,35 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
         except ImportError as exc:
             raise ImportError("h5py is required to snapshot DAgger replay") from exc
 
+        # A pure-beta rollout adds no teacher-executed rows after beta reaches
+        # zero.  Keep the immutable snapshot lineage already referenced by the
+        # checkpoint instead of rewriting the same (often 20+ GiB) H5 at every
+        # later save.  Validate the file identity so a restore from a different
+        # source path, a deleted file, or a stale replacement still rewrites it.
+        if (
+            row_count is None
+            and seen_count is None
+            and self.last_snapshot_id is not None
+            and self.last_snapshot_size == snapshot_size
+            and self.last_snapshot_seen == snapshot_seen
+            and os.path.isfile(self.path)
+        ):
+            try:
+                with h5py.File(self.path, "r") as replay:
+                    snapshot_is_current = (
+                        str(replay.attrs.get("replay_id", "")) == self.replay_id
+                        and str(replay.attrs.get("snapshot_id", ""))
+                        == self.last_snapshot_id
+                        and int(replay.attrs.get("num_transitions", -1))
+                        == snapshot_size
+                        and int(replay.attrs.get("num_seen_transitions", -1))
+                        == snapshot_seen
+                    )
+            except OSError:
+                snapshot_is_current = False
+            if snapshot_is_current:
+                return self.path
+
         snapshot_id = str(uuid.uuid4())
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
@@ -723,6 +917,7 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                         "storage_order": "oldest_to_newest",
                         "initial_transition_filter": DAGGER_INITIAL_TRANSITION_FILTER,
                         "action_parameterization": DAGGER_ACTION_PARAMETERIZATION,
+                        "dagger_control_semantics": DAGGER_CONTROL_SEMANTICS,
                         "replay_observation_semantics": DAGGER_REPLAY_OBSERVATION_SEMANTICS,
                         "vecnorm_fingerprint": self.vecnorm_fingerprint,
                         "reward_scalarization": SAC_REWARD_SCALARIZATION,
@@ -808,6 +1003,56 @@ class _DaggerRolloutPolicy(nn.Module):
         # Avoid registering the owner as our child (which would create a module
         # cycle and duplicate every parameter in state_dict()).
         object.__setattr__(self, "_owner", owner)
+        # The shared resume path starts from a fresh env.reset(), so this
+        # transient per-environment latch intentionally starts empty on resume.
+        self._safe_teacher_active = None
+        self._safe_teacher_hold = None
+
+    def _safe_selection(
+        self,
+        valid,
+        student_valid,
+        discrepancy_rms,
+        reset,
+    ):
+        owner = self._owner
+        if (
+            self._safe_teacher_active is None
+            or self._safe_teacher_active.shape != valid.shape
+            or self._safe_teacher_active.device != valid.device
+        ):
+            active = torch.zeros_like(valid)
+            hold = torch.zeros_like(valid, dtype=torch.long)
+        else:
+            active = self._safe_teacher_active
+            hold = self._safe_teacher_hold
+
+        active = active & valid & ~reset
+        hold = torch.where(active, hold, torch.zeros_like(hold))
+        unsafe = valid & (
+            ~student_valid
+            | (discrepancy_rms > float(owner.cfg.dagger_safe_takeover_rms))
+        )
+        takeover = valid & ~active & unsafe
+        active = active | takeover
+        hold = torch.where(
+            takeover,
+            torch.full_like(hold, int(owner.cfg.dagger_safe_min_teacher_steps)),
+            hold,
+        )
+        releasable = valid & active & ~takeover & (hold <= 0)
+        release = (
+            releasable
+            & student_valid
+            & (discrepancy_rms < float(owner.cfg.dagger_safe_release_rms))
+        )
+        active = active & ~release
+        hold = torch.where(
+            active & (hold > 0), hold - 1, torch.zeros_like(hold)
+        )
+        self._safe_teacher_active = active
+        self._safe_teacher_hold = hold
+        return active, unsafe, takeover, release
 
     @torch.no_grad()
     def forward(self, td: TensorDict):
@@ -841,36 +1086,105 @@ class _DaggerRolloutPolicy(nn.Module):
         valid = _valid_teacher_action_rows(
             teacher_action, owner.cfg.dagger_teacher_action_threshold
         )
-        beta = owner._teacher_mixture_probability()
-        choose_teacher = (
-            torch.rand(
-                valid.shape,
-                device=valid.device,
-                generator=owner.dagger_rng,
-            )
-            < beta
-        ) & valid
         # Invalid teacher rows are retained only as masked labels; never expose
         # NaN/Inf through a rollout TensorDict or to the environment action path.
         action_clip = float(owner.cfg.dagger_action_clip)
-        safe_teacher = torch.nan_to_num(
+        clipped_teacher_action = torch.nan_to_num(
             teacher_action,
             nan=0.0,
             posinf=action_clip,
             neginf=-action_clip,
         ).clamp(-action_clip, action_clip)
-        safe_student = torch.nan_to_num(
+        student_valid = torch.isfinite(raw_student_action).all(dim=-1) & (
+            raw_student_action.abs() <= action_clip
+        ).all(dim=-1)
+        clipped_student_action = torch.nan_to_num(
             raw_student_action,
             nan=0.0,
             posinf=action_clip,
             neginf=-action_clip,
         ).clamp(-action_clip, action_clip)
-        td[ACTION_KEY] = torch.where(
-            choose_teacher.unsqueeze(-1), safe_teacher, safe_student
+        discrepancy_rms, discrepancy_max = _normalized_action_discrepancy(
+            clipped_student_action, clipped_teacher_action, action_clip
         )
-        td[DAGGER_TEACHER_ACTION_KEY] = safe_teacher
+        discrepancy_rms = torch.where(
+            valid, discrepancy_rms, torch.zeros_like(discrepancy_rms)
+        )
+        discrepancy_max = torch.where(
+            valid, discrepancy_max, torch.zeros_like(discrepancy_max)
+        )
+        reset = td.get("is_init", None)
+        if reset is None:
+            reset = torch.zeros_like(valid)
+        else:
+            reset = reset.reshape(valid.shape).bool()
+
+        control_mode = owner._effective_control_mode()
+        safe_teacher_mask = torch.zeros_like(valid)
+        safe_unsafe = torch.zeros_like(valid)
+        safe_takeover = torch.zeros_like(valid)
+        safe_release = torch.zeros_like(valid)
+        if control_mode in ("safe", "hybrid"):
+            if owner._safe_teacher_control_enabled():
+                (
+                    safe_teacher_mask,
+                    safe_unsafe,
+                    safe_takeover,
+                    safe_release,
+                ) = self._safe_selection(
+                    valid,
+                    student_valid,
+                    discrepancy_rms,
+                    reset,
+                )
+            else:
+                # A configured cutoff is an explicit safety override. Preserve
+                # the counterfactual unsafe diagnostic, but clear hysteresis and
+                # never execute the teacher from the safe branch at/after K.
+                safe_unsafe = valid & (
+                    ~student_valid
+                    | (
+                        discrepancy_rms
+                        > float(owner.cfg.dagger_safe_takeover_rms)
+                    )
+                )
+                self._safe_teacher_active = torch.zeros_like(valid)
+                self._safe_teacher_hold = torch.zeros_like(
+                    valid, dtype=torch.long
+                )
+        elif control_mode != "beta":
+            raise RuntimeError(
+                f"Unsupported dagger_control_mode={control_mode!r}"
+            )
+
+        beta_teacher = torch.zeros_like(valid)
+        if control_mode in ("beta", "hybrid"):
+            beta = owner._teacher_mixture_probability()
+            beta_teacher = (
+                torch.rand(
+                    valid.shape,
+                    device=valid.device,
+                    generator=owner.dagger_rng,
+                )
+                < beta
+            ) & valid & ~safe_teacher_mask
+        choose_teacher = safe_teacher_mask | beta_teacher
+        td[ACTION_KEY] = torch.where(
+            choose_teacher.unsqueeze(-1),
+            clipped_teacher_action,
+            clipped_student_action,
+        )
+        td[DAGGER_TEACHER_ACTION_KEY] = clipped_teacher_action
         td[DAGGER_TEACHER_ACTION_VALID_KEY] = valid
         td[DAGGER_IS_STUDENT_ACTION_KEY] = ~choose_teacher
+        td[DAGGER_ACTION_DISCREPANCY_RMS_KEY] = discrepancy_rms
+        td[DAGGER_ACTION_DISCREPANCY_MAX_KEY] = discrepancy_max
+        td[DAGGER_SAFE_UNSAFE_KEY] = safe_unsafe
+        td[DAGGER_SAFE_TEACHER_KEY] = safe_teacher_mask
+        td[DAGGER_SAFE_TAKEOVER_KEY] = safe_takeover
+        td[DAGGER_SAFE_RELEASE_KEY] = safe_release
+        td[DAGGER_BETA_TEACHER_KEY] = beta_teacher
+        td[DAGGER_STUDENT_ACTION_VALID_KEY] = student_valid
         return td
 
 
@@ -895,7 +1209,7 @@ class _ClippedStudentRolloutPolicy(nn.Module):
 
 
 class PPOBCDaggerFinetune(PPOVEL):
-    """Depth student with pure DAgger BC and an IQL-pretrained C51 critic."""
+    """Depth student with pure DAgger BC and a FastSAC-compatible critic."""
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         self._validate_config(cfg)
@@ -931,26 +1245,31 @@ class PPOBCDaggerFinetune(PPOVEL):
             cfg.q_layer_norm,
             device,
             cfg.q_seed,
+            cfg.q_action_fusion,
         )
         self.qnet_target = copy.deepcopy(self.qnet).requires_grad_(False)
-        self.iql_value = _build_isolated_iql_value_network(
-            self._q_critic_dim,
-            cfg.q_hidden_dim,
-            cfg.q_layer_norm,
-            device,
-            int(cfg.q_seed) + 1,
+        action_clip = float(cfg.dagger_action_clip)
+        action_low = torch.full(
+            (self.action_dim,), -action_clip, device=device, dtype=torch.float32
+        )
+        action_high = torch.full_like(action_low, action_clip)
+        self.sac_dist_cls = functools.partial(
+            FastSACTanhNormal,
+            low=action_low,
+            high=action_high,
+            event_dims=1,
+        )
+        initial_log_std = math.log(
+            float(cfg.sac_bc_initial_action_std) / action_clip
+        )
+        self.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
+            self.action_dim, initial_log_std, device
         )
         self.opt_q = torch.optim.AdamW(
             self.qnet.parameters(),
             lr=cfg.q_lr,
             weight_decay=cfg.q_weight_decay,
             betas=(0.9, 0.95),
-            fused=str(device).startswith("cuda"),
-        )
-        self.opt_iql_value = torch.optim.Adam(
-            self.iql_value.parameters(),
-            lr=cfg.iql_value_lr,
-            betas=(0.9, 0.999),
             fused=str(device).startswith("cuda"),
         )
         self.bc_optimizer = torch.optim.AdamW(
@@ -970,6 +1289,13 @@ class PPOBCDaggerFinetune(PPOVEL):
             cfg.dagger_buffer_capacity,
             _resolve_replay_device(cfg.dagger_buffer_device, device),
         )
+        # This separate FIFO preserves teacher-executed rows after beta reaches
+        # zero. The normal DAgger ring remains unchanged and continues to own
+        # BC sampling from the recent state distribution.
+        self.q_teacher_replay = _DeviceReplay(
+            cfg.q_teacher_buffer_capacity,
+            _resolve_replay_device(cfg.dagger_buffer_device, device),
+        )
         self.teacher_replay = None
         self.teacher_replay_id = str(uuid.uuid4())
         self._loaded_teacher_replay_metadata = None
@@ -987,11 +1313,19 @@ class PPOBCDaggerFinetune(PPOVEL):
         self.q_rng = torch.Generator(device=generator_device).manual_seed(
             int(cfg.q_seed)
         )
+        self.sac_action_rng = torch.Generator(
+            device=generator_device
+        ).manual_seed(int(cfg.q_seed) + 1)
         self.dagger_rollout_count = 0
         self.dagger_environment_steps = 0
         self.bc_update_count = 0
         self.q_update_count = 0
-        self.iql_value_update_count = 0
+        self.finalization_rollout_count = 0
+        self._finalization_last_phase = None
+        self._finalization_source_state = None
+        self.staging_rollout_count = 0
+        self._staging_last_phase = None
+        self._staging_calibration_start_q_update_count = None
 
     @staticmethod
     def _validate_config(cfg):
@@ -1012,14 +1346,125 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "PPO-BC DAgger owns actor_adapt with one BC optimizer; disable "
                 "the inherited residual-distillation optimizer"
             )
+        control_mode = str(cfg.dagger_control_mode)
+        if control_mode not in DAGGER_CONTROL_MODES:
+            raise ValueError(
+                "dagger_control_mode must be one of "
+                f"{DAGGER_CONTROL_MODES}, got {control_mode!r}"
+            )
+        safe_zero_iteration = getattr(
+            cfg, "dagger_safe_zero_iteration", None
+        )
+        if safe_zero_iteration is not None:
+            if (
+                isinstance(safe_zero_iteration, bool)
+                or not isinstance(safe_zero_iteration, int)
+                or safe_zero_iteration < 1
+            ):
+                raise ValueError(
+                    "dagger_safe_zero_iteration must be a positive integer"
+                )
+            if control_mode == "beta":
+                raise ValueError(
+                    "dagger_safe_zero_iteration requires safe or hybrid control"
+                )
+        if bool(getattr(cfg, "dagger_finalization_enabled", False)):
+            stage_names = (
+                "dagger_finalize_perception_iterations",
+                "dagger_finalize_actor_iterations",
+                "dagger_finalize_recheck_iterations",
+                "dagger_finalize_calibration_iterations",
+            )
+            for name in stage_names:
+                value = getattr(cfg, name)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                ):
+                    raise ValueError(f"{name} must be a non-negative integer")
+            if int(cfg.dagger_finalize_calibration_iterations) < 1:
+                raise ValueError(
+                    "BC-DAgger finalization requires at least one fresh "
+                    "replay/Q calibration rollout"
+                )
+            calibration_mode = str(
+                cfg.dagger_finalize_calibration_control_mode
+            )
+            if calibration_mode != "beta":
+                raise ValueError(
+                    "dagger_finalize_calibration_control_mode currently "
+                    "requires 'beta'"
+                )
+            probability = float(
+                cfg.dagger_finalize_calibration_teacher_probability
+            )
+            if not math.isfinite(probability) or not 0.0 < probability < 1.0:
+                raise ValueError(
+                    "dagger_finalize_calibration_teacher_probability must be "
+                    "finite and strictly between zero and one"
+                )
+        staging_enabled = bool(
+            getattr(cfg, "dagger_staging_enabled", False)
+        )
+        if staging_enabled:
+            if bool(getattr(cfg, "dagger_finalization_enabled", False)):
+                raise ValueError(
+                    "BC-DAgger staging and finalization are mutually exclusive"
+                )
+            staging_iteration_names = (
+                "dagger_stage_joint_warmup_iterations",
+                "dagger_stage_cycles",
+                "dagger_stage_perception_iterations",
+                "dagger_stage_actor_iterations",
+                "dagger_stage_final_perception_iterations",
+                "dagger_stage_final_actor_iterations",
+                "dagger_stage_calibration_iterations",
+            )
+            for name in staging_iteration_names:
+                value = getattr(cfg, name, 0)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                ):
+                    raise ValueError(f"{name} must be a non-negative integer")
+            if int(getattr(cfg, "dagger_stage_calibration_iterations", 0)) < 1:
+                raise ValueError(
+                    "Staged BC-DAgger requires at least one fresh replay/Q "
+                    "calibration rollout"
+                )
+            if str(
+                getattr(cfg, "dagger_stage_calibration_control_mode", "beta")
+            ) != "beta":
+                raise ValueError(
+                    "dagger_stage_calibration_control_mode currently requires "
+                    "'beta'"
+                )
+            probability = float(
+                getattr(
+                    cfg,
+                    "dagger_stage_calibration_teacher_probability",
+                    0.5,
+                )
+            )
+            if not math.isfinite(probability) or not 0.0 < probability < 1.0:
+                raise ValueError(
+                    "dagger_stage_calibration_teacher_probability must be "
+                    "finite and strictly between zero and one"
+                )
         for name in (
             "dagger_bc_epochs",
+            "dagger_safe_min_teacher_steps",
             "dagger_buffer_capacity",
             "dagger_batch_size",
             "dagger_updates_per_rollout",
             "q_hidden_dim",
             "q_num_atoms",
-            "iql_batch_size",
+            "q_batch_size",
+            "q_updates_per_rollout",
+            "q_teacher_buffer_capacity",
+            "q_learning_starts_per_source",
             "teacher_buffer_capacity",
             "teacher_buffer_snapshot_chunk_rows",
         ):
@@ -1029,7 +1474,9 @@ class PPOBCDaggerFinetune(PPOVEL):
             "dagger_bc_lr",
             "dagger_actor_huber_delta",
             "q_lr",
-            "iql_value_lr",
+            "sac_bc_initial_action_std",
+            "sac_alpha_init",
+            "sac_entropy_reference_scale",
         ):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -1041,14 +1488,76 @@ class PPOBCDaggerFinetune(PPOVEL):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
+        release = float(cfg.dagger_safe_release_rms)
+        takeover = float(cfg.dagger_safe_takeover_rms)
+        if not (
+            math.isfinite(release)
+            and math.isfinite(takeover)
+            and 0.0 <= release < takeover <= 2.0
+        ):
+            raise ValueError(
+                "SafeDAgger thresholds require 0 <= "
+                "dagger_safe_release_rms < dagger_safe_takeover_rms <= 2"
+            )
         if int(cfg.q_hidden_dim) < 4:
             raise ValueError("q_hidden_dim must be at least 4")
         if cfg.q_num_atoms < 2 or not cfg.q_v_min < cfg.q_v_max:
             raise ValueError("distributional Q support is invalid")
+        if int(cfg.q_num_atoms) != 501:
+            raise ValueError("BC-DAgger FastSAC critic requires q_num_atoms=501")
+        if not bool(cfg.q_layer_norm):
+            raise ValueError("BC-DAgger FastSAC critic requires LayerNorm")
+        if str(cfg.q_action_fusion) != "early":
+            raise ValueError("BC-DAgger FastSAC critic requires early action fusion")
+        if str(cfg.q_action_coordinates) != "absolute":
+            raise ValueError(
+                "BC-DAgger FastSAC critic requires absolute action coordinates"
+            )
+        if not bool(cfg.sac_q_normalize_actions):
+            raise ValueError(
+                "BC-DAgger FastSAC critic requires normalized absolute actions"
+            )
+        if not math.isclose(
+            float(cfg.sac_q_action_input_gain),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("BC-DAgger FastSAC critic requires action gain 1")
+        if not bool(cfg.sac_clipped_double_q):
+            raise ValueError("BC-DAgger FastSAC critic requires clipped double Q")
+        if int(cfg.q_batch_size) % 2:
+            raise ValueError("q_batch_size must be even for an exact 50/50 draw")
+        if not math.isclose(
+            float(cfg.q_teacher_replay_ratio),
+            0.5,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "q_teacher_replay_ratio is fixed at 0.5 independently of beta"
+            )
         if not 0.0 <= float(cfg.q_tau) <= 1.0:
             raise ValueError("q_tau must be in [0, 1]")
-        if not 0.0 < float(cfg.iql_expectile) < 1.0:
-            raise ValueError("iql_expectile must be strictly in (0, 1)")
+        if not (
+            math.isfinite(float(cfg.sac_bc_log_std_min))
+            and math.isfinite(float(cfg.sac_bc_log_std_max))
+            and float(cfg.sac_bc_log_std_min) < float(cfg.sac_bc_log_std_max)
+        ):
+            raise ValueError("SAC log-std bounds must be finite and ordered")
+        initial_log_std = math.log(
+            float(cfg.sac_bc_initial_action_std)
+            / float(cfg.dagger_action_clip)
+        )
+        if not (
+            float(cfg.sac_bc_log_std_min)
+            <= initial_log_std
+            <= float(cfg.sac_bc_log_std_max)
+        ):
+            raise ValueError(
+                "sac_bc_initial_action_std lies outside the configured "
+                "dedicated SAC log-std bounds"
+            )
         if not math.isfinite(float(cfg.q_max_grad_norm)) or cfg.q_max_grad_norm < 0:
             raise ValueError("q_max_grad_norm must be finite and non-negative")
         if not math.isfinite(float(cfg.q_weight_decay)) or cfg.q_weight_decay < 0:
@@ -1076,12 +1585,403 @@ class PPOBCDaggerFinetune(PPOVEL):
     def requires_value_bootstrap(self):
         return False
 
+    def _finalization_config(self):
+        return {
+            "semantics": DAGGER_FINALIZATION_SEMANTICS,
+            "perception_consolidation_iterations": int(
+                getattr(self.cfg, "dagger_finalize_perception_iterations", 0)
+            ),
+            "actor_realignment_iterations": int(
+                getattr(self.cfg, "dagger_finalize_actor_iterations", 0)
+            ),
+            "perception_recheck_iterations": int(
+                getattr(self.cfg, "dagger_finalize_recheck_iterations", 0)
+            ),
+            "replay_q_calibration_iterations": int(
+                getattr(self.cfg, "dagger_finalize_calibration_iterations", 0)
+            ),
+            "calibration_control_mode": str(
+                getattr(
+                    self.cfg,
+                    "dagger_finalize_calibration_control_mode",
+                    "beta",
+                )
+            ),
+            "calibration_teacher_probability": float(
+                getattr(
+                    self.cfg,
+                    "dagger_finalize_calibration_teacher_probability",
+                    0.5,
+                )
+            ),
+        }
+
+    def _finalization_enabled(self):
+        return bool(getattr(self.cfg, "dagger_finalization_enabled", False))
+
+    def _finalization_phase(self, rollout_count=None):
+        if not self._finalization_enabled():
+            return None
+        index = (
+            self.finalization_rollout_count
+            if rollout_count is None
+            else int(rollout_count)
+        )
+        config = self._finalization_config()
+        boundary = 0
+        lengths = (
+            config["perception_consolidation_iterations"],
+            config["actor_realignment_iterations"],
+            config["perception_recheck_iterations"],
+            config["replay_q_calibration_iterations"],
+        )
+        for phase, length in zip(DAGGER_FINALIZATION_PHASES, lengths):
+            boundary += int(length)
+            if index < boundary:
+                return phase
+        return "complete"
+
+    def _staging_config(self):
+        return {
+            "semantics": DAGGER_STAGING_SEMANTICS,
+            "joint_warmup_iterations": int(
+                getattr(self.cfg, "dagger_stage_joint_warmup_iterations", 0)
+            ),
+            "cycles": int(getattr(self.cfg, "dagger_stage_cycles", 0)),
+            "perception_iterations": int(
+                getattr(self.cfg, "dagger_stage_perception_iterations", 0)
+            ),
+            "actor_iterations": int(
+                getattr(self.cfg, "dagger_stage_actor_iterations", 0)
+            ),
+            "final_perception_iterations": int(
+                getattr(
+                    self.cfg,
+                    "dagger_stage_final_perception_iterations",
+                    0,
+                )
+            ),
+            "final_actor_iterations": int(
+                getattr(self.cfg, "dagger_stage_final_actor_iterations", 0)
+            ),
+            "replay_q_calibration_iterations": int(
+                getattr(self.cfg, "dagger_stage_calibration_iterations", 0)
+            ),
+            "calibration_control_mode": str(
+                getattr(
+                    self.cfg,
+                    "dagger_stage_calibration_control_mode",
+                    "beta",
+                )
+            ),
+            "calibration_teacher_probability": float(
+                getattr(
+                    self.cfg,
+                    "dagger_stage_calibration_teacher_probability",
+                    0.5,
+                )
+            ),
+        }
+
+    def _staging_enabled(self):
+        return bool(getattr(self.cfg, "dagger_staging_enabled", False))
+
+    def _staging_phase_details(self, rollout_count=None):
+        if not self._staging_enabled():
+            return None, -1
+        index = (
+            self.staging_rollout_count
+            if rollout_count is None
+            else int(rollout_count)
+        )
+        if index < 0:
+            raise ValueError("staging rollout count must be non-negative")
+        config = self._staging_config()
+        boundary = config["joint_warmup_iterations"]
+        if index < boundary:
+            return "joint_warmup", -1
+
+        cycle_width = (
+            config["perception_iterations"] + config["actor_iterations"]
+        )
+        if cycle_width:
+            cycle_offset = index - boundary
+            cycle_span = config["cycles"] * cycle_width
+            if cycle_offset < cycle_span:
+                cycle_index = cycle_offset // cycle_width
+                within_cycle = cycle_offset % cycle_width
+                if within_cycle < config["perception_iterations"]:
+                    return "cycle_perception", int(cycle_index)
+                return "cycle_actor", int(cycle_index)
+            boundary += cycle_span
+
+        boundary += config["final_perception_iterations"]
+        if index < boundary:
+            return "final_perception", -1
+        boundary += config["final_actor_iterations"]
+        if index < boundary:
+            return "final_actor", -1
+        boundary += config["replay_q_calibration_iterations"]
+        if index < boundary:
+            return "replay_q_calibration", -1
+        return "complete", -1
+
+    def _staging_phase(self, rollout_count=None):
+        return self._staging_phase_details(rollout_count)[0]
+
+    def _staging_cycle_index(self, rollout_count=None):
+        return self._staging_phase_details(rollout_count)[1]
+
+    def _effective_control_mode(self):
+        if self._finalization_enabled():
+            if self._finalization_phase() == "replay_q_calibration":
+                return self._finalization_config()["calibration_control_mode"]
+            # Consolidation/realignment are pure-student rollouts. The teacher
+            # is still evaluated on every row for labels and diagnostics.
+            return "beta"
+        if (
+            self._staging_enabled()
+            and self._staging_phase() == "replay_q_calibration"
+        ):
+            return self._staging_config()["calibration_control_mode"]
+        return str(getattr(self.cfg, "dagger_control_mode", "beta"))
+
     def _teacher_mixture_probability(self):
+        if self._finalization_enabled():
+            if self._finalization_phase() == "replay_q_calibration":
+                return self._finalization_config()[
+                    "calibration_teacher_probability"
+                ]
+            return 0.0
+        if (
+            self._staging_enabled()
+            and self._staging_phase() == "replay_q_calibration"
+        ):
+            return self._staging_config()[
+                "calibration_teacher_probability"
+            ]
         return _linear_teacher_probability(
             self.cfg.dagger_beta_start,
             self.cfg.dagger_beta_end,
             self.cfg.dagger_beta_decay_rollouts,
             self.dagger_rollout_count,
+        )
+
+    def _safe_teacher_control_enabled(self):
+        """Whether SafeDAgger may execute the teacher this cumulative rollout."""
+        if self._finalization_enabled():
+            return False
+        if (
+            self._staging_enabled()
+            and self._staging_phase() == "replay_q_calibration"
+        ):
+            return False
+        cutoff = getattr(self.cfg, "dagger_safe_zero_iteration", None)
+        return cutoff is None or self.dagger_rollout_count < int(cutoff)
+
+    def _collect_dagger_replay_this_rollout(self):
+        if self._finalization_enabled():
+            return self._finalization_phase() in (
+                "actor_realignment",
+                "replay_q_calibration",
+            )
+        if self._staging_enabled():
+            return self._staging_phase() in (
+                "joint_warmup",
+                "cycle_actor",
+                "final_actor",
+                "replay_q_calibration",
+            )
+        return True
+
+    def _actor_updates_this_rollout(self):
+        if self._finalization_enabled():
+            enabled = self._finalization_phase() == "actor_realignment"
+        elif self._staging_enabled():
+            enabled = self._staging_phase() in (
+                "joint_warmup",
+                "cycle_actor",
+                "final_actor",
+            )
+        else:
+            enabled = True
+        if enabled:
+            return int(self.cfg.dagger_updates_per_rollout)
+        return 0
+
+    def _q_updates_this_rollout(self):
+        if self._finalization_enabled():
+            enabled = self._finalization_phase() == "replay_q_calibration"
+        elif self._staging_enabled():
+            enabled = self._staging_phase() in (
+                "joint_warmup",
+                "replay_q_calibration",
+            )
+        else:
+            enabled = True
+        if enabled:
+            return int(self.cfg.q_updates_per_rollout)
+        return 0
+
+    def _collect_q_teacher_rows_this_rollout(self):
+        if self._finalization_enabled():
+            return self._finalization_phase() == "replay_q_calibration"
+        if self._staging_enabled():
+            return self._staging_phase() in (
+                "joint_warmup",
+                "replay_q_calibration",
+            )
+        return True
+
+    def _export_teacher_rows_this_rollout(self):
+        if self._finalization_enabled():
+            return self._finalization_phase() == "replay_q_calibration"
+        if self._staging_enabled():
+            return self._staging_phase() == "replay_q_calibration"
+        return True
+
+    def _adaptation_update_this_rollout(self, rollout):
+        if self._finalization_enabled():
+            enabled = self._finalization_phase() in (
+                "perception_consolidation",
+                "perception_recheck",
+            )
+        elif self._staging_enabled():
+            enabled = self._staging_phase() in (
+                "joint_warmup",
+                "cycle_perception",
+                "final_perception",
+            )
+        else:
+            enabled = True
+        if enabled:
+            return self.train_adapt(rollout.copy())
+        return {}
+
+    def _prepare_finalization_phase(self):
+        phase = self._finalization_phase()
+        if phase is None or phase == self._finalization_last_phase:
+            return phase
+        if phase in (
+            "actor_realignment",
+            "perception_recheck",
+            "replay_q_calibration",
+        ):
+            self.dagger_replay.clear()
+        if phase == "replay_q_calibration":
+            self.q_teacher_replay.clear()
+            if self.teacher_replay is not None and (
+                self.teacher_replay.size or self.teacher_replay.seen
+            ):
+                raise RuntimeError(
+                    "Fresh finalization H5 received rows before replay/Q "
+                    "calibration"
+                )
+        self._apply_finalization_freeze_mask(phase)
+        self._finalization_last_phase = phase
+        return phase
+
+    def _prepare_staging_phase(self):
+        phase = self._staging_phase()
+        if phase is None or phase == self._staging_last_phase:
+            return phase
+        # Actor replay embeds the EMA-produced priv_pred. Every perception/actor
+        # handoff therefore starts with rows from the newly frozen producer.
+        if phase in (
+            "cycle_perception",
+            "cycle_actor",
+            "final_perception",
+            "final_actor",
+            "replay_q_calibration",
+        ):
+            self.dagger_replay.clear()
+        if phase == "replay_q_calibration":
+            # Joint warmup Q rows are useful only while that joint policy is
+            # fixed. The terminal Q/H5 lineage must describe the final frozen
+            # actor and perception representation exclusively.
+            self.q_teacher_replay.clear()
+            if getattr(
+                self,
+                "_staging_calibration_start_q_update_count",
+                None,
+            ) is None:
+                self._staging_calibration_start_q_update_count = int(
+                    self.q_update_count
+                )
+            if self.teacher_replay is not None and (
+                self.teacher_replay.size or self.teacher_replay.seen
+            ):
+                raise RuntimeError(
+                    "Staged BC-DAgger H5 received rows before final replay/Q "
+                    "calibration"
+                )
+        self._apply_staging_freeze_mask(phase)
+        self._staging_last_phase = phase
+        return phase
+
+    def _prepare_training_phase(self):
+        if self._finalization_enabled():
+            return self._prepare_finalization_phase()
+        if self._staging_enabled():
+            return self._prepare_staging_phase()
+        return None
+
+    def _apply_optimizer_ownership(
+        self,
+        *,
+        perception_enabled: bool,
+        actor_enabled: bool,
+        q_enabled: bool,
+    ):
+        perception = [self.adapt_module]
+        if hasattr(self, "object_adapt"):
+            perception.append(self.object_adapt)
+        if hasattr(self, "temporal_depth_gru"):
+            perception.append(self.temporal_depth_gru)
+        for module in (*perception, self.actor_adapt, self.qnet):
+            module.requires_grad_(False)
+            module.eval()
+            for parameter in module.parameters():
+                parameter.grad = None
+        if perception_enabled:
+            for module in perception:
+                module.requires_grad_(True)
+                module.train()
+        if actor_enabled:
+            self.actor_adapt.requires_grad_(True)
+            self.actor_adapt.train()
+        if q_enabled:
+            self.qnet.requires_grad_(True)
+            self.qnet.train()
+
+    def _apply_finalization_freeze_mask(self, phase):
+        """Make the phase's optimizer ownership explicit at module level."""
+        self._apply_optimizer_ownership(
+            perception_enabled=phase in (
+                "perception_consolidation",
+                "perception_recheck",
+            ),
+            actor_enabled=phase == "actor_realignment",
+            q_enabled=phase == "replay_q_calibration",
+        )
+
+    def _apply_staging_freeze_mask(self, phase):
+        """Expose only the optimizer owners selected by the staged phase."""
+        self._apply_optimizer_ownership(
+            perception_enabled=phase in (
+                "joint_warmup",
+                "cycle_perception",
+                "final_perception",
+            ),
+            actor_enabled=phase in (
+                "joint_warmup",
+                "cycle_actor",
+                "final_actor",
+            ),
+            q_enabled=phase in (
+                "joint_warmup",
+                "replay_q_calibration",
+            ),
         )
 
     @torch.no_grad()
@@ -1185,7 +2085,138 @@ class PPOBCDaggerFinetune(PPOVEL):
     def snapshot_teacher_replay(self, iteration, checkpoint_name):
         if self.teacher_replay is None:
             return None
+        if self._staging_enabled() and self._staging_phase() not in (
+            "replay_q_calibration",
+            "complete",
+        ):
+            # Checkpoint the model/schedule normally, but do not create even an
+            # empty persistent H5 for representation-changing staged phases.
+            return None
         return self.teacher_replay.snapshot(iteration, checkpoint_name)
+
+    @torch.no_grad()
+    def restore_q_teacher_replay(self, source_path):
+        """Refill the persistent critic teacher partition from its paired H5."""
+        if self.q_teacher_replay.size or self.q_teacher_replay.seen:
+            raise RuntimeError("Q teacher replay restore requires an empty FIFO")
+        try:
+            import h5py
+        except ImportError as exc:
+            raise ImportError(
+                "h5py is required to restore the Q teacher replay"
+            ) from exc
+        source_path = os.path.abspath(os.fspath(source_path))
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(source_path)
+        with h5py.File(source_path, "r") as replay:
+            required_attrs = {
+                "format": DAGGER_TEACHER_REPLAY_FORMAT,
+                "format_version": DAGGER_TEACHER_REPLAY_FORMAT_VERSION,
+                "teacher_only": True,
+                "action_parameterization": DAGGER_ACTION_PARAMETERIZATION,
+                "dagger_control_semantics": DAGGER_CONTROL_SEMANTICS,
+                "replay_observation_semantics": (
+                    DAGGER_REPLAY_OBSERVATION_SEMANTICS
+                ),
+                "reward_scalarization": SAC_REWARD_SCALARIZATION,
+                "truncation_next_observation": (
+                    TRUNCATION_NEXT_OBSERVATION_SEMANTICS
+                ),
+            }
+            for name, expected in required_attrs.items():
+                actual = replay.attrs.get(name)
+                if isinstance(expected, bool):
+                    actual = bool(actual)
+                elif isinstance(expected, int):
+                    actual = int(actual or 0)
+                else:
+                    actual = str(actual or "")
+                if actual != expected:
+                    raise ValueError(
+                        f"Q teacher replay {name}={actual!r} does not match "
+                        f"{expected!r}"
+                    )
+            if str(replay.attrs.get("vecnorm_fingerprint", "")) != str(
+                self._replay_vecnorm_fingerprint
+            ):
+                raise ValueError("Q teacher replay VecNorm fingerprint mismatch")
+            if not math.isclose(
+                float(replay.attrs.get("action_clip", float("nan"))),
+                float(self.cfg.dagger_action_clip),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                raise ValueError("Q teacher replay action clip mismatch")
+            missing = set(TEACHER_REPLAY_FIELDS).difference(replay.keys())
+            if missing:
+                raise ValueError(
+                    f"Q teacher replay is missing fields: {sorted(missing)}"
+                )
+            size = int(replay.attrs.get("num_transitions", -1))
+            if size < 1:
+                raise ValueError("Q teacher replay H5 is empty")
+            expected_shapes = {
+                "observations": (self._q_actor_dim,),
+                "critic_observations": (self._q_critic_dim,),
+                "actions": (self.action_dim,),
+                "rewards": (),
+                "dones": (),
+                "truncations": (),
+                "discounts": (),
+                "next_observations": (self._q_actor_dim,),
+                "next_critic_observations": (self._q_critic_dim,),
+            }
+            boolean_fields = {"dones", "truncations"}
+            for key, trailing_shape in expected_shapes.items():
+                dataset = replay[key]
+                expected_shape = (size, *trailing_shape)
+                if tuple(dataset.shape) != expected_shape:
+                    raise ValueError(
+                        f"Q teacher replay field {key!r} has shape "
+                        f"{tuple(dataset.shape)}, expected {expected_shape}"
+                    )
+                if key in boolean_fields:
+                    valid_dtype = np.issubdtype(dataset.dtype, np.bool_)
+                else:
+                    valid_dtype = np.issubdtype(dataset.dtype, np.floating)
+                if not valid_dtype:
+                    raise TypeError(
+                        f"Q teacher replay field {key!r} has invalid dtype "
+                        f"{dataset.dtype}"
+                    )
+            start = max(0, size - int(self.q_teacher_replay.capacity))
+            chunk_rows = int(self.cfg.teacher_buffer_snapshot_chunk_rows)
+            for chunk_start in range(start, size, chunk_rows):
+                chunk_end = min(chunk_start + chunk_rows, size)
+                values = {
+                    key: torch.from_numpy(
+                        np.asarray(replay[key][chunk_start:chunk_end])
+                    )
+                    for key in TEACHER_REPLAY_FIELDS
+                }
+                for key, value in values.items():
+                    if value.is_floating_point() and not torch.isfinite(
+                        value
+                    ).all():
+                        raise ValueError(
+                            f"Q teacher replay field {key!r} contains "
+                            "non-finite values"
+                        )
+                if (
+                    values["actions"].abs()
+                    > float(self.cfg.dagger_action_clip)
+                ).any():
+                    raise ValueError(
+                        "Q teacher replay action lies outside the configured "
+                        "executable support"
+                    )
+                self.q_teacher_replay.extend(values)
+        logging.info(
+            "Restored %d persistent teacher critic rows from %s.",
+            self.q_teacher_replay.size,
+            source_path,
+        )
+        return self.q_teacher_replay.size
 
     @staticmethod
     def _raw_replay_key(key):
@@ -1255,10 +2286,18 @@ class PPOBCDaggerFinetune(PPOVEL):
         return torch.cat(chunks, dim=-1)
 
     def _prepare_dagger_learning_batch(self, batch):
-        """Normalize one raw DAgger minibatch without mutating replay data."""
+        """Normalize present raw replay fields without mutating replay data.
+
+        BC projects its replay sample to the three fields it actually consumes;
+        Q still supplies all four observation fields.  Accepting a projected
+        mapping here avoids transferring and normalizing the two 2,341-wide
+        critic tensors and unused next state for every 4,096-row BC update.
+        """
         snapshot = self._vecnorm_snapshot()
         prepared = dict(batch)
         for field in ("observations", "next_observations"):
+            if field not in batch:
+                continue
             prepared[field] = self._normalize_replay_flat(
                 batch[field],
                 self.q_actor_keys,
@@ -1266,6 +2305,8 @@ class PPOBCDaggerFinetune(PPOVEL):
                 snapshot,
             )
         for field in ("critic_observations", "next_critic_observations"):
+            if field not in batch:
+                continue
             prepared[field] = self._normalize_replay_flat(
                 batch[field],
                 self.q_critic_keys,
@@ -1304,6 +2345,10 @@ class PPOBCDaggerFinetune(PPOVEL):
 
     @torch.no_grad()
     def capture_truncation_final_observations(self, td: TensorDict, step: int):
+        if not self._collect_dagger_replay_this_rollout():
+            self._truncation_final_batches = []
+            self._last_truncation_finals_used = 0
+            return
         truncations = _vaic_truncation_mask(td).reshape(-1).bool()
         if not truncations.any():
             return
@@ -1314,6 +2359,11 @@ class PPOBCDaggerFinetune(PPOVEL):
 
     @torch.no_grad()
     def capture_rollout_final_observation(self, carry: TensorDict):
+        if not self._collect_dagger_replay_this_rollout():
+            self._rollout_final_batch = None
+            self._truncation_final_batches = []
+            self._last_truncation_finals_used = 0
+            return
         self._rollout_final_batch = self._prepare_student_final_state(carry.clone())
 
     def _dagger_transition_chunks(self, td: TensorDict):
@@ -1412,6 +2462,135 @@ class PPOBCDaggerFinetune(PPOVEL):
         )
         return self.actor_adapt.get_dist(td)
 
+    def _sac_critic_dist_from_flat(self, actor_obs):
+        """Bounded small-noise target policy centred on the DAgger BC mean."""
+        mean_action = self._actor_dist_from_flat(actor_obs).mean
+        action_clip = float(self.cfg.dagger_action_clip)
+        mean_action = torch.nan_to_num(
+            mean_action,
+            nan=0.0,
+            posinf=action_clip,
+            neginf=-action_clip,
+        ).clamp(-action_clip, action_clip)
+        normalized = (mean_action / action_clip).clamp(
+            -1.0 + FASTSAC_REFERENCE_EPS,
+            1.0 - FASTSAC_REFERENCE_EPS,
+        )
+        loc = torch.atanh(normalized)
+        log_std = self.bc_dagger_sac_adapter.log_std.clamp(
+            float(self.cfg.sac_bc_log_std_min),
+            float(self.cfg.sac_bc_log_std_max),
+        )
+        scale = log_std.exp().expand_as(loc)
+        return mean_action, self.sac_dist_cls(loc, scale)
+
+    def _q_action_input(self, action):
+        """Normalize absolute executable actions exactly as Stage-2 does."""
+        action_clip = float(self.cfg.dagger_action_clip)
+        normalized = (action / action_clip).clamp(-1.0, 1.0)
+        gain = float(self.cfg.sac_q_action_input_gain)
+        return normalized if gain == 1.0 else normalized * gain
+
+    def _normalized_action_log_prob(self, physical_log_prob):
+        return physical_log_prob + float(
+            self.action_dim
+            * math.log(float(self.cfg.sac_entropy_reference_scale))
+        )
+
+    def _q_backend_metadata(self):
+        """Full Stage-2-facing critic contract saved with every checkpoint."""
+        return {
+            "actor_obs_keys": list(self.q_actor_keys),
+            "critic_obs_keys": list(self.q_critic_keys),
+            "actor_obs_dim": self._q_actor_dim,
+            "critic_obs_dim": self._q_critic_dim,
+            "q_input_dim": self._q_critic_dim,
+            "q_actuator_context": {"enabled": False},
+            "action_dim": self.action_dim,
+            "hidden_dim": int(self.cfg.q_hidden_dim),
+            "q_action_fusion": str(self.cfg.q_action_fusion),
+            "q_action_hidden_dim": _q_action_hidden_dim(
+                self.cfg.q_hidden_dim, self.cfg.q_action_fusion
+            ),
+            "q_action_fusion_semantics": FASTSAC_Q_EARLY_FUSION_SEMANTICS,
+            "q_reference_dueling": False,
+            "q_architecture_semantics": FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
+            "num_atoms": int(self.cfg.q_num_atoms),
+            "v_min": float(self.cfg.q_v_min),
+            "v_max": float(self.cfg.q_v_max),
+            "layer_norm": bool(self.cfg.q_layer_norm),
+            "gamma": float(self.cfg.gamma),
+            "replay_observation_semantics": REPLAY_OBSERVATION_SEMANTICS,
+            "reward_scalarization": SAC_REWARD_SCALARIZATION,
+            "reward_groups": list(self.reward_groups),
+            "truncation_semantics": TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
+            "target_entropy_semantics": (
+                FASTSAC_BC_DAGGER_TARGET_ENTROPY_SEMANTICS
+            ),
+            "q_action_coordinates": str(self.cfg.q_action_coordinates),
+            "q_action_normalized": bool(self.cfg.sac_q_normalize_actions),
+            "q_action_input_gain": float(self.cfg.sac_q_action_input_gain),
+            "q_action_semantics": FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS,
+            "clipped_double_q": bool(self.cfg.sac_clipped_double_q),
+            "q_backup_semantics": FASTSAC_CLIPPED_DOUBLE_Q_SEMANTICS,
+            "actor_q_reduction": "minimum",
+            "alpha_autotune": False,
+            "pretrain_effective_alpha": 0.0,
+            "stage2_alpha_init": float(self.cfg.sac_alpha_init),
+            "pretrain_backup_semantics": (
+                "stochastic_next_action_q_only_effective_alpha_zero_v1"
+            ),
+            "pretrain_target_policy": (
+                "dedicated_small_noise_stochastic_current_bc_student_v1"
+            ),
+            "replay_mix_semantics": (
+                "beta_independent_teacher_executed_0.5_student_executed_0.5_v1"
+            ),
+        }
+
+    def _sample_balanced_q_batch(self):
+        """Draw an exact beta-independent half-teacher/half-student batch."""
+        batch_size = int(self.cfg.q_batch_size)
+        teacher_count = batch_size // 2
+        student_count = batch_size - teacher_count
+        if self.q_teacher_replay.size < 1:
+            raise RuntimeError("Cannot sample Q before a teacher transition exists")
+        if self.dagger_replay.valid_count(DAGGER_IS_STUDENT_ACTION_KEY) < 1:
+            raise RuntimeError("Cannot sample Q before a student transition exists")
+        # The all-transition ring also owns BC-only labels.  Project both Q
+        # sources to the persistent teacher partition's field set so those
+        # extras never cross the replay-device boundary during Q updates.
+        q_fields = tuple(self.q_teacher_replay.data)
+        teacher = self.q_teacher_replay.sample(
+            teacher_count, self.device, self.q_rng, fields=q_fields
+        )
+        student = self.dagger_replay.sample(
+            student_count,
+            self.device,
+            self.q_rng,
+            valid_key=DAGGER_IS_STUDENT_ACTION_KEY,
+            fields=q_fields,
+        )
+        mixed = {
+            key: torch.cat((teacher[key], student[key]), dim=0)
+            for key in teacher
+        }
+        mixed[DAGGER_Q_TEACHER_SOURCE_KEY] = torch.cat((
+            torch.ones(
+                teacher_count, dtype=torch.bool, device=self.device
+            ),
+            torch.zeros(
+                student_count, dtype=torch.bool, device=self.device
+            ),
+        ))
+        permutation = torch.randperm(
+            batch_size, device=self.device, generator=self.q_rng
+        )
+        return {
+            key: value[permutation]
+            for key, value in mixed.items()
+        }
+
     def _bc_update(self, batch):
         valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
         if not valid.any():
@@ -1435,138 +2614,271 @@ class PPOBCDaggerFinetune(PPOVEL):
         return loss.detach(), mae, grad.detach()
 
     def _q_update(self, batch):
-        """Update V then twin C51 Qs with dataset-action IQL targets.
-
-        The DAgger actor is intentionally absent from this method.  This follows
-        IQL's in-sample critic update while keeping the existing distributional
-        Q topology required for an exact Stage-2 FastSAC weight transfer.
-        """
+        """Apply the Stage-2 Q-only stochastic C51 clipped-double-Q update."""
         critic_observations = batch["critic_observations"]
         with torch.no_grad():
-            target_logits = self.qnet_target(
-                critic_observations, batch["actions"]
+            next_mean, next_dist = self._sac_critic_dist_from_flat(
+                batch["next_observations"]
             )
-            target_q_heads = self.qnet_target.values(target_logits)
-            target_q = target_q_heads.min(dim=0).values
-
-        value = self.iql_value(critic_observations)
-        advantage = target_q - value
-        value_loss = _iql_expectile_loss(
-            advantage, self.cfg.iql_expectile, validate=False
-        ).mean()
-        self.opt_iql_value.zero_grad(set_to_none=True)
-        value_loss.backward()
-        if float(self.cfg.q_max_grad_norm) > 0.0:
-            value_grad = nn.utils.clip_grad_norm_(
-                self.iql_value.parameters(),
-                float(self.cfg.q_max_grad_norm),
+            next_action, next_log_prob = next_dist.rsample_with_log_prob(
+                generator=self.sac_action_rng
             )
-        else:
-            value_grad = nn.utils.clip_grad_norm_(
-                self.iql_value.parameters(), float("inf")
-            )
-        self.opt_iql_value.step()
-        self.iql_value_update_count += 1
-
-        with torch.no_grad():
-            next_value = self.iql_value(batch["next_critic_observations"])
+            next_log_prob = self._normalized_action_log_prob(next_log_prob)
             bootstrap = _sac_bootstrap_mask(
                 batch["dones"], batch["truncations"]
             )
             discount = float(self.cfg.gamma) * batch["discounts"]
-            scalar_target = (
-                batch["rewards"]
-                + bootstrap * discount * next_value
+            # Match Stage-2 before actor release exactly: keep stochastic
+            # next-policy sampling, but the Q-only effective alpha is zero.
+            entropy_tax = torch.zeros_like(batch["rewards"])
+            soft_reward = batch["rewards"]
+            unprojected_atoms = (
+                soft_reward[:, None]
+                + bootstrap[:, None]
+                * discount[:, None]
+                * self.qnet_target.support
             )
-            target = _project_scalar_to_c51(
-                scalar_target, self.qnet.support, validate=False
+            target = self.qnet_target.projection(
+                batch["next_critic_observations"],
+                self._q_action_input(next_action),
+                soft_reward,
+                bootstrap,
+                discount,
             )
-        logits = self.qnet(critic_observations, batch["actions"])
-        per_q = -(
-            target.unsqueeze(0) * F.log_softmax(logits, dim=-1)
-        ).sum(-1).mean(-1)
+            # ``projection`` already returns probabilities.  Applying
+            # ``values`` here used to softmax those probabilities a second time
+            # for diagnostics only.  Take their actual expectation instead.
+            raw_target_q_heads = (
+                target * self.qnet_target.support
+            ).sum(dim=-1)
+            target, selected_target_q_heads = _select_c51_twin_target(
+                target,
+                self.qnet_target.support,
+                bool(self.cfg.sac_clipped_double_q),
+            )
+
+        logits = self.qnet(
+            critic_observations, self._q_action_input(batch["actions"])
+        )
+        log_probs = F.log_softmax(logits, dim=-1)
+        per_q = -(target * log_probs).sum(-1).mean(-1)
         loss = per_q.sum()
         self.opt_q.zero_grad(set_to_none=True)
         loss.backward()
-        if float(self.cfg.q_max_grad_norm) > 0.0:
-            grad = nn.utils.clip_grad_norm_(
-                self.qnet.parameters(), float(self.cfg.q_max_grad_norm)
-            )
-        else:
-            grad = nn.utils.clip_grad_norm_(self.qnet.parameters(), float("inf"))
+        grad = _measure_or_clip_grad_norm(
+            self.qnet.parameters(), float(self.cfg.q_max_grad_norm)
+        )
         self.opt_q.step()
         self.q_update_count += 1
         with torch.no_grad():
-            for online, target_parameter in zip(
-                self.qnet.parameters(), self.qnet_target.parameters()
-            ):
-                target_parameter.lerp_(online, float(self.cfg.q_tau))
+            torch._foreach_lerp_(
+                tuple(self.qnet_target.parameters()),
+                tuple(self.qnet.parameters()),
+                float(self.cfg.q_tau),
+            )
         with torch.no_grad():
-            online_q_heads = self.qnet.values(logits)
+            # Reuse the normalization already computed for the C51 loss instead
+            # of launching a second softmax solely for telemetry.
+            online_q_heads = (
+                log_probs.detach().exp() * self.qnet.support
+            ).sum(dim=-1)
+            data_q = online_q_heads.min(dim=0).values
+            teacher_source = batch[DAGGER_Q_TEACHER_SOURCE_KEY].bool()
+            student_source = ~teacher_source
             support_low = self.qnet.support[0]
             support_high = self.qnet.support[-1]
             metrics = {
-                "value_loss": value_loss.detach(),
-                "value_grad_norm": value_grad.detach(),
-                "value_mean": value.detach().mean(),
-                "value_std": value.detach().std(unbiased=False),
-                "target_q_mean": target_q.mean(),
+                "target_q_mean": selected_target_q_heads[0].mean(),
                 "target_q_twin_disagreement": (
-                    target_q_heads[0] - target_q_heads[1]
+                    raw_target_q_heads[0] - raw_target_q_heads[1]
                 ).abs().mean(),
-                "advantage_mean": advantage.detach().mean(),
-                "advantage_std": advantage.detach().std(unbiased=False),
-                "advantage_positive_fraction": (
-                    advantage.detach() > 0.0
-                ).float().mean(),
-                "td_target_mean": scalar_target.mean(),
-                "td_target_std": scalar_target.std(unbiased=False),
+                "td_target_mean": selected_target_q_heads[0].mean(),
                 "td_target_support_low_fraction": (
-                    scalar_target < support_low
+                    unprojected_atoms < support_low
                 ).float().mean(),
                 "td_target_support_high_fraction": (
-                    scalar_target > support_high
+                    unprojected_atoms > support_high
                 ).float().mean(),
                 "q1_mean": online_q_heads[0].mean(),
                 "q2_mean": online_q_heads[1].mean(),
                 "q_twin_disagreement": (
                     online_q_heads[0] - online_q_heads[1]
                 ).abs().mean(),
+                "data_q_mean": data_q.mean(),
+                "teacher_data_q_mean": data_q[teacher_source].mean(),
+                "student_data_q_mean": data_q[student_source].mean(),
+                "next_action_mean_abs_deviation": (
+                    next_action - next_mean
+                ).abs().mean(),
+                "next_log_prob_mean": next_log_prob.mean(),
+                "entropy_tax_mean": entropy_tax.mean(),
+                "entropy_tax_abs_mean": entropy_tax.abs().mean(),
+                "reward_abs_mean": batch["rewards"].abs().mean(),
+                "entropy_tax_reward_abs_ratio": (
+                    entropy_tax.abs().mean()
+                    / batch["rewards"].abs().mean().clamp_min(
+                        torch.finfo(batch["rewards"].dtype).eps
+                    )
+                ),
             }
         return loss.detach(), per_q.detach(), grad.detach(), metrics
 
     def train_op(self, tensordict):
         rollout = tensordict.exclude("stats")
-        rollout_beta = self._teacher_mixture_probability()
+        training_phase = self._prepare_training_phase()
+        finalization_phase = (
+            training_phase if self._finalization_enabled() else None
+        )
+        staging_phase = training_phase if self._staging_enabled() else None
+        staging_cycle_index = (
+            self._staging_cycle_index() if self._staging_enabled() else -1
+        )
+        control_mode = self._effective_control_mode()
+        safe_zero_iteration = getattr(
+            self.cfg, "dagger_safe_zero_iteration", None
+        )
+        safe_control_enabled = (
+            control_mode in ("safe", "hybrid")
+            and self._safe_teacher_control_enabled()
+        )
+        scheduled_beta = self._teacher_mixture_probability()
+        rollout_beta = (
+            scheduled_beta if control_mode in ("beta", "hybrid") else 0.0
+        )
+
+        valid_diagnostic = rollout.get(
+            DAGGER_TEACHER_ACTION_VALID_KEY, None
+        )
+        if valid_diagnostic is None:
+            valid_diagnostic = torch.zeros(
+                rollout.batch_size,
+                dtype=torch.bool,
+                device=rollout.device,
+            )
+        else:
+            valid_diagnostic = valid_diagnostic.reshape(-1).bool()
+        valid_diagnostic_count = int(valid_diagnostic.sum().item())
+
+        def diagnostic_values(key):
+            value = rollout.get(key, None)
+            if value is None or valid_diagnostic_count < 1:
+                return None
+            value = value.reshape(-1)
+            return value[valid_diagnostic]
+
+        discrepancy_rms_values = diagnostic_values(
+            DAGGER_ACTION_DISCREPANCY_RMS_KEY
+        )
+        discrepancy_max_values = diagnostic_values(
+            DAGGER_ACTION_DISCREPANCY_MAX_KEY
+        )
+
+        def diagnostic_mean(key):
+            value = diagnostic_values(key)
+            return 0.0 if value is None else value.float().mean().item()
+
+        if discrepancy_rms_values is None:
+            discrepancy_rms_mean = discrepancy_rms_p95 = 0.0
+            discrepancy_rms_max = 0.0
+        else:
+            discrepancy_rms_values = discrepancy_rms_values.float()
+            discrepancy_rms_mean = discrepancy_rms_values.mean().item()
+            discrepancy_rms_p95 = torch.quantile(
+                discrepancy_rms_values, 0.95
+            ).item()
+            discrepancy_rms_max = discrepancy_rms_values.max().item()
+        if discrepancy_max_values is None:
+            discrepancy_joint_max_mean = discrepancy_joint_max_p95 = 0.0
+        else:
+            discrepancy_max_values = discrepancy_max_values.float()
+            discrepancy_joint_max_mean = discrepancy_max_values.mean().item()
+            discrepancy_joint_max_p95 = torch.quantile(
+                discrepancy_max_values, 0.95
+            ).item()
+
         appended = 0
         teacher_exported = 0
         teacher_selected = 0
         valid_labels = 0
-        for transitions in self._dagger_transition_chunks(rollout):
-            appended += self.dagger_replay.extend(transitions)
-            valid = transitions[DAGGER_TEACHER_ACTION_VALID_KEY]
-            teacher_executed = valid & ~transitions[DAGGER_IS_STUDENT_ACTION_KEY]
-            valid_labels += int(valid.sum().item())
-            teacher_selected += int(teacher_executed.sum().item())
-            if self.teacher_replay is not None and teacher_executed.any():
-                export = {
-                    key: transitions[key][teacher_executed].to(
-                        self.teacher_replay.device
-                    )
+        transition_chunks = (
+            tuple(self._dagger_transition_chunks(rollout))
+            if self._collect_dagger_replay_this_rollout()
+            else ()
+        )
+        if transition_chunks:
+            # Chunks are yielded in step-major, environment-major order.  One
+            # concatenation preserves that exact FIFO order while replacing 32
+            # replay appends and roughly 128 device synchronizations per
+            # rollout with one staged append and one pair of scalar counts.
+            transitions = {
+                key: torch.cat(
+                    [chunk[key] for chunk in transition_chunks], dim=0
+                )
+                for key in transition_chunks[0]
+            }
+            replay_device = getattr(
+                self.dagger_replay,
+                "device",
+                next(iter(transitions.values())).device,
+            )
+            staged = {
+                key: (
+                    value.detach()
+                    if value.device == replay_device
+                    else value.detach().to(replay_device)
+                )
+                for key, value in transitions.items()
+            }
+            # Do not retain the concatenated GPU staging tensors throughout all
+            # BC/Q/adaptation updates.  The CPU replay path now owns its staged
+            # copy; the policy-device path retains it through ``staged`` only.
+            del transitions, transition_chunks
+            appended = self.dagger_replay.extend(staged)
+            valid = staged[DAGGER_TEACHER_ACTION_VALID_KEY]
+            teacher_executed = (
+                valid & ~staged[DAGGER_IS_STUDENT_ACTION_KEY]
+            )
+            valid_labels = int(valid.sum().item())
+            teacher_selected = int(teacher_executed.sum().item())
+            if teacher_selected and self._collect_q_teacher_rows_this_rollout():
+                # Boolean indexing recomputes the same dynamic selection for
+                # every 23kB replay field.  One ascending index vector preserves
+                # the old row order and is reused by both teacher FIFOs.
+                teacher_indices = teacher_executed.nonzero(
+                    as_tuple=False
+                ).squeeze(-1)
+                q_teacher = {
+                    key: staged[key].index_select(0, teacher_indices)
                     for key in TEACHER_REPLAY_FIELDS
                 }
-                teacher_exported += self.teacher_replay.append(export)
+                self.q_teacher_replay.extend(q_teacher)
+                if (
+                    self._export_teacher_rows_this_rollout()
+                    and self.teacher_replay is not None
+                ):
+                    export = {
+                        key: (
+                            value
+                            if value.device == self.teacher_replay.device
+                            else value.to(self.teacher_replay.device)
+                        )
+                        for key, value in q_teacher.items()
+                    }
+                    teacher_exported = self.teacher_replay.append(export)
+                    del export
+                del q_teacher, teacher_indices
+            del staged, valid, teacher_executed
 
         q_metrics = []
         bc_metrics = []
+        student_q_rows = 0
         if self.dagger_replay.size:
             valid_bc_rows = self.dagger_replay.valid_count(
                 DAGGER_TEACHER_ACTION_VALID_KEY
             )
-            # DAgger BC remains the only actor objective. IQL then updates V/Q
-            # from a separate all-transition sample and never queries that actor,
-            # so the critic cannot feed back into the student action update.
-            for _ in range(int(self.cfg.dagger_updates_per_rollout)):
+            # DAgger BC remains the only actor objective and retains its normal
+            # recent all-transition sampling distribution.
+            for _ in range(self._actor_updates_this_rollout()):
                 if valid_bc_rows:
                     for _ in range(int(self.cfg.dagger_bc_epochs)):
                         batch = self.dagger_replay.sample(
@@ -1574,29 +2886,48 @@ class PPOBCDaggerFinetune(PPOVEL):
                             self.device,
                             self.q_rng,
                             valid_key=DAGGER_TEACHER_ACTION_VALID_KEY,
+                            fields=(
+                                "observations",
+                                DAGGER_REPLAY_TEACHER_ACTIONS,
+                                DAGGER_TEACHER_ACTION_VALID_KEY,
+                            ),
                         )
                         batch = self._prepare_dagger_learning_batch(batch)
                         bc_metrics.append(self._bc_update(batch))
-                batch = self.dagger_replay.sample(
-                    self.cfg.iql_batch_size, self.device, self.q_rng
-                )
-                batch = self._prepare_dagger_learning_batch(batch)
-                q_metrics.append(self._q_update(batch))
+
+            # Critic sampling is deliberately independent of beta. Sampling
+            # with replacement starts as soon as both behavior sources exist.
+            student_q_rows = self.dagger_replay.valid_count(
+                DAGGER_IS_STUDENT_ACTION_KEY
+            )
+            q_learning_starts = int(self.cfg.q_learning_starts_per_source)
+            if (
+                self.q_teacher_replay.size >= q_learning_starts
+                and student_q_rows >= q_learning_starts
+            ):
+                for _ in range(self._q_updates_this_rollout()):
+                    batch = self._sample_balanced_q_batch()
+                    batch = self._prepare_dagger_learning_batch(batch)
+                    q_metrics.append(self._q_update(batch))
 
         # Preserve the original VAIC supervised depth/object/latent updates and
         # their EMA soft copies.  actor_adapt is excluded because inherited
         # residual distillation is disabled in this config.
-        adapt_info = self.train_adapt(rollout.copy())
+        adapt_info = self._adaptation_update_this_rollout(rollout)
         self.num_updates += 1
         self.dagger_rollout_count += 1
         self.dagger_environment_steps += int(self.cfg.train_every)
+        if self._finalization_enabled():
+            self.finalization_rollout_count += 1
+        if self._staging_enabled():
+            self.staging_rollout_count += 1
 
         if q_metrics:
             q_loss = torch.stack([item[0] for item in q_metrics]).mean().item()
             q1_loss = torch.stack([item[1][0] for item in q_metrics]).mean().item()
             q2_loss = torch.stack([item[1][1] for item in q_metrics]).mean().item()
             q_grad = torch.stack([item[2] for item in q_metrics]).mean().item()
-            iql_metrics = {
+            critic_metrics = {
                 key: torch.stack(
                     [item[3][key] for item in q_metrics]
                 ).mean().item()
@@ -1604,25 +2935,26 @@ class PPOBCDaggerFinetune(PPOVEL):
             }
         else:
             q_loss = q1_loss = q2_loss = q_grad = 0.0
-            iql_metrics = {
+            critic_metrics = {
                 key: 0.0
                 for key in (
-                    "value_loss",
-                    "value_grad_norm",
-                    "value_mean",
-                    "value_std",
                     "target_q_mean",
                     "target_q_twin_disagreement",
-                    "advantage_mean",
-                    "advantage_std",
-                    "advantage_positive_fraction",
                     "td_target_mean",
-                    "td_target_std",
                     "td_target_support_low_fraction",
                     "td_target_support_high_fraction",
                     "q1_mean",
                     "q2_mean",
                     "q_twin_disagreement",
+                    "data_q_mean",
+                    "teacher_data_q_mean",
+                    "student_data_q_mean",
+                    "next_action_mean_abs_deviation",
+                    "next_log_prob_mean",
+                    "entropy_tax_mean",
+                    "entropy_tax_abs_mean",
+                    "reward_abs_mean",
+                    "entropy_tax_reward_abs_ratio",
                 )
             }
         if bc_metrics:
@@ -1635,10 +2967,62 @@ class PPOBCDaggerFinetune(PPOVEL):
             # Report the probability that collected this rollout, not the next
             # rollout's value after the stage-local counter increment.
             "dagger/beta": rollout_beta,
+            "dagger/beta_schedule": scheduled_beta,
+            "dagger/control_mode_safe": float(control_mode == "safe"),
+            "dagger/control_mode_hybrid": float(control_mode == "hybrid"),
+            "dagger/control_mode_beta": float(control_mode == "beta"),
+            "dagger/safe_control_enabled": float(safe_control_enabled),
+            "dagger/action_discrepancy_rms_mean": discrepancy_rms_mean,
+            "dagger/action_discrepancy_rms_p95": discrepancy_rms_p95,
+            "dagger/action_discrepancy_rms_max": discrepancy_rms_max,
+            "dagger/action_discrepancy_joint_max_mean": (
+                discrepancy_joint_max_mean
+            ),
+            "dagger/action_discrepancy_joint_max_p95": (
+                discrepancy_joint_max_p95
+            ),
+            "dagger/safe_unsafe_fraction": diagnostic_mean(
+                DAGGER_SAFE_UNSAFE_KEY
+            ),
+            "dagger/safe_teacher_fraction": diagnostic_mean(
+                DAGGER_SAFE_TEACHER_KEY
+            ),
+            "dagger/safe_takeover_fraction": diagnostic_mean(
+                DAGGER_SAFE_TAKEOVER_KEY
+            ),
+            "dagger/safe_release_fraction": diagnostic_mean(
+                DAGGER_SAFE_RELEASE_KEY
+            ),
+            "dagger/beta_teacher_fraction": diagnostic_mean(
+                DAGGER_BETA_TEACHER_KEY
+            ),
+            "dagger/student_invalid_fraction": 1.0 - diagnostic_mean(
+                DAGGER_STUDENT_ACTION_VALID_KEY
+            ) if valid_diagnostic_count else 0.0,
+            "dagger/safe_takeover_rms": float(
+                self.cfg.dagger_safe_takeover_rms
+            ),
+            "dagger/safe_release_rms": float(
+                self.cfg.dagger_safe_release_rms
+            ),
+            "dagger/safe_min_teacher_steps": int(
+                self.cfg.dagger_safe_min_teacher_steps
+            ),
+            "dagger/safe_zero_iteration": (
+                int(safe_zero_iteration)
+                if safe_zero_iteration is not None
+                else -1
+            ),
             "dagger/replay_size": self.dagger_replay.size,
             "dagger/replay_seen": self.dagger_replay.seen,
             "dagger/rollout_count": self.dagger_rollout_count,
+            "dagger/rollout_index": self.dagger_rollout_count - 1,
             "dagger/environment_steps": self.dagger_environment_steps,
+            "dagger/beta_zero_iteration": (
+                int(self.cfg.dagger_beta_decay_rollouts)
+                if float(self.cfg.dagger_beta_end) == 0.0
+                else -1
+            ),
             "dagger/teacher_fraction": teacher_selected / max(appended, 1),
             "dagger/valid_teacher_fraction": valid_labels / max(appended, 1),
             "dagger/teacher_exported": teacher_exported,
@@ -1651,48 +3035,128 @@ class PPOBCDaggerFinetune(PPOVEL):
             "dagger/q2_loss": q2_loss,
             "dagger/q_grad_norm": q_grad,
             "dagger/q_update_count": self.q_update_count,
-            "dagger/iql_value_loss": iql_metrics["value_loss"],
-            "dagger/iql_value_grad_norm": iql_metrics[
-                "value_grad_norm"
-            ],
-            "dagger/iql_value_mean": iql_metrics["value_mean"],
-            "dagger/iql_value_std": iql_metrics["value_std"],
-            "dagger/iql_target_q_mean": iql_metrics["target_q_mean"],
-            "dagger/iql_target_q_twin_disagreement": iql_metrics[
+            "dagger/critic_target_q_mean": critic_metrics["target_q_mean"],
+            "dagger/critic_target_q_twin_disagreement": critic_metrics[
                 "target_q_twin_disagreement"
             ],
-            "dagger/iql_advantage_mean": iql_metrics[
-                "advantage_mean"
-            ],
-            "dagger/iql_advantage_std": iql_metrics["advantage_std"],
-            "dagger/iql_advantage_positive_fraction": iql_metrics[
-                "advantage_positive_fraction"
-            ],
-            "dagger/iql_td_target_mean": iql_metrics["td_target_mean"],
-            "dagger/iql_td_target_std": iql_metrics["td_target_std"],
-            "dagger/iql_td_target_support_low_fraction": iql_metrics[
+            "dagger/critic_td_target_mean": critic_metrics["td_target_mean"],
+            "dagger/critic_td_target_support_low_fraction": critic_metrics[
                 "td_target_support_low_fraction"
             ],
-            "dagger/iql_td_target_support_high_fraction": iql_metrics[
+            "dagger/critic_td_target_support_high_fraction": critic_metrics[
                 "td_target_support_high_fraction"
             ],
-            "dagger/iql_q1_mean": iql_metrics["q1_mean"],
-            "dagger/iql_q2_mean": iql_metrics["q2_mean"],
-            "dagger/iql_q_twin_disagreement": iql_metrics[
+            "dagger/critic_q1_mean": critic_metrics["q1_mean"],
+            "dagger/critic_q2_mean": critic_metrics["q2_mean"],
+            "dagger/critic_q_twin_disagreement": critic_metrics[
                 "q_twin_disagreement"
             ],
-            "dagger/iql_expectile": float(self.cfg.iql_expectile),
-            "dagger/iql_value_update_count": self.iql_value_update_count,
+            "dagger/critic_data_q_mean": critic_metrics["data_q_mean"],
+            "dagger/critic_teacher_data_q_mean": critic_metrics[
+                "teacher_data_q_mean"
+            ],
+            "dagger/critic_student_data_q_mean": critic_metrics[
+                "student_data_q_mean"
+            ],
+            "dagger/critic_next_action_mean_abs_deviation": critic_metrics[
+                "next_action_mean_abs_deviation"
+            ],
+            "dagger/critic_next_log_prob_mean": critic_metrics[
+                "next_log_prob_mean"
+            ],
+            "dagger/critic_entropy_tax_mean": critic_metrics[
+                "entropy_tax_mean"
+            ],
+            "dagger/critic_entropy_tax_abs_mean": critic_metrics[
+                "entropy_tax_abs_mean"
+            ],
+            "dagger/critic_reward_abs_mean": critic_metrics[
+                "reward_abs_mean"
+            ],
+            "dagger/critic_entropy_tax_reward_abs_ratio": critic_metrics[
+                "entropy_tax_reward_abs_ratio"
+            ],
+            "dagger/critic_effective_alpha": 0.0,
+            "dagger/critic_teacher_replay_size": self.q_teacher_replay.size,
+            "dagger/critic_teacher_replay_seen": self.q_teacher_replay.seen,
+            "dagger/critic_student_replay_rows": student_q_rows,
+            "dagger/critic_sampled_teacher_rows": (
+                len(q_metrics) * int(self.cfg.q_batch_size) // 2
+            ),
+            "dagger/critic_sampled_student_rows": (
+                len(q_metrics) * int(self.cfg.q_batch_size) // 2
+            ),
+            "dagger/critic_teacher_ratio": 0.5,
+            "dagger/critic_replay_ready": float(
+                self.q_teacher_replay.size
+                >= int(self.cfg.q_learning_starts_per_source)
+                and student_q_rows
+                >= int(self.cfg.q_learning_starts_per_source)
+            ),
+            "dagger/critic_q_action_normalized": 1.0,
+            "dagger/critic_clipped_double_q": 1.0,
             "dagger/actor_q_weighting_enabled": 0.0,
             "dagger/truncation_finals": self._last_truncation_finals_used,
             "dagger/replay_observation_raw_pre_vecnorm": 1.0,
             "dagger/fixed_actor_anchor_enabled": 0.0,
         }
+        if self._finalization_enabled():
+            phase_values = {
+                name: float(finalization_phase == name)
+                for name in DAGGER_FINALIZATION_PHASES
+            }
+            info.update(
+                {
+                    "dagger/finalization_enabled": 1.0,
+                    "dagger/finalization_rollout_count": (
+                        self.finalization_rollout_count
+                    ),
+                    "dagger/finalization_rollout_index": (
+                        self.finalization_rollout_count - 1
+                    ),
+                    "dagger/finalization_complete": float(
+                        self._finalization_phase() == "complete"
+                    ),
+                    **{
+                        f"dagger/finalization_phase_{name}": value
+                        for name, value in phase_values.items()
+                    },
+                }
+            )
+        if self._staging_enabled():
+            phase_values = {
+                name: float(staging_phase == name)
+                for name in DAGGER_STAGING_PHASES
+            }
+            info.update(
+                {
+                    "dagger/staging_enabled": 1.0,
+                    "dagger/staging_rollout_count": (
+                        self.staging_rollout_count
+                    ),
+                    "dagger/staging_rollout_index": (
+                        self.staging_rollout_count - 1
+                    ),
+                    "dagger/staging_cycle_index": staging_cycle_index,
+                    "dagger/staging_complete": float(
+                        self._staging_phase() == "complete"
+                    ),
+                    **{
+                        f"dagger/staging_phase_{name}": value
+                        for name, value in phase_values.items()
+                    },
+                }
+            )
         info.update(adapt_info)
         return info
 
     def _checkpoint_config(self):
         names = (
+            "dagger_control_mode",
+            "dagger_safe_takeover_rms",
+            "dagger_safe_release_rms",
+            "dagger_safe_min_teacher_steps",
+            "dagger_safe_zero_iteration",
             "dagger_beta_start",
             "dagger_beta_end",
             "dagger_beta_decay_rollouts",
@@ -1711,14 +3175,26 @@ class PPOBCDaggerFinetune(PPOVEL):
             "q_v_min",
             "q_v_max",
             "q_layer_norm",
+            "q_action_fusion",
+            "q_action_coordinates",
+            "sac_q_normalize_actions",
+            "sac_q_action_input_gain",
+            "sac_clipped_double_q",
             "q_lr",
             "q_weight_decay",
             "q_seed",
             "q_tau",
             "q_max_grad_norm",
-            "iql_expectile",
-            "iql_value_lr",
-            "iql_batch_size",
+            "q_batch_size",
+            "q_updates_per_rollout",
+            "q_teacher_replay_ratio",
+            "q_teacher_buffer_capacity",
+            "q_learning_starts_per_source",
+            "sac_bc_initial_action_std",
+            "sac_bc_log_std_min",
+            "sac_bc_log_std_max",
+            "sac_alpha_init",
+            "sac_entropy_reference_scale",
             "teacher_buffer_capacity",
         )
         return {name: getattr(self.cfg, name) for name in names}
@@ -1730,33 +3206,37 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "training_algorithm": PPO_BC_DAGGER_TRAINING_ALGORITHM,
                 "actor_backend": PPO_BC_DAGGER_ACTOR_BACKEND,
                 "critic_learning_semantics": (
-                    PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS
+                    PPO_BC_DAGGER_SAC_CRITIC_SEMANTICS
                 ),
                 "actor_learning_semantics": (
                     PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS
                 ),
                 "dagger_backend_config": self._checkpoint_config(),
+                "q_backend_config": self._q_backend_metadata(),
                 "teacher_action_semantics": (
                     DAGGER_TEACHER_ACTION_SEMANTICS
                 ),
+                "dagger_control_semantics": DAGGER_CONTROL_SEMANTICS,
                 "dagger_rollout_count": self.dagger_rollout_count,
                 "dagger_environment_steps": self.dagger_environment_steps,
                 "bc_update_count": self.bc_update_count,
                 "q_update_count": self.q_update_count,
-                "iql_value_update_count": self.iql_value_update_count,
                 "dagger_rng_state": self.dagger_rng.get_state(),
                 "q_rng_state": self.q_rng.get_state(),
+                "sac_action_rng_state": self.sac_action_rng.get_state(),
                 "optimizer_resume_state": {
                     "bc_optimizer": self.bc_optimizer.state_dict(),
                     "q_optimizer": self.opt_q.state_dict(),
-                    "iql_value_optimizer": (
-                        self.opt_iql_value.state_dict()
-                    ),
                     "adapt_optimizer": self.opt_adapt.state_dict(),
                 },
                 "teacher_replay_id": self.teacher_replay_id,
                 "replay_resume_semantics": (
-                    "all_transition_ring_omitted_non_exact_resume_v1"
+                    "staged_ephemeral_rings_omitted_h5_only_after_final_q_v1"
+                    if self._staging_enabled()
+                    else (
+                        "recent_student_ring_omitted_teacher_partition_"
+                        "h5_refill_v2"
+                    )
                 ),
                 "replay_observation_semantics": (
                     DAGGER_REPLAY_OBSERVATION_SEMANTICS
@@ -1773,22 +3253,69 @@ class PPOBCDaggerFinetune(PPOVEL):
             state["frozen_teacher_replay_source_state"] = copy.deepcopy(
                 self._loaded_teacher_replay_metadata
             )
+        if self._finalization_enabled():
+            state["bc_dagger_finalization_state"] = {
+                "semantics": DAGGER_FINALIZATION_SEMANTICS,
+                "config": self._finalization_config(),
+                "rollout_count": int(self.finalization_rollout_count),
+                "phase": self._finalization_phase(),
+                "last_phase": self._finalization_last_phase,
+                "complete": self._finalization_phase() == "complete",
+                "source_state": copy.deepcopy(self._finalization_source_state),
+                "fresh_replay_id": str(self.teacher_replay_id),
+            }
+        if self._staging_enabled():
+            calibration_start_q_updates = getattr(
+                self,
+                "_staging_calibration_start_q_update_count",
+                None,
+            )
+            state["bc_dagger_staging_state"] = {
+                "semantics": DAGGER_STAGING_SEMANTICS,
+                "config": self._staging_config(),
+                "rollout_count": int(self.staging_rollout_count),
+                "phase": self._staging_phase(),
+                "last_phase": self._staging_last_phase,
+                "complete": self._staging_phase() == "complete",
+                "fresh_replay_id": str(self.teacher_replay_id),
+                "persistent_replay_semantics": (
+                    "h5_disabled_until_final_q_calibration_v1"
+                ),
+                "calibration_start_q_update_count": (
+                    None
+                    if calibration_start_q_updates is None
+                    else int(calibration_start_q_updates)
+                ),
+                "calibration_q_updates": (
+                    0
+                    if calibration_start_q_updates is None
+                    else int(self.q_update_count)
+                    - int(calibration_start_q_updates)
+                ),
+            }
         return state
 
     def load_state_dict(self, state_dict, strict=True):
         algorithm = state_dict.get("training_algorithm")
         same_stage = algorithm == PPO_BC_DAGGER_TRAINING_ALGORITHM
         if same_stage:
+            checkpoint_staging_state = state_dict.get(
+                "bc_dagger_staging_state"
+            )
+            if self._staging_enabled() != (
+                checkpoint_staging_state is not None
+            ):
+                raise ValueError(
+                    "PPO-BC DAgger staged/non-staged resume mode mismatch"
+                )
             if "qnet" not in state_dict:
                 raise KeyError("same-stage checkpoint is missing qnet")
             if "qnet_target" not in state_dict:
                 raise KeyError("same-stage checkpoint is missing qnet_target")
-            if "iql_value" not in state_dict:
-                raise KeyError("same-stage checkpoint is missing iql_value")
             if state_dict.get("critic_learning_semantics") != (
-                PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS
+                PPO_BC_DAGGER_SAC_CRITIC_SEMANTICS
             ):
-                raise ValueError("PPO-BC DAgger IQL critic semantics mismatch")
+                raise ValueError("PPO-BC DAgger SAC critic semantics mismatch")
             if state_dict.get("actor_learning_semantics") != (
                 PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS
             ):
@@ -1799,6 +3326,10 @@ class PPOBCDaggerFinetune(PPOVEL):
                 DAGGER_TEACHER_ACTION_SEMANTICS
             ):
                 raise ValueError("PPO-BC DAgger teacher action semantics mismatch")
+            if state_dict.get("dagger_control_semantics") != (
+                DAGGER_CONTROL_SEMANTICS
+            ):
+                raise ValueError("PPO-BC DAgger control semantics mismatch")
             checkpoint_fingerprint = state_dict.get("vecnorm_fingerprint")
             if (
                 checkpoint_fingerprint is not None
@@ -1812,12 +3343,24 @@ class PPOBCDaggerFinetune(PPOVEL):
             actual_config = state_dict.get("dagger_backend_config")
             expected_config = self._checkpoint_config() if hasattr(self, "device") else None
             if actual_config is not None and expected_config is not None:
+                # Checkpoints predating the optional cutoff are equivalent to
+                # its disabled default, but a non-null resumed cutoff must match.
+                actual_config = dict(actual_config)
+                actual_config.setdefault("dagger_safe_zero_iteration", None)
                 if actual_config != expected_config:
                     raise ValueError("PPO-BC DAgger checkpoint config mismatch")
+            actual_q_backend = state_dict.get("q_backend_config")
+            if actual_q_backend != self._q_backend_metadata():
+                raise ValueError("PPO-BC DAgger Q backend contract mismatch")
+        elif algorithm == PPO_BC_DAGGER_IQL_TRAINING_ALGORITHM:
+            raise ValueError(
+                "IQL-v2 BC-DAgger checkpoints cannot resume the SAC-critic "
+                "stage; start a new scripts/bc_dagger.py run from the PPO teacher."
+            )
         elif algorithm == PPO_BC_DAGGER_LEGACY_TRAINING_ALGORITHM:
             raise ValueError(
-                "Legacy Bellman BC-DAgger checkpoints do not contain the IQL "
-                "value network; start a new scripts/bc_dagger.py run."
+                "Legacy BC-DAgger checkpoints do not contain the compatible "
+                "SAC critic; start a new scripts/bc_dagger.py run."
             )
         elif algorithm is not None:
             raise ValueError(
@@ -1838,7 +3381,7 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "adapt_ema",
                 "qnet",
                 "qnet_target",
-                "iql_value",
+                "bc_dagger_sac_adapter",
             }
             if getattr(self.cfg, "use_object_adapt", False):
                 critical.update(("object_adapt", "object_adapt_ema"))
@@ -1856,13 +3399,6 @@ class PPOBCDaggerFinetune(PPOVEL):
                 raise ValueError("same-stage checkpoint lacks optimizer state")
             self.bc_optimizer.load_state_dict(optimizers["bc_optimizer"])
             self.opt_q.load_state_dict(optimizers["q_optimizer"])
-            if "iql_value_optimizer" not in optimizers:
-                raise ValueError(
-                    "same-stage checkpoint lacks IQL value optimizer state"
-                )
-            self.opt_iql_value.load_state_dict(
-                optimizers["iql_value_optimizer"]
-            )
             self.opt_adapt.load_state_dict(optimizers["adapt_optimizer"])
             self.dagger_rollout_count = int(
                 state_dict.get("dagger_rollout_count", 0)
@@ -1872,11 +3408,9 @@ class PPOBCDaggerFinetune(PPOVEL):
             )
             self.bc_update_count = int(state_dict.get("bc_update_count", 0))
             self.q_update_count = int(state_dict.get("q_update_count", 0))
-            self.iql_value_update_count = int(
-                state_dict.get("iql_value_update_count", 0)
-            )
             self.dagger_rng.set_state(state_dict["dagger_rng_state"])
             self.q_rng.set_state(state_dict["q_rng_state"])
+            self.sac_action_rng.set_state(state_dict["sac_action_rng_state"])
             self.teacher_replay_id = str(state_dict.get("teacher_replay_id"))
             self._loaded_teacher_replay_metadata = copy.deepcopy(
                 state_dict.get(
@@ -1892,10 +3426,119 @@ class PPOBCDaggerFinetune(PPOVEL):
                         )
                     )
                 )
-            warnings.warn(
-                "The live all-transition DAgger ring is intentionally not in "
-                "the checkpoint; same-stage replay resume is non-exact."
+            is_fresh_finalization = (
+                self._finalization_enabled()
+                and state_dict.get("bc_dagger_finalization_state") is None
             )
+            if is_fresh_finalization:
+                logging.info(
+                    "Starting BC-DAgger finalization from model/optimizer "
+                    "state only; the source H5 and both ephemeral learning "
+                    "rings are deliberately discarded."
+                )
+            elif self._staging_enabled():
+                warnings.warn(
+                    "Staged BC-DAgger checkpoint resume omits both ephemeral "
+                    "learning rings. They will refill from fresh rollouts; "
+                    "pre-calibration checkpoints intentionally have no H5."
+                )
+            else:
+                warnings.warn(
+                    "The recent student DAgger ring is intentionally not in "
+                    "the checkpoint. The persistent teacher critic partition "
+                    "must be refilled from the immutable H5 before Q updates "
+                    "resume."
+                )
+            if self._finalization_enabled():
+                finalization_state = state_dict.get(
+                    "bc_dagger_finalization_state"
+                )
+                if finalization_state is None:
+                    # Forking from a completed joint BC-DAgger run deliberately
+                    # ignores its representation-stale H5. Preserve weights,
+                    # optimizers, and RNG streams, but establish a new replay
+                    # lineage and a separate local phase counter.
+                    self._finalization_source_state = {
+                        "training_algorithm": algorithm,
+                        "dagger_rollout_count": self.dagger_rollout_count,
+                        "dagger_environment_steps": (
+                            self.dagger_environment_steps
+                        ),
+                        "bc_update_count": self.bc_update_count,
+                        "q_update_count": self.q_update_count,
+                        "teacher_replay_id": self.teacher_replay_id,
+                        "teacher_replay_state": copy.deepcopy(
+                            self._loaded_teacher_replay_metadata
+                        ),
+                    }
+                    self.finalization_rollout_count = 0
+                    self._finalization_last_phase = None
+                    self.teacher_replay_id = str(uuid.uuid4())
+                    self._loaded_teacher_replay_metadata = None
+                    self.dagger_replay.clear()
+                    self.q_teacher_replay.clear()
+                else:
+                    if finalization_state.get("semantics") != (
+                        DAGGER_FINALIZATION_SEMANTICS
+                    ):
+                        raise ValueError(
+                            "BC-DAgger finalization semantics mismatch"
+                        )
+                    if finalization_state.get("config") != (
+                        self._finalization_config()
+                    ):
+                        raise ValueError(
+                            "BC-DAgger finalization schedule mismatch"
+                        )
+                    self.finalization_rollout_count = int(
+                        finalization_state.get("rollout_count", 0)
+                    )
+                    self._finalization_last_phase = finalization_state.get(
+                        "last_phase"
+                    )
+                    self._finalization_source_state = copy.deepcopy(
+                        finalization_state.get("source_state")
+                    )
+                    expected_replay_id = str(
+                        finalization_state.get("fresh_replay_id", "")
+                    )
+                    if expected_replay_id and (
+                        expected_replay_id != self.teacher_replay_id
+                    ):
+                        raise ValueError(
+                            "BC-DAgger finalization replay lineage mismatch"
+                        )
+            if self._staging_enabled():
+                staging_state = state_dict.get("bc_dagger_staging_state")
+                if not isinstance(staging_state, dict):
+                    raise ValueError(
+                        "Staged BC-DAgger checkpoint lacks staging state"
+                    )
+                if staging_state.get("semantics") != DAGGER_STAGING_SEMANTICS:
+                    raise ValueError("BC-DAgger staging semantics mismatch")
+                if staging_state.get("config") != self._staging_config():
+                    raise ValueError("BC-DAgger staging schedule mismatch")
+                self.staging_rollout_count = int(
+                    staging_state.get("rollout_count", 0)
+                )
+                self._staging_last_phase = staging_state.get("last_phase")
+                calibration_start_q_updates = staging_state.get(
+                    "calibration_start_q_update_count"
+                )
+                self._staging_calibration_start_q_update_count = (
+                    None
+                    if calibration_start_q_updates is None
+                    else int(calibration_start_q_updates)
+                )
+                expected_replay_id = str(
+                    staging_state.get("fresh_replay_id", "")
+                )
+                if expected_replay_id and (
+                    expected_replay_id != self.teacher_replay_id
+                ):
+                    raise ValueError(
+                        "BC-DAgger staging replay lineage mismatch"
+                    )
         else:
             # The PPO checkpoint has neither depth-camera modules nor Qs.  Those
             # are the only expected fresh modules; teacher/student core failures
@@ -1906,7 +3549,7 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "temporal_depth_gru_ema",
                 "qnet",
                 "qnet_target",
-                "iql_value",
+                "bc_dagger_sac_adapter",
             }
             unexpected = set(failed).difference(allowed_fresh)
             if unexpected:
@@ -1917,12 +3560,14 @@ class PPOBCDaggerFinetune(PPOVEL):
             hard_copy_(self.qnet, self.qnet_target)
             self.qnet_target.requires_grad_(False)
             self.q_update_count = 0
-            self.iql_value_update_count = 0
             self.bc_update_count = 0
             self.dagger_rollout_count = 0
             self.dagger_environment_steps = 0
             self.q_rng.manual_seed(int(self.cfg.q_seed))
+            self.sac_action_rng.manual_seed(int(self.cfg.q_seed) + 1)
             self.dagger_rng.manual_seed(int(self.cfg.dagger_seed))
         if hasattr(self, "_freeze_teacher"):
             self._freeze_teacher()
+        if self._staging_enabled():
+            self._apply_staging_freeze_mask(self._staging_phase())
         return failed

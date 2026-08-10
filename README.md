@@ -252,30 +252,162 @@ python scripts/play.py algo=fastsac_vel_train task=G1/vaic/skateboard_tea checkp
 ### PPO teacher DAgger, depth student, and Q replay
 
 ```bash
-# Frozen PPO teacher + per-environment DAgger beta mixture + student BC.
+# Frozen PPO teacher + per-environment SafeDAgger control + student BC.
 # VAIC depth/object/adaptation supervision and EMA updates remain enabled.
-# A Stage-1-only IQL V network and independent C51 Q1/Q2 targets learn from
-# replay actions; the student actor remains pure DAgger BC.
+# Stage-2-compatible C51 Q1/Q2 learn from the actions actually executed;
+# the student actor remains pure DAgger BC.
 python scripts/bc_dagger.py \
   task=G1/vaic/skateboard_stu \
   checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
-  total_frames=19660800 \
-  algo.dagger_beta_decay_rollouts=1000
+  bc_dagger_iterations=1200
 ```
 
-The dedicated script default decays beta from `1.0 -> 0.0` over 1,800 new
-DAgger rollouts. This path performs Huber behavior cloning plus IQL-style
-critic/value pretraining; it does not call PPO/GAE/PPO-value optimization, an
-IQL advantage-weighted actor loss, or a SAC actor/entropy objective. Q1/Q2 keep
-the FastSAC C51 topology, while their scalar target is `r + gamma * V(next)`
-projected onto that support for direct Stage-2 weight transfer.
+`bc_dagger_iterations` is the number of outer DAgger rollout/update iterations;
+the entrypoint derives the exact all-rank frame budget from `task.num_envs *
+algo.train_every * world_size`. To retain SafeDAgger while also decaying beta to zero at a
+specific cumulative DAgger/checkpoint index, use hybrid mode:
+
+```bash
+python scripts/bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/path/to/ppo_teacher_checkpoint.pt \
+  bc_dagger_iterations=1200 \
+  algo.dagger_control_mode=hybrid \
+  algo.dagger_beta_zero_iteration=900
+```
+
+In this example, indices `0..899` use the linearly decaying beta in addition to
+SafeDAgger, and indices `900..1199` use pure SafeDAgger. In `safe` mode beta is
+unused; choose `beta` mode instead if SafeDAgger itself should be disabled.
+W&B logs the zero-based index as `dagger/rollout_index`; the completed-rollout
+counter `dagger/rollout_count` is therefore one larger.
+
+The dedicated script defaults to SafeDAgger. It compares the clipped,
+deterministic student action with the clipped PPO teacher mean in normalized
+action coordinates. Normalized RMS error above `0.006` gives control to the
+teacher; after at least eight control steps, error below `0.004` releases it
+back to the student. Hysteresis is tracked independently for every environment.
+`algo.dagger_control_mode=beta` retains the legacy Bernoulli schedule, while
+`hybrid` applies SafeDAgger and uses beta only on otherwise-safe rows.
+
+To deliberately end SafeDAgger control at a cumulative rollout boundary, use
+the project-specific cutoff below. This is not part of original SafeDAgger:
+
+```bash
+python scripts/bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/path/to/ppo_teacher_checkpoint.pt \
+  bc_dagger_iterations=2000 \
+  algo.dagger_control_mode=safe \
+  algo.dagger_safe_zero_iteration=1000
+```
+
+Indices `0..999` use SafeDAgger, and index `1000` onward is student-controlled;
+the active safety latch is cleared at the boundary. The cutoff is cumulative
+across a same-stage resume and must match the saved checkpoint configuration.
+The frozen teacher is still evaluated for BC labels and discrepancy logging, so
+this makes `dagger/safe_teacher_fraction` and (in `safe` mode)
+`dagger/teacher_fraction` exactly zero without ending DAgger supervision. It
+also overrides invalid-student takeover, so use it only when a student-only tail
+is intentional. In `hybrid` mode it disables only SafeDAgger; beta can still
+select the teacher until its separate beta schedule reaches zero. Before an
+early cutoff, confirm `dagger/critic_teacher_replay_size` has reached at least
+`algo.q_learning_starts_per_source` (default `8192`); otherwise the fixed 50/50
+critic cannot begin updating because too few teacher-executed rows exist.
+
+This path performs Huber behavior cloning plus SAC-compatible C51 clipped-double
+Q pretraining; it does not call PPO/GAE/PPO-value optimization, a Q-weighted
+actor loss, or a SAC actor/entropy optimizer. Q batches are always exactly 50%
+teacher-executed and 50% student-executed transitions, independent of the
+control mode. Bellman targets sample the student's dedicated small-noise next
+action, but use effective alpha zero during this Q-only stage. There is no IQL
+V network.
 Only valid, actually teacher-executed transitions are exported to
 `teacher_replay_buffer.h5`; the learning replay still contains every executed
 teacher/student transition. Observations in this H5 are stored before VecNorm
 and normalized with the checkpoint's fixed statistics when sampled. The
 `fastsac_vel_finetune` loader accepts this paired DAgger schema; it transfers
-the BC actor and IQL-pretrained Q/Q-target weights, then deliberately discards
-the Stage-1-only V network before ordinary Stage-2 FastSAC begins.
+the BC actor and pretrained Q/Q-target weights before ordinary Stage-2 FastSAC
+begins.
+
+BC sampling projects the replay to only the actor observation and teacher
+label fields it consumes, and rollout transitions are staged into the learning
+FIFOs once per outer iteration. These are automatic training-throughput
+optimizations and do not change control decisions, sampled row IDs, optimizer
+updates, or batch sizes. Checkpoints whose teacher FIFO has not changed reuse
+the existing immutable H5. For fewer full H5 snapshots during SafeDAgger (where
+teacher interventions may continue), add `save_interval=500`; this changes only
+crash-recovery granularity, not learning.
+
+To test block-coordinate BC-DAgger from a fresh PPO teacher, use the staged
+entrypoint:
+
+```bash
+python scripts/stage_bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
+  bc_dagger_iterations=3000 \
+  algo.dagger_control_mode=beta \
+  algo.dagger_beta_zero_iteration=500
+```
+
+The default 3,000-rollout schedule is `500` joint warm-up rollouts, seven
+coarse cycles of `100` perception-only plus `200` actor-only rollouts, then
+`100` final perception rollouts, `172` final actor realignment rollouts, and
+`128` frozen actor/perception replay-Q calibration rollouts. The initial joint
+block is intentional: a fresh PPO teacher checkpoint has no trained temporal
+depth CNN/GRU, so beta protects collection while that path boots up. The
+perception blocks update only the depth CNN/GRU, `object_adapt`, and
+`adapt_module`; actor blocks update only `actor_adapt`. The joint warm-up may
+also warm-start Q, but Q stays frozen throughout the isolated perception/actor
+cycles and is recalibrated only after their final representation is frozen.
+
+Every perception/actor handoff clears the actor-learning FIFO because its
+stored `priv_pred` belongs to the previous representation. At the final Q
+boundary both learning FIFOs are cleared, beta is fixed to the configured
+calibration probability (default `0.5`), and a new calibration-only
+`teacher_replay_buffer.h5` is built. Intermediate checkpoints are useful for
+evaluation but are rejected as Stage-2 sources; only the completed
+`checkpoint_final.pt` and the canonical H5 in the same Hydra output root should
+be passed to SAC/AWAC (the checkpoint itself lives under
+`wandb/latest-run/files/`).
+Staged resume is deliberately fail-fast in this first semantics version because
+the ephemeral learning FIFOs are not checkpointed. Phase lengths can be
+overridden, but `bc_dagger_iterations` must equal their exact sum. If
+`joint_warmup_iterations` changes, set `algo.dagger_beta_zero_iteration` to the
+same boundary as well.
+
+After a joint BC-DAgger run has converged, finalize its representation and
+replay/Q pair before Stage 2:
+
+```bash
+python scripts/bc_dagger_finalize.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/path/to/joint-bc-dagger/checkpoint_final.pt \
+  perception_consolidation_iterations=25 \
+  actor_realignment_iterations=0 \
+  perception_recheck_iterations=0 \
+  replay_q_calibration_iterations=128 \
+  calibration_control_mode=beta \
+  calibration_teacher_probability=0.5
+```
+
+The phases are isolated. Perception consolidation updates only the depth
+CNN/GRU, `object_adapt`, and `adapt_module` with the existing supervised
+privileged/object targets. Optional actor realignment updates only
+`actor_adapt` by DAgger BC. Optional perception recheck again updates only the
+three perception modules. At the calibration boundary both learning FIFOs are
+cleared; actor and perception are frozen, a fixed beta controller collects a
+brand-new teacher-only `teacher_replay_buffer.h5`, and only Q/Q-target are
+updated from fresh teacher/student sources. The H5 paired with the input joint
+checkpoint is deliberately neither read nor copied.
+
+The example runs 153 outer rollouts (25 + 128), or 2,506,752 frames at 512
+environments and `train_every=32`. The new output keeps the canonical
+`checkpoint_final.pt` and `teacher_replay_buffer.h5` names; use this new pair,
+not the input joint checkpoint, for Stage 2. Finalization currently starts only
+from the original completed joint BC-DAgger checkpoint and rejects a partially
+finalized checkpoint rather than risking a mixed replay lineage.
 
 For this BC-DAgger bridge, Stage-2 **training** collection samples the same
 bounded tanh-Gaussian distribution used by the SAC targets and actor loss. Its
@@ -301,7 +433,7 @@ Q-only updates with actor, alpha, and perception optimizers frozen. The target
 still samples the frozen stochastic next action so Q learns on the behavior's
 actual support, but effective alpha and the entropy target term are **exactly
 zero**. This is a temporary hard-Bellman compatibility bridge for the
-IQL-pretrained critic, not removal of entropy from the subsequent SAC phase.
+BC-DAgger SAC critic, not removal of entropy from the subsequent SAC phase.
 
 After the bridge, actor candidates are considered every 128 Q updates. An actor
 tick is applied only when its predicted twin-Q gain over the frozen BC action is
@@ -314,6 +446,116 @@ and the raw-unit entropy target is the standard `-action_dim`
 path. The guarded Stage-2 defaults are `sac_batch_size=512`,
 `q_lr=3e-5`, `sac_tau=0.001`, `sac_actor_lr=3e-7`, and
 `sac_policy_frequency=128`.
+
+Stage 2 can instead use the official AWAC actor update from the
+[AWAC paper](https://arxiv.org/abs/2006.09359) and the authors'
+[RLKit implementation](https://github.com/rail-berkeley/rlkit/blob/master/rlkit/torch/sac/awac_trainer.py):
+
+```bash
+python scripts/train.py \
+  algo=fastsac_vel_finetune \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/path/to/bc-dagger/checkpoint_final.pt \
+  algo.sac_finetune_actor_objective=awac \
+  algo.sac_actor_confidence_gate=false \
+  algo.sac_use_autotune=false \
+  algo.sac_awac_beta=1.0 \
+  algo.sac_updates_per_env_step=4 \
+  algo.sac_policy_frequency=64 \
+  algo.sac_actor_lr=3e-7
+```
+
+For each replay row this path computes
+`A = min(Q1(s, a_replay), Q2(s, a_replay)) - E[a~pi] min(Q1(s,a), Q2(s,a))`
+with the **online** critics, then minimizes replay-action negative log likelihood
+with detached mean-one weights
+`batch_size * softmax(A / sac_awac_beta)`. The defaults match the authors'
+general implementation: `sac_awac_beta=1`, one current-policy value sample
+(`sac_awac_v_samples=1`), and no upper score clamp
+(`sac_awac_score_clip=null`). Both actor mean and standard deviation are trained.
+
+AWAC uses a stochastic current-policy next action and a hard, clipped-double-Q
+Bellman target: effective alpha, alpha autotuning, the Stage-2 confidence gate,
+and the BC anchor are absent. Q/Q-target are **not frozen or restarted**: the
+compatible BC-DAgger v3 Q weights warm-start Stage 2, receive the configured
+Q-only bridge, and continue training from the mixed offline/online replay while
+the AWAC actor improves. The distributional C51 critic and the explicit 50/50
+RLPD replay mix are project integrations; the advantage and weighted-likelihood
+actor update follow official AWAC rather than this repository's separate
+Stage-1 `reference_awac` variant.
+
+Legacy `vaic_ppo_bc_dagger_student_iql_v2` checkpoints are not loaded as AWAC
+critics: their 101-atom/raw-action topology and expectile backup do not match the
+current 501-atom/normalized-action policy-evaluation critic. For such a legacy
+checkpoint use `algo.load_pretrained_q=false` to keep the BC actor but train a
+fresh AWAC Q. Current `scripts/bc_dagger.py` checkpoints use the compatible
+`vaic_ppo_bc_dagger_student_sac_critic_v3` critic and can retain the default
+`algo.load_pretrained_q=true`.
+
+The last three command overrides are a conservative VAIC starting profile, not
+paper defaults: UTD 4 yields 128 Q updates and two AWAC actor updates per
+32-step rollout while retaining the small BC-preserving actor learning rate.
+The authors' much larger `3e-4` actor learning rate and every-Q-step policy
+update should not be copied directly into this 23-action recurrent system. Do
+not add the earlier `sac_actor_learning_starts_finetune_iteration=32` override;
+leaving it null retains the 8,000-Q-update calibration bridge. If AWAC weights
+collapse (`fastsac/awac_weight_ess_fraction` near zero), increase beta before
+increasing actor learning rate or update frequency.
+
+A v3 BC-DAgger source normally transfers its dedicated `0.01` physical-action
+standard deviation exactly. Changing `sac_bc_initial_action_std` does not reset
+that saved adapter. For an intentional offline-to-online exploration experiment,
+use the Stage-2 boundary option below on a **fresh BC-DAgger transfer**:
+
+```bash
+algo.sac_stage2_initial_action_std=0.03
+```
+
+`null` (the default) preserves the source adapter bit-for-bit. A non-null value
+resets it once after loading the BC-DAgger source; a same-Stage-2 resume restores
+the learned adapter state and does not reset it again. The configured reset and
+the current effective standard deviation are logged as
+`fastsac/stage2_initial_action_std_config` and
+`fastsac/bc_sac_center_action_std_mean`. Broader stochastic collection can lower
+`train/stats/success` even when the deterministic evaluation mean improves, so
+compare deterministic checkpoint evaluations rather than the exploration curve
+alone.
+
+The BC adapter's global `log_std` normally shares `sac_actor_lr` with the actor
+mean. To let entropy change without accelerating the mean network, set an
+independent Stage-2 learning rate:
+
+```bash
+algo.sac_actor_lr=1e-7 \
+algo.sac_actor_log_std_lr=1e-4
+```
+
+The default `null` retains the legacy single AdamW parameter group exactly,
+including checkpoint optimizer compatibility. A non-null value is supported
+for the BC-DAgger adapter only: the actor mean remains at `sac_actor_lr`, while
+only `bc_dagger_sac_adapter.log_std` uses the new rate. This changes optimizer
+topology and is recorded in the Stage-2 resume schedule, so start the experiment
+from a BC-DAgger checkpoint and repeat the exact value when resuming or
+evaluating its Stage-2 checkpoints. Do not combine the first learning-rate
+ablation with an action-std reset or a temperature change.
+
+For a human-readable actor-release boundary, set the zero-based, Stage-2-local
+finetune iteration instead of converting iterations into Q optimizer updates:
+
+```bash
+python scripts/train.py \
+  algo=fastsac_vel_finetune \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/path/to/bc-dagger/checkpoint_final.pt \
+  algo.sac_actor_learning_starts_finetune_iteration=250
+```
+
+Iterations `0..249` remain actor-frozen and iteration `250` is the first
+eligible iteration. The first actual actor candidate still occurs on the next
+`sac_policy_frequency` Q-update boundary and must pass the confidence gate.
+The finetune-iteration counter starts at zero for a new Stage-2 transfer and is
+restored cumulatively on a same-stage resume. Leaving the option null preserves
+the historical `sac_actor_learning_starts_q_updates` gate exactly.
 
 Perception remains frozen for the whole stage because replay stores `priv_pred`,
 not the raw recurrent inputs needed to recompute it consistently. Stage-2
@@ -332,10 +574,9 @@ python scripts/train.py \
   algo.load_pretrained_q=false
 ```
 
-The default is `true`. With `false`, Stage-1 IQL Q/V weights and update counts
-are not required; both target critics become frozen exact copies of the fresh
-online Q networks. The BC actor and all student perception/EMA modules are
-still restored.
+The default is `true`. With `false`, Stage-1 Q weights and update counts are not
+required; both target critics become frozen exact copies of the fresh online Q
+networks. The BC actor and all student perception/EMA modules are still restored.
 
 To continue only the model training state from a DAgger checkpoint while
 leaving the existing `teacher_replay_buffer.h5` unchanged, use the dedicated
@@ -345,25 +586,26 @@ resume argument:
 python scripts/bc_dagger.py \
   task=G1/vaic/skateboard_stu \
   bc_dagger_checkpoint=/home/hcc/research/VAIC/outputs/2026-08-06/19-02-24-G1Skateboard-ppo_bc_dagger/wandb/latest-run/files/checkpoint_800.pt \
-  total_frames=6537216 \
-  algo.dagger_beta_decay_rollouts=1000
+  bc_dagger_iterations=399
 ```
 
 This restores the student/teacher modules, depth/adaptation modules and EMAs,
-IQL V, Q1/Q2 and target Q1/Q2, all four optimizer states, the dedicated
-DAgger/Q RNG states, and training counters. At startup it validates the source
+Q1/Q2 and target Q1/Q2, the BC/Q/adaptation optimizer states, the dedicated
+DAgger/Q/SAC-action RNG states, and training counters. At startup it validates the source
 H5's replay ID and VecNorm lineage, then makes an atomic, independent read-only
 copy at `<new-output>/teacher_replay_buffer.h5`, outside the W&B-watched
 `wandb/run-.../files/` directory. The source H5 is never modified, and the new
 copy receives no additional transitions or snapshots. This currently duplicates
 about 23 GiB; set `bc_dagger_copy_teacher_replay=false` to skip it.
 
-`total_frames` is the number of additional frames for the new process: the
-example adds 399 rollouts to checkpoint 800's 801 completed rollouts and ends at
-1,200. Reusing `total_frames=19660800` instead adds another 1,200 rollouts and
-ends at 2,001. The in-memory all-transition learning ring and the simulator
+`bc_dagger_iterations` is the number of additional iterations for the new
+process: the example adds 399 rollouts to checkpoint 800's 801 completed
+rollouts and ends at 1,200. Reusing `bc_dagger_iterations=1200` instead adds
+another 1,200 rollouts and ends at 2,001. The in-memory all-transition learning ring and the simulator
 episode state are not checkpointed, so they restart and the ring refills during
-roughly the first eight rollouts. A resumed run also creates a new W&B run.
+roughly the first eight rollouts. SafeDAgger's per-environment latch also starts
+empty because the simulator starts from a fresh reset. A resumed run creates a
+new W&B run.
 Stage 2 can auto-discover the copied H5 from a local resumed checkpoint path.
 The copy is not automatically uploaded to W&B, so `run:<resumed-run>` still
 needs an explicit local `teacher_replay_buffer_path` unless the H5 is uploaded

@@ -1,0 +1,98 @@
+# bc_dagger 
+
+# DAgger
+python scripts/bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
+  bc_dagger_iterations=3000 \
+  algo.dagger_control_mode=beta \
+  algo.dagger_beta_zero_iteration=500
+
+# SafeDAgger
+python scripts/bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
+  bc_dagger_iterations=2000 \
+  algo.dagger_control_mode=safe \
+  algo.dagger_safe_zero_iteration=1000
+
+# DAgger Finalize
+python scripts/bc_dagger_finalize.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-08/15-44-52-G1Skateboard-ppo_bc_dagger/wandb/latest-run/files/checkpoint_final.pt \
+  perception_consolidation_iterations=1000 \
+  actor_realignment_iterations=0 \
+  perception_recheck_iterations=0 \
+  replay_q_calibration_iterations=128 \
+  calibration_control_mode=beta \
+  calibration_teacher_probability=0.5
+
+# DAgger Structure
+python scripts/stage_bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
+  bc_dagger_iterations=10000 \
+  joint_warmup_iterations=500 \
+  stage_cycles=45 \
+  perception_iterations_per_cycle=100 \
+  actor_iterations_per_cycle=100 \
+  final_perception_iterations=100 \
+  final_actor_iterations=200 \
+  replay_q_calibration_iterations=200 \
+  calibration_control_mode=beta \
+  calibration_teacher_probability=0.5 \
+  algo.dagger_beta_zero_iteration=500 \
+  save_interval=100
+
+# AWAC
+python scripts/train.py \
+  algo=fastsac_vel_finetune \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-09/07-52-44-G1Skateboard-bc_dagger_finalize/wandb/latest-run/files/checkpoint_final.pt \
+  algo.sac_finetune_actor_objective=awac \
+  algo.sac_actor_confidence_gate=false \
+  algo.sac_use_autotune=false \
+  algo.sac_awac_beta=0.05 \
+  algo.sac_awac_score_clip=0.1 \
+  algo.sac_stage2_initial_action_std=0.01 \
+  algo.sac_updates_per_env_step=4 \
+  algo.sac_policy_frequency=128 \
+  algo.sac_actor_lr=3e-7 \
+  total_frames=1638400 \
+  save_interval=25
+
+# SAC
+python scripts/train.py \
+  algo=fastsac_vel_finetune \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-09/07-52-44-G1Skateboard-bc_dagger_finalize/wandb/latest-run/files/checkpoint_final.pt \
+  algo.sac_finetune_actor_objective=sac \
+  algo.sac_actor_confidence_gate=false \
+  algo.sac_use_autotune=true \
+  algo.sac_actor_learning_starts_finetune_iteration=250 \
+  algo.sac_updates_per_env_step=2 \
+  algo.sac_policy_frequency=256 \
+  algo.sac_actor_lr=1e-7 \
+  algo.sac_actor_log_std_lr=3e-4 \
+  algo.sac_bc_anchor_coef_start=0.0 \
+  algo.sac_bc_anchor_coef_end=0.0 \
+  total_frames=73728000 \
+  save_interval=100
+
+python scripts/train.py \
+  algo=fastsac_vel_finetune \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-10/03-47-49-G1Skateboard-stage_bc_dagger/wandb/latest-run/files/checkpoint_final.pt \
+  algo.sac_finetune_actor_objective=sac \
+  algo.sac_actor_confidence_gate=false \
+  algo.sac_use_autotune=true \
+  algo.sac_actor_learning_starts_finetune_iteration=128 \
+  algo.sac_updates_per_env_step=2 \
+  algo.sac_policy_frequency=256 \
+  algo.sac_actor_lr=1e-7 \
+  algo.sac_actor_log_std_lr=3e-4 \
+  algo.sac_bc_anchor_coef_start=0.0 \
+  algo.sac_bc_anchor_coef_end=0.0 \
+  total_frames=57344000 \
+  save_interval=100 \
+  seed=0

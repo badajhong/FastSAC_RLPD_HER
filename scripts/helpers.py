@@ -397,6 +397,10 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     freeze_bc_dagger_teacher_replay = (
         bool(cfg.get("_bc_dagger_model_only_resume", False))
     )
+    fresh_bc_dagger_source = bool(
+        cfg.get("_bc_dagger_finalization_source", False)
+        or cfg.get("_bc_dagger_staging_source", False)
+    )
     replay_consumer = not freeze_bc_dagger_teacher_replay and (
         cfg.algo.get("phase", None) == "finetune"
         or bool(cfg.algo.get("save_teacher_buffer", False))
@@ -404,6 +408,7 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     auto_resolve_replay = (
         configure_replay
         and replay_consumer
+        and not fresh_bc_dagger_source
         and cfg.algo.get("teacher_buffer_path", "__missing__") is None
     )
     checkpoint_path = parse_checkpoint_path(
@@ -448,7 +453,7 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         legacy_dagger_adapter = "vaic_fastsac_bc_dagger_adapter_v1"
         if detected_algorithm == "vaic_ppo_bc_dagger_student_v1":
             raise ValueError(
-                "This BC-DAgger checkpoint predates IQL critic training. "
+                "This BC-DAgger checkpoint predates compatible critic training. "
                 "Create a new checkpoint with scripts/bc_dagger.py before "
                 "starting fastsac_vel_finetune."
             )
@@ -459,8 +464,15 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                 "semantics. Restart Stage 2 from the original BC-DAgger "
                 "checkpoint; adapter_v1 resumes are intentionally rejected."
             )
+        current_dagger_algorithm = (
+            "vaic_ppo_bc_dagger_student_sac_critic_v3"
+        )
+        iql_dagger_algorithm = "vaic_ppo_bc_dagger_student_iql_v2"
         if configured_source == "auto":
-            if detected_algorithm == "vaic_ppo_bc_dagger_student_iql_v2":
+            if detected_algorithm in (
+                current_dagger_algorithm,
+                iql_dagger_algorithm,
+            ):
                 configured_source = "bc_dagger"
             elif detected_backend == current_dagger_adapter:
                 configured_source = "bc_dagger"
@@ -473,8 +485,14 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
             )
         cfg.algo.finetune_checkpoint_source = configured_source
         if configured_source == "bc_dagger":
+            direct_sac_dagger_transfer = (
+                detected_algorithm == current_dagger_algorithm
+            )
+            direct_iql_dagger_transfer = (
+                detected_algorithm == iql_dagger_algorithm
+            )
             direct_dagger_transfer = (
-                detected_algorithm == "vaic_ppo_bc_dagger_student_iql_v2"
+                direct_sac_dagger_transfer or direct_iql_dagger_transfer
             )
             same_stage_resume = (
                 detected_backend == current_dagger_adapter
@@ -518,6 +536,37 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                     "BC-DAgger transfer checkpoint lacks the saved action clip"
                 )
             cfg.algo.sac_bc_action_clip = source_actor_backend[action_clip_key]
+            if direct_sac_dagger_transfer:
+                direct_adapter_fields = (
+                    "sac_bc_initial_action_std",
+                    "sac_bc_log_std_min",
+                    "sac_bc_log_std_max",
+                    "sac_alpha_init",
+                    "sac_entropy_reference_scale",
+                )
+                for name in direct_adapter_fields:
+                    if name not in source_actor_backend:
+                        raise ValueError(
+                            "SAC-critic BC-DAgger checkpoint lacks adapter "
+                            f"field {name!r}"
+                        )
+                    cfg.algo[name] = source_actor_backend[name]
+                if bool(cfg.algo.get("load_pretrained_q", True)):
+                    critic_optimization_fields = {
+                        "q_lr": "q_lr",
+                        "q_weight_decay": "q_weight_decay",
+                        "sac_tau": "q_tau",
+                        "sac_max_grad_norm": "q_max_grad_norm",
+                    }
+                    for destination, source in (
+                        critic_optimization_fields.items()
+                    ):
+                        if source not in source_actor_backend:
+                            raise ValueError(
+                                "SAC-critic BC-DAgger checkpoint lacks critic "
+                                f"field {source!r}"
+                            )
+                        cfg.algo[destination] = source_actor_backend[source]
             if same_stage_resume:
                 # These values define registered adapter tensors and its action
                 # distribution, so materialize them before policy construction.
@@ -545,9 +594,17 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
             load_pretrained_q = cfg.algo.get("load_pretrained_q", True)
             if not isinstance(load_pretrained_q, bool):
                 raise ValueError("algo.load_pretrained_q must be a boolean")
+            if direct_iql_dagger_transfer and load_pretrained_q:
+                raise ValueError(
+                    "IQL-v2 BC-DAgger Q does not match the current Stage-2 "
+                    "SAC/AWAC critic topology or policy-evaluation backup. Set "
+                    "algo.load_pretrained_q=false or use a v3 SAC-critic "
+                    "BC-DAgger checkpoint."
+                )
             inherit_q = load_pretrained_q or same_stage_resume
             source_q_backend = policy_state.get(
-                "dagger_backend_config" if direct_dagger_transfer
+                "dagger_backend_config"
+                if direct_iql_dagger_transfer
                 else "q_backend_config"
             )
             if inherit_q and not isinstance(source_q_backend, dict):
@@ -557,23 +614,24 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                 )
             if inherit_q:
                 # Construct Q1/Q2 with the exact saved topology before loading.
-                # The DAgger IQL path uses 101 C51 atoms while native FastSAC
-                # historically defaulted to 501.
                 q_fields = {
                     "q_hidden_dim": (
-                        "q_hidden_dim" if direct_dagger_transfer else "hidden_dim"
+                        "q_hidden_dim"
+                        if direct_iql_dagger_transfer else "hidden_dim"
                     ),
                     "q_num_atoms": (
-                        "q_num_atoms" if direct_dagger_transfer else "num_atoms"
+                        "q_num_atoms"
+                        if direct_iql_dagger_transfer else "num_atoms"
                     ),
                     "q_v_min": (
-                        "q_v_min" if direct_dagger_transfer else "v_min"
+                        "q_v_min" if direct_iql_dagger_transfer else "v_min"
                     ),
                     "q_v_max": (
-                        "q_v_max" if direct_dagger_transfer else "v_max"
+                        "q_v_max" if direct_iql_dagger_transfer else "v_max"
                     ),
                     "q_layer_norm": (
-                        "q_layer_norm" if direct_dagger_transfer else "layer_norm"
+                        "q_layer_norm"
+                        if direct_iql_dagger_transfer else "layer_norm"
                     ),
                 }
                 for destination, source in q_fields.items():
@@ -584,7 +642,21 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                         )
                     cfg.algo[destination] = source_q_backend[source]
 
-            if direct_dagger_transfer and load_pretrained_q:
+            if direct_sac_dagger_transfer and load_pretrained_q:
+                transfer_q_fields = {
+                    "q_action_coordinates": "q_action_coordinates",
+                    "q_action_fusion": "q_action_fusion",
+                    "sac_q_normalize_actions": "q_action_normalized",
+                    "sac_q_action_input_gain": "q_action_input_gain",
+                    "sac_clipped_double_q": "clipped_double_q",
+                }
+                for destination, source in transfer_q_fields.items():
+                    if source not in source_q_backend:
+                        raise ValueError(
+                            "SAC-critic BC-DAgger checkpoint lacks Q field "
+                            f"{source!r}"
+                        )
+                    cfg.algo[destination] = source_q_backend[source]
                 incompatible = {
                     "q_action_coordinates": cfg.algo.get(
                         "q_action_coordinates", "absolute"
@@ -604,18 +676,22 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                         rtol=0.0,
                         atol=1e-12,
                     ),
+                    "sac_q_normalize_actions": not bool(cfg.algo.get(
+                        "sac_q_normalize_actions", False
+                    )),
+                    "sac_clipped_double_q": not bool(cfg.algo.get(
+                        "sac_clipped_double_q", False
+                    )),
                 }
                 enabled = [
                     name for name, invalid in incompatible.items() if invalid
                 ]
                 if enabled:
                     raise ValueError(
-                        "BC-DAgger FastSAC Q transfer requires its original "
-                        "direct, absolute-action topology; incompatible "
+                        "BC-DAgger FastSAC Q transfer requires normalized "
+                        "absolute early-fusion clipped-double-Q; incompatible "
                         f"settings: {enabled}"
                     )
-                # The pretrained DAgger Q consumed raw executable actions.
-                cfg.algo.sac_q_normalize_actions = False
             elif direct_dagger_transfer:
                 # The DAgger H5 stores absolute actor/Q observations and
                 # actions, but no framewise reference-action or actuator-state
@@ -673,7 +749,7 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                     "Stage-2 model/optimizer resume with online replay refill"
                 )
             elif load_pretrained_q:
-                source_detail = "raw-action Q transfer"
+                source_detail = "normalized SAC-compatible Q transfer"
             else:
                 source_detail = (
                     "fresh configured Q; checkpoint Q weights skipped"

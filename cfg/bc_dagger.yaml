@@ -7,25 +7,35 @@ defaults:
   - _self_
 
 # Four-hour single-GPU schedule calibrated from the full skateboard DAgger run
-# with 512 environments and train_every=32 (~5.88 s/rollout).  This is 2,400
-# rollouts: beta decays for 1,800 (~2 h 57 min), then remains exactly zero for
-# 600 (~59 min).  Wall time can still vary with machine load and final H5/W&B
-# I/O.  Save a resumable model + teacher-replay snapshot every 100 outer
-# rollout iterations as well as at finalization.
+# with 512 environments and train_every=32 (~5.88 s/rollout). SafeDAgger now
+# assigns control state-by-state for all 2,400 rollouts; the beta schedule below
+# remains available for beta/hybrid ablations. Wall time can still vary with
+# machine load and final H5/W&B I/O. Save a resumable model + replay snapshot
+# every 100 outer rollout iterations as well as at finalization.
 total_frames: 39_321_600
+# Optional, preferred iteration-facing budget. When set, the dedicated
+# entrypoint replaces total_frames with
+# bc_dagger_iterations * task.num_envs * algo.train_every * world_size, matching
+# train.py's global-frame convention. On same-stage resume this is the number of
+# additional iterations for the new process.
+bc_dagger_iterations: null
 save_interval: 100
 
 # Optional same-stage continuation checkpoint. Unlike checkpoint_path (which
 # normally bootstraps a fresh DAgger stage from the PPO teacher), this must be a
-# PPO-BC DAgger IQL-v2 checkpoint. It restores actor/perception/EMA, V, Q1/Q2,
-# target Q1/Q2, all training optimizers, the dedicated DAgger/Q RNG streams,
+# PPO-BC DAgger SAC-critic-v3 checkpoint. It restores actor/perception/EMA,
+# Q1/Q2, target Q1/Q2, all training optimizers, and the dedicated
+# DAgger/replay/stochastic-target RNG streams,
 # and stage counters while deliberately leaving the previously exported
-# teacher_replay_buffer.h5 immutable. total_frames remains the number of
-# *additional* frames to run.
+# teacher_replay_buffer.h5 immutable. bc_dagger_iterations (when set) is the
+# number of *additional* iterations to run; otherwise total_frames remains the
+# additional global frame budget.
 bc_dagger_checkpoint: null
 # Copy the compatible immutable H5 to the new Hydra output root, outside W&B's
 # watched files directory. This is a real independent copy (about 23 GiB for
-# the current skateboard replay), not a link. Disable it to avoid duplication.
+# the current skateboard replay), not a link. Disabling the copy avoids disk
+# duplication, but the source H5 is still required to refill the in-memory
+# fixed teacher critic partition on resume.
 bc_dagger_copy_teacher_replay: true
 # Internal guard set only after scripts/bc_dagger.py validates the checkpoint.
 _bc_dagger_model_only_resume: false
@@ -33,15 +43,46 @@ _bc_dagger_teacher_replay_copy_source: null
 _bc_dagger_teacher_replay_copy_path: null
 
 algo:
+  # Oracle-discrepancy SafeDAgger: compare clipped deterministic teacher/student
+  # actions in normalized coordinates. RMS > 0.006 takes over; after an
+  # 8-control-step minimum hold, RMS < 0.004 releases back to the student.
+  dagger_control_mode: safe
+  dagger_safe_takeover_rms: 0.006
+  dagger_safe_release_rms: 0.004
+  dagger_safe_min_teacher_steps: 8
+  # Optional project-specific safety override. With K, rollout indices 0..K-1
+  # retain SafeDAgger and index K onward disables safe teacher execution. The
+  # frozen teacher is still queried for DAgger labels and discrepancy logging.
+  dagger_safe_zero_iteration: null
+  # Used only when dagger_control_mode is beta or hybrid.
   dagger_beta_start: 1.0
   dagger_beta_end: 0.0
+  # Preferred CLI control: after this many cumulative DAgger rollouts have been
+  # completed, beta is exactly zero (rollout index K onward). Null keeps the
+  # legacy decay setting below.
+  dagger_beta_zero_iteration: null
   dagger_beta_decay_rollouts: 1800
-  # The actor remains pure DAgger BC. These values train only the Stage-1
-  # IQL V/Q critic warm start; no advantage-weighted actor loss is enabled.
-  iql_expectile: 0.7
-  iql_value_lr: 3.0e-4
-  iql_batch_size: 1024
-  q_tau: 0.005
+  # Actor training remains pure DAgger BC. Q uses the exact Stage-2 critic
+  # topology/operator with deterministic executed actions, a dedicated
+  # small-noise stochastic next action, and beta-independent 50/50 replay.
+  q_num_atoms: 501
+  q_action_fusion: early
+  q_action_coordinates: absolute
+  sac_q_normalize_actions: true
+  sac_q_action_input_gain: 1.0
+  sac_clipped_double_q: true
+  q_lr: 3.0e-5
+  q_tau: 0.001
+  q_batch_size: 512
+  q_updates_per_rollout: 128
+  q_teacher_replay_ratio: 0.5
+  # Standard replay warm-up, not a critic-confidence gate. Both execution
+  # sources must contain this many rows before exact 50/50 critic updates start.
+  q_learning_starts_per_source: 8192
+  sac_bc_initial_action_std: 0.01
+  # Saved for the Stage-2 alpha process. BC critic Q-only targets use
+  # effective alpha=0 while retaining stochastic next-action sampling.
+  sac_alpha_init: 1.0e-5
   # Teacher-executed raw pre-VecNorm FIFO for the later FastSAC stage (about
   # 22 GiB when full with the current skateboard observation dimensions).
   teacher_buffer_capacity: 1_048_576
