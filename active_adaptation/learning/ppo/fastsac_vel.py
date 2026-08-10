@@ -336,6 +336,8 @@ FASTSAC_Q_REFERENCE_RESIDUAL_SEMANTICS = (
 )
 FASTSAC_Q_ACTION_COORDINATES = ("absolute", "reference_residual")
 FASTSAC_Q_ACTION_FUSIONS = ("early", "late")
+FASTSAC_Q_DEFAULT_ACTION_FUSION = "late"
+FASTSAC_Q_LEGACY_ACTION_FUSION = "early"
 FASTSAC_Q_EARLY_FUSION_SEMANTICS = "input_concat_then_shared_trunk_v1"
 FASTSAC_Q_LATE_FUSION_SEMANTICS = (
     "separate_obs_and_action_stems_then_shared_trunk_v1"
@@ -1382,7 +1384,7 @@ class DistributionalQNetwork(nn.Module):
         hidden_dim,
         num_atoms,
         layer_norm=True,
-        action_fusion="early",
+        action_fusion=FASTSAC_Q_DEFAULT_ACTION_FUSION,
         reference_dueling=False,
     ):
         super().__init__()
@@ -1575,7 +1577,7 @@ class TwinDistributionalQ(nn.Module):
         v_min,
         v_max,
         layer_norm=True,
-        action_fusion="early",
+        action_fusion=FASTSAC_Q_DEFAULT_ACTION_FUSION,
         reference_dueling=False,
     ):
         super().__init__()
@@ -1643,7 +1645,8 @@ class TwinDistributionalQ(nn.Module):
 
 def _build_isolated_q_network(
     obs_dim, action_dim, hidden_dim, num_atoms, v_min, v_max,
-    layer_norm, device, seed, action_fusion="early",
+    layer_norm, device, seed,
+    action_fusion=FASTSAC_Q_DEFAULT_ACTION_FUSION,
     reference_dueling=False,
 ):
     """Build Q1/Q2 without advancing VAIC/environment default RNG streams."""
@@ -2033,7 +2036,8 @@ class TeacherReplayBuffer:
         self, path, capacity, actor_dim, critic_dim, action_dim, seed,
         device="cpu", snapshot_chunk_rows=4096, replay_id=None,
         actor_backend=FASTSAC_ACTOR_BACKEND, actor_obs_keys=None,
-        critic_obs_keys=None, extra_shapes=None, q_action_fusion="early",
+        critic_obs_keys=None, extra_shapes=None,
+        q_action_fusion=FASTSAC_Q_DEFAULT_ACTION_FUSION,
         q_action_hidden_dim=None, q_action_coordinates="absolute",
         q_reference_dueling=False, q_actuator_context=None,
     ):
@@ -2056,7 +2060,11 @@ class TeacherReplayBuffer:
             raise ValueError(
                 f"q_action_fusion must be one of {FASTSAC_Q_ACTION_FUSIONS}"
             )
-        default_action_hidden = 0 if self.q_action_fusion == "early" else None
+        # Standalone replay construction follows the production 768-wide Q
+        # default. Training code passes the exact derived width explicitly.
+        default_action_hidden = _q_action_hidden_dim(
+            768, self.q_action_fusion
+        )
         if q_action_hidden_dim is None:
             q_action_hidden_dim = default_action_hidden
         if (
@@ -2431,7 +2439,9 @@ class TeacherReplayBuffer:
             "replay_id": str(replay.attrs.get("replay_id", "")),
             "actor_backend": str(replay.attrs.get("actor_backend", "")),
             "q_action_fusion": str(
-                replay.attrs.get("q_action_fusion", "early")
+                replay.attrs.get(
+                    "q_action_fusion", FASTSAC_Q_LEGACY_ACTION_FUSION
+                )
             ),
             "q_action_hidden_dim": int(
                 replay.attrs.get("q_action_hidden_dim", 0)
@@ -2822,7 +2832,9 @@ class OfflineReplayH5:
                     f"checkpoint backend {str(expected_actor_backend)!r}."
                 )
             actual_q_action_fusion = str(
-                f.attrs.get("q_action_fusion", "early")
+                f.attrs.get(
+                    "q_action_fusion", FASTSAC_Q_LEGACY_ACTION_FUSION
+                )
             )
             actual_q_action_hidden_dim = int(
                 f.attrs.get("q_action_hidden_dim", 0)
@@ -3401,13 +3413,13 @@ class FastSACVelConfig(PPOConfig):
     q_v_min: float = -20.0
     q_v_max: float = 20.0
     q_layer_norm: bool = True
-    # ``early`` is the exact HOI/current concat-before-first-linear critic.
-    # ``late`` gives observations and executable actions independent stems
-    # before the 384/192 C51 trunk (768 hidden -> 128 action features).
-    q_action_fusion: str = "early"
+    # Keep the 2,341-D Skateboard state and 23-D executable action in separate
+    # stems so new critics cannot cheaply ignore the much smaller action input.
+    # Explicit ``early`` remains available for legacy checkpoint reproduction.
+    q_action_fusion: str = FASTSAC_Q_DEFAULT_ACTION_FUSION
     # Optional reference-anchored dueling C51 critic:
-    # logits(s,a)=V(s)+A(s,a)-A(s,a_ref). The default retains the exact
-    # historical monolithic action-conditioned Q topology and execution path.
+    # logits(s,a)=V(s)+A(s,a)-A(s,a_ref). False keeps the direct late-fusion
+    # C51 head; explicit early fusion exists only for legacy reproduction.
     q_reference_dueling: bool = False
     # Optional asymmetric critic-only actuator state. The actor and configured
     # VAIC observations remain unchanged. Q receives a delay one-hot plus the
@@ -4132,7 +4144,10 @@ class _FastSACVAICBase(PPOVEL):
         if cfg.q_hidden_dim < 4:
             raise ValueError("q_hidden_dim must be at least 4")
         _q_action_hidden_dim(
-            cfg.q_hidden_dim, getattr(cfg, "q_action_fusion", "early")
+            cfg.q_hidden_dim,
+            getattr(
+                cfg, "q_action_fusion", FASTSAC_Q_DEFAULT_ACTION_FUSION
+            ),
         )
         q_action_coordinates = str(getattr(
             cfg, "q_action_coordinates", "absolute"
@@ -4211,7 +4226,9 @@ class _FastSACVAICBase(PPOVEL):
         self.qnet = _build_isolated_q_network(
             q_input_dim, self.action_dim, cfg.q_hidden_dim, cfg.q_num_atoms,
             cfg.q_v_min, cfg.q_v_max, cfg.q_layer_norm, device, cfg.q_seed,
-            getattr(cfg, "q_action_fusion", "early"),
+            getattr(
+                cfg, "q_action_fusion", FASTSAC_Q_DEFAULT_ACTION_FUSION
+            ),
             getattr(cfg, "q_reference_dueling", False),
         )
         self.qnet_target = copy.deepcopy(self.qnet).requires_grad_(False)
@@ -4871,10 +4888,18 @@ class _FastSACVAICBase(PPOVEL):
             actor_obs_keys=self.q_actor_keys,
             critic_obs_keys=self.q_critic_keys,
             extra_shapes=self._teacher_replay_extra_shapes,
-            q_action_fusion=getattr(self.cfg, "q_action_fusion", "early"),
+            q_action_fusion=getattr(
+                self.cfg,
+                "q_action_fusion",
+                FASTSAC_Q_DEFAULT_ACTION_FUSION,
+            ),
             q_action_hidden_dim=_q_action_hidden_dim(
                 self.cfg.q_hidden_dim,
-                getattr(self.cfg, "q_action_fusion", "early"),
+                getattr(
+                    self.cfg,
+                    "q_action_fusion",
+                    FASTSAC_Q_DEFAULT_ACTION_FUSION,
+                ),
             ),
             q_action_coordinates=getattr(
                 self.cfg, "q_action_coordinates", "absolute"
@@ -5168,7 +5193,9 @@ class FastSACVEL(_FastSACVAICBase):
             self.cfg, "q_action_coordinates", "absolute"
         ))
         q_action_fusion = str(getattr(
-            self.cfg, "q_action_fusion", "early"
+            self.cfg,
+            "q_action_fusion",
+            FASTSAC_Q_DEFAULT_ACTION_FUSION,
         ))
         q_action_hidden_dim = _q_action_hidden_dim(
             self.cfg.q_hidden_dim, q_action_fusion
@@ -5532,35 +5559,6 @@ class FastSACVEL(_FastSACVAICBase):
                 "SAC-critic BC-DAgger Q transfer requires "
                 "sac_q_normalize_actions=true"
             )
-        if bool(getattr(self.cfg, "load_pretrained_q", True)):
-            pretrained_q_incompatible = {
-                "q_action_fusion": str(getattr(
-                    self.cfg, "q_action_fusion", "early"
-                )) != "early",
-                "sac_q_action_input_gain": not math.isclose(
-                    float(getattr(
-                        self.cfg, "sac_q_action_input_gain", 1.0
-                    )),
-                    1.0,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                ),
-                "sac_clipped_double_q": not bool(getattr(
-                    self.cfg, "sac_clipped_double_q", True
-                )),
-            }
-            incompatible = [
-                name
-                for name, enabled in pretrained_q_incompatible.items()
-                if enabled
-            ]
-            if incompatible:
-                raise ValueError(
-                    "Pretrained BC-DAgger Q requires early-fusion normalized "
-                    "absolute actions, unit gain and clipped double Q; "
-                    "incompatible settings: "
-                    f"{incompatible}"
-                )
         action_clip = float(self.cfg.sac_bc_action_clip)
         action_low = torch.full(
             (self.action_dim,), -action_clip, device=self.device,
@@ -7843,7 +7841,9 @@ class FastSACVEL(_FastSACVAICBase):
             # used the exact early-concat backend. Preserve that compatibility
             # while still rejecting them for a late-fusion policy.
             actual_q = dict(actual_q)
-            actual_q.setdefault("q_action_fusion", "early")
+            actual_q.setdefault(
+                "q_action_fusion", FASTSAC_Q_LEGACY_ACTION_FUSION
+            )
             actual_q.setdefault("q_action_hidden_dim", 0)
             if "q_input_dim" in expected_q:
                 actual_q.setdefault(
@@ -8266,11 +8266,17 @@ class FastSACVelFinetune(FastSACVEL):
                 expected_actor_obs_keys=self.q_actor_keys,
                 expected_critic_obs_keys=self.q_critic_keys,
                 expected_q_action_fusion=getattr(
-                    self.cfg, "q_action_fusion", "early"
+                    self.cfg,
+                    "q_action_fusion",
+                    FASTSAC_Q_DEFAULT_ACTION_FUSION,
                 ),
                 expected_q_action_hidden_dim=_q_action_hidden_dim(
                     getattr(self.cfg, "q_hidden_dim", 768),
-                    getattr(self.cfg, "q_action_fusion", "early"),
+                    getattr(
+                        self.cfg,
+                        "q_action_fusion",
+                        FASTSAC_Q_DEFAULT_ACTION_FUSION,
+                    ),
                 ),
                 expected_q_action_coordinates=getattr(
                     self.cfg, "q_action_coordinates", "absolute"
@@ -8694,10 +8700,19 @@ class FastSACVelFinetune(FastSACVEL):
                     "SAC-critic BC-DAgger checkpoint lacks q_backend_config"
                 )
             expected_contract = {
-                "q_action_fusion": "early",
+                "q_action_fusion": FASTSAC_Q_DEFAULT_ACTION_FUSION,
+                "q_action_hidden_dim": _q_action_hidden_dim(
+                    int(self.cfg.q_hidden_dim),
+                    FASTSAC_Q_DEFAULT_ACTION_FUSION,
+                ),
+                "q_action_fusion_semantics": (
+                    FASTSAC_Q_LATE_FUSION_SEMANTICS
+                ),
                 "q_action_coordinates": "absolute",
                 "q_action_normalized": True,
-                "q_action_input_gain": 1.0,
+                "q_action_input_gain": float(
+                    self.cfg.sac_q_action_input_gain
+                ),
                 "clipped_double_q": True,
                 "num_atoms": 501,
                 "layer_norm": True,

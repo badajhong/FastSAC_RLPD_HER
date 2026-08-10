@@ -359,6 +359,82 @@ def apply_fastsac_buffer_steps(cfg: DictConfig):
     return capacity
 
 
+def _apply_direct_sac_dagger_q_transfer(algo_cfg, source_q_backend):
+    """Materialize and validate the transferable BC-DAgger Q contract.
+
+    Missing fusion metadata belongs to the legacy early-fusion generation.  It
+    must not be interpreted using the new late-fusion topology merely because
+    the destination config now defaults to late fusion: tensor shapes and, more
+    importantly, the action-conditioning semantics would differ.
+    """
+    if not isinstance(source_q_backend, dict):
+        raise ValueError(
+            "BC-DAgger transfer checkpoint is missing its Q backend "
+            "configuration"
+        )
+
+    source_fusion = str(source_q_backend.get("q_action_fusion", "early"))
+    if source_fusion != "late":
+        raise ValueError(
+            "Pretrained BC-DAgger Q transfer requires a late-fusion source; "
+            f"this checkpoint uses {source_fusion!r} fusion (missing metadata "
+            "is legacy early fusion). Set algo.load_pretrained_q=false to "
+            "transfer the BC actor/perception with a fresh Stage-2 Q."
+        )
+
+    transfer_q_fields = {
+        "q_action_coordinates": "q_action_coordinates",
+        "q_action_fusion": "q_action_fusion",
+        "sac_q_normalize_actions": "q_action_normalized",
+        "sac_q_action_input_gain": "q_action_input_gain",
+        "sac_clipped_double_q": "clipped_double_q",
+    }
+    missing = [
+        source
+        for source in transfer_q_fields.values()
+        if source not in source_q_backend
+    ]
+    if missing:
+        raise ValueError(
+            "SAC-critic BC-DAgger checkpoint lacks Q field(s) "
+            f"{missing!r}"
+        )
+    transferred = {
+        destination: source_q_backend[source]
+        for destination, source in transfer_q_fields.items()
+    }
+    incompatible = {
+        "q_action_coordinates": transferred["q_action_coordinates"]
+        != "absolute",
+        "q_action_fusion": transferred["q_action_fusion"] != "late",
+        "q_reference_dueling": bool(
+            algo_cfg.get("q_reference_dueling", False)
+        ),
+        "q_condition_on_actuator_state": bool(
+            algo_cfg.get("q_condition_on_actuator_state", False)
+        ),
+        "sac_q_action_input_gain": (
+            not np.isfinite(float(transferred["sac_q_action_input_gain"]))
+            or float(transferred["sac_q_action_input_gain"]) <= 0.0
+        ),
+        "sac_q_normalize_actions": not bool(
+            transferred["sac_q_normalize_actions"]
+        ),
+        "sac_clipped_double_q": not bool(
+            transferred["sac_clipped_double_q"]
+        ),
+    }
+    enabled = [name for name, invalid in incompatible.items() if invalid]
+    if enabled:
+        raise ValueError(
+            "BC-DAgger FastSAC Q transfer requires normalized absolute "
+            "late-fusion, finite-positive-gain, clipped-double-Q semantics; "
+            f"incompatible settings: {enabled}"
+        )
+    for destination, value in transferred.items():
+        algo_cfg[destination] = value
+
+
 def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     OmegaConf.set_struct(cfg, False)
 
@@ -643,55 +719,9 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                     cfg.algo[destination] = source_q_backend[source]
 
             if direct_sac_dagger_transfer and load_pretrained_q:
-                transfer_q_fields = {
-                    "q_action_coordinates": "q_action_coordinates",
-                    "q_action_fusion": "q_action_fusion",
-                    "sac_q_normalize_actions": "q_action_normalized",
-                    "sac_q_action_input_gain": "q_action_input_gain",
-                    "sac_clipped_double_q": "clipped_double_q",
-                }
-                for destination, source in transfer_q_fields.items():
-                    if source not in source_q_backend:
-                        raise ValueError(
-                            "SAC-critic BC-DAgger checkpoint lacks Q field "
-                            f"{source!r}"
-                        )
-                    cfg.algo[destination] = source_q_backend[source]
-                incompatible = {
-                    "q_action_coordinates": cfg.algo.get(
-                        "q_action_coordinates", "absolute"
-                    ) != "absolute",
-                    "q_action_fusion": cfg.algo.get(
-                        "q_action_fusion", "early"
-                    ) != "early",
-                    "q_reference_dueling": bool(cfg.algo.get(
-                        "q_reference_dueling", False
-                    )),
-                    "q_condition_on_actuator_state": bool(cfg.algo.get(
-                        "q_condition_on_actuator_state", False
-                    )),
-                    "sac_q_action_input_gain": not np.isclose(
-                        float(cfg.algo.get("sac_q_action_input_gain", 1.0)),
-                        1.0,
-                        rtol=0.0,
-                        atol=1e-12,
-                    ),
-                    "sac_q_normalize_actions": not bool(cfg.algo.get(
-                        "sac_q_normalize_actions", False
-                    )),
-                    "sac_clipped_double_q": not bool(cfg.algo.get(
-                        "sac_clipped_double_q", False
-                    )),
-                }
-                enabled = [
-                    name for name, invalid in incompatible.items() if invalid
-                ]
-                if enabled:
-                    raise ValueError(
-                        "BC-DAgger FastSAC Q transfer requires normalized "
-                        "absolute early-fusion clipped-double-Q; incompatible "
-                        f"settings: {enabled}"
-                    )
+                _apply_direct_sac_dagger_q_transfer(
+                    cfg.algo, source_q_backend
+                )
             elif direct_dagger_transfer:
                 # The DAgger H5 stores absolute actor/Q observations and
                 # actions, but no framewise reference-action or actuator-state

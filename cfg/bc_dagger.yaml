@@ -87,7 +87,9 @@ algo:
   # topology/operator with deterministic executed actions, a dedicated
   # small-noise stochastic next action, and beta-independent 50/50 replay.
   q_num_atoms: 501
-  q_action_fusion: early
+  # Separate 2,341-D state and 23-D action stems; with q_hidden_dim=768 the
+  # action branch is 128-D before the shared distributional-Q trunk.
+  q_action_fusion: late
   q_action_coordinates: absolute
   sac_q_normalize_actions: true
   sac_q_action_input_gain: 1.0

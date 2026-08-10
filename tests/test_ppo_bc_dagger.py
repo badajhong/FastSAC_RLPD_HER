@@ -60,6 +60,7 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
 )
 from active_adaptation.learning.ppo.fastsac_vel import (
     BCDaggerOfflineReplayH5,
+    FASTSAC_Q_LATE_FUSION_SEMANTICS,
     TEACHER_REPLAY_FIELDS,
 )
 
@@ -130,7 +131,7 @@ def test_config_store_registers_exact_student_observation_surface():
     assert dagger.q_num_atoms == 501
     assert dagger.q_v_min < dagger.q_v_max
     assert dagger.q_layer_norm is True
-    assert dagger.q_action_fusion == "early"
+    assert dagger.q_action_fusion == "late"
     assert dagger.q_action_coordinates == "absolute"
     assert dagger.sac_q_normalize_actions is True
     assert dagger.sac_q_action_input_gain == pytest.approx(1.0)
@@ -199,6 +200,27 @@ def test_bc_critic_rejects_layernorm_override_at_startup():
         PPOBCDaggerFinetune._validate_config(cfg)
 
 
+def test_bc_critic_requires_late_action_fusion():
+    cfg = PPOBCDaggerFinetuneConfig(q_action_fusion="early")
+
+    with pytest.raises(ValueError, match="late action fusion"):
+        PPOBCDaggerFinetune._validate_config(cfg)
+
+
+@pytest.mark.parametrize("gain", [0.0, -1.0, float("nan"), float("inf")])
+def test_bc_critic_rejects_nonpositive_or_nonfinite_action_gain(gain):
+    cfg = PPOBCDaggerFinetuneConfig(sac_q_action_input_gain=gain)
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        PPOBCDaggerFinetune._validate_config(cfg)
+
+
+def test_bc_critic_accepts_positive_action_gain_ablation():
+    cfg = PPOBCDaggerFinetuneConfig(sac_q_action_input_gain=8.0)
+
+    PPOBCDaggerFinetune._validate_config(cfg)
+
+
 @pytest.mark.parametrize("value", [0, True, 1.5, "10"])
 def test_safe_zero_iteration_rejects_non_positive_integer_values(value):
     cfg = PPOBCDaggerFinetuneConfig(dagger_safe_zero_iteration=value)
@@ -225,7 +247,7 @@ def test_bc_critic_checkpoint_metadata_matches_fastsac_q_contract():
     policy._q_actor_dim = 3
     policy._q_critic_dim = 5
     policy._q_input_dim = 5
-    policy.action_dim = 2
+    policy.action_dim = 23
     policy.reward_groups = ["task"]
 
     dagger_backend = policy._checkpoint_config()
@@ -235,14 +257,20 @@ def test_bc_critic_checkpoint_metadata_matches_fastsac_q_contract():
 
     assert dagger_backend["q_num_atoms"] == 501
     assert dagger_backend["q_layer_norm"] is True
-    assert dagger_backend["q_action_fusion"] == "early"
+    assert dagger_backend["q_action_fusion"] == "late"
     assert dagger_backend["q_action_coordinates"] == "absolute"
     assert dagger_backend["sac_q_normalize_actions"] is True
     assert dagger_backend["sac_q_action_input_gain"] == pytest.approx(1.0)
     assert dagger_backend["sac_clipped_double_q"] is True
     assert q_backend["num_atoms"] == 501
     assert q_backend["layer_norm"] is True
-    assert q_backend["q_action_fusion"] == "early"
+    assert q_backend["q_action_fusion"] == "late"
+    assert q_backend["action_dim"] == 23
+    assert q_backend["q_action_hidden_dim"] == 128
+    assert (
+        q_backend["q_action_fusion_semantics"]
+        == FASTSAC_Q_LATE_FUSION_SEMANTICS
+    )
     assert q_backend["q_action_coordinates"] == "absolute"
     assert q_backend["q_action_normalized"] is True
     assert q_backend["q_action_input_gain"] == pytest.approx(1.0)

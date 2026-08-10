@@ -140,7 +140,7 @@ def test_teacher_replay_capacity_is_262144():
     assert cfg.sac_teacher_awac_weight_clip == 20.0
     assert cfg.sac_teacher_learning_starts_transitions == 98_304
     assert cfg.q_num_atoms == 501
-    assert cfg.q_action_fusion == "early"
+    assert cfg.q_action_fusion == "late"
     assert cfg.q_reference_dueling is False
     assert cfg.save_teacher_buffer is False
     replay = TeacherReplayBuffer(
@@ -401,8 +401,8 @@ def test_snapshot_is_ordered_and_offline_sampling_never_reopens_h5(tmp_path):
             snapshot.attrs["action_parameterization"]
             == FASTSAC_ACTION_PARAMETERIZATION
         )
-        assert snapshot.attrs["q_action_fusion"] == "early"
-        assert int(snapshot.attrs["q_action_hidden_dim"]) == 0
+        assert snapshot.attrs["q_action_fusion"] == "late"
+        assert int(snapshot.attrs["q_action_hidden_dim"]) == 128
         assert bool(snapshot.attrs["q_reference_dueling"]) is False
         assert snapshot.attrs["storage_policy"] == "circular_fifo"
         assert snapshot.attrs["storage_order"] == "oldest_to_newest"

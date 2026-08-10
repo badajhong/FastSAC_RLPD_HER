@@ -938,13 +938,14 @@ def test_q_reference_residual_coordinates_scale_without_clamp_and_keep_gradient(
         policy._q_action_input(action, reference[:, :1])
 
 
-def test_default_early_q_fusion_preserves_exact_module_topology():
+def test_explicit_legacy_early_q_fusion_preserves_exact_module_topology():
     q = DistributionalQNetwork(
         obs_dim=7,
         action_dim=3,
         hidden_dim=12,
         num_atoms=5,
         layer_norm=True,
+        action_fusion="early",
     )
 
     assert q.action_fusion == "early"
@@ -1084,16 +1085,16 @@ def test_reference_dueling_q_wrappers_use_current_and_next_reference_frames():
     )
 
 
-def test_late_q_fusion_has_separate_768_and_128_feature_stems():
+def test_default_late_q_fusion_has_separate_768_and_128_feature_stems():
     q = DistributionalQNetwork(
         obs_dim=2341,
         action_dim=23,
         hidden_dim=768,
         num_atoms=501,
         layer_norm=True,
-        action_fusion="late",
     )
 
+    assert q.action_fusion == "late"
     assert q.action_hidden_dim == 128
     assert q.obs_net[0].in_features == 2341
     assert q.obs_net[0].out_features == 768
@@ -1147,18 +1148,18 @@ def test_late_twin_q_build_is_seeded_without_advancing_global_rng():
         ).load_state_dict(first.state_dict(), strict=True)
 
 
-def test_default_early_twin_q_build_remains_isolated_and_reproducible():
+def test_default_late_twin_q_build_remains_isolated_and_reproducible():
     global_before = torch.random.get_rng_state().clone()
     first = _build_isolated_q_network(
         11, 3, 24, 7, -2.0, 2.0, True, "cpu", 29
     )
     second = _build_isolated_q_network(
-        11, 3, 24, 7, -2.0, 2.0, True, "cpu", 29, "early"
+        11, 3, 24, 7, -2.0, 2.0, True, "cpu", 29, "late"
     )
 
     assert torch.equal(torch.random.get_rng_state(), global_before)
-    assert all("obs_net" not in name for name in first.state_dict())
-    assert all("action_net" not in name for name in first.state_dict())
+    assert any("obs_net" in name for name in first.state_dict())
+    assert any("action_net" in name for name in first.state_dict())
     for name, value in first.state_dict().items():
         assert torch.equal(value, second.state_dict()[name])
 

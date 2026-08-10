@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from active_adaptation.learning.ppo.fastsac_vel import (
@@ -32,6 +33,7 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     _ClippedStudentRolloutPolicy,
 )
 from active_adaptation.learning.ppo.ppo_vel import PPOVEL
+from scripts.helpers import _apply_direct_sac_dagger_q_transfer
 
 
 _DELETE = object()
@@ -187,7 +189,7 @@ def _stage2_policy(*, load_pretrained_q=True):
         q_v_max=2.0,
         q_layer_norm=True,
         q_action_coordinates="absolute",
-        q_action_fusion="early",
+        q_action_fusion="late",
         q_reference_dueling=False,
         q_condition_on_actuator_state=False,
         sac_q_normalize_actions=True,
@@ -288,6 +290,86 @@ def test_stage2_loads_pretrained_q_by_default_and_validates_boolean_option():
         _validate_fastsac_finetune_config(cfg)
 
 
+def _helper_direct_sac_q_backend(*, fusion="late", gain=1.0):
+    backend = {
+        "q_action_coordinates": "absolute",
+        "q_action_normalized": True,
+        "q_action_input_gain": gain,
+        "clipped_double_q": True,
+    }
+    if fusion is not None:
+        backend["q_action_fusion"] = fusion
+    return backend
+
+
+def test_helper_materializes_late_unit_gain_bc_dagger_q_transfer():
+    algo = OmegaConf.create({
+        # Source metadata must win over destination defaults/overrides whenever
+        # pretrained tensors are requested.
+        "q_action_coordinates": "reference_residual",
+        "q_action_fusion": "early",
+        "q_reference_dueling": False,
+        "q_condition_on_actuator_state": False,
+        "sac_q_normalize_actions": False,
+        "sac_q_action_input_gain": 7.0,
+        "sac_clipped_double_q": False,
+    })
+
+    _apply_direct_sac_dagger_q_transfer(
+        algo, _helper_direct_sac_q_backend()
+    )
+
+    assert algo.q_action_coordinates == "absolute"
+    assert algo.q_action_fusion == "late"
+    assert algo.sac_q_normalize_actions is True
+    assert algo.sac_q_action_input_gain == pytest.approx(1.0)
+    assert algo.sac_clipped_double_q is True
+
+
+@pytest.mark.parametrize("fusion", ("early", None))
+def test_helper_requires_fresh_q_for_legacy_early_bc_dagger_source(fusion):
+    algo = OmegaConf.create({
+        "q_reference_dueling": False,
+        "q_condition_on_actuator_state": False,
+    })
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"late-fusion source.*load_pretrained_q=false.*fresh Stage-2 Q"
+        ),
+    ):
+        _apply_direct_sac_dagger_q_transfer(
+            algo, _helper_direct_sac_q_backend(fusion=fusion)
+        )
+
+
+def test_helper_preserves_positive_non_unit_gain_late_bc_dagger_q_source():
+    algo = OmegaConf.create({
+        "q_reference_dueling": False,
+        "q_condition_on_actuator_state": False,
+    })
+
+    _apply_direct_sac_dagger_q_transfer(
+        algo, _helper_direct_sac_q_backend(gain=2.0)
+    )
+
+    assert algo.sac_q_action_input_gain == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("gain", (0.0, -1.0, float("inf"), float("nan")))
+def test_helper_rejects_non_positive_or_non_finite_late_q_gain(gain):
+    algo = OmegaConf.create({
+        "q_reference_dueling": False,
+        "q_condition_on_actuator_state": False,
+    })
+
+    with pytest.raises(ValueError, match="finite-positive-gain"):
+        _apply_direct_sac_dagger_q_transfer(
+            algo, _helper_direct_sac_q_backend(gain=gain)
+        )
+
+
 def test_stochastic_stage2_resume_requires_checkpointed_rollout_rng():
     policy = _stage2_policy()
     policy.cfg.sac_deterministic_rollout = False
@@ -309,8 +391,6 @@ def test_stochastic_stage2_resume_requires_checkpointed_rollout_rng():
         ),
         ({"q_reference_dueling": True}, False, "fields"),
         ({"q_condition_on_actuator_state": True}, False, "fields"),
-        ({"q_action_fusion": "late"}, True, "early-fusion"),
-        ({"sac_q_action_input_gain": 2.0}, True, "unit gain"),
         ({"sac_q_normalize_actions": False}, True, "normalize_actions"),
     ],
 )
@@ -323,7 +403,7 @@ def test_bc_dagger_q_coordinates_must_match_checkpoint_and_replay_schema(
         "q_action_coordinates": "absolute",
         "q_reference_dueling": False,
         "q_condition_on_actuator_state": False,
-        "q_action_fusion": "early",
+        "q_action_fusion": "late",
         "sac_q_action_input_gain": 1.0,
         "sac_q_normalize_actions": True,
         "load_pretrained_q": load_pretrained_q,
@@ -335,7 +415,7 @@ def test_bc_dagger_q_coordinates_must_match_checkpoint_and_replay_schema(
         policy._configure_bc_dagger_actor_backend()
 
 
-def test_bc_pretrained_q_backend_accepts_normalized_early_unit_gain(
+def test_bc_pretrained_q_backend_accepts_normalized_late_unit_gain(
     monkeypatch,
 ):
     policy = _stage2_policy()
@@ -354,7 +434,7 @@ def test_bc_pretrained_q_backend_accepts_normalized_early_unit_gain(
     assert policy.actor_backend == FASTSAC_BC_DAGGER_ACTOR_BACKEND
     assert policy.cfg.q_num_atoms == 501
     assert policy.cfg.q_layer_norm is True
-    assert policy.cfg.q_action_fusion == "early"
+    assert policy.cfg.q_action_fusion == "late"
     assert policy.cfg.sac_q_normalize_actions is True
     assert policy.cfg.sac_q_action_input_gain == pytest.approx(1.0)
     assert policy.cfg.sac_clipped_double_q is True
@@ -393,7 +473,7 @@ def _v3_bc_critic_checkpoint(policy):
             "q_v_min": -2.0,
             "q_v_max": 2.0,
             "q_layer_norm": True,
-            "q_action_fusion": "early",
+            "q_action_fusion": "late",
             "q_action_coordinates": "absolute",
             "sac_q_normalize_actions": True,
             "sac_q_action_input_gain": 1.0,
@@ -416,7 +496,7 @@ def _v3_bc_critic_checkpoint(policy):
     }
 
 
-def test_stage2_accepts_full_fastsac_501_normalized_early_ln_bc_q_metadata(
+def test_stage2_accepts_full_fastsac_501_normalized_late_ln_bc_q_metadata(
     monkeypatch,
 ):
     policy = _stage2_policy()
@@ -440,7 +520,7 @@ def test_stage2_accepts_full_fastsac_501_normalized_early_ln_bc_q_metadata(
     assert "iql_value" not in state
     assert state["q_backend_config"]["num_atoms"] == 501
     assert state["q_backend_config"]["q_action_normalized"] is True
-    assert state["q_backend_config"]["q_action_fusion"] == "early"
+    assert state["q_backend_config"]["q_action_fusion"] == "late"
     assert state["q_backend_config"]["layer_norm"] is True
     assert state["q_backend_config"]["q_action_input_gain"] == pytest.approx(1.0)
     assert state["q_backend_config"]["clipped_double_q"] is True
@@ -456,7 +536,7 @@ def test_stage2_accepts_full_fastsac_501_normalized_early_ln_bc_q_metadata(
     (
         ("num_atoms", 101),
         ("q_action_normalized", False),
-        ("q_action_fusion", "late"),
+        ("q_action_fusion", "early"),
         ("layer_norm", False),
         ("q_action_input_gain", 2.0),
         ("clipped_double_q", False),

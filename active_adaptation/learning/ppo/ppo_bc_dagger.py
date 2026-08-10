@@ -42,8 +42,10 @@ from .fastsac_vel import (
     FASTSAC_BC_DAGGER_TARGET_ENTROPY_SEMANTICS,
     FASTSAC_CLIPPED_DOUBLE_Q_SEMANTICS,
     FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS,
+    FASTSAC_Q_DEFAULT_ACTION_FUSION,
     FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
     FASTSAC_Q_EARLY_FUSION_SEMANTICS,
+    FASTSAC_Q_LATE_FUSION_SEMANTICS,
     FASTSAC_REFERENCE_EPS,
     FASTSAC_RAW_OBSERVATION_ROOT,
     FastSACTanhNormal,
@@ -421,7 +423,9 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
     q_v_min: float = -20.0
     q_v_max: float = 20.0
     q_layer_norm: bool = True
-    q_action_fusion: str = "early"
+    # Keep the 2,341-D Skateboard state and 23-D executable action in separate
+    # stems so the critic cannot cheaply ignore the much smaller action input.
+    q_action_fusion: str = FASTSAC_Q_DEFAULT_ACTION_FUSION
     q_action_coordinates: str = "absolute"
     sac_q_normalize_actions: bool = True
     sac_q_action_input_gain: float = 1.0
@@ -1518,8 +1522,10 @@ class PPOBCDaggerFinetune(PPOVEL):
             raise ValueError("BC-DAgger FastSAC critic requires q_num_atoms=501")
         if not bool(cfg.q_layer_norm):
             raise ValueError("BC-DAgger FastSAC critic requires LayerNorm")
-        if str(cfg.q_action_fusion) != "early":
-            raise ValueError("BC-DAgger FastSAC critic requires early action fusion")
+        if str(cfg.q_action_fusion) != FASTSAC_Q_DEFAULT_ACTION_FUSION:
+            raise ValueError(
+                "BC-DAgger FastSAC critic requires late action fusion"
+            )
         if str(cfg.q_action_coordinates) != "absolute":
             raise ValueError(
                 "BC-DAgger FastSAC critic requires absolute action coordinates"
@@ -1528,13 +1534,11 @@ class PPOBCDaggerFinetune(PPOVEL):
             raise ValueError(
                 "BC-DAgger FastSAC critic requires normalized absolute actions"
             )
-        if not math.isclose(
-            float(cfg.sac_q_action_input_gain),
-            1.0,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            raise ValueError("BC-DAgger FastSAC critic requires action gain 1")
+        q_action_input_gain = float(cfg.sac_q_action_input_gain)
+        if not math.isfinite(q_action_input_gain) or q_action_input_gain <= 0.0:
+            raise ValueError(
+                "sac_q_action_input_gain must be finite and positive"
+            )
         if not bool(cfg.sac_clipped_double_q):
             raise ValueError("BC-DAgger FastSAC critic requires clipped double Q")
         if int(cfg.q_batch_size) % 2:
@@ -2530,6 +2534,14 @@ class PPOBCDaggerFinetune(PPOVEL):
 
     def _q_backend_metadata(self):
         """Full Stage-2-facing critic contract saved with every checkpoint."""
+        q_action_fusion = str(self.cfg.q_action_fusion)
+        q_action_hidden_dim = _q_action_hidden_dim(
+            self.cfg.q_hidden_dim, q_action_fusion
+        )
+        q_action_fusion_semantics = {
+            "early": FASTSAC_Q_EARLY_FUSION_SEMANTICS,
+            "late": FASTSAC_Q_LATE_FUSION_SEMANTICS,
+        }[q_action_fusion]
         return {
             "actor_obs_keys": list(self.q_actor_keys),
             "critic_obs_keys": list(self.q_critic_keys),
@@ -2539,11 +2551,9 @@ class PPOBCDaggerFinetune(PPOVEL):
             "q_actuator_context": {"enabled": False},
             "action_dim": self.action_dim,
             "hidden_dim": int(self.cfg.q_hidden_dim),
-            "q_action_fusion": str(self.cfg.q_action_fusion),
-            "q_action_hidden_dim": _q_action_hidden_dim(
-                self.cfg.q_hidden_dim, self.cfg.q_action_fusion
-            ),
-            "q_action_fusion_semantics": FASTSAC_Q_EARLY_FUSION_SEMANTICS,
+            "q_action_fusion": q_action_fusion,
+            "q_action_hidden_dim": q_action_hidden_dim,
+            "q_action_fusion_semantics": q_action_fusion_semantics,
             "q_reference_dueling": False,
             "q_architecture_semantics": FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
             "num_atoms": int(self.cfg.q_num_atoms),

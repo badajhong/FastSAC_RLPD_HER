@@ -44,6 +44,7 @@ def test_student_keeps_ppo_vel_inputs_and_uses_guarded_stage2_defaults():
     for config in (fastsac_teacher, fastsac):
         assert config.gamma == 0.99
         assert config.q_num_atoms == 501
+        assert config.q_action_fusion == "late"
         assert config.sac_replay_raw_observations is True
         assert config.sac_q_normalize_actions is True
         assert config.sac_q_action_input_gain == 1.0
