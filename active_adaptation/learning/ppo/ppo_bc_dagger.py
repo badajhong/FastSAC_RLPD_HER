@@ -127,6 +127,12 @@ DAGGER_STAGING_SEMANTICS = (
     "joint_then_cyclic_perception_actor_then_final_perception_actor_"
     "then_fresh_replay_q_v1"
 )
+DAGGER_STAGING_REPLAY_SEMANTICS = (
+    "h5_disabled_until_final_q_calibration_v1"
+)
+DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS = (
+    "h5_materialized_once_at_completed_final_checkpoint_v1"
+)
 DAGGER_STAGING_PHASES = (
     "joint_warmup",
     "cycle_perception",
@@ -385,6 +391,7 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
     dagger_stage_calibration_iterations: int = 0
     dagger_stage_calibration_control_mode: str = "beta"
     dagger_stage_calibration_teacher_probability: float = 0.5
+    dagger_stage_h5_final_only: bool = False
 
     dagger_bc_lr: float = 3e-4
     dagger_bc_epochs: int = 1
@@ -1453,6 +1460,10 @@ class PPOBCDaggerFinetune(PPOVEL):
                     "dagger_stage_calibration_teacher_probability must be "
                     "finite and strictly between zero and one"
                 )
+            if not isinstance(
+                getattr(cfg, "dagger_stage_h5_final_only", False), bool
+            ):
+                raise ValueError("dagger_stage_h5_final_only must be boolean")
         for name in (
             "dagger_bc_epochs",
             "dagger_safe_min_teacher_steps",
@@ -1681,6 +1692,9 @@ class PPOBCDaggerFinetune(PPOVEL):
                     0.5,
                 )
             ),
+            "h5_final_only": bool(
+                getattr(self.cfg, "dagger_stage_h5_final_only", False)
+            ),
         }
 
     def _staging_enabled(self):
@@ -1739,11 +1753,15 @@ class PPOBCDaggerFinetune(PPOVEL):
             # Consolidation/realignment are pure-student rollouts. The teacher
             # is still evaluated on every row for labels and diagnostics.
             return "beta"
-        if (
-            self._staging_enabled()
-            and self._staging_phase() == "replay_q_calibration"
-        ):
-            return self._staging_config()["calibration_control_mode"]
+        if self._staging_enabled():
+            phase = self._staging_phase()
+            if phase == "replay_q_calibration":
+                return self._staging_config()["calibration_control_mode"]
+            if phase in ("final_perception", "final_actor"):
+                # The terminal representation/actor cleanup must observe the
+                # frozen final student's state distribution, independent of
+                # the joint phase's SafeDAgger/beta controller.
+                return "beta"
         return str(getattr(self.cfg, "dagger_control_mode", "beta"))
 
     def _teacher_mixture_probability(self):
@@ -1753,13 +1771,14 @@ class PPOBCDaggerFinetune(PPOVEL):
                     "calibration_teacher_probability"
                 ]
             return 0.0
-        if (
-            self._staging_enabled()
-            and self._staging_phase() == "replay_q_calibration"
-        ):
-            return self._staging_config()[
-                "calibration_teacher_probability"
-            ]
+        if self._staging_enabled():
+            phase = self._staging_phase()
+            if phase == "replay_q_calibration":
+                return self._staging_config()[
+                    "calibration_teacher_probability"
+                ]
+            if phase in ("final_perception", "final_actor"):
+                return 0.0
         return _linear_teacher_probability(
             self.cfg.dagger_beta_start,
             self.cfg.dagger_beta_end,
@@ -1771,9 +1790,10 @@ class PPOBCDaggerFinetune(PPOVEL):
         """Whether SafeDAgger may execute the teacher this cumulative rollout."""
         if self._finalization_enabled():
             return False
-        if (
-            self._staging_enabled()
-            and self._staging_phase() == "replay_q_calibration"
+        if self._staging_enabled() and self._staging_phase() in (
+            "final_perception",
+            "final_actor",
+            "replay_q_calibration",
         ):
             return False
         cutoff = getattr(self.cfg, "dagger_safe_zero_iteration", None)
@@ -2085,13 +2105,24 @@ class PPOBCDaggerFinetune(PPOVEL):
     def snapshot_teacher_replay(self, iteration, checkpoint_name):
         if self.teacher_replay is None:
             return None
-        if self._staging_enabled() and self._staging_phase() not in (
-            "replay_q_calibration",
-            "complete",
-        ):
-            # Checkpoint the model/schedule normally, but do not create even an
-            # empty persistent H5 for representation-changing staged phases.
-            return None
+        if self._staging_enabled():
+            phase = self._staging_phase()
+            if self._staging_config()["h5_final_only"]:
+                if phase != "complete" or checkpoint_name != "checkpoint_final":
+                    return None
+                result = self.teacher_replay.snapshot(
+                    iteration, checkpoint_name
+                )
+                if result is None:
+                    raise RuntimeError(
+                        "Completed inline BC-DAgger calibration produced no "
+                        "teacher rows for its final H5"
+                    )
+                return result
+            if phase not in ("replay_q_calibration", "complete"):
+                # Checkpoint the model/schedule normally, but do not create even
+                # an empty persistent H5 for representation-changing phases.
+                return None
         return self.teacher_replay.snapshot(iteration, checkpoint_name)
 
     @torch.no_grad()
@@ -3246,7 +3277,17 @@ class PPOBCDaggerFinetune(PPOVEL):
             }
         )
         if self.teacher_replay is not None:
-            state["teacher_replay_state"] = self.teacher_replay.checkpoint_metadata()
+            h5_final_only = (
+                self._staging_enabled()
+                and self._staging_config()["h5_final_only"]
+            )
+            if (
+                not h5_final_only
+                or self.teacher_replay.last_snapshot_id is not None
+            ):
+                state["teacher_replay_state"] = (
+                    self.teacher_replay.checkpoint_metadata()
+                )
         elif self._loaded_teacher_replay_metadata is not None:
             # This is provenance only: model-only resume deliberately has no
             # live/paired H5 and must not claim an exact replay snapshot.
@@ -3279,7 +3320,9 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "complete": self._staging_phase() == "complete",
                 "fresh_replay_id": str(self.teacher_replay_id),
                 "persistent_replay_semantics": (
-                    "h5_disabled_until_final_q_calibration_v1"
+                    DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS
+                    if self._staging_config()["h5_final_only"]
+                    else DAGGER_STAGING_REPLAY_SEMANTICS
                 ),
                 "calibration_start_q_update_count": (
                     None
@@ -3516,7 +3559,15 @@ class PPOBCDaggerFinetune(PPOVEL):
                     )
                 if staging_state.get("semantics") != DAGGER_STAGING_SEMANTICS:
                     raise ValueError("BC-DAgger staging semantics mismatch")
-                if staging_state.get("config") != self._staging_config():
+                loaded_staging_config = staging_state.get("config")
+                if isinstance(loaded_staging_config, dict):
+                    # Older staged checkpoints predate configurable final-only
+                    # publication and therefore imply the legacy False value.
+                    loaded_staging_config = copy.deepcopy(
+                        loaded_staging_config
+                    )
+                    loaded_staging_config.setdefault("h5_final_only", False)
+                if loaded_staging_config != self._staging_config():
                     raise ValueError("BC-DAgger staging schedule mismatch")
                 self.staging_rollout_count = int(
                     staging_state.get("rollout_count", 0)

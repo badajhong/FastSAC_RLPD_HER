@@ -10,6 +10,7 @@ from tensordict import TensorDict
 from active_adaptation.learning.ppo.fastsac_vel import (
     BC_DAGGER_ACTOR_BACKEND,
     BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
+    BC_DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS,
     BC_DAGGER_SAC_CRITIC_SEMANTICS,
     BC_DAGGER_LEGACY_TRAINING_ALGORITHM,
     BC_DAGGER_TRAINING_ALGORITHM,
@@ -67,6 +68,7 @@ def _complete_staging_source_state():
                 "replay_q_calibration_iterations": 128,
                 "calibration_control_mode": "beta",
                 "calibration_teacher_probability": 0.5,
+                "h5_final_only": False,
             },
             "rollout_count": 3000,
             "phase": "complete",
@@ -91,6 +93,66 @@ def test_stage2_accepts_only_complete_staged_bc_dagger_source():
     state["bc_dagger_staging_state"]["phase"] = "final_actor"
     state["bc_dagger_staging_state"]["rollout_count"] = 2872
     with pytest.raises(ValueError, match="completed staged rollout budget"):
+        _validate_complete_bc_dagger_staging_source(state)
+
+
+def _inline_complete_staging_source_state():
+    state = _complete_staging_source_state()
+    config = state["bc_dagger_staging_state"]["config"]
+    config.update(
+        {
+            "joint_warmup_iterations": 2400,
+            "cycles": 0,
+            "perception_iterations": 0,
+            "actor_iterations": 0,
+            "final_perception_iterations": 0,
+            "final_actor_iterations": 50,
+            "replay_q_calibration_iterations": 128,
+            "h5_final_only": True,
+        }
+    )
+    completed = 2400 + 50 + 128
+    state["dagger_rollout_count"] = completed
+    state["bc_dagger_staging_state"]["rollout_count"] = completed
+    state["bc_dagger_staging_state"]["persistent_replay_semantics"] = (
+        BC_DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS
+    )
+    return state
+
+
+def test_stage2_accepts_complete_inline_joint_actor_q_source():
+    state = _inline_complete_staging_source_state()
+
+    _validate_complete_bc_dagger_staging_source(state)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("perception_iterations", "actor_iterations"),
+)
+def test_stage2_rejects_unused_nonzero_cycle_lengths_when_cycles_are_zero(
+    field,
+):
+    state = _inline_complete_staging_source_state()
+    state["bc_dagger_staging_state"]["config"][field] = 1
+
+    with pytest.raises(ValueError, match="cycles|zero|unused"):
+        _validate_complete_bc_dagger_staging_source(state)
+
+
+def test_stage2_rejects_inline_source_without_final_checkpoint_snapshot():
+    state = _inline_complete_staging_source_state()
+    state["teacher_replay_state"]["checkpoint_name"] = "checkpoint_2552"
+
+    with pytest.raises(ValueError, match="checkpoint_final|final replay"):
+        _validate_complete_bc_dagger_staging_source(state)
+
+
+def test_stage2_rejects_non_boolean_staged_h5_publication_contract():
+    state = _inline_complete_staging_source_state()
+    state["bc_dagger_staging_state"]["config"]["h5_final_only"] = 1
+
+    with pytest.raises(ValueError, match="h5_final_only|boolean"):
         _validate_complete_bc_dagger_staging_source(state)
 
 

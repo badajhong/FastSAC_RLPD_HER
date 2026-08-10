@@ -48,6 +48,7 @@ def _staging_policy(
     final_actor=172,
     calibration=128,
     teacher_probability=0.5,
+    h5_final_only=False,
 ):
     cfg = PPOBCDaggerFinetuneConfig()
     cfg.dagger_staging_enabled = True
@@ -60,6 +61,7 @@ def _staging_policy(
     cfg.dagger_stage_calibration_iterations = calibration
     cfg.dagger_stage_calibration_control_mode = "beta"
     cfg.dagger_stage_calibration_teacher_probability = teacher_probability
+    cfg.dagger_stage_h5_final_only = h5_final_only
     policy = _bare_policy()
     policy.cfg = cfg
     policy.staging_rollout_count = 0
@@ -295,6 +297,7 @@ def test_staging_config_dataclass_exposes_every_runtime_control():
         "dagger_stage_calibration_iterations",
         "dagger_stage_calibration_control_mode",
         "dagger_stage_calibration_teacher_probability",
+        "dagger_stage_h5_final_only",
     ):
         assert hasattr(cfg, name), name
 
@@ -492,6 +495,131 @@ def test_staging_teacher_h5_snapshot_is_disabled_until_final_calibration():
     ]
 
 
+def test_inline_staging_h5_is_published_once_at_completed_final_checkpoint():
+    # Default inline bc_dagger is joint training -> frozen-perception actor BC
+    # -> frozen actor/perception Q. Perception consolidation is optional.
+    policy = _staging_policy(
+        joint=2,
+        cycles=0,
+        perception=0,
+        actor=0,
+        final_perception=0,
+        final_actor=1,
+        calibration=2,
+        h5_final_only=True,
+    )
+    policy.teacher_replay = _TeacherSnapshotRecorder()
+
+    assert policy._staging_config()["h5_final_only"] is True
+
+    assert policy._staging_phase(0) == "joint_warmup"
+    assert policy._staging_phase(1) == "joint_warmup"
+    assert policy._staging_phase(2) == "final_actor"
+    assert policy._staging_phase(3) == "replay_q_calibration"
+    assert policy._staging_phase(4) == "replay_q_calibration"
+    assert policy._staging_phase(5) == "complete"
+
+    # Calibration rows may already be held by the in-memory export FIFO, but
+    # neither periodic saves nor a premature artifact save may materialize H5.
+    for count, checkpoint_name in (
+        (0, "checkpoint_0"),
+        (2, "checkpoint_2"),
+        (3, "checkpoint_3"),
+        (4, "checkpoint_4"),
+        (4, "checkpoint_final"),
+        (5, "checkpoint_5"),
+    ):
+        policy.staging_rollout_count = count
+        assert policy.snapshot_teacher_replay(count, checkpoint_name) is None
+
+    assert policy.teacher_replay.calls == []
+
+    policy.staging_rollout_count = 5
+    assert policy.snapshot_teacher_replay(5, "checkpoint_final") == (
+        "snapshot-result"
+    )
+    assert policy.teacher_replay.calls == [(5, "checkpoint_final")]
+
+
+def test_inline_staging_optimizer_phases_match_joint_perception_actor_q_contract():
+    policy = _staging_policy(
+        joint=1,
+        cycles=0,
+        perception=0,
+        actor=0,
+        final_perception=1,
+        final_actor=1,
+        calibration=1,
+        h5_final_only=True,
+    )
+    policy.cfg.dagger_updates_per_rollout = 7
+    policy.cfg.q_updates_per_rollout = 11
+    policy.train_adapt = lambda rollout: {"adapt/called": 1.0}
+    rollout = TensorDict({"marker": torch.ones(1, 1)}, batch_size=[1])
+
+    expected = (
+        # phase, actor labels/replay, Q-teacher rows, actor steps, Q steps,
+        # perception update
+        ("joint_warmup", True, True, 7, 11, True),
+        ("final_perception", False, False, 0, 0, True),
+        ("final_actor", True, False, 7, 0, False),
+        ("replay_q_calibration", True, True, 0, 11, False),
+    )
+    for count, (
+        phase,
+        collect_actor,
+        collect_q_teacher,
+        actor_updates,
+        q_updates,
+        adapt,
+    ) in enumerate(expected):
+        policy.staging_rollout_count = count
+        assert policy._staging_phase() == phase
+        assert policy._collect_dagger_replay_this_rollout() is collect_actor
+        assert (
+            policy._collect_q_teacher_rows_this_rollout()
+            is collect_q_teacher
+        )
+        assert policy._actor_updates_this_rollout() == actor_updates
+        assert policy._q_updates_this_rollout() == q_updates
+        assert bool(policy._adaptation_update_this_rollout(rollout)) is adapt
+
+
+def test_inline_perception_and_actor_tails_are_pure_student_before_calibration():
+    policy = _staging_policy(
+        joint=1,
+        cycles=0,
+        perception=0,
+        actor=0,
+        final_perception=1,
+        final_actor=1,
+        calibration=1,
+        teacher_probability=0.5,
+        h5_final_only=True,
+    )
+    # The joint controller can be SafeDAgger. Inline finalization must override
+    # it locally without mutating the saved backend compatibility contract.
+    assert policy.cfg.dagger_control_mode == "safe"
+
+    policy.staging_rollout_count = 1
+    assert policy._staging_phase() == "final_perception"
+    assert policy._effective_control_mode() == "beta"
+    assert policy._teacher_mixture_probability() == pytest.approx(0.0)
+    assert policy._safe_teacher_control_enabled() is False
+
+    policy.staging_rollout_count = 2
+    assert policy._staging_phase() == "final_actor"
+    assert policy._effective_control_mode() == "beta"
+    assert policy._teacher_mixture_probability() == pytest.approx(0.0)
+    assert policy._safe_teacher_control_enabled() is False
+
+    policy.staging_rollout_count = 3
+    assert policy._staging_phase() == "replay_q_calibration"
+    assert policy._effective_control_mode() == "beta"
+    assert policy._teacher_mixture_probability() == pytest.approx(0.5)
+    assert policy._safe_teacher_control_enabled() is False
+
+
 def test_staging_h5_is_final_only_and_q_teacher_rows_skip_actor_phases():
     policy = _staging_policy(
         joint=1,
@@ -632,3 +760,80 @@ def test_staging_checkpoint_metadata_marks_incomplete_and_complete(
         100 if complete else None
     )
     assert staging["calibration_q_updates"] == (1 if complete else 0)
+
+
+def test_inline_partial_checkpoint_omits_unpublished_replay_lineage(
+    monkeypatch,
+):
+    policy = _staging_policy(
+        joint=1,
+        cycles=0,
+        perception=0,
+        actor=0,
+        final_perception=1,
+        final_actor=0,
+        calibration=1,
+        h5_final_only=True,
+    )
+    policy.staging_rollout_count = 2
+    policy._staging_last_phase = "final_perception"
+    policy.dagger_rollout_count = 2
+    policy.dagger_environment_steps = 64
+    policy.bc_update_count = 10
+    policy.q_update_count = 20
+    policy._staging_calibration_start_q_update_count = None
+    policy.dagger_rng = torch.Generator().manual_seed(1)
+    policy.q_rng = torch.Generator().manual_seed(2)
+    policy.sac_action_rng = torch.Generator().manual_seed(3)
+    policy.bc_optimizer = SimpleNamespace(state_dict=lambda: {"name": "bc"})
+    policy.opt_q = SimpleNamespace(state_dict=lambda: {"name": "q"})
+    policy.opt_adapt = SimpleNamespace(
+        state_dict=lambda: {"name": "adapt"}
+    )
+    policy.teacher_replay_id = "fresh-inline-replay"
+    metadata = {
+        "replay_id": "fresh-inline-replay",
+        "snapshot_id": None,
+        "checkpoint_name": "",
+        "size": 32,
+        "seen": 32,
+    }
+    policy.teacher_replay = SimpleNamespace(
+        last_snapshot_id=None,
+        checkpoint_metadata=lambda: dict(metadata),
+    )
+    policy._loaded_teacher_replay_metadata = None
+    policy._replay_vecnorm_fingerprint = "sha256:" + "d" * 64
+    policy.env = SimpleNamespace(current_iter=77)
+    policy._q_backend_metadata = lambda: {"contract": "unchanged-v3"}
+    monkeypatch.setattr(PPOVEL, "state_dict", lambda self: {})
+
+    partial = policy.state_dict()
+
+    assert "teacher_replay_state" not in partial
+    staging = partial["bc_dagger_staging_state"]
+    assert staging["complete"] is False
+    assert "final" in staging["persistent_replay_semantics"]
+    assert staging["persistent_replay_semantics"] != (
+        "h5_disabled_until_final_q_calibration_v1"
+    )
+
+    # Once the terminal snapshot has actually been published, its exact
+    # lineage is safe to advertise to Stage 2.
+    policy.staging_rollout_count = 3
+    policy._staging_last_phase = "replay_q_calibration"
+    policy.dagger_rollout_count = 3
+    policy.q_update_count = 21
+    policy._staging_calibration_start_q_update_count = 20
+    metadata.update(
+        {
+            "snapshot_id": "inline-final-snapshot",
+            "checkpoint_name": "checkpoint_final",
+        }
+    )
+    policy.teacher_replay.last_snapshot_id = "inline-final-snapshot"
+
+    complete = policy.state_dict()
+
+    assert complete["teacher_replay_state"] == metadata
+    assert complete["bc_dagger_staging_state"]["complete"] is True

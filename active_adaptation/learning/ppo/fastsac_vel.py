@@ -93,6 +93,9 @@ BC_DAGGER_STAGING_SEMANTICS = (
 BC_DAGGER_STAGING_REPLAY_SEMANTICS = (
     "h5_disabled_until_final_q_calibration_v1"
 )
+BC_DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS = (
+    "h5_materialized_once_at_completed_final_checkpoint_v1"
+)
 BC_DAGGER_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
 BC_DAGGER_REPLAY_FORMAT_VERSION = 2
 BC_DAGGER_LEGACY_REPLAY_FORMAT_VERSION = 1
@@ -133,8 +136,10 @@ def _validate_complete_bc_dagger_staging_source(state_dict) -> None:
         raise ValueError("BC-DAgger staging state must be a mapping")
     if staging.get("semantics") != BC_DAGGER_STAGING_SEMANTICS:
         raise ValueError("BC-DAgger staging semantics mismatch")
-    if staging.get("persistent_replay_semantics") != (
-        BC_DAGGER_STAGING_REPLAY_SEMANTICS
+    replay_semantics = staging.get("persistent_replay_semantics")
+    if replay_semantics not in (
+        BC_DAGGER_STAGING_REPLAY_SEMANTICS,
+        BC_DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS,
     ):
         raise ValueError("BC-DAgger staged replay semantics mismatch")
 
@@ -159,9 +164,19 @@ def _validate_complete_bc_dagger_staging_source(state_dict) -> None:
         return int(value)
 
     joint = _count("joint_warmup_iterations", positive=True)
-    cycles = _count("cycles", positive=True)
-    perception = _count("perception_iterations", positive=True)
-    actor = _count("actor_iterations", positive=True)
+    cycles = _count("cycles", positive=False)
+    perception = _count("perception_iterations", positive=False)
+    actor = _count("actor_iterations", positive=False)
+    if cycles > 0 and (perception < 1 or actor < 1):
+        raise ValueError(
+            "BC-DAgger staging with positive cycles requires positive "
+            "perception and actor iteration counts"
+        )
+    if cycles == 0 and (perception != 0 or actor != 0):
+        raise ValueError(
+            "BC-DAgger staging perception/actor cycle lengths must be zero "
+            "when cycles are zero because those fields are unused"
+        )
     final_perception = _count(
         "final_perception_iterations", positive=False
     )
@@ -169,6 +184,19 @@ def _validate_complete_bc_dagger_staging_source(state_dict) -> None:
     calibration = _count(
         "replay_q_calibration_iterations", positive=True
     )
+    h5_final_only = config.get("h5_final_only", False)
+    if not isinstance(h5_final_only, bool):
+        raise ValueError("BC-DAgger staging h5_final_only must be boolean")
+    expected_replay_semantics = (
+        BC_DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS
+        if h5_final_only
+        else BC_DAGGER_STAGING_REPLAY_SEMANTICS
+    )
+    if replay_semantics != expected_replay_semantics:
+        raise ValueError(
+            "BC-DAgger staged replay semantics disagree with final-only "
+            "publication config"
+        )
     if config.get("calibration_control_mode") != "beta":
         raise ValueError(
             "BC-DAgger staged calibration control mode must be beta"
@@ -266,6 +294,13 @@ def _validate_complete_bc_dagger_staging_source(state_dict) -> None:
         )
     replay_size = replay_state.get("size")
     replay_seen = replay_state.get("seen")
+    if h5_final_only and replay_state.get("checkpoint_name") != (
+        "checkpoint_final"
+    ):
+        raise ValueError(
+            "BC-DAgger final-only source requires final replay metadata from "
+            "checkpoint_final"
+        )
     if (
         replay_state.get("replay_id") != fresh_replay_id
         or not isinstance(replay_state.get("snapshot_id"), str)

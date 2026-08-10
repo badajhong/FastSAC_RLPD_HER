@@ -13,6 +13,10 @@ hydra:
 exp_name: ${oc.select:task.name,test}-stage_bc_dagger
 save_interval: 100
 
+# This entrypoint installs its own cyclic schedule. Do not append the compact
+# inline finalization owned by scripts/bc_dagger.py.
+bc_dagger_inline_finalization: false
+
 # The default phases add up to exactly 3,000 rollouts:
 #   500 + 7 * (100 + 200) + 100 + 172 + 128 = 3,000.
 # If bc_dagger_iterations is null, the entrypoint derives it from this sum.  A

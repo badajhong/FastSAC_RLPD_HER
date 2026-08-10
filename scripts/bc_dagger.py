@@ -304,14 +304,205 @@ def prepare_bc_dagger_checkpoint(cfg: DictConfig) -> dict | None:
     }
 
 
+def _inline_iteration(name: str, value, *, positive: bool) -> int:
+    lower = 1 if positive else 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < lower:
+        requirement = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be a {requirement} integer")
+    return int(value)
+
+
+def apply_inline_finalization_controls(cfg: DictConfig) -> dict | None:
+    """Map the compact joint/perception/actor/Q tail onto staged ownership.
+
+    The hidden joint count makes this function idempotent: once ``total_frames``
+    includes the appended tail, later validation/schedule calls must not infer a
+    progressively larger joint budget from that rewritten frame count.
+    """
+    enabled = cfg.get("bc_dagger_inline_finalization", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("bc_dagger_inline_finalization must be boolean")
+    if not enabled:
+        return None
+    if cfg.get("bc_dagger_checkpoint", None) is not None:
+        raise ValueError(
+            "BC-DAgger inline finalization does not support same-stage resume: "
+            "pre-final checkpoints deliberately have no paired H5. Start from "
+            "the fresh PPO checkpoint, or set "
+            "bc_dagger_inline_finalization=false for the legacy resume path."
+        )
+    if cfg.get("teacher_replay_buffer_path", None) is not None or cfg.algo.get(
+        "teacher_buffer_path", None
+    ) is not None:
+        raise ValueError(
+            "BC-DAgger inline finalization requires a fresh final replay and "
+            "cannot restore an existing teacher H5"
+        )
+
+    stored_joint = cfg.get("_bc_dagger_inline_joint_iterations", None)
+    requested_joint = cfg.get("bc_dagger_iterations", None)
+    if stored_joint is not None:
+        joint_iterations = _inline_iteration(
+            "_bc_dagger_inline_joint_iterations",
+            stored_joint,
+            positive=True,
+        )
+        if requested_joint is not None and _inline_iteration(
+            "bc_dagger_iterations", requested_joint, positive=True
+        ) != joint_iterations:
+            raise ValueError(
+                "bc_dagger_iterations changed after inline finalization was "
+                "resolved"
+            )
+    elif requested_joint is not None:
+        joint_iterations = _inline_iteration(
+            "bc_dagger_iterations", requested_joint, positive=True
+        )
+    else:
+        num_envs = int(cfg.task.num_envs)
+        train_every = int(cfg.algo.train_every)
+        world_size = int(aa.get_world_size())
+        total_frames = int(cfg.total_frames)
+        if min(num_envs, train_every, world_size, total_frames) < 1:
+            raise ValueError(
+                "task.num_envs, algo.train_every, distributed world size, "
+                "and total_frames must be positive"
+            )
+        joint_iterations = total_frames // (
+            num_envs * train_every * world_size
+        )
+        if joint_iterations < 1:
+            raise ValueError(
+                "total_frames does not contain one complete joint rollout"
+            )
+
+    perception_iterations = _inline_iteration(
+        "perception_consolidation_iterations",
+        cfg.get("perception_consolidation_iterations", None),
+        positive=False,
+    )
+    actor_iterations = _inline_iteration(
+        "actor_realignment_iterations",
+        cfg.get("actor_realignment_iterations", None),
+        positive=False,
+    )
+    calibration_iterations = _inline_iteration(
+        "replay_q_calibration_iterations",
+        cfg.get("replay_q_calibration_iterations", None),
+        positive=True,
+    )
+    probability = cfg.get("calibration_teacher_probability", None)
+    if (
+        isinstance(probability, bool)
+        or not isinstance(probability, (int, float))
+        or not math.isfinite(float(probability))
+        or not 0.0 < float(probability) < 1.0
+    ):
+        raise ValueError(
+            "calibration_teacher_probability must be finite and strictly "
+            "between zero and one"
+        )
+
+    controls = {
+        "joint_iterations": joint_iterations,
+        "perception_consolidation_iterations": perception_iterations,
+        "actor_realignment_iterations": actor_iterations,
+        "replay_q_calibration_iterations": calibration_iterations,
+        "calibration_teacher_probability": float(probability),
+    }
+    total_iterations = sum(
+        controls[name]
+        for name in (
+            "joint_iterations",
+            "perception_consolidation_iterations",
+            "actor_realignment_iterations",
+            "replay_q_calibration_iterations",
+        )
+    )
+    num_envs = int(cfg.task.num_envs)
+    train_every = int(cfg.algo.train_every)
+    world_size = int(aa.get_world_size())
+    if min(num_envs, train_every, world_size) < 1:
+        raise ValueError(
+            "task.num_envs, algo.train_every, and distributed world size "
+            "must be positive"
+        )
+
+    with open_dict(cfg):
+        cfg._bc_dagger_inline_joint_iterations = joint_iterations
+        cfg._bc_dagger_inline_finalization_applied = True
+        # Prevent helpers.py from auto-pairing an unrelated H5 found beside
+        # the fresh PPO source checkpoint.
+        cfg._bc_dagger_staging_source = True
+        cfg.total_frames = (
+            total_iterations * num_envs * train_every * world_size
+        )
+        cfg.teacher_replay_buffer_path = None
+    with open_dict(cfg.algo):
+        cfg.algo.teacher_buffer_path = None
+        cfg.algo.save_teacher_buffer = True
+        cfg.algo.dagger_staging_enabled = True
+        cfg.algo.dagger_stage_joint_warmup_iterations = joint_iterations
+        cfg.algo.dagger_stage_cycles = 0
+        cfg.algo.dagger_stage_perception_iterations = 0
+        cfg.algo.dagger_stage_actor_iterations = 0
+        cfg.algo.dagger_stage_final_perception_iterations = (
+            perception_iterations
+        )
+        cfg.algo.dagger_stage_final_actor_iterations = actor_iterations
+        cfg.algo.dagger_stage_calibration_iterations = calibration_iterations
+        cfg.algo.dagger_stage_calibration_control_mode = "beta"
+        cfg.algo.dagger_stage_calibration_teacher_probability = float(
+            probability
+        )
+        cfg.algo.dagger_stage_h5_final_only = True
+    return controls
+
+
+def prepare_inline_bc_dagger_source(cfg: DictConfig) -> dict | None:
+    """Require a fresh PPO teacher for the non-resumable inline schedule."""
+    if not bool(cfg.get("bc_dagger_inline_finalization", False)):
+        return None
+    try:
+        from .stage_bc_dagger import (
+            _resolve_source_checkpoint,
+            _validate_source_checkpoint,
+        )
+    except ImportError:
+        from stage_bc_dagger import (  # type: ignore
+            _resolve_source_checkpoint,
+            _validate_source_checkpoint,
+        )
+
+    source_path = _resolve_source_checkpoint(cfg.get("checkpoint_path", None))
+    checkpoint = torch.load(
+        source_path, map_location="cpu", weights_only=False
+    )
+    policy_state = _validate_source_checkpoint(checkpoint, cfg)
+    with open_dict(cfg):
+        cfg.checkpoint_path = source_path
+        cfg._bc_dagger_staging_source = True
+        cfg._bc_dagger_model_only_resume = False
+        cfg._bc_dagger_finalization_source = False
+        cfg._bc_dagger_finalize = False
+    return {
+        "path": source_path,
+        "source_last_iter": int(policy_state.get("last_iter", -1)),
+    }
+
+
 def apply_bc_dagger_iteration_controls(cfg: DictConfig) -> None:
     """Resolve iteration-facing CLI controls into the shared frame trainer."""
-    iterations = cfg.get("bc_dagger_iterations", None)
+    inline = apply_inline_finalization_controls(cfg)
+    iterations = (
+        inline["joint_iterations"]
+        if inline is not None
+        else cfg.get("bc_dagger_iterations", None)
+    )
     if iterations is not None:
-        if isinstance(iterations, bool) or not isinstance(iterations, int):
-            raise ValueError("bc_dagger_iterations must be a positive integer")
-        if iterations < 1:
-            raise ValueError("bc_dagger_iterations must be a positive integer")
+        iterations = _inline_iteration(
+            "bc_dagger_iterations", iterations, positive=True
+        )
         num_envs = int(cfg.task.num_envs)
         train_every = int(cfg.algo.train_every)
         if num_envs < 1 or train_every < 1:
@@ -322,7 +513,16 @@ def apply_bc_dagger_iteration_controls(cfg: DictConfig) -> None:
         with open_dict(cfg):
             # train.py interprets total_frames as the all-rank budget and divides
             # it by world_size before constructing each rank's iteration range.
-            cfg.total_frames = iterations * num_envs * train_every * world_size
+            total_iterations = iterations
+            if inline is not None:
+                total_iterations += (
+                    inline["perception_consolidation_iterations"]
+                    + inline["actor_realignment_iterations"]
+                    + inline["replay_q_calibration_iterations"]
+                )
+            cfg.total_frames = (
+                total_iterations * num_envs * train_every * world_size
+            )
 
     beta_zero_iteration = cfg.algo.get(
         "dagger_beta_zero_iteration", None
@@ -357,6 +557,7 @@ def apply_bc_dagger_iteration_controls(cfg: DictConfig) -> None:
 def bc_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
     """Return the effective additional rollout schedule for this process."""
     apply_bc_dagger_iteration_controls(cfg)
+    inline = apply_inline_finalization_controls(cfg)
     num_envs = int(cfg.task.num_envs)
     train_every = int(cfg.algo.train_every)
     total_frames = int(cfg.total_frames)
@@ -376,9 +577,34 @@ def bc_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
     if start_rollout < 0:
         raise ValueError("bc_dagger_resume_rollout_count must be non-negative")
     end_rollout = start_rollout + additional_rollouts
+    controller_end_rollout = end_rollout
+    pure_student_tail = 0
+    if inline is not None:
+        expected_rollouts = sum(
+            inline[name]
+            for name in (
+                "joint_iterations",
+                "perception_consolidation_iterations",
+                "actor_realignment_iterations",
+                "replay_q_calibration_iterations",
+            )
+        )
+        if start_rollout != 0 or additional_rollouts != expected_rollouts:
+            raise ValueError(
+                "inline BC-DAgger frame budget disagrees with its phase sum"
+            )
+        controller_end_rollout = inline["joint_iterations"]
+        pure_student_tail = (
+            inline["perception_consolidation_iterations"]
+            + inline["actor_realignment_iterations"]
+        )
     decay_rollouts = int(cfg.algo.dagger_beta_decay_rollouts)
     beta_zero_rollouts = (
-        max(end_rollout - max(start_rollout, decay_rollouts), 0)
+        max(
+            controller_end_rollout - max(start_rollout, decay_rollouts),
+            0,
+        )
+        + pure_student_tail
         if float(cfg.algo.dagger_beta_end) == 0.0
         else 0
     )
@@ -386,11 +612,16 @@ def bc_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
         "dagger_safe_zero_iteration", None
     )
     safe_zero_rollouts = (
-        max(end_rollout - max(start_rollout, safe_zero_iteration), 0)
+        max(
+            controller_end_rollout
+            - max(start_rollout, safe_zero_iteration),
+            0,
+        )
+        + pure_student_tail
         if safe_zero_iteration is not None
         else 0
     )
-    return {
+    schedule = {
         "frames_per_rollout": frames_per_rollout,
         "total_rollouts": additional_rollouts,
         "start_rollout": start_rollout,
@@ -399,10 +630,29 @@ def bc_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
         "beta_zero_rollouts": beta_zero_rollouts,
         "safe_zero_rollouts": safe_zero_rollouts,
     }
+    if inline is not None:
+        schedule.update(
+            {
+                "joint_rollouts": inline["joint_iterations"],
+                "perception_consolidation_rollouts": inline[
+                    "perception_consolidation_iterations"
+                ],
+                "actor_realignment_rollouts": inline[
+                    "actor_realignment_iterations"
+                ],
+                "replay_q_calibration_rollouts": inline[
+                    "replay_q_calibration_iterations"
+                ],
+                "tail_rollouts": additional_rollouts
+                - inline["joint_iterations"],
+            }
+        )
+    return schedule
 
 
 def validate_bc_dagger_config(cfg: DictConfig) -> None:
     apply_bc_dagger_iteration_controls(cfg)
+    inline = apply_inline_finalization_controls(cfg)
     algo_name = cfg.algo.get("name")
     if algo_name != EXPECTED_ALGO_NAME:
         raise ValueError(
@@ -471,6 +721,13 @@ def validate_bc_dagger_config(cfg: DictConfig) -> None:
             raise ValueError(
                 "bc_dagger_checkpoint cannot be combined with a teacher replay path"
             )
+    if inline is not None:
+        if not bool(cfg.algo.get("dagger_staging_enabled", False)):
+            raise ValueError("inline BC-DAgger staging backend is disabled")
+        if not bool(cfg.algo.get("dagger_stage_h5_final_only", False)):
+            raise ValueError("inline BC-DAgger requires final-only H5 output")
+        if not bool(cfg.algo.get("save_teacher_buffer", False)):
+            raise ValueError("inline BC-DAgger must create a final fresh H5")
     schedule = bc_dagger_rollout_schedule(cfg)
     if (
         control_mode in ("beta", "hybrid")
@@ -506,7 +763,10 @@ def validate_bc_dagger_config(cfg: DictConfig) -> None:
 
 @hydra.main(config_path=CONFIG_PATH, config_name="bc_dagger", version_base=None)
 def main(cfg: DictConfig):
+    inline = apply_inline_finalization_controls(cfg)
     apply_bc_dagger_iteration_controls(cfg)
+    if inline is not None:
+        prepare_inline_bc_dagger_source(cfg)
     resume = prepare_bc_dagger_checkpoint(cfg)
     validate_bc_dagger_config(cfg)
     schedule = bc_dagger_rollout_schedule(cfg)
@@ -542,6 +802,19 @@ def main(cfg: DictConfig):
             f"({schedule['frames_per_rollout']} frames each), "
             f"{control_schedule}"
         )
+        if inline is not None:
+            print(
+                "Inline finalization: "
+                f"joint={schedule['joint_rollouts']}, "
+                "pure-student perception="
+                f"{schedule['perception_consolidation_rollouts']}, "
+                "pure-student frozen-perception actor BC="
+                f"{schedule['actor_realignment_rollouts']}, "
+                f"Q calibration={schedule['replay_q_calibration_rollouts']} "
+                f"at teacher probability "
+                f"{inline['calibration_teacher_probability']:.3f}; "
+                "H5 is materialized only with checkpoint_final"
+            )
     else:
         print(
             "BC DAgger resume schedule: "

@@ -4,7 +4,7 @@ import h5py
 import pytest
 import torch
 from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from scripts import bc_dagger
 from scripts.train import run_training as shared_run_training
@@ -76,7 +76,42 @@ def _cfg(
         "bc_dagger_checkpoint": bc_dagger_checkpoint,
         "bc_dagger_copy_teacher_replay": copy_teacher_replay,
         "teacher_replay_buffer_path": teacher_replay_buffer_path,
+        # Legacy-focused fixtures opt out explicitly. Hydra's real dedicated
+        # config defaults this to true and is covered separately below.
+        "bc_dagger_inline_finalization": False,
+        "perception_consolidation_iterations": 0,
+        "actor_realignment_iterations": 0,
+        "replay_q_calibration_iterations": 1,
+        "calibration_teacher_probability": 0.5,
     })
+
+
+def _inline_cfg(
+    *,
+    joint_iterations=10,
+    perception_iterations=2,
+    actor_iterations=3,
+    calibration_iterations=4,
+    teacher_probability=0.5,
+    enabled=True,
+    **overrides,
+):
+    """Small inline-tail schedule without changing legacy resume fixtures."""
+    cfg = _cfg(
+        total_frames=1,
+        iterations=joint_iterations,
+        control_mode="beta",
+        beta_decay=joint_iterations,
+        beta_zero_iteration=joint_iterations,
+        **overrides,
+    )
+    with open_dict(cfg):
+        cfg.bc_dagger_inline_finalization = enabled
+        cfg.perception_consolidation_iterations = perception_iterations
+        cfg.actor_realignment_iterations = actor_iterations
+        cfg.replay_q_calibration_iterations = calibration_iterations
+        cfg.calibration_teacher_probability = teacher_probability
+    return cfg
 
 
 def _write_resume_checkpoint(
@@ -129,6 +164,34 @@ def _write_resume_checkpoint(
     return path
 
 
+def _write_fresh_ppo_checkpoint(path: Path, *, task_name="G1Skateboard"):
+    policy = {
+        "last_phase": "train",
+        "last_iter": 6000,
+        "actor": {},
+        "actor_adapt": {},
+        "encoder_priv": {},
+        "adapt_module": {},
+        "adapt_ema": {},
+        "critic": {},
+    }
+    source_cfg = OmegaConf.create(
+        {
+            "task": {"name": task_name},
+            "algo": {
+                "name": "ppo_vel",
+                "_target_": "active_adaptation.learning.ppo.ppo_vel.PPOVEL",
+                "phase": "train",
+                "use_object_adapt": False,
+            },
+        }
+    )
+    torch.save(
+        {"policy": policy, "vecnorm": {}, "cfg": source_cfg}, path
+    )
+    return path
+
+
 def test_bc_dagger_config_inherits_train_and_selects_dedicated_defaults():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(
@@ -161,16 +224,223 @@ def test_bc_dagger_config_inherits_train_and_selects_dedicated_defaults():
     assert cfg.algo.dagger_replay_raw_observations is True
     assert cfg.algo.teacher_buffer_capacity == 1_048_576
 
+    # The normal entrypoint owns its terminal cleanup now; the iteration
+    # values remain user-facing so a short ablation can disable an optional
+    # phase without switching to another script.
+    assert cfg.bc_dagger_inline_finalization is True
+    assert cfg.perception_consolidation_iterations == 0
+    assert cfg.actor_realignment_iterations == 50
+    assert cfg.replay_q_calibration_iterations == 128
+    assert 0.0 < cfg.calibration_teacher_probability < 1.0
+
+    bc_dagger.apply_inline_finalization_controls(cfg)
     schedule = bc_dagger.bc_dagger_rollout_schedule(cfg)
-    assert schedule == {
-        "frames_per_rollout": 16_384,
-        "total_rollouts": 2400,
-        "start_rollout": 0,
-        "end_rollout": 2400,
-        "decay_rollouts": 1800,
-        "beta_zero_rollouts": 600,
-        "safe_zero_rollouts": 0,
+    tail_rollouts = (
+        int(cfg.perception_consolidation_iterations)
+        + int(cfg.actor_realignment_iterations)
+        + int(cfg.replay_q_calibration_iterations)
+    )
+    assert schedule["frames_per_rollout"] == 16_384
+    assert schedule["joint_rollouts"] == 2400
+    assert schedule["tail_rollouts"] == tail_rollouts
+    assert schedule["total_rollouts"] == 2400 + tail_rollouts
+    assert schedule["start_rollout"] == 0
+    assert schedule["end_rollout"] == 2400 + tail_rollouts
+    assert schedule["decay_rollouts"] == 1800
+    assert schedule["beta_zero_rollouts"] >= 600
+    assert schedule["safe_zero_rollouts"] == 0
+    assert cfg.total_frames == (2400 + tail_rollouts) * 16_384
+
+
+def test_inline_finalization_maps_simple_surface_to_existing_staging_backend():
+    cfg = _inline_cfg()
+
+    controls = bc_dagger.apply_inline_finalization_controls(cfg)
+    schedule = bc_dagger.bc_dagger_rollout_schedule(cfg)
+    bc_dagger.validate_bc_dagger_config(cfg)
+
+    assert controls == {
+        "joint_iterations": 10,
+        "perception_consolidation_iterations": 2,
+        "actor_realignment_iterations": 3,
+        "replay_q_calibration_iterations": 4,
+        "calibration_teacher_probability": pytest.approx(0.5),
     }
+    assert cfg.algo.dagger_staging_enabled is True
+    assert cfg.algo.dagger_stage_joint_warmup_iterations == 10
+    assert cfg.algo.dagger_stage_cycles == 0
+    assert cfg.algo.dagger_stage_perception_iterations == 0
+    assert cfg.algo.dagger_stage_actor_iterations == 0
+    assert cfg.algo.dagger_stage_final_perception_iterations == 2
+    assert cfg.algo.dagger_stage_final_actor_iterations == 3
+    assert cfg.algo.dagger_stage_calibration_iterations == 4
+    assert cfg.algo.dagger_stage_calibration_control_mode == "beta"
+    assert cfg.algo.dagger_stage_calibration_teacher_probability == (
+        pytest.approx(0.5)
+    )
+    assert cfg.algo.dagger_stage_h5_final_only is True
+    assert schedule["joint_rollouts"] == 10
+    assert schedule["tail_rollouts"] == 9
+    assert schedule["total_rollouts"] == 19
+    assert schedule["start_rollout"] == 0
+    assert schedule["end_rollout"] == 19
+    assert cfg.total_frames == 19 * 512 * 32
+
+
+def test_disabling_inline_finalization_preserves_joint_only_legacy_schedule():
+    cfg = _inline_cfg(enabled=False)
+
+    controls = bc_dagger.apply_inline_finalization_controls(cfg)
+    schedule = bc_dagger.bc_dagger_rollout_schedule(cfg)
+
+    assert controls is None
+    assert schedule["total_rollouts"] == 10
+    assert schedule.get("joint_rollouts", 10) == 10
+    assert schedule.get("tail_rollouts", 0) == 0
+    assert cfg.total_frames == 10 * 512 * 32
+    assert not bool(cfg.algo.get("dagger_staging_enabled", False))
+
+
+@pytest.mark.parametrize(
+    ("perception_iterations", "actor_iterations", "expected_total"),
+    ((0, 0, 14), (2, 0, 16), (0, 3, 17)),
+)
+def test_inline_optional_supervised_tail_phases_may_be_skipped(
+    perception_iterations, actor_iterations, expected_total
+):
+    cfg = _inline_cfg(
+        perception_iterations=perception_iterations,
+        actor_iterations=actor_iterations,
+    )
+
+    bc_dagger.apply_inline_finalization_controls(cfg)
+    schedule = bc_dagger.bc_dagger_rollout_schedule(cfg)
+
+    assert cfg.algo.dagger_stage_final_perception_iterations == (
+        perception_iterations
+    )
+    assert cfg.algo.dagger_stage_final_actor_iterations == actor_iterations
+    assert schedule["total_rollouts"] == expected_total
+
+
+@pytest.mark.parametrize("explicit_joint_iterations", (False, True))
+def test_inline_control_application_and_schedule_are_idempotent(
+    explicit_joint_iterations,
+):
+    cfg = _inline_cfg(joint_iterations=10)
+    if not explicit_joint_iterations:
+        with open_dict(cfg):
+            cfg.bc_dagger_iterations = None
+            cfg.total_frames = 10 * 512 * 32
+
+    first = bc_dagger.apply_inline_finalization_controls(cfg)
+    first_total = int(cfg.total_frames)
+    second = bc_dagger.apply_inline_finalization_controls(cfg)
+    bc_dagger.apply_bc_dagger_iteration_controls(cfg)
+    schedule_a = bc_dagger.bc_dagger_rollout_schedule(cfg)
+    bc_dagger.validate_bc_dagger_config(cfg)
+    schedule_b = bc_dagger.bc_dagger_rollout_schedule(cfg)
+    bc_dagger.validate_bc_dagger_config(cfg)
+
+    assert first == second
+    assert first_total == 19 * 512 * 32
+    assert cfg.total_frames == first_total
+    assert schedule_a == schedule_b
+    assert schedule_a["joint_rollouts"] == 10
+    assert schedule_a["tail_rollouts"] == 9
+    assert schedule_a["total_rollouts"] == 19
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("perception_consolidation_iterations", -1, "non-negative"),
+        ("perception_consolidation_iterations", True, "non-negative"),
+        ("actor_realignment_iterations", -1, "non-negative"),
+        ("replay_q_calibration_iterations", 0, "positive"),
+        ("replay_q_calibration_iterations", True, "positive"),
+        ("calibration_teacher_probability", 0.0, "strictly between"),
+        ("calibration_teacher_probability", 1.0, "strictly between"),
+    ),
+)
+def test_inline_finalization_rejects_invalid_controls_before_training(
+    field, value, message
+):
+    cfg = _inline_cfg()
+    with open_dict(cfg):
+        cfg[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        bc_dagger.apply_inline_finalization_controls(cfg)
+
+
+def test_inline_finalization_rejects_same_stage_resume_before_h5_lookup():
+    cfg = _inline_cfg(
+        checkpoint=None,
+        bc_dagger_checkpoint="/does/not/need/to/exist.pt",
+    )
+
+    with pytest.raises(ValueError, match="inline finalization|resume"):
+        bc_dagger.apply_inline_finalization_controls(cfg)
+
+
+def test_inline_source_accepts_fresh_ppo_and_canonicalizes_runtime_flags(
+    tmp_path,
+):
+    checkpoint = _write_fresh_ppo_checkpoint(
+        tmp_path / "checkpoint_6000.pt"
+    )
+    cfg = _inline_cfg(checkpoint=str(checkpoint))
+
+    prepared = bc_dagger.prepare_inline_bc_dagger_source(cfg)
+
+    assert prepared == {
+        "path": str(checkpoint.resolve()),
+        "source_last_iter": 6000,
+    }
+    assert cfg.checkpoint_path == str(checkpoint.resolve())
+    assert cfg._bc_dagger_staging_source is True
+    assert cfg._bc_dagger_model_only_resume is False
+
+
+def test_inline_source_rejects_bc_checkpoint_through_generic_path(tmp_path):
+    checkpoint = _write_resume_checkpoint(tmp_path / "checkpoint_final.pt")
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    fresh = _write_fresh_ppo_checkpoint(tmp_path / "fresh.pt")
+    fresh_saved = torch.load(fresh, map_location="cpu", weights_only=False)
+    saved["cfg"] = fresh_saved["cfg"]
+    torch.save(saved, checkpoint)
+    cfg = _inline_cfg(checkpoint=str(checkpoint))
+
+    with pytest.raises(ValueError, match="fresh PPO teacher|resume"):
+        bc_dagger.prepare_inline_bc_dagger_source(cfg)
+
+
+def test_hydra_accepts_inline_tail_overrides_without_plus_prefix():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(
+        config_dir=str(config_dir), version_base=None
+    ):
+        cfg = compose(
+            config_name="bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "bc_dagger_iterations=10",
+                "perception_consolidation_iterations=2",
+                "actor_realignment_iterations=3",
+                "replay_q_calibration_iterations=4",
+                "calibration_teacher_probability=0.25",
+            ],
+        )
+
+    controls = bc_dagger.apply_inline_finalization_controls(cfg)
+
+    assert controls["joint_iterations"] == 10
+    assert controls["perception_consolidation_iterations"] == 2
+    assert controls["actor_realignment_iterations"] == 3
+    assert controls["replay_q_calibration_iterations"] == 4
+    assert controls["calibration_teacher_probability"] == pytest.approx(0.25)
+    assert cfg.total_frames == 19 * 512 * 32
 
 
 def test_hydra_accepts_iteration_and_teacher_zero_overrides_without_plus_prefix():
@@ -182,6 +452,7 @@ def test_hydra_accepts_iteration_and_teacher_zero_overrides_without_plus_prefix(
             config_name="bc_dagger",
             overrides=[
                 "task=G1/vaic/skateboard_stu",
+                "bc_dagger_inline_finalization=false",
                 "bc_dagger_iterations=1200",
                 "algo.dagger_control_mode=hybrid",
                 "algo.dagger_beta_zero_iteration=900",
@@ -335,6 +606,35 @@ def test_bc_dagger_entrypoint_reuses_shared_training_engine(monkeypatch):
 
     assert result == "shared-result"
     assert received == [cfg]
+
+
+def test_bc_dagger_main_installs_inline_tail_before_shared_training(monkeypatch):
+    cfg = _inline_cfg()
+    received = []
+    sources = []
+    monkeypatch.setattr(
+        bc_dagger,
+        "prepare_inline_bc_dagger_source",
+        lambda actual: sources.append(actual) or {"path": "/fresh/ppo.pt"},
+    )
+    monkeypatch.setattr(
+        bc_dagger,
+        "run_training",
+        lambda actual: received.append(actual) or "inline-result",
+    )
+
+    result = bc_dagger.main.__wrapped__(cfg)
+
+    assert result == "inline-result"
+    assert sources == [cfg]
+    assert received == [cfg]
+    assert cfg.algo.dagger_staging_enabled is True
+    assert cfg.algo.dagger_stage_joint_warmup_iterations == 10
+    assert cfg.algo.dagger_stage_final_perception_iterations == 2
+    assert cfg.algo.dagger_stage_final_actor_iterations == 3
+    assert cfg.algo.dagger_stage_calibration_iterations == 4
+    assert cfg.algo.dagger_stage_h5_final_only is True
+    assert cfg.total_frames == 19 * 512 * 32
 
 
 def test_iteration_controls_override_frames_and_name_beta_zero_index():

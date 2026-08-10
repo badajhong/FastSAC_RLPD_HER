@@ -262,10 +262,19 @@ python scripts/bc_dagger.py \
   bc_dagger_iterations=1200
 ```
 
-`bc_dagger_iterations` is the number of outer DAgger rollout/update iterations;
-the entrypoint derives the exact all-rank frame budget from `task.num_envs *
-algo.train_every * world_size`. To retain SafeDAgger while also decaying beta to zero at a
-specific cumulative DAgger/checkpoint index, use hybrid mode:
+`bc_dagger_iterations` is the number of joint actor/perception/Q rollout/update
+iterations. The default inline cleanup then appends `0` optional pure-student
+perception-only rollouts, `50` frozen-perception actor-realignment rollouts, and
+`128` frozen actor/perception Q-calibration rollouts. Thus the example executes
+1,378 rollouts in one process. The entrypoint derives the all-rank frame budget
+from `task.num_envs * algo.train_every * world_size`. To retain SafeDAgger while
+also decaying beta to zero at a specific joint-training index, use hybrid mode:
+
+The zero perception-cleanup default assumes joint training already has a long
+pure-student tail. Use `dagger_control_mode=beta` with beta reaching zero well
+before the joint boundary, or set `dagger_safe_zero_iteration` when using the
+safe/hybrid controller. Otherwise keep a positive
+`perception_consolidation_iterations` ablation.
 
 ```bash
 python scripts/bc_dagger.py \
@@ -322,22 +331,30 @@ teacher-executed and 50% student-executed transitions, independent of the
 control mode. Bellman targets sample the student's dedicated small-noise next
 action, but use effective alpha zero during this Q-only stage. There is no IQL
 V network.
-Only valid, actually teacher-executed transitions are exported to
-`teacher_replay_buffer.h5`; the learning replay still contains every executed
-teacher/student transition. Observations in this H5 are stored before VecNorm
-and normalized with the checkpoint's fixed statistics when sampled. The
-`fastsac_vel_finetune` loader accepts this paired DAgger schema; it transfers
-the BC actor and pretrained Q/Q-target weights before ordinary Stage-2 FastSAC
-begins.
+At the end of joint training, optional perception consolidation can freeze the
+actor and update the three perception paths on pure-student rollouts (default
+`0`). Actor realignment then clears stale replay, freezes perception, and
+applies only DAgger BC against the fixed final predicted representation
+(default `50`). At the Q-calibration
+boundary both learning FIFOs are cleared, actor/perception stay frozen, and
+beta is fixed to `calibration_teacher_probability` (default `0.5`). Only valid,
+actually teacher-executed calibration transitions are retained for export;
+the Q learning replay still contains both executed teacher and student
+transitions. Those teacher rows stay in the CPU FIFO during calibration, and
+`teacher_replay_buffer.h5` is materialized exactly once with
+`checkpoint_final`. Observations are stored before VecNorm and normalized with
+the checkpoint's fixed statistics when sampled. The `fastsac_vel_finetune`
+loader accepts this paired DAgger schema and transfers the BC actor and
+pretrained Q/Q-target weights before Stage-2 FastSAC begins.
 
-BC sampling projects the replay to only the actor observation and teacher
-label fields it consumes, and rollout transitions are staged into the learning
-FIFOs once per outer iteration. These are automatic training-throughput
-optimizations and do not change control decisions, sampled row IDs, optimizer
-updates, or batch sizes. Checkpoints whose teacher FIFO has not changed reuse
-the existing immutable H5. For fewer full H5 snapshots during SafeDAgger (where
-teacher interventions may continue), add `save_interval=500`; this changes only
-crash-recovery granularity, not learning.
+BC sampling projects the replay to only the actor observation and teacher label
+fields it consumes, and rollout transitions are staged into the learning FIFOs
+once per outer iteration. These are automatic training-throughput optimizations
+and do not change control decisions, sampled row IDs, optimizer updates, or
+batch sizes. Periodic inline checkpoints are model-only evaluation/debugging
+artifacts; only `checkpoint_final.pt` has final H5 lineage and is accepted by
+Stage 2. Set `bc_dagger_inline_finalization=false` only when deliberately using
+the legacy joint-only periodic-H5/resume contract.
 
 To test block-coordinate BC-DAgger from a fresh PPO teacher, use the staged
 entrypoint:
@@ -377,8 +394,8 @@ overridden, but `bc_dagger_iterations` must equal their exact sum. If
 `joint_warmup_iterations` changes, set `algo.dagger_beta_zero_iteration` to the
 same boundary as well.
 
-After a joint BC-DAgger run has converged, finalize its representation and
-replay/Q pair before Stage 2:
+For a legacy joint-only checkpoint, or to ablate the integrated schedule, the
+separate finalizer remains available:
 
 ```bash
 python scripts/bc_dagger_finalize.py \
@@ -585,6 +602,7 @@ resume argument:
 ```bash
 python scripts/bc_dagger.py \
   task=G1/vaic/skateboard_stu \
+  bc_dagger_inline_finalization=false \
   bc_dagger_checkpoint=/home/hcc/research/VAIC/outputs/2026-08-06/19-02-24-G1Skateboard-ppo_bc_dagger/wandb/latest-run/files/checkpoint_800.pt \
   bc_dagger_iterations=399
 ```

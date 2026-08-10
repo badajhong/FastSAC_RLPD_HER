@@ -10,15 +10,34 @@ defaults:
 # with 512 environments and train_every=32 (~5.88 s/rollout). SafeDAgger now
 # assigns control state-by-state for all 2,400 rollouts; the beta schedule below
 # remains available for beta/hybrid ablations. Wall time can still vary with
-# machine load and final H5/W&B I/O. Save a resumable model + replay snapshot
-# every 100 outer rollout iterations as well as at finalization.
+# machine load and final H5/W&B I/O. Save a model checkpoint every 100 outer
+# rollout iterations. With inline finalization enabled, only checkpoint_final
+# is paired with an H5 and is ready for Stage 2; partial checkpoints are for
+# evaluation/debugging and intentionally are not exact-resume sources.
 total_frames: 39_321_600
 # Optional, preferred iteration-facing budget. When set, the dedicated
 # entrypoint replaces total_frames with
 # bc_dagger_iterations * task.num_envs * algo.train_every * world_size, matching
-# train.py's global-frame convention. On same-stage resume this is the number of
-# additional iterations for the new process.
+# train.py's global-frame convention. With inline finalization this is the
+# joint-training budget; the perception/actor/Q tail below is appended. On
+# legacy same-stage resume this is the number of additional iterations.
 bc_dagger_iterations: null
+
+# Finish the ordinary joint BC-DAgger run inside this same process:
+#   joint actor+perception+Q
+#   -> pure-student perception consolidation with the actor frozen
+#   -> pure-student actor BC with all perception modules frozen
+#   -> beta=0.5 Q-only calibration with actor/perception frozen
+# The calibration teacher rows are retained in memory, then materialized to H5
+# exactly once when checkpoint_final is saved. Set this false to recover the
+# legacy joint-only schedule and periodic H5 snapshots/resume contract.
+# The zero perception default assumes joint training already contains a long
+# pure-student tail (for example beta control with beta_zero_iteration reached).
+bc_dagger_inline_finalization: true
+perception_consolidation_iterations: 0
+actor_realignment_iterations: 50
+replay_q_calibration_iterations: 128
+calibration_teacher_probability: 0.5
 save_interval: 100
 
 # Optional same-stage continuation checkpoint. Unlike checkpoint_path (which
@@ -29,7 +48,9 @@ save_interval: 100
 # and stage counters while deliberately leaving the previously exported
 # teacher_replay_buffer.h5 immutable. bc_dagger_iterations (when set) is the
 # number of *additional* iterations to run; otherwise total_frames remains the
-# additional global frame budget.
+# additional global frame budget. This legacy resume path requires
+# bc_dagger_inline_finalization=false because inline partial checkpoints have no
+# paired H5 by design.
 bc_dagger_checkpoint: null
 # Copy the compatible immutable H5 to the new Hydra output root, outside W&B's
 # watched files directory. This is a real independent copy (about 23 GiB for

@@ -4,9 +4,12 @@
 python scripts/bc_dagger.py \
   task=G1/vaic/skateboard_stu \
   checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
-  bc_dagger_iterations=3000 \
+  bc_dagger_iterations=10000 \
   algo.dagger_control_mode=beta \
-  algo.dagger_beta_zero_iteration=500
+  algo.dagger_beta_zero_iteration=500 \
+  perception_consolidation_iterations=200 \
+  actor_realignment_iterations=200 \
+  replay_q_calibration_iterations=600
 
 # SafeDAgger
 python scripts/bc_dagger.py \
@@ -82,15 +85,15 @@ python scripts/train.py \
 python scripts/train.py \
   algo=fastsac_vel_finetune \
   task=G1/vaic/skateboard_stu \
-  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-10/03-47-49-G1Skateboard-stage_bc_dagger/wandb/latest-run/files/checkpoint_final.pt \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-09/07-52-44-G1Skateboard-bc_dagger_finalize/wandb/latest-run/files/checkpoint_final.pt \
   algo.sac_finetune_actor_objective=sac \
-  algo.sac_actor_confidence_gate=false \
+  algo.sac_actor_confidence_gate=true \
   algo.sac_use_autotune=true \
-  algo.sac_actor_learning_starts_finetune_iteration=128 \
+  algo.sac_actor_learning_starts_finetune_iteration=null \
   algo.sac_updates_per_env_step=2 \
-  algo.sac_policy_frequency=256 \
-  algo.sac_actor_lr=1e-7 \
-  algo.sac_actor_log_std_lr=3e-4 \
+  algo.sac_policy_frequency=64 \
+  algo.sac_actor_lr=3e-7 \
+  algo.sac_actor_log_std_lr=1e-4 \
   algo.sac_bc_anchor_coef_start=0.0 \
   algo.sac_bc_anchor_coef_end=0.0 \
   total_frames=57344000 \
