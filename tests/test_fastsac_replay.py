@@ -132,7 +132,7 @@ def test_teacher_replay_capacity_is_262144():
     cfg = FastSACVelConfig()
     assert cfg.teacher_buffer_capacity == 262_144
     assert cfg.teacher_training_replay_device == "policy"
-    assert cfg.sac_updates_per_env_step == 4
+    assert not hasattr(cfg, "sac_updates_per_env_step")
     assert cfg.sac_teacher_updates_per_env_step == 4
     assert cfg.sac_teacher_n_steps == 1
     assert cfg.sac_teacher_actor_objective == "sac"

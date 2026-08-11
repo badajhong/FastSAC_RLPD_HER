@@ -1,4 +1,10 @@
-# bc_dagger 
+# RL_DAgger
+nohup python scripts/rl_bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
+  bc_dagger_iterations=6000 \
+  algo.dagger_control_mode=beta
+  > bc_dagger_nohup.log 2>&1 &
 
 # DAgger
 nohup python scripts/bc_dagger.py \
@@ -86,22 +92,34 @@ python scripts/train.py \
 python scripts/train.py \
   algo=fastsac_vel_finetune \
   task=G1/vaic/skateboard_stu \
-  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-09/07-52-44-G1Skateboard-bc_dagger_finalize/wandb/latest-run/files/checkpoint_final.pt \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-10/18-09-58-G1Skateboard-ppo_bc_dagger/wandb/latest-run/files/checkpoint_final.pt \
   algo.sac_finetune_actor_objective=sac \
   algo.sac_actor_confidence_gate=false \
   algo.sac_use_autotune=true \
-  algo.load_pretrained_q=false \
-  algo.q_action_fusion=late \
-  algo.sac_q_action_input_gain=1.0 \
   algo.sac_stage2_initial_action_std=0.05 \
-  algo.sac_actor_learning_starts_finetune_iteration=null \
-  algo.sac_actor_learning_starts_q_updates=20000 \
-  algo.sac_updates_per_env_step=2 \
-  algo.sac_policy_frequency=64 \
-  algo.sac_actor_lr=3e-7 \
+  algo.sac_actor_learning_starts_finetune_iteration=0 \
+  algo.sac_batch_size=64 \
+  algo.sac_updates_per_env_step=1 \
+  algo.sac_policy_frequency=1 \
+  algo.sac_actor_lr=1e-7 \
   algo.sac_actor_log_std_lr=1e-4 \
-  algo.sac_bc_anchor_coef_start=0.0 \
-  algo.sac_bc_anchor_coef_end=0.0 \
+  save_interval=100
+
+python scripts/train.py \
+  algo=fastsac_vel_finetune \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-10/18-09-58-G1Skateboard-ppo_bc_dagger/wandb/latest-run/files/checkpoint_final.pt \
+  algo.sac_finetune_actor_objective=sac \
+  algo.sac_actor_confidence_gate=false \
+  algo.sac_use_autotune=true \
+  algo.sac_stage2_initial_action_std=0.05 \
+  algo.sac_actor_learning_starts_finetune_iteration=0 \
+  algo.sac_batch_size=64 \
+  algo.train_every=1 \
+  algo.sac_updates_per_env_step=1 \
+  algo.sac_policy_frequency=1 \
+  algo.sac_actor_lr=1e-7 \
+  algo.sac_actor_log_std_lr=1e-4 \
   total_frames=57344000 \
   save_interval=100 \
   seed=0

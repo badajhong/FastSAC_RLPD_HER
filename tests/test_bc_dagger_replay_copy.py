@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import stat
 from pathlib import Path
@@ -12,14 +13,79 @@ from scripts import bc_dagger
 from scripts import helpers as helpers_module
 
 
+_EXECUTION_PAYLOAD = {
+    "semantics": "bounded_policy_and_replay_command_support_v1",
+    "source": "scalar_dagger_safety_envelope",
+    "joint_names": ["joint_a", "joint_b"],
+    "action_low": [-20.0, -20.0],
+    "action_high": [20.0, 20.0],
+}
+_Q_TRANSFORM_PAYLOAD = {
+    "semantics": "affine_nominal_joint_coordinates_unclipped_then_fixed_gain_v3",
+    "source": "soft_joint_limits_at_default_pose",
+    "joint_names": ["joint_a", "joint_b"],
+    "action_center": [0.0, 1.0],
+    "action_scale": [2.0, 2.0],
+    "clamp": None,
+}
+_ENTROPY_PAYLOAD = {
+    "semantics": "nominal_joint_action_density_coordinates_v1",
+    "source": "nominal_joint_action_coordinates",
+    "joint_names": ["joint_a", "joint_b"],
+    "action_scale": [2.0, 2.0],
+}
+
+
+def _sha256(payload):
+    return "sha256:" + hashlib.sha256(json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+_ACTION_CONTRACT_PAYLOAD = {
+    "semantics": bc_dagger.EXPECTED_ACTION_CONTRACT_SEMANTICS,
+    "action_bound_source": "scalar_dagger_safety_envelope",
+    "execution_support_semantics": _EXECUTION_PAYLOAD["semantics"],
+    "execution_support_fingerprint": _sha256(_EXECUTION_PAYLOAD),
+    "joint_names": ["joint_a", "joint_b"],
+    "action_low": [-20.0, -20.0],
+    "action_high": [20.0, 20.0],
+    "action_center": [0.0, 0.0],
+    "action_scale": [20.0, 20.0],
+    "q_action_coordinate_source": "soft_joint_limits_at_default_pose",
+    "nominal_action_low": [-2.0, -1.0],
+    "nominal_action_high": [2.0, 3.0],
+    "q_action_center": [0.0, 1.0],
+    "q_action_scale": [2.0, 2.0],
+    "q_action_clamp": None,
+    "q_action_transform_semantics": _Q_TRANSFORM_PAYLOAD["semantics"],
+    "q_action_transform_fingerprint": _sha256(_Q_TRANSFORM_PAYLOAD),
+    "entropy_reference_source": "nominal_joint_action_coordinates",
+    "entropy_reference_scale": [2.0, 2.0],
+    "entropy_reference_semantics": _ENTROPY_PAYLOAD["semantics"],
+    "entropy_reference_fingerprint": _sha256(_ENTROPY_PAYLOAD),
+    "joint_offset_low": [0.0, 0.0],
+    "joint_offset_high": [0.0, 0.0],
+}
+ACTION_CONTRACT = {
+    **_ACTION_CONTRACT_PAYLOAD,
+    "fingerprint": _sha256(_ACTION_CONTRACT_PAYLOAD),
+}
+
 REPLAY_LINEAGE = {
-    "format": "vaic_bc_dagger_teacher_replay",
-    "format_version": 2,
+    "format": bc_dagger.EXPECTED_REPLAY_FORMAT,
+    "format_version": bc_dagger.EXPECTED_REPLAY_FORMAT_VERSION,
     "replay_id": "frozen-replay-id",
     "dagger_control_semantics": bc_dagger.EXPECTED_CONTROL_SEMANTICS,
-    "replay_observation_semantics": "raw_pre_vecnorm_v1",
+    "replay_observation_semantics": "raw_pre_vecnorm_sample_current_v1",
     "vecnorm_fingerprint": "sha256:" + "a" * 64,
+    "actor_backend": bc_dagger.EXPECTED_ACTOR_BACKEND,
+    "action_parameterization": bc_dagger.EXPECTED_ACTION_PARAMETERIZATION,
     "action_clip": 20.0,
+    "action_contract": ACTION_CONTRACT,
 }
 
 
@@ -30,9 +96,21 @@ def _write_resume_checkpoint(path: Path) -> Path:
     }
     policy = {
         "training_algorithm": bc_dagger.EXPECTED_TRAINING_ALGORITHM,
+        "actor_backend": bc_dagger.EXPECTED_ACTOR_BACKEND,
         "critic_learning_semantics": bc_dagger.EXPECTED_CRITIC_SEMANTICS,
         "dagger_control_semantics": bc_dagger.EXPECTED_CONTROL_SEMANTICS,
-        "q_backend_config": {},
+        "action_contract": ACTION_CONTRACT,
+        "dagger_backend_config": {
+            "dagger_action_clip": 20.0,
+            "fresh_ppo_actor_initialization_semantics": (
+                bc_dagger.EXPECTED_FRESH_ACTOR_INITIALIZATION_SEMANTICS
+            ),
+        },
+        "q_backend_config": {
+            "q_action_transform_fingerprint": ACTION_CONTRACT[
+                "q_action_transform_fingerprint"
+            ]
+        },
         "actor_adapt": {},
         "bc_dagger_sac_adapter": {},
         "qnet": {},
@@ -55,7 +133,11 @@ def _write_resume_checkpoint(path: Path) -> Path:
 def _write_teacher_replay(path: Path, payload=b"offline-transitions") -> Path:
     with h5py.File(path, "w") as replay:
         for key, value in REPLAY_LINEAGE.items():
-            replay.attrs[key] = value
+            replay.attrs[key] = (
+                json.dumps(value, sort_keys=True, separators=(",", ":"))
+                if key == "action_contract"
+                else value
+            )
         replay.create_dataset("payload", data=list(payload), dtype="u1")
     return path
 
@@ -243,6 +325,17 @@ def test_enabled_resume_copy_rejects_replay_with_different_action_clip(
     cfg = _resume_cfg(checkpoint)
 
     with pytest.raises(ValueError, match="action_clip.*does not match"):
+        bc_dagger.prepare_bc_dagger_checkpoint(cfg)
+
+
+def test_enabled_resume_copy_requires_executable_action_contract(tmp_path):
+    checkpoint = _write_resume_checkpoint(tmp_path / "checkpoint_800.pt")
+    source = _write_teacher_replay(tmp_path / "teacher_replay_buffer.h5")
+    with h5py.File(source, "r+") as replay:
+        del replay.attrs["action_contract"]
+    cfg = _resume_cfg(checkpoint)
+
+    with pytest.raises(ValueError, match="missing.*action_contract"):
         bc_dagger.prepare_bc_dagger_checkpoint(cfg)
 
 

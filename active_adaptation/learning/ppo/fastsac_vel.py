@@ -70,21 +70,26 @@ TEACHER_REPLAY_MIN_STEP_COUNT = 1
 STUDENT_REPLAY_MIN_STEP_COUNT = 5
 FASTSAC_ACTOR_BACKEND = "vaic_fastsac_tanh_gaussian_v2"
 BC_DAGGER_TRAINING_ALGORITHM = (
-    "vaic_ppo_bc_dagger_student_sac_critic_v3"
+    "vaic_ppo_bc_dagger_student_sac_critic_v6"
 )
 BC_DAGGER_IQL_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_iql_v2"
 BC_DAGGER_LEGACY_TRAINING_ALGORITHM = "vaic_ppo_bc_dagger_student_v1"
-BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_independent_normal_bc_dagger_v1"
+BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_latent_tanh_bc_dagger_v4"
 BC_DAGGER_IQL_CRITIC_SEMANTICS = (
     "dataset_action_target_twin_expected_c51_expectile_v_to_scalar_td_"
     "c51_projection_v1"
 )
 BC_DAGGER_SAC_CRITIC_SEMANTICS = (
-    "beta_independent_half_teacher_half_student_executed_action_"
-    "stochastic_student_q_only_c51_clipped_double_q_v1"
+    "beta_independent_half_teacher_half_student_safety_envelope_action_"
+    "unclipped_nominal_joint_q_coordinates_bc_centered_bounded_residual_"
+    "stochastic_student_q_only_c51_clipped_double_q_v5"
 )
 BC_DAGGER_ACTOR_LEARNING_SEMANTICS = (
-    "dagger_teacher_huber_bc_only_no_q_or_advantage_weighting_v1"
+    "dagger_safety_envelope_inverse_tanh_latent_huber_bc_only_"
+    "no_q_or_advantage_weighting_v3"
+)
+BC_DAGGER_FRESH_ACTOR_INITIALIZATION_SEMANTICS = (
+    "physical_absolute_head_safety_tanh_linearized_at_zero_v2"
 )
 BC_DAGGER_STAGING_SEMANTICS = (
     "joint_then_cyclic_perception_actor_then_final_perception_actor_"
@@ -97,13 +102,13 @@ BC_DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS = (
     "h5_materialized_once_at_completed_final_checkpoint_v1"
 )
 BC_DAGGER_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
-BC_DAGGER_REPLAY_FORMAT_VERSION = 2
+BC_DAGGER_REPLAY_FORMAT_VERSION = 5
 BC_DAGGER_LEGACY_REPLAY_FORMAT_VERSION = 1
 BC_DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS = (
     "normalized_frozen_vecnorm_v1"
 )
 BC_DAGGER_REPLAY_OBSERVATION_SEMANTICS = REPLAY_OBSERVATION_SEMANTICS
-FASTSAC_BC_DAGGER_ACTOR_BACKEND = "vaic_fastsac_bc_dagger_adapter_v2"
+FASTSAC_BC_DAGGER_ACTOR_BACKEND = "vaic_fastsac_bc_dagger_adapter_v6"
 FASTSAC_BC_DAGGER_LEGACY_ACTOR_BACKEND = (
     "vaic_fastsac_bc_dagger_adapter_v1"
 )
@@ -123,7 +128,7 @@ STAGE2_BEHAVIOR_MAX_ABS_DEVIATION_KEY = (
 def _validate_complete_bc_dagger_staging_source(state_dict) -> None:
     """Reject incomplete or internally inconsistent staged BC sources.
 
-    Staged checkpoints deliberately retain the ordinary v3 BC-DAgger
+    Staged checkpoints deliberately retain the ordinary v6 BC-DAgger
     training-algorithm marker so their final actor/Q contract remains directly
     transferable.  The explicit staging state is therefore the only reliable
     boundary between an evaluation-only intermediate checkpoint and the final
@@ -323,10 +328,19 @@ FASTSAC_TARGET_ENTROPY_SEMANTICS = (
     "normalized_tanh_action_log_prob_target_v3"
 )
 FASTSAC_BC_DAGGER_TARGET_ENTROPY_SEMANTICS = (
-    "fixed_raw_action_reference_scale_log_prob_target_v1"
+    "nominal_joint_scale_reference_log_prob_target_v2"
 )
 FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS = (
-    "affine_executable_to_unit_box_then_fixed_gain_v2"
+    "affine_nominal_joint_coordinates_unclipped_then_fixed_gain_v3"
+)
+FASTSAC_ACTION_CONTRACT_SEMANTICS = (
+    "separate_execution_support_q_and_entropy_coordinates_v2"
+)
+FASTSAC_EXECUTION_SUPPORT_SEMANTICS = (
+    "bounded_policy_and_replay_command_support_v1"
+)
+FASTSAC_ENTROPY_REFERENCE_SEMANTICS = (
+    "nominal_joint_action_density_coordinates_v1"
 )
 FASTSAC_Q_RAW_ACTION_SEMANTICS = (
     "executable_action_coordinates_then_fixed_gain_v2"
@@ -822,11 +836,12 @@ class FastSACTanhNormal(TanhNormal):
     def mean(self):
         # TanhNormal has no analytic expectation. HOI uses tanh(mu) for
         # deterministic inference, which is also the quantity distilled by VAIC.
-        return self.deterministic_sample
+        sample = self.deterministic_sample
+        return torch.maximum(torch.minimum(sample, self.high), self.low)
 
     @property
     def mode(self):
-        return self.deterministic_sample
+        return self.mean
 
     def entropy(self):
         # The squashed distribution has no analytic entropy. FastSAC itself
@@ -862,6 +877,12 @@ class FastSACTanhNormal(TanhNormal):
         action_scale = (self.high - self.low) * 0.5
         action_bias = (self.high + self.low) * 0.5
         action = tanh_action * action_scale + action_bias
+        # Float32 affine reconstruction can overshoot an asymmetric endpoint by
+        # one ULP even though tanh_action is inside [-1, 1]. Keep the executed,
+        # replayed, and Q action inside the exact serialized contract. Log-prob
+        # remains that of the pre-clamp latent; this guard changes at most a
+        # floating-point rounding unit.
+        action = torch.maximum(torch.minimum(action, self.high), self.low)
 
         # Stable equivalent of log(1 - tanh(raw_action) ** 2).  Unlike the
         # literal expression, this keeps a useful gradient at saturated logits.
@@ -943,6 +964,132 @@ def _fastsac_action_center_to_latent(
     return torch.atanh(center_normalized)
 
 
+def _sanitize_fastsac_latent(
+    latent: torch.Tensor,
+    reference_eps: float = FASTSAC_REFERENCE_EPS,
+) -> torch.Tensor:
+    """Make a policy latent finite without clipping any finite actor output.
+
+    A finite latent is already safe because the shared tanh/affine transform
+    maps the complete real line into executable support.  NaN is mapped to the
+    interval centre and infinities to the largest finite inward coordinate used
+    by the inverse transform.  This is only a numerical-failure guard; unlike
+    the old ``+-20`` action clamp it does not define actor or Q coordinates.
+    """
+    if not torch.is_floating_point(latent):
+        raise TypeError("FastSAC policy latent must be floating point")
+    reference_eps = float(reference_eps)
+    if not math.isfinite(reference_eps) or not 0.0 < reference_eps < 1.0:
+        raise ValueError("FastSAC latent reference epsilon must be in (0, 1)")
+    inward_limit = math.atanh(1.0 - reference_eps)
+    return torch.nan_to_num(
+        latent,
+        nan=0.0,
+        posinf=inward_limit,
+        neginf=-inward_limit,
+    )
+
+
+def _fastsac_latent_to_action(
+    latent: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    reference_eps: float = FASTSAC_REFERENCE_EPS,
+) -> torch.Tensor:
+    """Map an unconstrained actor latent into per-joint executable actions."""
+    action_low = torch.as_tensor(
+        action_low, device=latent.device, dtype=latent.dtype
+    )
+    action_high = torch.as_tensor(
+        action_high, device=latent.device, dtype=latent.dtype
+    )
+    if action_low.ndim != 1 or action_high.shape != action_low.shape:
+        raise ValueError("executable action bounds must be matching vectors")
+    if latent.shape[-1] != action_low.numel():
+        raise ValueError("policy latent dimension does not match action bounds")
+    if not torch.isfinite(action_low).all() or not torch.isfinite(
+        action_high
+    ).all():
+        raise ValueError("executable action bounds must be finite")
+    if not torch.all(action_high > action_low):
+        raise ValueError("executable action high must exceed low joint-wise")
+    finite_latent = _sanitize_fastsac_latent(latent, reference_eps)
+    action_scale = (action_high - action_low) * 0.5
+    action_bias = (action_high + action_low) * 0.5
+    action = torch.tanh(finite_latent) * action_scale + action_bias
+    # Affine reconstruction can overshoot an asymmetric endpoint by one ULP.
+    # Keep the actual environment/replay value inside the exact contract.
+    return torch.maximum(torch.minimum(action, action_high), action_low)
+
+
+def _fastsac_bc_residual_support(
+    anchor_action: torch.Tensor,
+    nominal_half_range: torch.Tensor,
+    execution_low: torch.Tensor,
+    execution_high: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return a safe, state-dependent support around a frozen BC action.
+
+    Stage 2 learns a residual relative to the frozen BC latent rather than an
+    unconstrained absolute replacement.  At residual zero the policy is exactly
+    the BC behavior.  Each joint can move by at most one nominal joint half
+    range, further reduced only when required to remain inside the serialized
+    execution envelope.
+    """
+    nominal_half_range = torch.as_tensor(
+        nominal_half_range,
+        device=anchor_action.device,
+        dtype=anchor_action.dtype,
+    )
+    execution_low = torch.as_tensor(
+        execution_low, device=anchor_action.device, dtype=anchor_action.dtype
+    )
+    execution_high = torch.as_tensor(
+        execution_high, device=anchor_action.device, dtype=anchor_action.dtype
+    )
+    expected = (anchor_action.shape[-1],)
+    for name, value in (
+        ("nominal_half_range", nominal_half_range),
+        ("execution_low", execution_low),
+        ("execution_high", execution_high),
+    ):
+        if value.shape != expected:
+            raise ValueError(
+                f"BC residual {name} must match the action dimension"
+            )
+    if not torch.isfinite(anchor_action).all():
+        raise RuntimeError("Frozen BC anchor action contains non-finite values")
+    if not torch.isfinite(nominal_half_range).all() or not torch.all(
+        nominal_half_range > 0
+    ):
+        raise ValueError("BC residual nominal half-ranges must be positive")
+    if not torch.all(execution_high > execution_low):
+        raise ValueError("BC residual execution support has non-positive width")
+
+    # The affine-tanh actor is theoretically open at both endpoints, but a
+    # float32 reconstruction may round onto one. Move only that numerical edge
+    # inward so the residual distribution remains bijective and finite.
+    inward = (execution_high - execution_low) * FASTSAC_REFERENCE_EPS
+    safe_anchor = torch.maximum(
+        torch.minimum(anchor_action, execution_high - inward),
+        execution_low + inward,
+    )
+    available_room = torch.minimum(
+        safe_anchor - execution_low,
+        execution_high - safe_anchor,
+    )
+    residual_radius = torch.minimum(nominal_half_range, available_room)
+    if not torch.isfinite(residual_radius).all() or not torch.all(
+        residual_radius > 0
+    ):
+        raise RuntimeError("BC residual action support collapsed at an endpoint")
+    return (
+        safe_anchor - residual_radius,
+        safe_anchor + residual_radius,
+        residual_radius,
+    )
+
+
 def _fastsac_target_entropy(
     action_low: torch.Tensor,
     action_high: torch.Tensor,
@@ -968,6 +1115,305 @@ def _fastsac_target_entropy(
             "FastSAC target_entropy_ratio must be finite and non-negative"
         )
     return float(-action_low.numel() * target_entropy_ratio)
+
+
+def _vaic_nominal_action_coordinates(env, device):
+    """Return joint-wise nominal raw-action coordinates for VAIC control.
+
+    ``JointPosition`` executes ``default + randomized_offset + scale * action``.
+    Map the soft joint-limit interval through the task's default-pose affine
+    control law. These values are a physically meaningful, episode-invariant
+    *coordinate scale* for Q inputs and entropy density; randomized per-episode
+    offsets are serialized as provenance but do not move this coordinate
+    system. They are not an environment clamp. In particular, PPO commands
+    outside this nominal interval are still executed through PD/effort
+    saturation.
+    """
+    device = torch.device(device)
+    manager = env.action_manager
+    joint_ids = torch.as_tensor(
+        manager.joint_ids, device=device, dtype=torch.long
+    )
+    limits = manager.asset.data.soft_joint_pos_limits[
+        0, joint_ids
+    ].detach().to(device, torch.float32)
+    default = manager.default_joint_pos[
+        0, joint_ids
+    ].detach().to(device, torch.float32)
+    scaling = manager.action_scaling.detach().to(device, torch.float32)
+    if scaling.shape != default.shape or not torch.all(scaling > 0):
+        raise ValueError(
+            "VAIC nominal action coordinates require one strictly positive "
+            "scale per joint"
+        )
+
+    offset_low = torch.zeros_like(default)
+    offset_high = torch.zeros_like(default)
+    randomizations = getattr(env, "randomizations", {})
+    offset_randomizer = (
+        randomizations.get("random_joint_offset")
+        if hasattr(randomizations, "get")
+        else None
+    )
+    if offset_randomizer is not None:
+        random_joint_ids = torch.as_tensor(
+            offset_randomizer.joint_ids, dtype=torch.long
+        ).detach().cpu().tolist()
+        random_ranges = torch.as_tensor(
+            offset_randomizer.offset_range,
+            device=device,
+            dtype=torch.float32,
+        )
+        if random_ranges.ndim == 3:
+            configured_low = random_ranges.amin(dim=(0, 2))
+            configured_high = random_ranges.amax(dim=(0, 2))
+        elif random_ranges.ndim == 2:
+            configured_low = random_ranges.amin(dim=1)
+            configured_high = random_ranges.amax(dim=1)
+        else:
+            raise ValueError(
+                "random_joint_offset range must have shape [J, 2] or [N, J, 2]"
+            )
+        if configured_low.numel() != len(random_joint_ids):
+            raise ValueError(
+                "random_joint_offset joint ids and configured ranges disagree"
+            )
+        range_by_joint = {
+            int(asset_joint_id): (configured_low[index], configured_high[index])
+            for index, asset_joint_id in enumerate(random_joint_ids)
+        }
+        for index, asset_joint_id in enumerate(
+            joint_ids.detach().cpu().tolist()
+        ):
+            if asset_joint_id in range_by_joint:
+                low, high = range_by_joint[asset_joint_id]
+                offset_low[index] = low
+                offset_high[index] = high
+
+    action_low = (limits[:, 0] - default) / scaling
+    action_high = (limits[:, 1] - default) / scaling
+    if not torch.isfinite(action_low).all() or not torch.isfinite(action_high).all():
+        raise ValueError(
+            "VAIC joint limits produced non-finite nominal action coordinates"
+        )
+    if not torch.all(action_high > action_low):
+        raise ValueError(
+            "VAIC joint limits produced an empty nominal action interval"
+        )
+    if not torch.all((action_low < 0.0) & (action_high > 0.0)):
+        raise ValueError(
+            "VAIC raw action zero must be strictly inside every nominal joint "
+            "interval at the task default pose"
+        )
+    return action_low, action_high, offset_low, offset_high
+
+
+def _validate_action_safety_clip(action_low, action_high, safety_clip: float):
+    """Require the scalar execution envelope to contain declared bounds."""
+    action_low = torch.as_tensor(action_low)
+    action_high = torch.as_tensor(action_high)
+    safety_clip = float(safety_clip)
+    if not math.isfinite(safety_clip) or safety_clip <= 0.0:
+        raise ValueError("action safety clip must be finite and positive")
+    if action_low.ndim != 1 or action_high.shape != action_low.shape:
+        raise ValueError("declared action bounds must be matching vectors")
+    if not torch.isfinite(action_low).all() or not torch.isfinite(action_high).all():
+        raise ValueError("declared action bounds must be finite")
+    if not torch.all(action_high > action_low):
+        raise ValueError("declared action upper bounds must exceed lower bounds")
+    support_max = torch.maximum(action_low.abs(), action_high.abs()).amax().item()
+    if safety_clip < support_max:
+        raise ValueError(
+            "action safety envelope must contain every declared joint bound: "
+            f"clip={safety_clip}, required>={support_max}"
+        )
+
+
+def _vaic_action_contract_metadata(
+    joint_names,
+    nominal_action_low,
+    nominal_action_high,
+    offset_low,
+    offset_high,
+    *,
+    execution_action_low=None,
+    execution_action_high=None,
+    execution_support_source=None,
+):
+    """Serialize separately defined actor, Q, and entropy coordinates.
+
+    Native FastSAC uses the nominal soft-limit coordinates as its actor support.
+    The PPO-BC bridge instead keeps PPO's scalar safety envelope as actor support
+    while Q normalization and entropy density retain the joint-wise nominal
+    coordinates.  Keeping all three transforms in one fingerprint prevents a
+    checkpoint/H5 consumer from silently recombining incompatible coordinates.
+    """
+    nominal_action_low = torch.as_tensor(
+        nominal_action_low, dtype=torch.float32
+    ).detach().cpu()
+    nominal_action_high = torch.as_tensor(
+        nominal_action_high, dtype=torch.float32
+    ).detach().cpu()
+    if execution_action_low is None:
+        execution_action_low = nominal_action_low
+    if execution_action_high is None:
+        execution_action_high = nominal_action_high
+    action_low = torch.as_tensor(
+        execution_action_low, dtype=torch.float32
+    ).detach().cpu()
+    action_high = torch.as_tensor(
+        execution_action_high, dtype=torch.float32
+    ).detach().cpu()
+    offset_low = torch.as_tensor(offset_low, dtype=torch.float32).detach().cpu()
+    offset_high = torch.as_tensor(offset_high, dtype=torch.float32).detach().cpu()
+    joint_names = list(joint_names)
+    expected = (len(joint_names),)
+    for name, value in (
+        ("action_low", action_low),
+        ("action_high", action_high),
+        ("nominal_action_low", nominal_action_low),
+        ("nominal_action_high", nominal_action_high),
+        ("joint_offset_low", offset_low),
+        ("joint_offset_high", offset_high),
+    ):
+        if value.shape != expected:
+            raise ValueError(
+                f"{name} shape {tuple(value.shape)} does not match joint order {expected}"
+            )
+    center = (action_low + action_high) * 0.5
+    scale = (action_high - action_low) * 0.5
+    q_center = (nominal_action_low + nominal_action_high) * 0.5
+    q_scale = (nominal_action_high - nominal_action_low) * 0.5
+    if not torch.all(action_high > action_low):
+        raise ValueError("execution action support must have positive width")
+    if not torch.all(nominal_action_high > nominal_action_low):
+        raise ValueError("nominal Q action coordinates must have positive width")
+    if execution_support_source is None:
+        execution_support_source = "soft_joint_limits_at_default_pose"
+    def _fingerprint(value):
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    execution_payload = {
+        "semantics": FASTSAC_EXECUTION_SUPPORT_SEMANTICS,
+        "source": str(execution_support_source),
+        "joint_names": joint_names,
+        "action_low": action_low.tolist(),
+        "action_high": action_high.tolist(),
+    }
+    q_transform_payload = {
+        "semantics": FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS,
+        "source": "soft_joint_limits_at_default_pose",
+        "joint_names": joint_names,
+        "action_center": q_center.tolist(),
+        "action_scale": q_scale.tolist(),
+        "clamp": None,
+    }
+    entropy_payload = {
+        "semantics": FASTSAC_ENTROPY_REFERENCE_SEMANTICS,
+        "source": "nominal_joint_action_coordinates",
+        "joint_names": joint_names,
+        "action_scale": q_scale.tolist(),
+    }
+    payload = {
+        "semantics": FASTSAC_ACTION_CONTRACT_SEMANTICS,
+        "action_bound_source": str(execution_support_source),
+        "execution_support_semantics": FASTSAC_EXECUTION_SUPPORT_SEMANTICS,
+        "execution_support_fingerprint": _fingerprint(execution_payload),
+        "joint_names": joint_names,
+        "action_low": action_low.tolist(),
+        "action_high": action_high.tolist(),
+        "action_center": center.tolist(),
+        "action_scale": scale.tolist(),
+        "q_action_coordinate_source": (
+            "soft_joint_limits_at_default_pose"
+        ),
+        "nominal_action_low": nominal_action_low.tolist(),
+        "nominal_action_high": nominal_action_high.tolist(),
+        "q_action_center": q_center.tolist(),
+        "q_action_scale": q_scale.tolist(),
+        "q_action_clamp": None,
+        "q_action_transform_semantics": (
+            FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS
+        ),
+        "q_action_transform_fingerprint": _fingerprint(q_transform_payload),
+        "entropy_reference_source": "nominal_joint_action_coordinates",
+        "entropy_reference_scale": q_scale.tolist(),
+        "entropy_reference_semantics": FASTSAC_ENTROPY_REFERENCE_SEMANTICS,
+        "entropy_reference_fingerprint": _fingerprint(entropy_payload),
+        "joint_offset_low": offset_low.tolist(),
+        "joint_offset_high": offset_high.tolist(),
+    }
+    payload["fingerprint"] = _fingerprint(payload)
+    return payload
+
+
+def _validate_vaic_action_contract_metadata(action_contract, action_dim=None):
+    """Validate a serialized contract and return its executable bounds."""
+    if not isinstance(action_contract, dict):
+        raise ValueError("VAIC action contract must be a mapping")
+    required = (
+        "joint_names",
+        "action_low",
+        "action_high",
+        "nominal_action_low",
+        "nominal_action_high",
+        "joint_offset_low",
+        "joint_offset_high",
+    )
+    missing = [name for name in required if name not in action_contract]
+    if missing:
+        raise ValueError(f"VAIC action contract is missing fields: {missing}")
+    canonical = _vaic_action_contract_metadata(
+        action_contract["joint_names"],
+        action_contract["nominal_action_low"],
+        action_contract["nominal_action_high"],
+        action_contract["joint_offset_low"],
+        action_contract["joint_offset_high"],
+        execution_action_low=action_contract["action_low"],
+        execution_action_high=action_contract["action_high"],
+        execution_support_source=action_contract.get("action_bound_source"),
+    )
+    if action_contract != canonical:
+        raise ValueError(
+            "VAIC action contract contents or fingerprint are not canonical"
+        )
+    action_low = torch.as_tensor(canonical["action_low"], dtype=torch.float32)
+    action_high = torch.as_tensor(canonical["action_high"], dtype=torch.float32)
+    if action_dim is not None and action_low.shape != (int(action_dim),):
+        raise ValueError("VAIC action contract has the wrong action dimension")
+    return action_low, action_high
+
+
+def _project_to_execution_support(
+    action: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    safety_clip: float,
+) -> torch.Tensor:
+    """Sanitize a policy command into its serialized execution support."""
+    action_low = torch.as_tensor(
+        action_low, device=action.device, dtype=action.dtype
+    )
+    action_high = torch.as_tensor(
+        action_high, device=action.device, dtype=action.dtype
+    )
+    if action_low.ndim != 1 or action_high.shape != action_low.shape:
+        raise ValueError("execution support bounds must be matching vectors")
+    if action.shape[-1] != action_low.numel():
+        raise ValueError("action dimension does not match execution support")
+    guarded = torch.nan_to_num(
+        action,
+        nan=0.0,
+        posinf=float(safety_clip),
+        neginf=-float(safety_clip),
+    )
+    bounded = torch.maximum(torch.minimum(guarded, action_high), action_low)
+    # This final numerical guard is a no-op when support already equals the
+    # scalar safety envelope, and remains a last-resort guard for native actors.
+    return bounded.clamp(-float(safety_clip), float(safety_clip))
 
 
 def _measure_or_clip_grad_norm(parameters, max_norm: float) -> torch.Tensor:
@@ -3048,7 +3494,7 @@ class OfflineReplayH5:
 
 
 class BCDaggerOfflineReplayH5:
-    """Load raw-v2 or legacy normalized-v1 BC-DAgger data for Stage 2."""
+    """Load raw BC-DAgger data under the exact execution/Q contract."""
 
     def __init__(
         self,
@@ -3064,6 +3510,7 @@ class BCDaggerOfflineReplayH5:
         expected_critic_obs_keys=None,
         expected_vecnorm_fingerprint=None,
         expected_action_clip=None,
+        expected_action_contract=None,
         expected_replay_metadata=None,
     ):
         import h5py
@@ -3088,6 +3535,21 @@ class BCDaggerOfflineReplayH5:
                 raise ValueError(
                     "expected_action_clip must be finite and positive"
                 )
+        if expected_action_contract is not None:
+            expected_action_contract = copy.deepcopy(expected_action_contract)
+            expected_action_low, expected_action_high = (
+                _validate_vaic_action_contract_metadata(
+                    expected_action_contract, int(action_dim)
+                )
+            )
+            if expected_action_clip is not None:
+                _validate_action_safety_clip(
+                    expected_action_low,
+                    expected_action_high,
+                    expected_action_clip,
+                )
+        else:
+            expected_action_low = expected_action_high = None
         shapes = {
             "observations": (int(actor_dim),),
             "critic_observations": (int(critic_dim),),
@@ -3116,16 +3578,12 @@ class BCDaggerOfflineReplayH5:
                 BC_DAGGER_REPLAY_FORMAT_VERSION,
                 BC_DAGGER_REPLAY_OBSERVATION_SEMANTICS,
             )
-            legacy_schema = (
-                BC_DAGGER_LEGACY_REPLAY_FORMAT_VERSION,
-                BC_DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS,
-            )
-            if schema not in (raw_schema, legacy_schema):
+            if schema != raw_schema:
                 raise ValueError(
                     "Unsupported PPO-BC DAgger replay schema: "
                     f"version={version}, observations={observation_semantics!r}"
                 )
-            self.observations_pre_normalized = schema == legacy_schema
+            self.observations_pre_normalized = False
             actual_vecnorm_fingerprint = str(
                 replay.attrs.get("vecnorm_fingerprint", "")
             )
@@ -3152,18 +3610,30 @@ class BCDaggerOfflineReplayH5:
             ):
                 raise ValueError("BC-DAgger replay actor backend mismatch")
             replay_action_clip = replay.attrs.get("action_clip")
-            if (
-                expected_action_clip is not None
-                and replay_action_clip is not None
-                and not math.isclose(
-                    float(replay_action_clip),
-                    expected_action_clip,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
+            if replay_action_clip is None:
+                raise ValueError(
+                    "BC-DAgger replay is missing its final action safety clip"
                 )
+            replay_action_contract = json.loads(str(
+                replay.attrs.get("action_contract", "{}")
+            ))
+            replay_action_low, replay_action_high = (
+                _validate_vaic_action_contract_metadata(
+                    replay_action_contract, int(action_dim)
+                )
+            )
+            _validate_action_safety_clip(
+                replay_action_low,
+                replay_action_high,
+                float(replay_action_clip),
+            )
+            if (
+                expected_action_contract is not None
+                and replay_action_contract != expected_action_contract
             ):
                 raise ValueError(
-                    "BC-DAgger replay action clip does not match Stage 2"
+                    "BC-DAgger replay executable action contract does not match "
+                    "Stage 2"
                 )
             actor_keys = json.loads(str(
                 replay.attrs.get("actor_obs_keys", "[]")
@@ -3262,6 +3732,7 @@ class BCDaggerOfflineReplayH5:
                     None if replay_action_clip is None
                     else float(replay_action_clip)
                 ),
+                "action_contract": replay_action_contract,
                 "replay_id": actual_replay_metadata["replay_id"],
             }
             self.data = {}
@@ -3275,6 +3746,17 @@ class BCDaggerOfflineReplayH5:
                         raise ValueError(
                             f"BC-DAgger replay field {name!r} has shape "
                             f"{actual_shape}, expected {expected_shape}"
+                        )
+                    expected_dtype = np.dtype(
+                        np.bool_
+                        if dtypes[name] == torch.bool
+                        else np.float32
+                    )
+                    actual_dtype = np.dtype(replay[name].dtype)
+                    if actual_dtype != expected_dtype:
+                        raise ValueError(
+                            f"BC-DAgger replay field {name!r} has dtype "
+                            f"{actual_dtype}, expected {expected_dtype}"
                         )
                     self.data[name] = torch.empty(
                         (self.size, *shapes[name]),
@@ -3292,14 +3774,25 @@ class BCDaggerOfflineReplayH5:
                         host = torch.from_numpy(np.asarray(
                             replay[name][source : source + count]
                         ))
-                        if name == "actions" and expected_action_clip is not None:
+                        if name == "actions":
+                            validation_low = (
+                                expected_action_low
+                                if expected_action_low is not None
+                                else replay_action_low
+                            )
+                            validation_high = (
+                                expected_action_high
+                                if expected_action_high is not None
+                                else replay_action_high
+                            )
                             if (
                                 not torch.isfinite(host).all()
-                                or (host.abs() > expected_action_clip).any()
+                                or (host < validation_low).any()
+                                or (host > validation_high).any()
                             ):
                                 raise ValueError(
                                     "BC-DAgger replay contains an action outside "
-                                    "the Stage-2 actor/Q support"
+                                    "the Stage-2 execution safety-envelope support"
                                 )
                         self.data[name][
                             destination : destination + count
@@ -3554,10 +4047,8 @@ class FastSACVelConfig(PPOConfig):
     # skateboard run stayed far below it.
     sac_teacher_q_max_grad_norm: float = 0.0
     sac_teacher_actor_max_grad_norm: float = 1.0
-    # Stage-2 retains the original per-control-step RLPD update schedule.
     sac_learning_starts: int = 10
     sac_batch_size: int = 8192
-    sac_updates_per_env_step: int = 4
     sac_policy_frequency: int = 2
     sac_actor_lr: float = 3e-4
     sac_alpha_lr: float = 3e-4
@@ -3586,9 +4077,12 @@ class FastSACVelFinetuneConfig(FastSACVelConfig):
     # before beginning Q updates.  The actor and alpha have a second, longer
     # Q-update gate below.
     sac_learning_starts: int = 98_304
-    # Match one 512-row vector step with one replay minibatch by default.
+    # Total replay rows sampled per newly accepted online replay row. Unlike a
+    # minibatch count per vector-control step, this definition is invariant to
+    # both num_envs and sac_batch_size. With the default 50/50 replay mixture,
+    # total UTD=1 corresponds to 0.5 online rows redrawn per new online row.
     sac_batch_size: int = 512
-    sac_updates_per_env_step: int = 1
+    sac_update_to_data_ratio: float = 1.0
     q_lr: float = 3e-5
     sac_policy_frequency: int = 128
     sac_actor_lr: float = 3e-7
@@ -3603,8 +4097,9 @@ class FastSACVelFinetuneConfig(FastSACVelConfig):
     # value after actor release even when Q came from SAC-compatible DAgger.
     sac_alpha_init: float = 1e-5
     sac_alpha_ramp_q_updates: int = 20_000
-    # In the raw-action unit reference, the standard SAC target is -action_dim.
-    # The old ratio 4 compensated for the now-removed +log(20) clip offset.
+    # In explicit entropy-reference coordinates, the standard SAC target is
+    # -action_dim. BC sources use nominal joint scales, never the +/-20 actor
+    # envelope, as that density reference.
     sac_target_entropy_ratio: float = 1.0
     sac_tau: float = 0.001
     sac_max_grad_norm: float = 1.0
@@ -3637,29 +4132,24 @@ class FastSACVelFinetuneConfig(FastSACVelConfig):
     sac_actor_gate_disagreement_multiplier: float = 1.0
     sac_actor_gate_min_accept_fraction: float = 0.10
     sac_actor_gate_absolute_margin: float = 0.0
-    # A BC-DAgger source clips every executed teacher/student action to this
-    # symmetric raw-action support. scripts/helpers.py replaces the default
-    # with the exact checkpoint value before policy construction.
+    # BC actor/replay execution envelope. Q normalization and entropy density
+    # use separate nominal joint coordinates serialized in the source contract.
     sac_bc_action_clip: float = 20.0
-    # Entropy density coordinates are independent of the DAgger safety clip.
-    # A value of one means log pi is measured per raw-action unit rather than
-    # in the artificial [-sac_bc_action_clip, sac_bc_action_clip] unit box.
-    sac_entropy_reference_scale: float = 1.0
     # Dedicated Stage-2 exploration state. This is intentionally independent
     # of PPO Actor.actor_std, which pure DAgger BC never optimized or sampled.
     sac_bc_initial_action_std: float = 0.01
-    # Optional physical-action exploration reset applied exactly once when a
-    # BC-DAgger checkpoint is first transferred into Stage 2. ``None`` retains
-    # the checkpointed stochastic adapter bit-for-bit. A positive value lets an
-    # offline-to-online run deliberately start with broader support without
-    # mutating the BC-DAgger checkpoint contract; same-stage resumes restore the
-    # learned adapter and never reapply this reset.
+    # Optional centre-local physical-action exploration reset applied exactly
+    # once when a BC-DAgger checkpoint is first transferred into Stage 2.
+    # Internally latent_std=physical_std/safety_clip; away from latent zero the
+    # tanh Jacobian reduces the resulting physical std. ``None`` retains the
+    # checkpointed stochastic adapter bit-for-bit. Same-stage resumes restore
+    # the learned adapter and never reapply this reset.
     sac_stage2_initial_action_std: float | None = None
     sac_bc_log_std_min: float = -8.0
     sac_bc_log_std_max: float = -2.0
     # Training collection samples the same bounded distribution used by SAC so
     # online replay supports the actions queried by the critic and actor. Eval
-    # always executes the clipped BC/SAC mean. True is retained only as an
+    # always executes the bounded latent-tanh BC/SAC mean. True is retained as an
     # explicit deterministic behavior ablation.
     sac_deterministic_rollout: bool = False
     # Confidence gating, not an auxiliary BC regression loss, guards actor
@@ -3923,19 +4413,11 @@ def _validate_fastsac_finetune_config(cfg) -> None:
             "sac_actor_gate_absolute_margin must be finite and non-negative"
         )
     action_clip = float(cfg.sac_bc_action_clip)
-    entropy_reference_scale = float(cfg.sac_entropy_reference_scale)
     initial_action_std = float(cfg.sac_bc_initial_action_std)
     bc_log_std_min = float(cfg.sac_bc_log_std_min)
     bc_log_std_max = float(cfg.sac_bc_log_std_max)
     if not math.isfinite(action_clip) or action_clip <= 0.0:
         raise ValueError("sac_bc_action_clip must be finite and positive")
-    if (
-        not math.isfinite(entropy_reference_scale)
-        or entropy_reference_scale <= 0.0
-    ):
-        raise ValueError(
-            "sac_entropy_reference_scale must be finite and positive"
-        )
     if not math.isfinite(initial_action_std) or initial_action_std <= 0.0:
         raise ValueError(
             "sac_bc_initial_action_std must be finite and positive"
@@ -3948,12 +4430,8 @@ def _validate_fastsac_finetune_config(cfg) -> None:
         raise ValueError(
             "sac_bc_log_std_min and sac_bc_log_std_max must be finite and ordered"
         )
-    initial_log_std = math.log(initial_action_std / action_clip)
-    if not bc_log_std_min <= initial_log_std <= bc_log_std_max:
-        raise ValueError(
-            "sac_bc_initial_action_std maps outside the dedicated BC-adapter "
-            "log-std bounds"
-        )
+    # Conversion from physical action std to latent log std uses the BC actor's
+    # safety-envelope scale and is validated during backend construction.
     stage2_initial_action_std = getattr(
         cfg, "sac_stage2_initial_action_std", None
     )
@@ -3978,14 +4456,7 @@ def _validate_fastsac_finetune_config(cfg) -> None:
                 "sac_stage2_initial_action_std must be a finite positive "
                 "physical-action standard deviation or null"
             )
-        stage2_initial_log_std = math.log(
-            stage2_initial_action_std / action_clip
-        )
-        if not bc_log_std_min <= stage2_initial_log_std <= bc_log_std_max:
-            raise ValueError(
-                "sac_stage2_initial_action_std maps outside the dedicated "
-                "BC-adapter log-std bounds"
-            )
+        # Its joint-wise latent conversion is validated during fresh transfer.
     anchor_start = float(cfg.sac_bc_anchor_coef_start)
     anchor_end = float(cfg.sac_bc_anchor_coef_end)
     anchor_huber_delta = float(cfg.sac_bc_anchor_huber_delta)
@@ -4006,10 +4477,30 @@ def _validate_fastsac_finetune_config(cfg) -> None:
         getattr(cfg, "q_condition_on_actuator_state", False), bool
     ):
         raise ValueError("q_condition_on_actuator_state must be a boolean")
-    positive_ints = ("sac_updates_per_env_step", "sac_policy_frequency", "sac_batch_size")
+    positive_ints = ("sac_policy_frequency", "sac_batch_size")
     for name in positive_ints:
-        if int(getattr(cfg, name)) < 1:
+        value = getattr(cfg, name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or int(value) < 1
+        ):
             raise ValueError(f"{name} must be positive")
+    update_to_data_ratio = getattr(cfg, "sac_update_to_data_ratio")
+    if isinstance(update_to_data_ratio, bool):
+        raise ValueError(
+            "sac_update_to_data_ratio must be finite and strictly positive"
+        )
+    try:
+        update_to_data_ratio = float(update_to_data_ratio)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            "sac_update_to_data_ratio must be finite and strictly positive"
+        ) from None
+    if not math.isfinite(update_to_data_ratio) or update_to_data_ratio <= 0.0:
+        raise ValueError(
+            "sac_update_to_data_ratio must be finite and strictly positive"
+        )
     positive_floats = (
         "q_lr",
         "sac_actor_lr",
@@ -4270,6 +4761,9 @@ class _FastSACVAICBase(PPOVEL):
         self.sac_environment_steps = 0
         self.sac_rollout_count = 0
         self.sac_update_count = 0
+        # Residual replay-row credit for the Stage-2 UTD scheduler. Credit is
+        # deliberately not accumulated during replay warm-up.
+        self.sac_update_row_credit = 0.0
         self.sac_actor_update_count = 0
         self.sac_alpha_update_count = 0
         self._configure_actor_backend()
@@ -4458,15 +4952,19 @@ class _FastSACVAICBase(PPOVEL):
         return (FASTSAC_RAW_OBSERVATION_ROOT, key)
 
     def _normalize_executable_action(self, action: torch.Tensor) -> torch.Tensor:
-        """Affinely map executable VAIC actions into the closed unit box."""
-        action_low = self._fastsac_q_action_low.to(
+        """Map physical actions into joint-wise nominal Q coordinates.
+
+        Do not clamp: BC/PPO commands can legitimately lie outside the nominal
+        soft-limit coordinate interval, and clipping would alias distinct
+        environment commands at the critic input.
+        """
+        action_center = self._fastsac_q_action_center.to(
             device=action.device, dtype=action.dtype
         )
         action_scale = self._fastsac_q_action_scale.to(
             device=action.device, dtype=action.dtype
         )
-        normalized = (action - action_low) / action_scale - 1.0
-        return normalized.clamp(-1.0, 1.0)
+        return (action - action_center) / action_scale
 
     def _q_uses_reference_residual(self) -> bool:
         return str(getattr(
@@ -4489,11 +4987,10 @@ class _FastSACVAICBase(PPOVEL):
     ) -> torch.Tensor:
         """Return the action coordinates consumed by Q1/Q2 only.
 
-        Replay and environment actions intentionally remain in executable VAIC
-        coordinates. Absolute normalization clamps only as a numerical guard:
-        valid actor/replay actions already lie in the configured executable
-        interval. Reference-residual coordinates deliberately do not clamp;
-        their state-dependent valid interval may extend to roughly [-2, 2].
+        Replay and environment actions intentionally remain in physical VAIC
+        command coordinates. Neither absolute nor reference-residual Q
+        coordinates clamp: commands outside the nominal soft-limit scale must
+        remain distinguishable to Q.
         """
         coordinates = str(getattr(
             self.cfg, "q_action_coordinates", "absolute"
@@ -4689,18 +5186,14 @@ class _FastSACVAICBase(PPOVEL):
         return reward.sum(dim=-1)
 
     def _normalized_action_log_prob(self, physical_log_prob):
-        """Express log pi in the configured entropy reference coordinates.
-
-        Actor distributions always score executable physical actions.  The
-        entropy objective may use a different fixed unit, and therefore adds
-        only that reference coordinate's log determinant.  In particular, the
-        BC-DAgger safety clip is not implicitly an entropy normalization scale.
-        """
-        return physical_log_prob + float(getattr(
-            self,
-            "_fastsac_entropy_reference_log_scale_sum",
-            getattr(self, "_fastsac_action_log_scale_sum", 0.0),
-        ))
+        """Express log pi in the explicit entropy-reference coordinates."""
+        return physical_log_prob + float(
+            getattr(
+                self,
+                "_fastsac_entropy_reference_log_scale_sum",
+                getattr(self, "_fastsac_action_log_scale_sum", 0.0),
+            )
+        )
 
     def _configure_actor_backend(self):
         raise NotImplementedError
@@ -4989,81 +5482,16 @@ class FastSACVEL(_FastSACVAICBase):
     """
 
     def _vaic_action_bounds(self):
-        manager = self.env.action_manager
-        joint_ids = torch.as_tensor(
-            manager.joint_ids, device=self.device, dtype=torch.long
+        action_low, action_high, offset_low, offset_high = (
+            _vaic_nominal_action_coordinates(self.env, self.device)
         )
-        limits = manager.asset.data.soft_joint_pos_limits[
-            0, joint_ids
-        ].detach().to(self.device, torch.float32)
-        default = manager.default_joint_pos[
-            0, joint_ids
-        ].detach().to(self.device, torch.float32)
-        scaling = manager.action_scaling.detach().to(self.device, torch.float32)
-        if scaling.shape != default.shape or not torch.all(scaling > 0):
-            raise ValueError(
-                "FastSAC requires one strictly positive action scale per VAIC joint"
-            )
-
-        # JointPosition executes default + randomized_offset + scale * action.
-        # Use the intersection of the allowed intervals over the configured
-        # random_joint_offset range.  This makes every actor sample executable in
-        # every environment rather than relying on the later physical clamp.
-        offset_low = torch.zeros_like(default)
-        offset_high = torch.zeros_like(default)
-        randomizations = getattr(self.env, "randomizations", {})
-        offset_randomizer = (
-            randomizations.get("random_joint_offset")
-            if hasattr(randomizations, "get")
-            else None
+        self._fastsac_action_contract = _vaic_action_contract_metadata(
+            self.joint_names,
+            action_low,
+            action_high,
+            offset_low,
+            offset_high,
         )
-        if offset_randomizer is not None:
-            random_joint_ids = torch.as_tensor(
-                offset_randomizer.joint_ids, dtype=torch.long
-            ).detach().cpu().tolist()
-            random_ranges = torch.as_tensor(
-                offset_randomizer.offset_range,
-                device=self.device,
-                dtype=torch.float32,
-            )
-            if random_ranges.ndim == 3:
-                configured_low = random_ranges.amin(dim=(0, 2))
-                configured_high = random_ranges.amax(dim=(0, 2))
-            elif random_ranges.ndim == 2:
-                configured_low = random_ranges.amin(dim=1)
-                configured_high = random_ranges.amax(dim=1)
-            else:
-                raise ValueError(
-                    "random_joint_offset range must have shape [J, 2] or [N, J, 2]"
-                )
-            if configured_low.numel() != len(random_joint_ids):
-                raise ValueError(
-                    "random_joint_offset joint ids and configured ranges disagree"
-                )
-            range_by_joint = {
-                int(asset_joint_id): (configured_low[index], configured_high[index])
-                for index, asset_joint_id in enumerate(random_joint_ids)
-            }
-            for index, asset_joint_id in enumerate(joint_ids.detach().cpu().tolist()):
-                if asset_joint_id in range_by_joint:
-                    low, high = range_by_joint[asset_joint_id]
-                    offset_low[index] = low
-                    offset_high[index] = high
-
-        action_low = (limits[:, 0] - default - offset_low) / scaling
-        action_high = (limits[:, 1] - default - offset_high) / scaling
-        if not torch.isfinite(action_low).all() or not torch.isfinite(action_high).all():
-            raise ValueError("VAIC joint limits produced non-finite FastSAC action bounds")
-        if not torch.all(action_high > action_low):
-            raise ValueError(
-                "VAIC joint limits and joint-offset randomization produced an empty "
-                "FastSAC action interval"
-            )
-        if not torch.all((action_low < 0.0) & (action_high > 0.0)):
-            raise ValueError(
-                "VAIC raw action zero must be strictly inside every executable "
-                "joint interval across the configured joint-offset range"
-            )
         self._fastsac_joint_offset_low = offset_low.detach().cpu().tolist()
         self._fastsac_joint_offset_high = offset_high.detach().cpu().tolist()
         return action_low, action_high
@@ -5074,14 +5502,23 @@ class FastSACVEL(_FastSACVAICBase):
             official_awac = str(getattr(
                 self.cfg, "sac_finetune_actor_objective", "sac"
             )) == "awac"
+            action_scale = torch.as_tensor(
+                self._fastsac_q_action_scale, dtype=torch.float64
+            ).detach().cpu()
+            initial_log_std = torch.log(
+                action_scale.new_full(
+                    action_scale.shape,
+                    float(self.cfg.sac_bc_initial_action_std),
+                ) / action_scale
+            ).tolist()
             metadata = {
                 "action_parameterization": (
-                    "bc_dagger_clipped_mean_deterministic_rollout_"
-                    "dedicated_tanh_gaussian_learning_v2"
+                    "frozen_bc_centered_nominal_bounded_residual_tanh_mean_"
+                    "deterministic_rollout_gaussian_learning_v9"
                     if deterministic_rollout
                     else
-                    "bc_dagger_dedicated_tanh_gaussian_train_behavior_"
-                    "deterministic_clipped_mean_eval_v3"
+                    "frozen_bc_centered_nominal_bounded_residual_tanh_"
+                    "gaussian_train_behavior_deterministic_mean_eval_v9"
                 ),
                 "source_actor_backend": BC_DAGGER_ACTOR_BACKEND,
                 "student_input_dim": self._q_actor_dim,
@@ -5090,30 +5527,31 @@ class FastSACVEL(_FastSACVAICBase):
                 "initial_action_std": float(
                     self.cfg.sac_bc_initial_action_std
                 ),
-                "initial_log_std": math.log(
-                    float(self.cfg.sac_bc_initial_action_std)
-                    / float(self.cfg.sac_bc_action_clip)
+                "initial_action_std_semantics": (
+                    "center_local_first_order_physical_std_latent_std_equals_"
+                    "physical_over_nominal_residual_half_range_v3"
                 ),
+                "initial_log_std": initial_log_std,
                 "log_std_min": self.cfg.sac_bc_log_std_min,
                 "log_std_max": self.cfg.sac_bc_log_std_max,
-                "action_bound_source": "bc_dagger_action_clip",
-                "action_clip": float(self.cfg.sac_bc_action_clip),
+                "action_bound_source": "scalar_dagger_safety_envelope",
+                "action_safety_clip": float(self.cfg.sac_bc_action_clip),
+                "action_contract": copy.deepcopy(
+                    self._fastsac_action_contract
+                ),
                 "rollout_behavior": (
-                    "deterministic_clipped_bc_mean"
+                    "deterministic_executable_bc_mean"
                     if deterministic_rollout
                     else
-                    "train_stochastic_dedicated_tanh_gaussian_"
-                    "eval_deterministic_clipped_bc_mean"
+                    "train_stochastic_per_joint_tanh_gaussian_"
+                    "eval_deterministic_executable_bc_mean"
                 ),
                 "perception_frozen": bool(self.cfg.sac_freeze_perception),
                 "action_low": self._fastsac_action_low,
                 "action_high": self._fastsac_action_high,
                 "action_log_scale_sum": self._fastsac_action_log_scale_sum,
                 "entropy_reference_coordinates": (
-                    "raw_action_divide_fixed_reference_scale_v1"
-                ),
-                "entropy_reference_scale": float(
-                    self.cfg.sac_entropy_reference_scale
+                    "nominal_joint_action_coordinates_v2"
                 ),
                 "entropy_reference_log_scale_sum": float(
                     self._fastsac_entropy_reference_log_scale_sum
@@ -5144,10 +5582,11 @@ class FastSACVEL(_FastSACVAICBase):
                 stage2_initial_action_std = float(stage2_initial_action_std)
                 metadata.update({
                     "stage2_initial_action_std": stage2_initial_action_std,
-                    "stage2_initial_log_std": math.log(
-                        stage2_initial_action_std
-                        / float(self.cfg.sac_bc_action_clip)
-                    ),
+                    "stage2_initial_log_std": torch.log(
+                        action_scale.new_full(
+                            action_scale.shape, stage2_initial_action_std
+                        ) / action_scale
+                    ).tolist(),
                     "stage2_initial_action_std_semantics": (
                         "fresh_bc_dagger_transfer_reset_once_v1"
                     ),
@@ -5174,11 +5613,12 @@ class FastSACVEL(_FastSACVAICBase):
             "teacher_action_center": "reference_pre_tanh",
             "student_action_center": "zero_pre_tanh",
             "action_bound_source": (
-                "soft_joint_limits_intersect_random_joint_offset_range"
+                "soft_joint_limits_at_default_pose"
             ),
             "action_low": self._fastsac_action_low,
             "action_high": self._fastsac_action_high,
             "action_log_scale_sum": self._fastsac_action_log_scale_sum,
+            "action_contract": copy.deepcopy(self._fastsac_action_contract),
             "joint_offset_low": self._fastsac_joint_offset_low,
             "joint_offset_high": self._fastsac_joint_offset_high,
             "joint_names": list(self.joint_names),
@@ -5253,6 +5693,25 @@ class FastSACVEL(_FastSACVAICBase):
             ),
             "q_action_coordinates": q_action_coordinates,
             "q_action_normalized": q_action_normalized,
+            "q_action_transform_semantics": (
+                FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS
+                if q_action_normalized
+                else FASTSAC_Q_RAW_ACTION_SEMANTICS
+            ),
+            "q_action_center": (
+                self._fastsac_q_action_center.detach().cpu().tolist()
+                if q_action_normalized
+                else None
+            ),
+            "q_action_scale": (
+                self._fastsac_q_action_scale.detach().cpu().tolist()
+                if q_action_normalized
+                else None
+            ),
+            "q_action_joint_names": list(self.joint_names),
+            "q_action_transform_fingerprint": self._fastsac_action_contract[
+                "q_action_transform_fingerprint"
+            ],
             "q_action_input_gain": float(
                 getattr(self.cfg, "sac_q_action_input_gain", 1.0)
             ),
@@ -5560,11 +6019,46 @@ class FastSACVEL(_FastSACVAICBase):
                 "sac_q_normalize_actions=true"
             )
         action_clip = float(self.cfg.sac_bc_action_clip)
-        action_low = torch.full(
-            (self.action_dim,), -action_clip, device=self.device,
-            dtype=torch.float32,
+        nominal_action_low, nominal_action_high = self._vaic_action_bounds()
+        offset_low = torch.as_tensor(
+            getattr(
+                self,
+                "_fastsac_joint_offset_low",
+                torch.zeros_like(nominal_action_low),
+            ),
+            device=nominal_action_low.device,
+            dtype=nominal_action_low.dtype,
         )
-        action_high = torch.full_like(action_low, action_clip)
+        offset_high = torch.as_tensor(
+            getattr(
+                self,
+                "_fastsac_joint_offset_high",
+                torch.zeros_like(nominal_action_high),
+            ),
+            device=nominal_action_high.device,
+            dtype=nominal_action_high.dtype,
+        )
+        # Current VAIC PPO is an unbounded Gaussian policy and the action
+        # manager does not clamp commands at the soft joint limits. Preserve
+        # that learned command behavior inside its existing safety envelope;
+        # the nominal joint ranges below are Q/entropy coordinates only.
+        _validate_action_safety_clip(
+            nominal_action_low, nominal_action_high, action_clip
+        )
+        action_low = torch.full_like(nominal_action_low, -action_clip)
+        action_high = torch.full_like(nominal_action_high, action_clip)
+        self._fastsac_action_contract = _vaic_action_contract_metadata(
+            self.joint_names,
+            nominal_action_low,
+            nominal_action_high,
+            offset_low,
+            offset_high,
+            execution_action_low=action_low,
+            execution_action_high=action_high,
+            execution_support_source="scalar_dagger_safety_envelope",
+        )
+        self._fastsac_joint_offset_low = offset_low.detach().cpu().tolist()
+        self._fastsac_joint_offset_high = offset_high.detach().cpu().tolist()
         self.dist_cls = functools.partial(
             FastSACTanhNormal,
             low=action_low,
@@ -5584,27 +6078,41 @@ class FastSACVEL(_FastSACVAICBase):
         ]
         self._fastsac_action_low = action_low.detach().cpu().tolist()
         self._fastsac_action_high = action_high.detach().cpu().tolist()
-        self._fastsac_q_action_low = action_low.detach()
-        self._fastsac_q_action_scale = (
+        self._fastsac_actor_action_center = (
+            (action_high + action_low) * 0.5
+        ).detach()
+        self._fastsac_actor_action_scale = (
             (action_high - action_low) * 0.5
         ).detach()
+        self._fastsac_q_action_center = (
+            (nominal_action_high + nominal_action_low) * 0.5
+        ).detach()
+        self._fastsac_q_action_scale = (
+            (nominal_action_high - nominal_action_low) * 0.5
+        ).detach()
         self._fastsac_action_log_scale_sum = float(
-            torch.log((action_high - action_low) * 0.5).sum().item()
-        )
-        # The executable support is a DAgger safety guard, not an entropy
-        # coordinate choice. Score entropy in a fixed raw-action unit so a
-        # different safety clip cannot silently add action_dim * log(clip) to
-        # every SAC target and actor loss.
-        self._fastsac_entropy_reference_scale = float(
-            self.cfg.sac_entropy_reference_scale
+            torch.log(self._fastsac_actor_action_scale).sum().item()
         )
         self._fastsac_entropy_reference_log_scale_sum = float(
-            self.action_dim
-            * math.log(self._fastsac_entropy_reference_scale)
+            torch.log(self._fastsac_q_action_scale).sum().item()
         )
-        initial_log_std = math.log(
-            float(self.cfg.sac_bc_initial_action_std) / action_clip
+        # The tanh latent maps to the scalar safety envelope, but alpha targets
+        # entropy in nominal per-joint control units. Otherwise a ±20 actor
+        # envelope would incorrectly encourage exploration over that full box.
+        action_scale = self._fastsac_q_action_scale
+        initial_log_std = torch.log(
+            action_scale.new_full(
+                action_scale.shape, float(self.cfg.sac_bc_initial_action_std)
+            ) / action_scale
         )
+        if (
+            (initial_log_std < float(self.cfg.sac_bc_log_std_min)).any()
+            or (initial_log_std > float(self.cfg.sac_bc_log_std_max)).any()
+        ):
+            raise ValueError(
+                "sac_bc_initial_action_std maps outside the per-joint BC-adapter "
+                "latent log-std bounds"
+            )
         self.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
             self.action_dim, initial_log_std, self.device
         )
@@ -5699,15 +6207,26 @@ class FastSACVEL(_FastSACVAICBase):
         self._fastsac_teacher_actor_dim = int(teacher_dim)
         self._fastsac_action_low = action_low.detach().cpu().tolist()
         self._fastsac_action_high = action_high.detach().cpu().tolist()
+        self._fastsac_actor_action_center = (
+            (action_high + action_low) * 0.5
+        ).detach()
+        self._fastsac_actor_action_scale = (
+            (action_high - action_low) * 0.5
+        ).detach()
         # These tensors are deliberately Q-input transforms, not changes to the
         # actor distribution or replay schema.  They are derivable from the
         # checkpoint-validated actor bounds and therefore need no state entry.
-        self._fastsac_q_action_low = action_low.detach()
+        self._fastsac_q_action_center = (
+            (action_high + action_low) * 0.5
+        ).detach()
         self._fastsac_q_action_scale = (
             (action_high - action_low) * 0.5
         ).detach()
         self._fastsac_action_log_scale_sum = float(
-            torch.log((action_high - action_low) * 0.5).sum().item()
+            torch.log(self._fastsac_actor_action_scale).sum().item()
+        )
+        self._fastsac_entropy_reference_log_scale_sum = float(
+            torch.log(self._fastsac_q_action_scale).sum().item()
         )
 
         # PPOVEL constructs the shared VAIC modules before this backend replaces
@@ -5915,10 +6434,6 @@ class FastSACVEL(_FastSACVAICBase):
 
     def requires_value_bootstrap(self):
         return False
-
-    def _sac_updates_per_env_step(self):
-        """Return the Stage-2 RLPD update count per vector-environment step."""
-        return int(self.cfg.sac_updates_per_env_step)
 
     def _teacher_updates_due(self, accepted_rows: int) -> int:
         """Return one configured Q-update burst on scheduled control steps."""
@@ -7485,7 +8000,11 @@ class FastSACVEL(_FastSACVAICBase):
             ),
             "fastsac/physical_action_entropy": (
                 self._mean_metric(actor_metrics, "entropy", self.device).item()
-                + self._fastsac_action_log_scale_sum
+                + float(getattr(
+                    self,
+                    "_fastsac_entropy_reference_log_scale_sum",
+                    self._fastsac_action_log_scale_sum,
+                ))
                 if actor_metrics else 0.0
             ),
             "fastsac/action_std": self._mean_metric(actor_metrics, "action_std", self.device).item(),
@@ -7989,14 +8508,20 @@ class FastSACVEL(_FastSACVAICBase):
 class _BCDaggerSACAdapter(nn.Module):
     """Dedicated Stage-2 stochastic state for a deterministic BC actor."""
 
-    def __init__(self, action_dim: int, initial_log_std: float, device):
+    def __init__(self, action_dim: int, initial_log_std, device):
         super().__init__()
-        self.log_std = nn.Parameter(torch.full(
-            (int(action_dim),),
-            float(initial_log_std),
-            device=device,
-            dtype=torch.float32,
-        ))
+        initial_log_std = torch.as_tensor(
+            initial_log_std, device=device, dtype=torch.float32
+        )
+        if initial_log_std.ndim == 0:
+            initial_log_std = initial_log_std.expand(int(action_dim)).clone()
+        if initial_log_std.shape != (int(action_dim),):
+            raise ValueError(
+                "BC-DAgger SAC initial log std must be scalar or action-sized"
+            )
+        if not torch.isfinite(initial_log_std).all():
+            raise ValueError("BC-DAgger SAC initial log std must be finite")
+        self.log_std = nn.Parameter(initial_log_std.clone())
 
 
 class _BCDaggerSACRolloutActor(nn.Module):
@@ -8027,14 +8552,25 @@ class _BCDaggerSACRolloutActor(nn.Module):
             action, _ = dist.rsample_with_log_prob(
                 generator=self._owner.sac_rollout_rng
             )
-        action_clip = float(self._owner.cfg.sac_bc_action_clip)
+        action_low = torch.as_tensor(
+            self._owner._fastsac_action_low,
+            device=action.device,
+            dtype=action.dtype,
+        )
+        action_high = torch.as_tensor(
+            self._owner._fastsac_action_high,
+            device=action.device,
+            dtype=action.dtype,
+        )
         action_in_support = (
-            torch.isfinite(action) & (action.abs() <= action_clip)
+            torch.isfinite(action)
+            & (action >= action_low)
+            & (action <= action_high)
         ).all()
         if not action_in_support:
             raise RuntimeError(
                 "BC-DAgger Stage-2 behavior sampled an action outside its "
-                "finite actor/replay/Q support before environment execution"
+                "serialized execution/replay safety envelope"
             )
         absolute_deviation = (action - mean_action).abs()
         td[ACTION_KEY] = action
@@ -8097,11 +8633,24 @@ class FastSACVelFinetune(FastSACVEL):
         action_std = getattr(self.cfg, "sac_stage2_initial_action_std", None)
         if action_std is None:
             return
-        initial_log_std = math.log(
-            float(action_std) / float(self.cfg.sac_bc_action_clip)
+        action_scale = self._fastsac_q_action_scale.to(
+            device=self.bc_dagger_sac_adapter.log_std.device,
+            dtype=self.bc_dagger_sac_adapter.log_std.dtype,
         )
+        initial_log_std = torch.log(
+            action_scale.new_full(action_scale.shape, float(action_std))
+            / action_scale
+        )
+        if (
+            (initial_log_std < float(self.cfg.sac_bc_log_std_min)).any()
+            or (initial_log_std > float(self.cfg.sac_bc_log_std_max)).any()
+        ):
+            raise ValueError(
+                "sac_stage2_initial_action_std maps outside the per-joint "
+                "BC-adapter latent log-std bounds"
+            )
         with torch.no_grad():
-            self.bc_dagger_sac_adapter.log_std.fill_(initial_log_std)
+            self.bc_dagger_sac_adapter.log_std.copy_(initial_log_std)
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         if cfg.enable_residual_distillation:
@@ -8211,6 +8760,33 @@ class FastSACVelFinetune(FastSACVEL):
         # the zero point of the effective-alpha ramp.
         self._stage2_actor_release_q_update = None
 
+    def _stage2_updates_due(self, accepted_rows: int) -> int:
+        """Schedule Q updates from total sampled-row/new-row UTD credit."""
+        if (
+            isinstance(accepted_rows, bool)
+            or not isinstance(accepted_rows, (int, np.integer))
+            or int(accepted_rows) < 0
+        ):
+            raise ValueError("accepted_rows must be a non-negative integer")
+        batch_size = int(self.cfg.sac_batch_size)
+        self.sac_update_row_credit = float(getattr(
+            self, "sac_update_row_credit", 0.0
+        )) + (
+            int(accepted_rows) * float(self.cfg.sac_update_to_data_ratio)
+        )
+        updates = int(self.sac_update_row_credit // batch_size)
+        self.sac_update_row_credit -= updates * batch_size
+        # Avoid retaining a tiny negative residue from floating-point
+        # subtraction while preserving arbitrary fractional UTD values.
+        if self.sac_update_row_credit < 0.0:
+            if self.sac_update_row_credit > -1e-9:
+                self.sac_update_row_credit = 0.0
+            else:
+                raise RuntimeError("Stage-2 UTD row credit became negative")
+        if not 0.0 <= self.sac_update_row_credit < batch_size:
+            raise RuntimeError("Stage-2 UTD row credit escaped its batch range")
+        return updates
+
     def configure_offline_replay(self, path):
         if getattr(self, "_replay_vecnorm", None) is None:
             raise RuntimeError(
@@ -8255,6 +8831,7 @@ class FastSACVelFinetune(FastSACVEL):
                     self._replay_vecnorm_fingerprint
                 ),
                 expected_action_clip=float(self.cfg.sac_bc_action_clip),
+                expected_action_contract=self._fastsac_action_contract,
                 expected_replay_metadata=expected_replay_metadata,
             )
         else:
@@ -8319,7 +8896,7 @@ class FastSACVelFinetune(FastSACVEL):
             "load_pretrained_q",
             "sac_learning_starts",
             "sac_batch_size",
-            "sac_updates_per_env_step",
+            "sac_update_to_data_ratio",
             "sac_policy_frequency",
             "q_lr",
             "sac_actor_lr",
@@ -8335,7 +8912,6 @@ class FastSACVelFinetune(FastSACVEL):
             "sac_actor_gate_min_accept_fraction",
             "sac_actor_gate_absolute_margin",
             "sac_bc_action_clip",
-            "sac_entropy_reference_scale",
             "sac_bc_initial_action_std",
             "sac_bc_log_std_min",
             "sac_bc_log_std_max",
@@ -8348,9 +8924,15 @@ class FastSACVelFinetune(FastSACVEL):
             "teacher_buffer_ratio",
         )
         schedule = {
-            "version": 4,
+            "version": 12,
+            "update_to_data_ratio_semantics": (
+                "total_replay_rows_sampled_per_newly_accepted_online_row_v1"
+            ),
+            "alpha_update_semantics": (
+                "every_q_update_after_successful_actor_release_v1"
+            ),
             "entropy_semantics": (
-                "fixed_reference_action_density_hard_q_bridge_then_"
+                "nominal_joint_reference_density_hard_q_bridge_then_"
                 "post_release_linear_effective_alpha_v1"
             ),
             "actor_confidence_gate_semantics": (
@@ -8360,7 +8942,6 @@ class FastSACVelFinetune(FastSACVEL):
         }
         if self._stage2_uses_awac():
             schedule.update({
-                "version": 6,
                 "sac_finetune_actor_objective": "awac",
                 "sac_awac_beta": float(self.cfg.sac_awac_beta),
                 "sac_awac_v_samples": int(self.cfg.sac_awac_v_samples),
@@ -8384,7 +8965,6 @@ class FastSACVelFinetune(FastSACVEL):
         )
         if actor_start_iteration is not None:
             schedule.update({
-                "version": 7 if self._stage2_uses_awac() else 5,
                 "actor_start_semantics": (
                     "zero_based_cumulative_stage2_finetune_iteration_gte_"
                     "then_q_frequency_v1"
@@ -8402,7 +8982,6 @@ class FastSACVelFinetune(FastSACVEL):
         )
         if stage2_initial_action_std is not None:
             schedule.update({
-                "version": 8,
                 "sac_stage2_initial_action_std": float(
                     stage2_initial_action_std
                 ),
@@ -8415,13 +8994,15 @@ class FastSACVelFinetune(FastSACVEL):
         )
         if actor_log_std_lr is not None:
             schedule.update({
-                "version": 9,
                 "sac_actor_log_std_lr": float(actor_log_std_lr),
                 "actor_optimizer_semantics": (
                     "bc_dagger_actor_mean_and_adapter_log_std_separate_"
                     "adamw_parameter_groups_v1"
                 ),
             })
+        # This version is unconditional: every Stage-2 schedule now uses the
+        # row-level UTD accumulator and post-release per-Q alpha cadence.
+        schedule["version"] = 12
         return schedule
 
     def _checkpoint_for_q_transfer(self, state_dict, *, load_q=None):
@@ -8497,6 +9078,10 @@ class FastSACVelFinetune(FastSACVEL):
                     "Stage-2 checkpoint is missing the actor-release alpha-ramp "
                     "origin"
                 )
+            if "sac_update_row_credit" not in state_dict:
+                raise ValueError(
+                    "Stage-2 checkpoint is missing UTD row-credit state"
+                )
         load_state = self._checkpoint_for_q_transfer(state_dict, load_q=load_q)
         failed = super().load_state_dict(load_state, strict)
         if load_q and (
@@ -8542,6 +9127,7 @@ class FastSACVelFinetune(FastSACVEL):
             self.sac_rollout_count = 0
             self.sac_actor_update_count = 0
             self.sac_alpha_update_count = 0
+            self.sac_update_row_credit = 0.0
             # Stage 2 is a new learning process, just like its fresh alpha and
             # optimizer state.  Do not inherit the teacher's advanced sampling
             # streams or silently ignore the Stage-2 q_seed.
@@ -8550,6 +9136,21 @@ class FastSACVelFinetune(FastSACVEL):
             self.sac_rollout_rng.manual_seed(int(self.cfg.q_seed) + 2)
             self._stage2_actor_release_q_update = None
         elif source_phase == "finetune":
+            row_credit = state_dict["sac_update_row_credit"]
+            if isinstance(row_credit, bool):
+                raise ValueError("Stage-2 checkpoint UTD row credit is invalid")
+            try:
+                row_credit = float(row_credit)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    "Stage-2 checkpoint UTD row credit is invalid"
+                ) from None
+            if (
+                not math.isfinite(row_credit)
+                or not 0.0 <= row_credit < int(self.cfg.sac_batch_size)
+            ):
+                raise ValueError("Stage-2 checkpoint UTD row credit is invalid")
+            self.sac_update_row_credit = row_credit
             release_q_update = state_dict["stage2_actor_release_q_update"]
             if release_q_update is not None:
                 if (
@@ -8619,7 +9220,7 @@ class FastSACVelFinetune(FastSACVEL):
             raise ValueError(
                 "IQL-v2 BC-DAgger Q does not match the current Stage-2 "
                 "SAC/AWAC critic topology or policy-evaluation backup. Use "
-                "algo.load_pretrained_q=false or train a v3 SAC critic."
+                "algo.load_pretrained_q=false or train a v6 SAC critic."
             )
         if sac_critic_source and "bc_dagger_sac_adapter" not in state_dict:
             raise KeyError(
@@ -8649,20 +9250,27 @@ class FastSACVelFinetune(FastSACVEL):
         backend_cfg = state_dict.get("dagger_backend_config")
         if not isinstance(backend_cfg, dict):
             raise ValueError("BC-DAgger checkpoint lacks backend configuration")
-        source_action_clip = backend_cfg.get("dagger_action_clip")
-        if (
-            source_action_clip is None
-            or not math.isclose(
-                float(source_action_clip),
-                float(self.cfg.sac_bc_action_clip),
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-        ):
+        if backend_cfg.get(
+            "fresh_ppo_actor_initialization_semantics"
+        ) != BC_DAGGER_FRESH_ACTOR_INITIALIZATION_SEMANTICS:
             raise ValueError(
-                "BC-DAgger checkpoint action clip does not match the Stage-2 "
-                "actor/replay/Q support"
+                "BC-DAgger checkpoint did not migrate the fresh PPO physical "
+                "student head into the required native latent coordinates"
             )
+        source_action_contract = state_dict.get("action_contract")
+        if source_action_contract != self._fastsac_action_contract:
+            raise ValueError(
+                "BC-DAgger checkpoint executable action contract does not match "
+                "the current environment"
+            )
+        source_action_clip = backend_cfg.get("dagger_action_clip")
+        if source_action_clip is None:
+            raise ValueError("BC-DAgger checkpoint lacks its action safety clip")
+        _validate_action_safety_clip(
+            source_action_contract["action_low"],
+            source_action_contract["action_high"],
+            float(source_action_clip),
+        )
         expected_q = {
             "q_hidden_dim": int(self.cfg.q_hidden_dim),
             "q_num_atoms": int(self.cfg.q_num_atoms),
@@ -8676,6 +9284,49 @@ class FastSACVelFinetune(FastSACVEL):
                 f"BC-DAgger Q configuration {actual_q} does not match "
                 f"Stage 2 {expected_q}"
             )
+        expected_adapter = {
+            "sac_bc_initial_action_std": float(
+                self.cfg.sac_bc_initial_action_std
+            ),
+            "sac_bc_log_std_min": float(self.cfg.sac_bc_log_std_min),
+            "sac_bc_log_std_max": float(self.cfg.sac_bc_log_std_max),
+        }
+        actual_adapter = {
+            name: backend_cfg.get(name) for name in expected_adapter
+        }
+        if sac_critic_source and actual_adapter != expected_adapter:
+            raise ValueError(
+                "BC-DAgger and Stage-2 stochastic adapter contracts differ: "
+                f"source={actual_adapter}, stage2={expected_adapter}"
+            )
+        source_adapter_state = state_dict.get("bc_dagger_sac_adapter")
+        source_log_std = (
+            source_adapter_state.get("log_std")
+            if isinstance(source_adapter_state, dict)
+            else None
+        )
+        if sac_critic_source and not torch.is_tensor(source_log_std):
+            raise ValueError(
+                "BC-DAgger checkpoint lacks its stochastic adapter log_std"
+            )
+        if sac_critic_source:
+            source_log_std = source_log_std.detach().reshape(-1)
+            if (
+                source_log_std.shape != (self.action_dim,)
+                or not torch.isfinite(source_log_std).all()
+                or (
+                    source_log_std
+                    < expected_adapter["sac_bc_log_std_min"]
+                ).any()
+                or (
+                    source_log_std
+                    > expected_adapter["sac_bc_log_std_max"]
+                ).any()
+            ):
+                raise ValueError(
+                    "BC-DAgger checkpoint stochastic adapter state is outside "
+                    "its declared per-joint log-std contract"
+                )
         if load_pretrained_q:
             expected_optimization = {
                 "q_lr": float(self.cfg.q_lr),
@@ -8710,6 +9361,19 @@ class FastSACVelFinetune(FastSACVEL):
                 ),
                 "q_action_coordinates": "absolute",
                 "q_action_normalized": True,
+                "q_action_transform_semantics": (
+                    FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS
+                ),
+                "q_action_center": (
+                    self._fastsac_q_action_center.detach().cpu().tolist()
+                ),
+                "q_action_scale": (
+                    self._fastsac_q_action_scale.detach().cpu().tolist()
+                ),
+                "q_action_joint_names": list(self.joint_names),
+                "q_action_transform_fingerprint": self._fastsac_action_contract[
+                    "q_action_transform_fingerprint"
+                ],
                 "q_action_input_gain": float(
                     self.cfg.sac_q_action_input_gain
                 ),
@@ -8729,7 +9393,8 @@ class FastSACVelFinetune(FastSACVEL):
                     "stochastic_next_action_q_only_effective_alpha_zero_v1"
                 ),
                 "pretrain_target_policy": (
-                    "dedicated_small_noise_stochastic_current_bc_student_v1"
+                    "dedicated_small_noise_bc_centered_nominal_bounded_"
+                    "residual_v3"
                 ),
                 "alpha_autotune": False,
                 "stage2_alpha_init": float(self.cfg.sac_alpha_init),
@@ -8771,6 +9436,11 @@ class FastSACVelFinetune(FastSACVEL):
                 "target_entropy_semantics",
                 "q_action_coordinates",
                 "q_action_normalized",
+                "q_action_transform_semantics",
+                "q_action_center",
+                "q_action_scale",
+                "q_action_joint_names",
+                "q_action_transform_fingerprint",
                 "q_action_input_gain",
                 "q_action_semantics",
                 "clipped_double_q",
@@ -8800,7 +9470,7 @@ class FastSACVelFinetune(FastSACVEL):
         # constructor-created states selected by load_pretrained_q.
         load_state = self._checkpoint_for_q_transfer(state_dict)
         load_state = dict(load_state)
-        # v3 already owns the exact dedicated stochastic target-policy state.
+        # v6 owns the exact dedicated stochastic target-policy state.
         # IQL-v2 predates it and is allowed only for actor-only/fresh-Q transfer.
         if not sac_critic_source:
             load_state["bc_dagger_sac_adapter"] = (
@@ -8841,7 +9511,7 @@ class FastSACVelFinetune(FastSACVEL):
                 if name not in {"qnet", "qnet_target"}
             ]
 
-        # A v3 BC-DAgger checkpoint owns the exact small-noise adapter used by
+        # A v6 BC-DAgger checkpoint owns the exact small-noise adapter used by
         # its critic target. Preserve it by default, but allow an explicit
         # offline-to-online experiment to broaden behavior support exactly once
         # at the fresh Stage-2 boundary. Same-stage resumes use the ordinary
@@ -8866,6 +9536,7 @@ class FastSACVelFinetune(FastSACVEL):
         self.sac_update_count = 0
         self.sac_actor_update_count = 0
         self.sac_alpha_update_count = 0
+        self.sac_update_row_credit = 0.0
         self.sac_environment_steps = 0
         self.sac_rollout_count = 0
         self.q_rng.manual_seed(int(self.cfg.q_seed))
@@ -8923,6 +9594,7 @@ class FastSACVelFinetune(FastSACVEL):
         state["stage2_actor_release_q_update"] = getattr(
             self, "_stage2_actor_release_q_update", None
         )
+        state["sac_update_row_credit"] = float(self.sac_update_row_credit)
         if self.offline_replay is not None:
             state["offline_teacher_replay_state"] = copy.deepcopy(
                 self.offline_replay.snapshot_metadata
@@ -9099,45 +9771,65 @@ class FastSACVelFinetune(FastSACVEL):
         return self.actor_adapt.get_dist(td)
 
     def _bc_dagger_behavior_action(self, td: TensorDict, actor=None):
-        """Apply the exact finite-value guard and clamp used by DAgger."""
+        """Map the BC actor's native latent mean into executable actions."""
         actor = self.actor_adapt if actor is None else actor
-        mean_action = actor.get_dist(td).mean
-        action_clip = float(self.cfg.sac_bc_action_clip)
-        return torch.nan_to_num(
-            mean_action,
-            nan=0.0,
-            posinf=action_clip,
-            neginf=-action_clip,
-        ).clamp(-action_clip, action_clip)
-
-    def _bc_dagger_behavior_action_and_dist(self, td: TensorDict):
-        # Center the dedicated Stage-2 distribution on the exact clipped DAgger
-        # behavior. The same object is used by train collection and SAC learning;
-        # PPO actor_std remains untouched and unused.
-        mean_action = self._bc_dagger_behavior_action(td)
+        loc = _sanitize_fastsac_latent(actor.get_dist(td).mean)
         action_low = torch.as_tensor(
             self._fastsac_action_low,
-            device=mean_action.device,
-            dtype=mean_action.dtype,
+            device=loc.device,
+            dtype=loc.dtype,
         )
         action_high = torch.as_tensor(
             self._fastsac_action_high,
-            device=mean_action.device,
-            dtype=mean_action.dtype,
+            device=loc.device,
+            dtype=loc.dtype,
         )
-        action_scale = (action_high - action_low) * 0.5
-        action_bias = (action_high + action_low) * 0.5
-        normalized = ((mean_action - action_bias) / action_scale).clamp(
-            -1.0 + FASTSAC_REFERENCE_EPS,
-            1.0 - FASTSAC_REFERENCE_EPS,
+        return _fastsac_latent_to_action(
+            loc,
+            action_low,
+            action_high,
         )
-        loc = torch.atanh(normalized)
+
+    def _bc_dagger_behavior_action_and_dist(self, td: TensorDict):
+        """Return a frozen-BC-centered, joint-wise bounded residual policy."""
+        proposal_latent = _sanitize_fastsac_latent(
+            self.actor_adapt.get_dist(td).mean
+        )
+        with torch.no_grad():
+            anchor_latent = _sanitize_fastsac_latent(
+                self.bc_dagger_actor_anchor.get_dist(td).mean
+            )
+            anchor_action = _fastsac_latent_to_action(
+                anchor_latent,
+                self._fastsac_action_low,
+                self._fastsac_action_high,
+            )
+        # The copied actor and frozen anchor are identical on a fresh transfer,
+        # so residual loc is exactly zero and deterministic behavior is exactly
+        # the BC policy. SAC can move each joint by at most one nominal
+        # half-range.
+        residual_loc = _sanitize_fastsac_latent(
+            proposal_latent - anchor_latent
+        )
+        residual_low, residual_high, _ = _fastsac_bc_residual_support(
+            anchor_action,
+            self._fastsac_q_action_scale,
+            self._fastsac_action_low,
+            self._fastsac_action_high,
+        )
         log_std = self.bc_dagger_sac_adapter.log_std.clamp(
             float(self.cfg.sac_bc_log_std_min),
             float(self.cfg.sac_bc_log_std_max),
         )
-        scale = log_std.exp().expand_as(loc)
-        return mean_action, self.dist_cls(loc, scale)
+        scale = log_std.exp().expand_as(residual_loc)
+        dist = FastSACTanhNormal(
+            residual_loc,
+            scale,
+            low=residual_low,
+            high=residual_high,
+            event_dims=1,
+        )
+        return dist.mean, dist
 
     def _bc_dagger_actor_dist_from_td(self, td: TensorDict):
         return self._bc_dagger_behavior_action_and_dist(td)[1]
@@ -9438,7 +10130,7 @@ class FastSACVelFinetune(FastSACVEL):
         if not self._uses_bc_dagger_finetune_source():
             return zero, zero
         td = self._actor_td_from_flat(actor_obs)
-        current_action = self._bc_dagger_behavior_action(td)
+        current_action, _ = self._bc_dagger_behavior_action_and_dist(td)
         with torch.no_grad():
             anchor_action = self._bc_dagger_behavior_action(
                 td, actor=self.bc_dagger_actor_anchor
@@ -9453,9 +10145,9 @@ class FastSACVelFinetune(FastSACVEL):
 
     def _stage2_deterministic_action(self, actor_obs, dist=None):
         if self._uses_bc_dagger_finetune_source():
-            return self._bc_dagger_behavior_action(
-                self._actor_td_from_flat(actor_obs)
-            )
+            if dist is None:
+                dist = self._actor_dist_from_flat(actor_obs)
+            return dist.mean
         if dist is None:
             dist = self._actor_dist_from_flat(actor_obs)
         return dist.mean
@@ -10060,12 +10752,11 @@ class FastSACVelFinetune(FastSACVEL):
                 if not self._stage2_uses_awac():
                     entropy = -log_prob.mean().detach()
 
-        # Couple the entropy dual to the confidence-approved actor cadence.
-        # A scheduled-but-rejected tick changes Q only, leaving both actor and
-        # alpha parameters/counters untouched.
+        # Once an actor step has genuinely released Stage 2, update the entropy
+        # dual on every Q batch. Actor delay and later confidence-gate failures
+        # must not undersample or freeze the temperature controller.
         if (
-            actor_update_applied
-            and alpha_ramp_progress > 0.0
+            alpha_ramp_progress > 0.0
             and self._stage2_alpha_autotune_enabled()
         ):
             alpha_loss = -(
@@ -10224,10 +10915,10 @@ class FastSACVelFinetune(FastSACVEL):
                     max_deviation.float().amax().item()
                 )
         start_environment_step = self.sac_environment_steps
-        updates_per_step = self._sac_updates_per_env_step()
         replay_mix_counts = self._stage2_replay_mix_counts()
         online_batch_count = replay_mix_counts["online"]
         new_online_rows = 0
+        eligible_new_online_rows = 0
         sampled_total_draws = 0
         sampled_online_draws = 0
         sampled_offline_draws = 0
@@ -10238,17 +10929,28 @@ class FastSACVelFinetune(FastSACVEL):
         for local_step, online in enumerate(
             self._student_transition_chunks(rollout_td)
         ):
-            new_online_rows += int(online["rewards"].shape[0])
+            accepted_rows = int(online["rewards"].shape[0])
+            new_online_rows += accepted_rows
             if self._uses_bc_dagger_finetune_source():
                 online_actions = online["actions"]
-                action_clip = float(self.cfg.sac_bc_action_clip)
+                action_low = torch.as_tensor(
+                    self._fastsac_action_low,
+                    device=online_actions.device,
+                    dtype=online_actions.dtype,
+                )
+                action_high = torch.as_tensor(
+                    self._fastsac_action_high,
+                    device=online_actions.device,
+                    dtype=online_actions.dtype,
+                )
                 if (
                     not torch.isfinite(online_actions).all()
-                    or (online_actions.abs() > action_clip).any()
+                    or (online_actions < action_low).any()
+                    or (online_actions > action_high).any()
                 ):
                     raise RuntimeError(
                         "BC-DAgger Stage-2 rollout produced an action outside "
-                        "the actor/replay/Q support"
+                        "the serialized execution/replay safety envelope"
                     )
             self.online_replay.extend(online)
             logical_step = start_environment_step + local_step
@@ -10261,13 +10963,17 @@ class FastSACVelFinetune(FastSACVEL):
                 or (online_batch_count and self.online_replay.size < 1)
             ):
                 continue
-            for update_index in range(updates_per_step):
+            # No warm-up backlog is accumulated. The first chunk that makes
+            # replay ready earns credit only for that newly accepted chunk.
+            eligible_new_online_rows += accepted_rows
+            updates_due = self._stage2_updates_due(accepted_rows)
+            for update_index in range(updates_due):
                 batch = self._mix_batch()
                 sampled_total_draws += replay_mix_counts["total"]
                 sampled_online_draws += replay_mix_counts["online"]
                 sampled_offline_draws += replay_mix_counts["offline"]
                 update_actor = self._sac_actor_update_is_due(
-                    update_index, logical_step, updates_per_step
+                    update_index, logical_step, updates_due
                 )
                 actor_update_scheduled_count += int(update_actor)
                 update_metrics = self._sac_update(batch, update_actor)
@@ -10860,11 +11566,12 @@ class FastSACVelFinetune(FastSACVEL):
             "fastsac/alpha_loss": alpha_loss,
             "fastsac/entropy": entropy,
             "fastsac/entropy_reference_action_entropy": entropy,
-            # Retained for dashboard compatibility; the explicit coordinate
-            # flags below identify that BC Stage 2 now uses raw-action units.
+            # Retained for dashboard compatibility. BC adapters use explicit
+            # nominal joint coordinates rather than the +/-20 actor envelope.
             "fastsac/normalized_action_entropy": entropy,
             "fastsac/physical_action_entropy": (
-                entropy + float(getattr(
+                entropy
+                + float(getattr(
                     self,
                     "_fastsac_entropy_reference_log_scale_sum",
                     self._fastsac_action_log_scale_sum,
@@ -10928,21 +11635,14 @@ class FastSACVelFinetune(FastSACVEL):
             "fastsac/target_entropy_active": float(
                 not self._stage2_uses_awac()
             ),
-            "fastsac/target_entropy_normalized_coordinates": float(
-                not self._uses_bc_dagger_finetune_source()
-            ),
+            "fastsac/target_entropy_normalized_coordinates": 1.0,
             "fastsac/target_entropy_reference_coordinates": 1.0,
-            "fastsac/target_entropy_raw_action_unit_coordinates": float(
-                self._uses_bc_dagger_finetune_source()
-            ),
+            "fastsac/target_entropy_raw_action_unit_coordinates": 0.0,
             "fastsac/action_log_scale_sum": self._fastsac_action_log_scale_sum,
-            "fastsac/entropy_reference_scale": float(getattr(
-                self.cfg, "sac_entropy_reference_scale", 1.0
-            )),
             "fastsac/entropy_reference_log_scale_sum": float(getattr(
                 self,
                 "_fastsac_entropy_reference_log_scale_sum",
-                self._fastsac_action_log_scale_sum,
+                getattr(self, "_fastsac_action_log_scale_sum", 0.0),
             )),
             "fastsac/q_update_count": self.q_update_count,
             "fastsac/actor_update_count": self.sac_actor_update_count,
@@ -10968,10 +11668,12 @@ class FastSACVelFinetune(FastSACVEL):
             ),
             "fastsac/truncation_finals": self._last_truncation_finals_used,
             "fastsac/environment_steps": self.sac_environment_steps,
-            "fastsac/effective_updates_per_env_step": (
-                len(metrics) / float(self.cfg.train_every)
+            "fastsac/update_to_data_ratio_config": float(
+                self.cfg.sac_update_to_data_ratio
             ),
-            "fastsac/updates_per_env_step_config": updates_per_step,
+            "fastsac/update_row_credit": float(self.sac_update_row_credit),
+            "fastsac/q_updates_applied": len(metrics),
+            "fastsac/eligible_new_online_rows": eligible_new_online_rows,
             "fastsac/q_action_normalized": float(
                 bool(getattr(self.cfg, "sac_q_normalize_actions", False))
             ),
@@ -10991,10 +11693,14 @@ class FastSACVelFinetune(FastSACVEL):
                 float(self.cfg.sac_bc_log_std_min),
                 float(self.cfg.sac_bc_log_std_max),
             )
+            residual_half_range = self._fastsac_q_action_scale.to(
+                device=clipped_log_std.device,
+                dtype=clipped_log_std.dtype,
+            )
             info.update({
                 "fastsac/bc_sac_log_std_mean": clipped_log_std.mean().item(),
                 "fastsac/bc_sac_center_action_std_mean": (
-                    clipped_log_std.exp() * float(self.cfg.sac_bc_action_clip)
+                    clipped_log_std.exp() * residual_half_range
                 ).mean().item(),
                 "fastsac/bc_sac_log_std_lr_config": (
                     -1.0

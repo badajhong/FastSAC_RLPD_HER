@@ -31,6 +31,7 @@ from tensordict import TensorDict
 
 from .common import (
     ACTION_KEY,
+    Actor,
     CMD_KEY,
     DONE_KEY,
     OBS_KEY,
@@ -57,10 +58,19 @@ from .fastsac_vel import (
     _BCDaggerSACAdapter,
     _build_isolated_q_network,
     _filter_replay_rows,
+    _fastsac_action_center_to_latent,
+    _fastsac_bc_residual_support,
+    _fastsac_latent_to_action,
     _measure_or_clip_grad_norm,
     _q_action_hidden_dim,
     _sac_bootstrap_mask,
     _select_c51_twin_target,
+    _project_to_execution_support,
+    _sanitize_fastsac_latent,
+    _vaic_action_contract_metadata,
+    _vaic_nominal_action_coordinates,
+    _validate_action_safety_clip,
+    _validate_vaic_action_contract_metadata,
     _vaic_truncation_mask,
     _vecnorm_state_fingerprint,
 )
@@ -80,7 +90,7 @@ from .ppo_vel import (
 
 
 PPO_BC_DAGGER_TRAINING_ALGORITHM = (
-    "vaic_ppo_bc_dagger_student_sac_critic_v3"
+    "vaic_ppo_bc_dagger_student_sac_critic_v6"
 )
 PPO_BC_DAGGER_IQL_TRAINING_ALGORITHM = (
     "vaic_ppo_bc_dagger_student_iql_v2"
@@ -88,10 +98,11 @@ PPO_BC_DAGGER_IQL_TRAINING_ALGORITHM = (
 PPO_BC_DAGGER_LEGACY_TRAINING_ALGORITHM = (
     "vaic_ppo_bc_dagger_student_v1"
 )
-PPO_BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_independent_normal_bc_dagger_v1"
+PPO_BC_DAGGER_ACTOR_BACKEND = "vaic_ppo_latent_tanh_bc_dagger_v4"
 PPO_BC_DAGGER_SAC_CRITIC_SEMANTICS = (
-    "beta_independent_half_teacher_half_student_executed_action_"
-    "stochastic_student_q_only_c51_clipped_double_q_v1"
+    "beta_independent_half_teacher_half_student_safety_envelope_action_"
+    "unclipped_nominal_joint_q_coordinates_bc_centered_bounded_residual_"
+    "stochastic_student_q_only_c51_clipped_double_q_v5"
 )
 # Kept only as a checkpoint/version sentinel. The production path below no
 # longer constructs or optimizes an IQL value network.
@@ -100,21 +111,25 @@ PPO_BC_DAGGER_IQL_CRITIC_SEMANTICS = (
     "c51_projection_v1"
 )
 PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS = (
-    "dagger_teacher_huber_bc_only_no_q_or_advantage_weighting_v1"
+    "dagger_safety_envelope_inverse_tanh_latent_huber_bc_only_"
+    "no_q_or_advantage_weighting_v3"
+)
+PPO_BC_DAGGER_FRESH_ACTOR_INITIALIZATION_SEMANTICS = (
+    "physical_absolute_head_safety_tanh_linearized_at_zero_v2"
 )
 DAGGER_TEACHER_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
-DAGGER_TEACHER_REPLAY_FORMAT_VERSION = 2
+DAGGER_TEACHER_REPLAY_FORMAT_VERSION = 5
 DAGGER_LEGACY_REPLAY_OBSERVATION_SEMANTICS = (
     "normalized_frozen_vecnorm_v1"
 )
 DAGGER_REPLAY_OBSERVATION_SEMANTICS = REPLAY_OBSERVATION_SEMANTICS
 DAGGER_INITIAL_TRANSITION_FILTER = "step_count_gt_5"
 DAGGER_ACTION_PARAMETERIZATION = (
-    "absolute_executable_safe_hysteresis_or_beta_teacher_or_student_v2"
+    "absolute_safety_envelope_teacher_or_latent_tanh_student_v5"
 )
 DAGGER_TEACHER_ACTION_SEMANTICS = "ppo_reference_plus_residual_v1"
 DAGGER_CONTROL_SEMANTICS = (
-    "clipped_deterministic_mean_normalized_rms_safe_hysteresis_or_beta_v1"
+    "safety_envelope_latent_tanh_mean_envelope_normalized_safe_or_beta_v5"
 )
 DAGGER_FINALIZATION_SEMANTICS = (
     "perception_then_actor_then_perception_then_fresh_replay_q_v1"
@@ -169,7 +184,7 @@ def _valid_teacher_action_rows(
         raise ValueError("teacher action threshold must be finite and positive")
     if actions.ndim < 1:
         raise ValueError("teacher actions must contain an action dimension")
-    return torch.isfinite(actions).all(dim=-1) & (actions.abs() <= threshold).all(
+    return torch.isfinite(actions).all(dim=-1) & (actions.abs() < threshold).all(
         dim=-1
     )
 
@@ -179,7 +194,7 @@ def _normalized_action_discrepancy(
     teacher_mean_action: torch.Tensor,
     action_clip: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return per-row RMS and max error in the critic's unit action box."""
+    """Return RMS/max error relative to the DAgger behavior envelope."""
     if student_action.shape != teacher_mean_action.shape:
         raise ValueError(
             "SafeDAgger student/teacher action shapes must match, got "
@@ -189,8 +204,10 @@ def _normalized_action_discrepancy(
         raise ValueError("SafeDAgger actions must contain an action dimension")
     action_clip = float(action_clip)
     if not math.isfinite(action_clip) or action_clip <= 0.0:
-        raise ValueError("SafeDAgger action_clip must be finite and positive")
-    normalized_error = (student_action - teacher_mean_action).abs() / action_clip
+        raise ValueError("SafeDAgger action clip must be finite and positive")
+    normalized_error = (
+        student_action - teacher_mean_action
+    ).abs() / action_clip
     return (
         normalized_error.square().mean(dim=-1).sqrt(),
         normalized_error.amax(dim=-1),
@@ -346,8 +363,10 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
 
     # SafeDAgger is the default controller. ``beta`` remains as a reproducible
     # ablation, while ``hybrid`` takes over unsafe rows and also applies beta on
-    # otherwise safe rows. All comparisons use clipped deterministic means.
+    # otherwise safe rows. All comparisons use safety-envelope tanh means.
     dagger_control_mode: str = "safe"
+    # RMS error is normalized by the scalar DAgger behavior envelope. Q and
+    # entropy use separate nominal joint coordinates.
     dagger_safe_takeover_rms: float = 0.006
     dagger_safe_release_rms: float = 0.004
     dagger_safe_min_teacher_steps: int = 8
@@ -365,6 +384,7 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
     dagger_beta_zero_iteration: int | None = None
     dagger_seed: int = 0
     dagger_teacher_action_threshold: float = 20.0
+    # Actor/replay execution envelope only; it is not the Q/entropy scale.
     dagger_action_clip: float = 20.0
 
     # Optional post-DAgger consolidation pipeline.  These fields are internal
@@ -455,7 +475,6 @@ class PPOBCDaggerFinetuneConfig(PPOConfig):
     # Initialized here and transferred for Stage 2; BC's Q-only target keeps
     # effective alpha at zero exactly like the Stage-2 actor burn-in.
     sac_alpha_init: float = 1e-5
-    sac_entropy_reference_scale: float = 1.0
 
     save_teacher_buffer: bool = True
     teacher_buffer_filename: str = "teacher_replay_buffer.h5"
@@ -646,7 +665,14 @@ class _DeviceReplay:
 class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
     """Teacher-executed FIFO with a DAgger-specific, truthful H5 manifest."""
 
-    def __init__(self, *args, vecnorm_fingerprint, action_clip, **kwargs):
+    def __init__(
+        self,
+        *args,
+        vecnorm_fingerprint,
+        action_clip,
+        action_contract,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         fingerprint = str(vecnorm_fingerprint or "")
         if not fingerprint.startswith("sha256:"):
@@ -657,16 +683,26 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
         self.action_clip = float(action_clip)
         if not math.isfinite(self.action_clip) or self.action_clip <= 0.0:
             raise ValueError("DAgger replay action_clip must be finite and positive")
+        self.action_contract = copy.deepcopy(action_contract)
+        self.action_low, self.action_high = (
+            _validate_vaic_action_contract_metadata(
+                self.action_contract, self.action_dim
+            )
+        )
+        _validate_action_safety_clip(
+            self.action_low, self.action_high, self.action_clip
+        )
 
     def _validated_values(self, data):
         count, values = super()._validated_values(data)
         actions = values["actions"]
         if not torch.isfinite(actions).all():
             raise ValueError("DAgger replay actions must all be finite")
-        if (actions.abs() > self.action_clip).any():
+        low = self.action_low.to(device=actions.device, dtype=actions.dtype)
+        high = self.action_high.to(device=actions.device, dtype=actions.dtype)
+        if (actions < low).any() or (actions > high).any():
             raise ValueError(
-                "DAgger replay action lies outside the configured symmetric "
-                f"support [-{self.action_clip}, {self.action_clip}]"
+                "DAgger replay action lies outside the execution safety envelope"
             )
         return count, values
 
@@ -690,6 +726,7 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
             "critic_obs_dim": self.critic_dim,
             "action_dim": self.action_dim,
             "action_clip": self.action_clip,
+            "action_contract": copy.deepcopy(self.action_contract),
             "capacity": self.capacity,
             "size": self.last_snapshot_size if has_snapshot else self.size,
             "seen": self.last_snapshot_seen if has_snapshot else self.seen,
@@ -765,6 +802,11 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                 )
             ):
                 raise ValueError("DAgger replay action clip mismatch")
+            replay_action_contract = json.loads(str(
+                replay.attrs.get("action_contract", "{}")
+            ))
+            if replay_action_contract != self.action_contract:
+                raise ValueError("DAgger replay executable action contract mismatch")
             manifest = {
                 "actor_obs_keys": json.loads(
                     str(replay.attrs.get("actor_obs_keys", "[]"))
@@ -848,10 +890,13 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                                 raise ValueError(
                                     "DAgger replay actions must all be finite"
                                 )
-                            if (host.abs() > self.action_clip).any():
+                            if (
+                                (host < self.action_low).any()
+                                or (host > self.action_high).any()
+                            ):
                                 raise ValueError(
                                     "DAgger replay action lies outside the "
-                                    "configured symmetric support"
+                                    "execution safety envelope"
                                 )
                         self.data[name][start:end].copy_(host)
             self.size = size
@@ -948,6 +993,12 @@ class _DaggerTeacherReplayBuffer(TeacherReplayBuffer):
                         "critic_obs_dim": self.critic_dim,
                         "action_dim": self.action_dim,
                         "action_clip": self.action_clip,
+                        "action_contract": json.dumps(
+                            self.action_contract,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ),
                         "buffer_capacity": self.capacity,
                         "num_transitions": snapshot_size,
                         "num_seen_transitions": snapshot_seen,
@@ -1068,7 +1119,7 @@ class _DaggerRolloutPolicy(nn.Module):
     @torch.no_grad()
     def forward(self, td: TensorDict):
         owner = self._owner
-        raw_student_action = owner._student_action(td)
+        raw_student_latent = owner._student_latent(td)
         # Unlike PPO, DAgger does not need the old distribution parameters or
         # perception intermediates in its N x T rollout.  Keep only PRIV_PRED
         # and recurrent next-state keys needed by replay/adaptation; otherwise
@@ -1097,26 +1148,21 @@ class _DaggerRolloutPolicy(nn.Module):
         valid = _valid_teacher_action_rows(
             teacher_action, owner.cfg.dagger_teacher_action_threshold
         )
-        # Invalid teacher rows are retained only as masked labels; never expose
-        # NaN/Inf through a rollout TensorDict or to the environment action path.
-        action_clip = float(owner.cfg.dagger_action_clip)
-        clipped_teacher_action = torch.nan_to_num(
-            teacher_action,
-            nan=0.0,
-            posinf=action_clip,
-            neginf=-action_clip,
-        ).clamp(-action_clip, action_clip)
-        student_valid = torch.isfinite(raw_student_action).all(dim=-1) & (
-            raw_student_action.abs() <= action_clip
-        ).all(dim=-1)
-        clipped_student_action = torch.nan_to_num(
-            raw_student_action,
-            nan=0.0,
-            posinf=action_clip,
-            neginf=-action_clip,
-        ).clamp(-action_clip, action_clip)
+        # Invalid teacher rows are retained only as masked labels. Both policies
+        # are projected onto the same serialized safety envelope before control
+        # selection, environment execution, replay, or BC supervision.
+        clipped_teacher_action = owner._project_execution_action(teacher_action)
+        # The student head is an unconstrained pre-tanh latent. Every finite
+        # value therefore maps into the finite execution envelope; only a
+        # numerical failure can make the student invalid for SafeDAgger.
+        student_valid = torch.isfinite(raw_student_latent).all(dim=-1)
+        bounded_student_action = owner._student_action_from_latent(
+            raw_student_latent
+        )
         discrepancy_rms, discrepancy_max = _normalized_action_discrepancy(
-            clipped_student_action, clipped_teacher_action, action_clip
+            bounded_student_action,
+            clipped_teacher_action,
+            float(owner.cfg.dagger_action_clip),
         )
         discrepancy_rms = torch.where(
             valid, discrepancy_rms, torch.zeros_like(discrepancy_rms)
@@ -1183,7 +1229,7 @@ class _DaggerRolloutPolicy(nn.Module):
         td[ACTION_KEY] = torch.where(
             choose_teacher.unsqueeze(-1),
             clipped_teacher_action,
-            clipped_student_action,
+            bounded_student_action,
         )
         td[DAGGER_TEACHER_ACTION_KEY] = clipped_teacher_action
         td[DAGGER_TEACHER_ACTION_VALID_KEY] = valid
@@ -1199,23 +1245,40 @@ class _DaggerRolloutPolicy(nn.Module):
         return td
 
 
-class _ClippedStudentRolloutPolicy(nn.Module):
-    """Keep play/evaluation action semantics identical to DAgger collection."""
+class _LatentStudentRolloutPolicy(nn.Module):
+    """Map the PPO student's sampled latent into safe evaluation commands."""
 
-    def __init__(self, policy: nn.Module, action_clip: float):
+    def __init__(
+        self,
+        policy: nn.Module,
+        action_low: torch.Tensor,
+        action_high: torch.Tensor,
+        action_clip: float,
+    ):
         super().__init__()
         self.policy = policy
         self.action_clip = float(action_clip)
+        self.register_buffer(
+            "action_low", torch.as_tensor(action_low, dtype=torch.float32).clone()
+        )
+        self.register_buffer(
+            "action_high", torch.as_tensor(action_high, dtype=torch.float32).clone()
+        )
 
     @torch.no_grad()
     def forward(self, td: TensorDict):
         td = self.policy(td)
-        td[ACTION_KEY] = torch.nan_to_num(
+        action = _fastsac_latent_to_action(
             td[ACTION_KEY],
-            nan=0.0,
-            posinf=self.action_clip,
-            neginf=-self.action_clip,
-        ).clamp(-self.action_clip, self.action_clip)
+            self.action_low,
+            self.action_high,
+        )
+        td[ACTION_KEY] = _project_to_execution_support(
+            action,
+            self.action_low,
+            self.action_high,
+            self.action_clip,
+        )
         return td
 
 
@@ -1225,6 +1288,56 @@ class PPOBCDaggerFinetune(PPOVEL):
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         self._validate_config(cfg)
         super().__init__(cfg, observation_spec, action_spec, reward_spec, device, env)
+        nominal_action_low, nominal_action_high, offset_low, offset_high = (
+            _vaic_nominal_action_coordinates(env, device)
+        )
+        _validate_action_safety_clip(
+            nominal_action_low,
+            nominal_action_high,
+            float(cfg.dagger_action_clip),
+        )
+        # PPO and JointPosition do not clamp commands at the nominal soft joint
+        # range. Preserve PPO behavior inside the existing scalar safety
+        # envelope, while keeping nominal per-joint scales for Q and entropy.
+        # SafeDAgger discrepancy remains normalized by the safety envelope.
+        action_low = torch.full_like(
+            nominal_action_low, -float(cfg.dagger_action_clip)
+        )
+        action_high = torch.full_like(
+            nominal_action_high, float(cfg.dagger_action_clip)
+        )
+        self._fastsac_action_low = action_low.detach()
+        self._fastsac_action_high = action_high.detach()
+        self._fastsac_actor_action_center = (
+            (action_low + action_high) * 0.5
+        ).detach()
+        self._fastsac_actor_action_scale = (
+            (action_high - action_low) * 0.5
+        ).detach()
+        self._fastsac_q_action_center = (
+            (nominal_action_low + nominal_action_high) * 0.5
+        ).detach()
+        self._fastsac_q_action_scale = (
+            (nominal_action_high - nominal_action_low) * 0.5
+        ).detach()
+        self._fastsac_action_log_scale_sum = float(
+            torch.log(self._fastsac_actor_action_scale).sum().item()
+        )
+        self._fastsac_entropy_reference_log_scale_sum = float(
+            torch.log(self._fastsac_q_action_scale).sum().item()
+        )
+        self._fastsac_joint_offset_low = offset_low.detach()
+        self._fastsac_joint_offset_high = offset_high.detach()
+        self._fastsac_action_contract = _vaic_action_contract_metadata(
+            self.joint_names,
+            nominal_action_low,
+            nominal_action_high,
+            offset_low,
+            offset_high,
+            execution_action_low=action_low,
+            execution_action_high=action_high,
+            execution_support_source="scalar_dagger_safety_envelope",
+        )
 
         command_key = (
             "command_"
@@ -1259,20 +1372,25 @@ class PPOBCDaggerFinetune(PPOVEL):
             cfg.q_action_fusion,
         )
         self.qnet_target = copy.deepcopy(self.qnet).requires_grad_(False)
-        action_clip = float(cfg.dagger_action_clip)
-        action_low = torch.full(
-            (self.action_dim,), -action_clip, device=device, dtype=torch.float32
-        )
-        action_high = torch.full_like(action_low, action_clip)
         self.sac_dist_cls = functools.partial(
             FastSACTanhNormal,
             low=action_low,
             high=action_high,
             event_dims=1,
         )
-        initial_log_std = math.log(
-            float(cfg.sac_bc_initial_action_std) / action_clip
+        initial_log_std = torch.log(
+            action_low.new_full(
+                action_low.shape, float(cfg.sac_bc_initial_action_std)
+            ) / self._fastsac_q_action_scale
         )
+        if (
+            (initial_log_std < float(cfg.sac_bc_log_std_min)).any()
+            or (initial_log_std > float(cfg.sac_bc_log_std_max)).any()
+        ):
+            raise ValueError(
+                "sac_bc_initial_action_std maps outside the per-joint "
+                "BC-adapter latent log-std bounds"
+            )
         self.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
             self.action_dim, initial_log_std, device
         )
@@ -1491,7 +1609,6 @@ class PPOBCDaggerFinetune(PPOVEL):
             "q_lr",
             "sac_bc_initial_action_std",
             "sac_alpha_init",
-            "sac_entropy_reference_scale",
         ):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -1503,6 +1620,13 @@ class PPOBCDaggerFinetune(PPOVEL):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
+        if float(cfg.dagger_teacher_action_threshold) > float(
+            cfg.dagger_action_clip
+        ):
+            raise ValueError(
+                "dagger_teacher_action_threshold must not exceed the actor "
+                "execution envelope"
+            )
         release = float(cfg.dagger_safe_release_rms)
         takeover = float(cfg.dagger_safe_takeover_rms)
         if not (
@@ -1560,19 +1684,8 @@ class PPOBCDaggerFinetune(PPOVEL):
             and float(cfg.sac_bc_log_std_min) < float(cfg.sac_bc_log_std_max)
         ):
             raise ValueError("SAC log-std bounds must be finite and ordered")
-        initial_log_std = math.log(
-            float(cfg.sac_bc_initial_action_std)
-            / float(cfg.dagger_action_clip)
-        )
-        if not (
-            float(cfg.sac_bc_log_std_min)
-            <= initial_log_std
-            <= float(cfg.sac_bc_log_std_max)
-        ):
-            raise ValueError(
-                "sac_bc_initial_action_std lies outside the configured "
-                "dedicated SAC log-std bounds"
-            )
+        # Physical std maps through the nominal Stage-2 residual half-range and
+        # is validated after the environment action contract is available.
         if not math.isfinite(float(cfg.q_max_grad_norm)) or cfg.q_max_grad_norm < 0:
             raise ValueError("q_max_grad_norm must be finite and non-negative")
         if not math.isfinite(float(cfg.q_weight_decay)) or cfg.q_weight_decay < 0:
@@ -2008,9 +2121,111 @@ class PPOBCDaggerFinetune(PPOVEL):
             ),
         )
 
+    def _project_execution_action(self, action: torch.Tensor) -> torch.Tensor:
+        return _project_to_execution_support(
+            action,
+            self._fastsac_action_low,
+            self._fastsac_action_high,
+            float(self.cfg.dagger_action_clip),
+        )
+
+    def _student_action_from_latent(
+        self, latent: torch.Tensor
+    ) -> torch.Tensor:
+        action = _fastsac_latent_to_action(
+            latent,
+            self._fastsac_action_low,
+            self._fastsac_action_high,
+        )
+        return _project_to_execution_support(
+            action,
+            self._fastsac_action_low,
+            self._fastsac_action_high,
+            float(self.cfg.dagger_action_clip),
+        )
+
+    @torch.no_grad()
+    def _migrate_fresh_ppo_student_actor_to_latent(self) -> None:
+        """Convert a fresh PPO physical-action head into a native latent head.
+
+        The source PPO student's last layer emits an absolute physical action
+        ``a = W h + b``. BC-DAgger and Stage 2 instead require a pre-tanh
+        latent. With no calibration observations available at load time, use
+        the exact first-order inverse of the safety-envelope affine-tanh transform
+        at VAIC's neutral raw action ``a0=0``:
+
+        ``z ~= z0 + k*a``, where ``z0=atanh(-center/half_range)`` and
+        ``k=1/(half_range*(1-(-center/half_range)^2))``.
+
+        Thus the migrated actor executes exactly zero when the old actor did,
+        and its physical-action Jacobian with respect to the old output is one
+        at zero. SafeDAgger handles larger nonlinear deviations while BC trains
+        the head directly in latent coordinates. This operation is fresh-load
+        only and must never be repeated on a BC-DAgger resume.
+        """
+        if getattr(self, "_fresh_ppo_actor_latent_migration_applied", False):
+            raise RuntimeError(
+                "Fresh PPO student actor latent migration was applied twice"
+            )
+        cores = [
+            module
+            for module in self.actor_adapt.modules()
+            if isinstance(module, Actor)
+        ]
+        if len(cores) != 1:
+            raise RuntimeError(
+                "Fresh PPO student migration requires exactly one Actor core; "
+                f"found {len(cores)}"
+            )
+        core = cores[0]
+        if bool(core.predict_std):
+            raise RuntimeError(
+                "Fresh PPO student migration requires a separate fixed std head"
+            )
+        mean_head = core.actor_mean
+        weight = mean_head.weight
+        bias = mean_head.bias
+        action_center = self._fastsac_actor_action_center.to(
+            device=weight.device, dtype=weight.dtype
+        )
+        action_scale = self._fastsac_actor_action_scale.to(
+            device=weight.device, dtype=weight.dtype
+        )
+        if weight.shape[0] != action_center.numel() or bias.shape != (
+            action_center.numel(),
+        ):
+            raise RuntimeError(
+                "Fresh PPO student mean-head shape does not match action contract"
+            )
+        normalized_zero = -action_center / action_scale
+        if (
+            not torch.isfinite(normalized_zero).all()
+            or not (normalized_zero.abs() < 1.0).all()
+        ):
+            raise RuntimeError(
+                "Fresh PPO student migration requires zero strictly inside "
+                "the actor execution interval"
+            )
+        latent_zero = torch.atanh(normalized_zero)
+        inverse_slope = (
+            action_scale * (1.0 - normalized_zero.square())
+        ).reciprocal()
+        if not torch.isfinite(inverse_slope).all():
+            raise RuntimeError(
+                "Fresh PPO student migration produced a non-finite slope"
+            )
+        weight.mul_(inverse_slope.unsqueeze(-1))
+        bias.mul_(inverse_slope).add_(latent_zero)
+        self._fresh_ppo_actor_latent_migration_applied = True
+        logging.info(
+            "Migrated fresh PPO student mean from physical actions to native "
+            "per-joint tanh latents (%s)",
+            PPO_BC_DAGGER_FRESH_ACTOR_INITIALIZATION_SEMANTICS,
+        )
+
     @torch.no_grad()
     def _teacher_action(self, td: TensorDict):
-        """Return the checkpoint PPO teacher in executable absolute coordinates."""
+        """Return the checkpoint PPO teacher in absolute command coordinates."""
         self.object_transform(td)
         if hasattr(self, "height_encoder"):
             self.height_encoder(td)
@@ -2019,7 +2234,7 @@ class PPOBCDaggerFinetune(PPOVEL):
         return (td[REF_JPOS_KEY] + residual).detach()
 
     @torch.no_grad()
-    def _student_action(self, td: TensorDict):
+    def _student_latent(self, td: TensorDict):
         if hasattr(self, "temporal_depth_gru_ema"):
             self.temporal_depth_gru_ema(td)
         else:
@@ -2033,8 +2248,11 @@ class PPOBCDaggerFinetune(PPOVEL):
     def get_rollout_policy(self, mode="train"):
         if mode == "train":
             return _DaggerRolloutPolicy(self)
-        return _ClippedStudentRolloutPolicy(
-            super().get_rollout_policy(mode), self.cfg.dagger_action_clip
+        return _LatentStudentRolloutPolicy(
+            super().get_rollout_policy(mode),
+            self._fastsac_action_low,
+            self._fastsac_action_high,
+            self.cfg.dagger_action_clip,
         )
 
     def configure_teacher_replay(self, path, restore_path=None):
@@ -2078,6 +2296,7 @@ class PPOBCDaggerFinetune(PPOVEL):
             critic_obs_keys=self.q_critic_keys,
             vecnorm_fingerprint=self._replay_vecnorm_fingerprint,
             action_clip=self.cfg.dagger_action_clip,
+            action_contract=self._fastsac_action_contract,
         )
         if (
             restore_path is not None
@@ -2175,13 +2394,27 @@ class PPOBCDaggerFinetune(PPOVEL):
                 self._replay_vecnorm_fingerprint
             ):
                 raise ValueError("Q teacher replay VecNorm fingerprint mismatch")
-            if not math.isclose(
-                float(replay.attrs.get("action_clip", float("nan"))),
+            replay_action_clip = float(
+                replay.attrs.get("action_clip", float("nan"))
+            )
+            replay_action_contract = json.loads(str(
+                replay.attrs.get("action_contract", "{}")
+            ))
+            if replay_action_contract != self._fastsac_action_contract:
+                raise ValueError("Q teacher replay action contract mismatch")
+            replay_action_low, replay_action_high = (
+                _validate_vaic_action_contract_metadata(
+                    replay_action_contract, self.action_dim
+                )
+            )
+            _validate_action_safety_clip(
+                replay_action_low, replay_action_high, replay_action_clip
+            )
+            _validate_action_safety_clip(
+                replay_action_low,
+                replay_action_high,
                 float(self.cfg.dagger_action_clip),
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            ):
-                raise ValueError("Q teacher replay action clip mismatch")
+            )
             missing = set(TEACHER_REPLAY_FIELDS).difference(replay.keys())
             if missing:
                 raise ValueError(
@@ -2237,10 +2470,18 @@ class PPOBCDaggerFinetune(PPOVEL):
                             f"Q teacher replay field {key!r} contains "
                             "non-finite values"
                         )
+                action_low = replay_action_low.to(
+                    device=values["actions"].device,
+                    dtype=values["actions"].dtype,
+                )
+                action_high = replay_action_high.to(
+                    device=values["actions"].device,
+                    dtype=values["actions"].dtype,
+                )
                 if (
-                    values["actions"].abs()
-                    > float(self.cfg.dagger_action_clip)
-                ).any():
+                    (values["actions"] < action_low).any()
+                    or (values["actions"] > action_high).any()
+                ):
                     raise ValueError(
                         "Q teacher replay action lies outside the configured "
                         "executable support"
@@ -2498,38 +2739,51 @@ class PPOBCDaggerFinetune(PPOVEL):
         return self.actor_adapt.get_dist(td)
 
     def _sac_critic_dist_from_flat(self, actor_obs):
-        """Bounded small-noise target policy centred on the DAgger BC mean."""
-        mean_action = self._actor_dist_from_flat(actor_obs).mean
-        action_clip = float(self.cfg.dagger_action_clip)
-        mean_action = torch.nan_to_num(
-            mean_action,
-            nan=0.0,
-            posinf=action_clip,
-            neginf=-action_clip,
-        ).clamp(-action_clip, action_clip)
-        normalized = (mean_action / action_clip).clamp(
-            -1.0 + FASTSAC_REFERENCE_EPS,
-            1.0 - FASTSAC_REFERENCE_EPS,
+        """Small-noise target policy centered exactly on current BC behavior."""
+        actor_latent = _sanitize_fastsac_latent(
+            self._actor_dist_from_flat(actor_obs).mean
         )
-        loc = torch.atanh(normalized)
+        mean_action = _fastsac_latent_to_action(
+            actor_latent,
+            self._fastsac_action_low,
+            self._fastsac_action_high,
+        ).detach()
+        residual_low, residual_high, _ = _fastsac_bc_residual_support(
+            mean_action,
+            self._fastsac_q_action_scale,
+            self._fastsac_action_low,
+            self._fastsac_action_high,
+        )
         log_std = self.bc_dagger_sac_adapter.log_std.clamp(
             float(self.cfg.sac_bc_log_std_min),
             float(self.cfg.sac_bc_log_std_max),
         )
-        scale = log_std.exp().expand_as(loc)
-        return mean_action, self.sac_dist_cls(loc, scale)
+        scale = log_std.exp().expand_as(actor_latent)
+        dist = FastSACTanhNormal(
+            torch.zeros_like(actor_latent),
+            scale,
+            low=residual_low,
+            high=residual_high,
+            event_dims=1,
+        )
+        return mean_action, dist
 
     def _q_action_input(self, action):
-        """Normalize absolute executable actions exactly as Stage-2 does."""
-        action_clip = float(self.cfg.dagger_action_clip)
-        normalized = (action / action_clip).clamp(-1.0, 1.0)
+        """Map absolute commands to the same unclipped Q coordinates as Stage 2."""
+        action_center = self._fastsac_q_action_center.to(
+            device=action.device, dtype=action.dtype
+        )
+        action_scale = self._fastsac_q_action_scale.to(
+            device=action.device, dtype=action.dtype
+        )
+        normalized = (action - action_center) / action_scale
         gain = float(self.cfg.sac_q_action_input_gain)
         return normalized if gain == 1.0 else normalized * gain
 
     def _normalized_action_log_prob(self, physical_log_prob):
-        return physical_log_prob + float(
-            self.action_dim
-            * math.log(float(self.cfg.sac_entropy_reference_scale))
+        return (
+            physical_log_prob
+            + self._fastsac_entropy_reference_log_scale_sum
         )
 
     def _q_backend_metadata(self):
@@ -2570,6 +2824,19 @@ class PPOBCDaggerFinetune(PPOVEL):
             ),
             "q_action_coordinates": str(self.cfg.q_action_coordinates),
             "q_action_normalized": bool(self.cfg.sac_q_normalize_actions),
+            "q_action_transform_semantics": (
+                FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS
+            ),
+            "q_action_center": (
+                self._fastsac_q_action_center.detach().cpu().tolist()
+            ),
+            "q_action_scale": (
+                self._fastsac_q_action_scale.detach().cpu().tolist()
+            ),
+            "q_action_joint_names": list(self.joint_names),
+            "q_action_transform_fingerprint": self._fastsac_action_contract[
+                "q_action_transform_fingerprint"
+            ],
             "q_action_input_gain": float(self.cfg.sac_q_action_input_gain),
             "q_action_semantics": FASTSAC_Q_ACTION_NORMALIZATION_SEMANTICS,
             "clipped_double_q": bool(self.cfg.sac_clipped_double_q),
@@ -2582,7 +2849,8 @@ class PPOBCDaggerFinetune(PPOVEL):
                 "stochastic_next_action_q_only_effective_alpha_zero_v1"
             ),
             "pretrain_target_policy": (
-                "dedicated_small_noise_stochastic_current_bc_student_v1"
+                "dedicated_small_noise_bc_centered_nominal_bounded_"
+                "residual_v3"
             ),
             "replay_mix_semantics": (
                 "beta_independent_teacher_executed_0.5_student_executed_0.5_v1"
@@ -2637,11 +2905,29 @@ class PPOBCDaggerFinetune(PPOVEL):
         if not valid.any():
             zero = torch.zeros((), device=self.device)
             return zero, zero, zero
-        prediction = self._actor_dist_from_flat(batch["observations"]).mean[valid]
-        target = batch[DAGGER_REPLAY_TEACHER_ACTIONS][valid].detach()
+        prediction_latent = self._actor_dist_from_flat(
+            batch["observations"]
+        ).mean[valid]
+        if not torch.isfinite(prediction_latent).all():
+            raise RuntimeError("BC student latent contains non-finite values")
+        target_action = batch[DAGGER_REPLAY_TEACHER_ACTIONS][valid].detach()
+        action_center = self._fastsac_actor_action_center.to(
+            device=target_action.device, dtype=target_action.dtype
+        )
+        action_scale = self._fastsac_actor_action_scale.to(
+            device=target_action.device, dtype=target_action.dtype
+        )
+        target_latent = _fastsac_action_center_to_latent(
+            target_action,
+            action_scale,
+            action_center,
+            FASTSAC_REFERENCE_EPS,
+        ).detach()
+        # Supervise the actor's native latent directly. This avoids both a hard
+        # projection's zero gradient and inverse-tanh amplification in Stage 2.
         loss = F.smooth_l1_loss(
-            prediction,
-            target,
+            prediction_latent,
+            target_latent,
             beta=float(self.cfg.dagger_actor_huber_delta),
         )
         self.bc_optimizer.zero_grad(set_to_none=True)
@@ -2651,7 +2937,10 @@ class PPOBCDaggerFinetune(PPOVEL):
         )
         self.bc_optimizer.step()
         self.bc_update_count += 1
-        mae = (prediction.detach() - target).abs().mean()
+        prediction_action = self._student_action_from_latent(
+            prediction_latent.detach()
+        )
+        mae = (prediction_action - target_action).abs().mean()
         return loss.detach(), mae, grad.detach()
 
     def _q_update(self, batch):
@@ -3235,10 +3524,24 @@ class PPOBCDaggerFinetune(PPOVEL):
             "sac_bc_log_std_min",
             "sac_bc_log_std_max",
             "sac_alpha_init",
-            "sac_entropy_reference_scale",
             "teacher_buffer_capacity",
         )
-        return {name: getattr(self.cfg, name) for name in names}
+        return {
+            **{name: getattr(self.cfg, name) for name in names},
+            "rollout_action_projection_semantics": (
+                "finite_guard_then_scalar_safety_envelope_affine_tanh_v3"
+            ),
+            "bc_actor_loss_semantics": (
+                "raw_student_latent_vs_inverse_safety_tanh_teacher_v3"
+            ),
+            "sac_bc_initial_action_std_semantics": (
+                "center_local_first_order_physical_std_latent_std_equals_"
+                "physical_over_nominal_residual_half_range_v3"
+            ),
+            "fresh_ppo_actor_initialization_semantics": (
+                PPO_BC_DAGGER_FRESH_ACTOR_INITIALIZATION_SEMANTICS
+            ),
+        }
 
     def state_dict(self):
         state = super().state_dict()
@@ -3253,6 +3556,9 @@ class PPOBCDaggerFinetune(PPOVEL):
                     PPO_BC_DAGGER_ACTOR_LEARNING_SEMANTICS
                 ),
                 "dagger_backend_config": self._checkpoint_config(),
+                "action_contract": copy.deepcopy(
+                    self._fastsac_action_contract
+                ),
                 "q_backend_config": self._q_backend_metadata(),
                 "teacher_action_semantics": (
                     DAGGER_TEACHER_ACTION_SEMANTICS
@@ -3405,6 +3711,8 @@ class PPOBCDaggerFinetune(PPOVEL):
             actual_q_backend = state_dict.get("q_backend_config")
             if actual_q_backend != self._q_backend_metadata():
                 raise ValueError("PPO-BC DAgger Q backend contract mismatch")
+            if state_dict.get("action_contract") != self._fastsac_action_contract:
+                raise ValueError("PPO-BC DAgger executable action contract mismatch")
         elif algorithm == PPO_BC_DAGGER_IQL_TRAINING_ALGORITHM:
             raise ValueError(
                 "IQL-v2 BC-DAgger checkpoints cannot resume the SAC-critic "
@@ -3618,6 +3926,7 @@ class PPOBCDaggerFinetune(PPOVEL):
                     "Failed to load critical PPO teacher/student modules: "
                     f"{sorted(unexpected)}"
                 )
+            self._migrate_fresh_ppo_student_actor_to_latent()
             hard_copy_(self.qnet, self.qnet_target)
             self.qnet_target.requires_grad_(False)
             self.q_update_count = 0

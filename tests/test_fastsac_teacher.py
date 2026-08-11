@@ -858,14 +858,14 @@ def test_actor_q_reduction_uses_minimum_or_legacy_twin_mean():
     )
 
 
-def test_q_action_input_affinely_maps_executable_bounds_to_unit_box():
+def test_q_action_input_uses_unclipped_nominal_joint_coordinates():
     policy = FastSACVEL.__new__(FastSACVEL)
     torch.nn.Module.__init__(policy)
     policy.cfg = SimpleNamespace(
         sac_q_normalize_actions=True,
         sac_q_action_input_gain=1.0,
     )
-    policy._fastsac_q_action_low = torch.tensor([-2.0, 1.0])
+    policy._fastsac_q_action_center = torch.tensor([2.0, 3.0])
     policy._fastsac_q_action_scale = torch.tensor([4.0, 2.0])
     executable = torch.tensor([
         [-2.0, 1.0],
@@ -879,7 +879,7 @@ def test_q_action_input_affinely_maps_executable_bounds_to_unit_box():
     assert torch.equal(normalized[0], torch.tensor([-1.0, -1.0]))
     assert torch.equal(normalized[1], torch.tensor([0.0, 0.0]))
     assert torch.equal(normalized[2], torch.tensor([1.0, 1.0]))
-    assert torch.equal(normalized[3], torch.tensor([-1.0, 1.0]))
+    assert torch.equal(normalized[3], torch.tensor([-1.25, 2.5]))
     # Q normalization never mutates the replay/environment tensor.
     assert torch.equal(executable[-1], torch.tensor([-3.0, 8.0]))
 
@@ -894,7 +894,7 @@ def test_q_action_input_gain_applies_after_optional_normalization():
         sac_q_normalize_actions=True,
         sac_q_action_input_gain=2.5,
     )
-    policy._fastsac_q_action_low = torch.tensor([-2.0, 1.0])
+    policy._fastsac_q_action_center = torch.tensor([2.0, 3.0])
     policy._fastsac_q_action_scale = torch.tensor([4.0, 2.0])
     executable = torch.tensor([[0.0, 3.0]])
 
@@ -1049,7 +1049,7 @@ def test_reference_dueling_q_wrappers_use_current_and_next_reference_frames():
         sac_q_normalize_actions=True,
         sac_q_action_input_gain=1.0,
     )
-    policy._fastsac_q_action_low = torch.tensor([-2.0])
+    policy._fastsac_q_action_center = torch.tensor([0.0])
     policy._fastsac_q_action_scale = torch.tensor([2.0])
     q_spy = _ReferenceDuelingQCallSpy()
     observations = torch.zeros(2, 1)
@@ -1193,6 +1193,13 @@ def test_q_checkpoint_metadata_makes_action_coordinates_incompatible():
     policy._q_actor_dim = 2
     policy._q_critic_dim = 3
     policy.action_dim = 1
+    policy.joint_names = ["joint"]
+    policy._fastsac_q_action_center = torch.tensor([0.0])
+    policy._fastsac_q_action_scale = torch.tensor([2.0])
+    policy._fastsac_action_contract = {
+        "fingerprint": "test-contract",
+        "q_action_transform_fingerprint": "test-q-transform",
+    }
     policy.reward_groups = ["task"]
 
     normalized = policy._q_backend_metadata()
@@ -1808,7 +1815,6 @@ def test_interleaved_resume_waits_for_first_accepted_replay_row():
         phase="train",
         train_every=2,
         sac_learning_starts=0,
-        sac_updates_per_env_step=1,
         sac_policy_frequency=100,
         sac_batch_size=2,
         sac_teacher_learning_starts_transitions=0,
@@ -1960,7 +1966,6 @@ def test_true_teacher_train_op_never_calls_ppo_or_enables_h5_export(
         train_every=2,
         teacher_buffer_start_iteration=5100,
         sac_learning_starts=0,
-        sac_updates_per_env_step=2,
         sac_policy_frequency=2,
         sac_batch_size=3,
         sac_teacher_learning_starts_transitions=0,
@@ -2291,7 +2296,7 @@ def test_teacher_q_target_uses_stochastic_action_and_truncation_bootstrap(
         sac_use_autotune=autotune,
         sac_teacher_n_steps=4,
     )
-    policy._fastsac_q_action_low = torch.tensor([-2.0])
+    policy._fastsac_q_action_center = torch.tensor([2.0])
     policy._fastsac_q_action_scale = torch.tensor([4.0])
     policy.sac_action_rng = torch.Generator().manual_seed(1)
     policy.qnet = _TinyQ()
@@ -2816,7 +2821,7 @@ def test_teacher_actor_and_diagnostics_send_only_normalized_actions_to_q():
         sac_teacher_actor_max_grad_norm=0.0,
         sac_q_normalize_actions=True,
     )
-    policy._fastsac_q_action_low = torch.tensor([-2.0])
+    policy._fastsac_q_action_center = torch.tensor([0.0])
     policy._fastsac_q_action_scale = torch.tensor([2.0])
     policy.sac_action_rng = torch.Generator().manual_seed(1)
     actor_parameter = torch.nn.Parameter(torch.tensor(1.0))

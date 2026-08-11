@@ -474,6 +474,8 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         bool(cfg.get("_bc_dagger_model_only_resume", False))
     )
     fresh_bc_dagger_source = bool(
+        cfg.get("_bc_dagger_fresh_source", False)
+        or
         cfg.get("_bc_dagger_finalization_source", False)
         or cfg.get("_bc_dagger_staging_source", False)
     )
@@ -525,23 +527,38 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         )
         detected_algorithm = policy_state.get("training_algorithm")
         detected_backend = policy_state.get("actor_backend")
-        current_dagger_adapter = "vaic_fastsac_bc_dagger_adapter_v2"
-        legacy_dagger_adapter = "vaic_fastsac_bc_dagger_adapter_v1"
+        current_dagger_adapter = "vaic_fastsac_bc_dagger_adapter_v6"
+        legacy_dagger_adapters = {
+            "vaic_fastsac_bc_dagger_adapter_v1",
+            "vaic_fastsac_bc_dagger_adapter_v2",
+            "vaic_fastsac_bc_dagger_adapter_v3",
+            "vaic_fastsac_bc_dagger_adapter_v4",
+            "vaic_fastsac_bc_dagger_adapter_v5",
+        }
         if detected_algorithm == "vaic_ppo_bc_dagger_student_v1":
             raise ValueError(
                 "This BC-DAgger checkpoint predates compatible critic training. "
                 "Create a new checkpoint with scripts/bc_dagger.py before "
                 "starting fastsac_vel_finetune."
             )
-        if detected_backend == legacy_dagger_adapter:
+        if detected_algorithm == "vaic_ppo_bc_dagger_student_sac_critic_v3":
+            raise ValueError(
+                "This BC-DAgger checkpoint predates the separated execution, "
+                "Q, and entropy action contract. Start a new BC-DAgger run; "
+                "SAC-critic-v3 "
+                "checkpoints are intentionally incompatible with Stage 2."
+            )
+        if detected_backend in legacy_dagger_adapters:
             raise ValueError(
                 "This Stage-2 BC-DAgger adapter checkpoint reused PPO's "
-                "untrained actor_std and used the old action/entropy "
-                "semantics. Restart Stage 2 from the original BC-DAgger "
-                "checkpoint; adapter_v1 resumes are intentionally rejected."
+                "old action support and/or coupled action/Q/entropy "
+                "coordinates. Start a new BC-DAgger run with the separated "
+                "safety-envelope, nominal-Q, and bounded-residual contract; "
+                "adapter_v1-v5 resumes are "
+                "intentionally rejected."
             )
         current_dagger_algorithm = (
-            "vaic_ppo_bc_dagger_student_sac_critic_v3"
+            "vaic_ppo_bc_dagger_student_sac_critic_v6"
         )
         iql_dagger_algorithm = "vaic_ppo_bc_dagger_student_iql_v2"
         if configured_source == "auto":
@@ -604,21 +621,88 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                     "BC-DAgger transfer checkpoint is missing its actor/action "
                     "backend configuration"
                 )
+            source_action_contract = (
+                policy_state.get("action_contract")
+                if direct_dagger_transfer
+                else source_actor_backend.get("action_contract")
+            )
+            if not isinstance(source_action_contract, dict):
+                raise ValueError(
+                    "BC-DAgger transfer checkpoint is missing its executable "
+                    "per-joint action contract"
+                )
+            if source_action_contract.get("semantics") != (
+                "separate_execution_support_q_and_entropy_coordinates_v2"
+            ):
+                raise ValueError(
+                    "BC-DAgger transfer checkpoint has incompatible executable "
+                    "action-contract semantics"
+                )
+            action_contract_fingerprint = str(
+                source_action_contract.get("fingerprint", "")
+            )
+            if not action_contract_fingerprint.startswith("sha256:"):
+                raise ValueError(
+                    "BC-DAgger transfer checkpoint action contract lacks a "
+                    "fingerprint"
+                )
+            # The scalar clip is the BC actor's symmetric tanh support. Q and
+            # entropy coordinates are separate fields in the action contract,
+            # so a different Stage-2 clip would change actor semantics.
             action_clip_key = (
-                "dagger_action_clip" if direct_dagger_transfer else "action_clip"
+                "dagger_action_clip"
+                if direct_dagger_transfer
+                else "action_safety_clip"
             )
             if action_clip_key not in source_actor_backend:
                 raise ValueError(
-                    "BC-DAgger transfer checkpoint lacks the saved action clip"
+                    "BC-DAgger transfer checkpoint lacks the saved final action "
+                    "safety clip"
                 )
-            cfg.algo.sac_bc_action_clip = source_actor_backend[action_clip_key]
+            action_low = source_action_contract.get("action_low")
+            action_high = source_action_contract.get("action_high")
+            if (
+                not isinstance(action_low, list)
+                or not isinstance(action_high, list)
+                or not action_low
+                or len(action_low) != len(action_high)
+            ):
+                raise ValueError(
+                    "BC-DAgger transfer checkpoint action contract has invalid "
+                    "joint-wise bounds"
+                )
+            required_safety_clip = max(
+                max(abs(float(low)), abs(float(high)))
+                for low, high in zip(action_low, action_high)
+            )
+            source_safety_clip = float(source_actor_backend[action_clip_key])
+            configured_safety_clip = float(cfg.algo.sac_bc_action_clip)
+            if not np.isfinite(source_safety_clip) or not np.isclose(
+                source_safety_clip,
+                required_safety_clip,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "BC-DAgger checkpoint safety clip does not exactly match "
+                    "its actor execution support"
+                )
+            if not np.isfinite(configured_safety_clip) or not np.isclose(
+                configured_safety_clip,
+                source_safety_clip,
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "Configured Stage-2 safety clip does not exactly match "
+                    "the checkpoint actor support"
+                )
             if direct_sac_dagger_transfer:
                 direct_adapter_fields = (
                     "sac_bc_initial_action_std",
                     "sac_bc_log_std_min",
                     "sac_bc_log_std_max",
                     "sac_alpha_init",
-                    "sac_entropy_reference_scale",
                 )
                 for name in direct_adapter_fields:
                     if name not in source_actor_backend:
@@ -661,7 +745,7 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                         )
                     value = source_actor_backend[source]
                     if destination == "sac_deterministic_rollout":
-                        value = value == "deterministic_clipped_bc_mean"
+                        value = value == "deterministic_executable_bc_mean"
                     cfg.algo[destination] = value
 
             # A direct actor-only transfer deliberately keeps the current,
@@ -674,7 +758,7 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                 raise ValueError(
                     "IQL-v2 BC-DAgger Q does not match the current Stage-2 "
                     "SAC/AWAC critic topology or policy-evaluation backup. Set "
-                    "algo.load_pretrained_q=false or use a v3 SAC-critic "
+                    "algo.load_pretrained_q=false or use a v6 SAC-critic "
                     "BC-DAgger checkpoint."
                 )
             inherit_q = load_pretrained_q or same_stage_resume
@@ -689,6 +773,15 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                     "configuration"
                 )
             if inherit_q:
+                if source_q_backend.get(
+                    "q_action_transform_fingerprint"
+                ) != source_action_contract.get(
+                    "q_action_transform_fingerprint"
+                ):
+                    raise ValueError(
+                        "BC-DAgger Q action-transform fingerprint does not "
+                        "match the checkpoint action contract"
+                    )
                 # Construct Q1/Q2 with the exact saved topology before loading.
                 q_fields = {
                     "q_hidden_dim": (
@@ -786,8 +879,9 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
                 )
             print(colored(
                 "[Info]: FastSAC finetune source: PPO-BC DAgger "
-                "(bounded stochastic train behavior, deterministic clipped "
-                "evaluation mean, dedicated SAC std, exact executed-action "
+                "(frozen-BC-centered bounded-residual stochastic train "
+                "behavior, deterministic residual mean evaluation, dedicated "
+                "SAC std, exact physical-action "
                 f"replay, {source_detail}).",
                 "green",
             ))
@@ -924,6 +1018,7 @@ def evaluate(
 
     env.base_env.eval()
     env.eval()
+    policy.eval()
     env.set_seed(seed)
 
     tensordict_ = env.reset()

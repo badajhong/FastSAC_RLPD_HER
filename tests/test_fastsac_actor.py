@@ -395,6 +395,7 @@ def test_vaic_action_bounds_are_asymmetric_executable_raw_joint_limits():
     policy = FastSACVEL.__new__(FastSACVEL)
     torch.nn.Module.__init__(policy)
     policy.device = torch.device("cpu")
+    policy.joint_names = ["joint_0", "joint_1", "joint_2"]
 
     soft_limits = torch.tensor([[[-1.0, 2.0], [-3.0, 1.0], [0.0, 3.0]]])
     default_joint_pos = torch.tensor([[0.0, -1.0, 0.5]])
@@ -426,10 +427,11 @@ def test_vaic_action_bounds_are_asymmetric_executable_raw_joint_limits():
     assert torch.equal(default + action_high * action_scaling, soft_limits[0, :, 1])
 
 
-def test_vaic_action_bounds_intersect_random_joint_offset_extremes():
+def test_vaic_nominal_action_coordinates_ignore_episode_random_offset():
     policy = FastSACVEL.__new__(FastSACVEL)
     torch.nn.Module.__init__(policy)
     policy.device = torch.device("cpu")
+    policy.joint_names = ["joint_0", "joint_1", "joint_2"]
 
     soft_limits = torch.tensor([[[-1.0, 2.0], [-3.0, 1.0], [0.0, 3.0]]])
     default_joint_pos = torch.tensor([[0.0, -1.0, 0.5]])
@@ -459,26 +461,25 @@ def test_vaic_action_bounds_intersect_random_joint_offset_extremes():
 
     action_low, action_high = policy._vaic_action_bounds()
 
-    expected_low = torch.tensor([-1.8, -8.0, -0.05])
-    expected_high = torch.tensor([3.6, 8.0, 1.1])
+    expected_low = torch.tensor([-2.0, -8.0, -0.25])
+    expected_high = torch.tensor([4.0, 8.0, 1.25])
     assert torch.allclose(action_low, expected_low)
     assert torch.allclose(action_high, expected_high)
 
     default = default_joint_pos[0, manager.joint_ids]
     offset_low = torch.tensor([-0.10, 0.0, -0.40])
     offset_high = torch.tensor([0.20, 0.0, 0.30])
-    lower_targets = default + offset_low + action_low * action_scaling
-    upper_targets = default + offset_high + action_high * action_scaling
+    lower_targets = default + action_low * action_scaling
+    upper_targets = default + action_high * action_scaling
     assert torch.allclose(lower_targets, soft_limits[0, :, 0])
     assert torch.allclose(upper_targets, soft_limits[0, :, 1])
 
-    # The opposite offset corners must also remain inside the physical range;
-    # therefore every configured offset admits every sampled bounded action.
-    assert torch.all(
-        default + offset_high + action_low * action_scaling
-        >= soft_limits[0, :, 0]
+    # Episode offsets are provenance/dynamics, not a moving Q coordinate.
+    assert torch.allclose(
+        torch.tensor(policy._fastsac_action_contract["joint_offset_low"]),
+        offset_low,
     )
-    assert torch.all(
-        default + offset_low + action_high * action_scaling
-        <= soft_limits[0, :, 1]
+    assert torch.allclose(
+        torch.tensor(policy._fastsac_action_contract["joint_offset_high"]),
+        offset_high,
     )

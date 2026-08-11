@@ -19,6 +19,7 @@ bc_dagger_module = importlib.import_module(
 )
 from active_adaptation.learning.ppo.fastsac_vel import (  # noqa: E402
     TEACHER_REPLAY_FIELDS,
+    _vaic_action_contract_metadata,
 )
 from active_adaptation.learning.ppo.ppo_bc_dagger import (  # noqa: E402
     DAGGER_IS_STUDENT_ACTION_KEY,
@@ -66,6 +67,9 @@ def _staging_policy(
     policy.cfg = cfg
     policy.staging_rollout_count = 0
     policy._staging_last_phase = None
+    policy._fastsac_action_contract = _vaic_action_contract_metadata(
+        ["joint"], [-1.0], [1.0], [0.0], [0.0]
+    )
     return policy
 
 
@@ -121,6 +125,7 @@ def _write_fresh_ppo_teacher(path: Path):
                 "name": stage.EXPECTED_PPO_ALGO_NAME,
                 "_target_": stage.EXPECTED_PPO_ALGO_TARGET,
                 "phase": "train",
+                "enable_residual_distillation": True,
                 "use_object_adapt": False,
             },
         }
@@ -233,6 +238,17 @@ def test_prepare_stage_accepts_only_fresh_ppo_and_installs_backend_controls(
     assert cfg.algo.save_teacher_buffer is True
     assert cfg.algo.teacher_buffer_path is None
     assert cfg.teacher_replay_buffer_path is None
+
+
+def test_prepare_stage_rejects_absolute_output_ppo_teacher(tmp_path):
+    checkpoint = _write_fresh_ppo_teacher(tmp_path / "absolute_teacher.pt")
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    saved["cfg"]["algo"]["enable_residual_distillation"] = False
+    torch.save(saved, checkpoint)
+    cfg = _runtime_cfg(checkpoint_path=str(checkpoint))
+
+    with pytest.raises(ValueError, match="residual_distillation|added twice"):
+        stage.prepare_stage_bc_dagger(cfg)
 
 
 @pytest.mark.parametrize("complete", (False, True))

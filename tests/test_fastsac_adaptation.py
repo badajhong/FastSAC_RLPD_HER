@@ -1,3 +1,4 @@
+import copy
 import functools
 import math
 from types import SimpleNamespace
@@ -21,6 +22,8 @@ from active_adaptation.learning.ppo.fastsac_vel import (
     TEACHER_REF_ACTION_FIELD,
     TeacherReplayBuffer,
     _official_awac_weights,
+    _fastsac_latent_to_action,
+    _vaic_action_contract_metadata,
     _validate_fastsac_finetune_config,
 )
 from active_adaptation.learning.modules.distributions import IndependentNormal
@@ -52,7 +55,7 @@ def test_student_keeps_ppo_vel_inputs_and_uses_guarded_stage2_defaults():
         assert config.q_reference_dueling is False
         assert config.sac_clipped_double_q is True
         assert config.sac_use_autotune is True
-    assert fastsac_teacher.sac_updates_per_env_step == 4
+    assert not hasattr(fastsac_teacher, "sac_updates_per_env_step")
     assert fastsac_teacher.sac_policy_frequency == 2
     assert fastsac_teacher.sac_target_entropy_ratio == 0.5
     assert fastsac_teacher.sac_tau == 0.05
@@ -80,7 +83,7 @@ def test_student_keeps_ppo_vel_inputs_and_uses_guarded_stage2_defaults():
     # next 128-update cadence boundary, Q update 8064.
     assert fastsac.sac_learning_starts == 98_304
     assert fastsac.sac_batch_size == 512
-    assert fastsac.sac_updates_per_env_step == 1
+    assert fastsac.sac_update_to_data_ratio == 1.0
     assert fastsac.q_lr == 3e-5
     assert fastsac.sac_policy_frequency == 128
     assert fastsac.sac_actor_learning_starts_q_updates == 8_000
@@ -104,7 +107,7 @@ def test_student_keeps_ppo_vel_inputs_and_uses_guarded_stage2_defaults():
     assert fastsac.sac_deterministic_rollout is False
     assert fastsac.sac_freeze_perception is True
     assert fastsac.sac_bc_action_clip == 20.0
-    assert fastsac.sac_entropy_reference_scale == 1.0
+    assert not hasattr(fastsac, "sac_entropy_reference_scale")
     assert fastsac.sac_bc_initial_action_std == 0.01
     assert fastsac.sac_stage2_initial_action_std is None
     assert fastsac.sac_bc_log_std_min == -8.0
@@ -357,7 +360,7 @@ def test_stage2_train_op_uses_seen_gate_and_keeps_perception_frozen():
     policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
     torch.nn.Module.__init__(policy)
     policy.cfg = SimpleNamespace(
-        sac_updates_per_env_step=2,
+        sac_update_to_data_ratio=2.0,
         sac_policy_frequency=32,
         sac_actor_learning_starts_q_updates=8_000,
         teacher_buffer_ratio=0.5,
@@ -453,6 +456,10 @@ def test_stage2_train_op_uses_seen_gate_and_keeps_perception_frozen():
     assert info["fastsac/alpha_active"] == 0.0
     assert info["fastsac/new_online_rows"] == 6
     assert info["fastsac/sampled_total_draws"] == 4
+    assert info["fastsac/update_to_data_ratio_config"] == pytest.approx(2.0)
+    assert info["fastsac/update_row_credit"] == pytest.approx(0.0)
+    assert info["fastsac/q_updates_applied"] == 2
+    assert info["fastsac/eligible_new_online_rows"] == 2
     assert info["fastsac/sampled_online_draws"] == 2
     assert info["fastsac/sampled_offline_draws"] == 2
     assert info["fastsac/sampled_draws_per_new_row_valid"] == 1.0
@@ -466,6 +473,70 @@ def test_stage2_train_op_uses_seen_gate_and_keeps_perception_frozen():
         2.0 / 6.0
     )
     assert set(policy.online_replay.extended) == set(TeacherReplayBuffer.fields)
+
+
+def test_stage2_row_level_utd_is_batch_size_and_chunking_invariant():
+    def schedule(batch_size, chunks):
+        policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+        torch.nn.Module.__init__(policy)
+        policy.cfg = SimpleNamespace(
+            sac_batch_size=batch_size,
+            sac_update_to_data_ratio=2.0,
+        )
+        policy.sac_update_row_credit = 0.0
+        updates = sum(policy._stage2_updates_due(chunk) for chunk in chunks)
+        return updates, policy.sac_update_row_credit
+
+    small_updates, small_credit = schedule(64, [512])
+    large_updates, large_credit = schedule(512, [512])
+    chunked_updates, chunked_credit = schedule(64, [100, 200, 212])
+
+    assert small_updates == 16
+    assert large_updates == 2
+    assert small_updates * 64 == large_updates * 512 == 1_024
+    assert chunked_updates == small_updates
+    assert chunked_credit == pytest.approx(small_credit)
+    assert small_credit == pytest.approx(0.0)
+
+
+def test_stage2_fractional_utd_credit_resumes_at_same_boundary():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        sac_batch_size=64,
+        sac_update_to_data_ratio=0.5,
+    )
+    policy.sac_update_row_credit = 0.0
+
+    assert policy._stage2_updates_due(100) == 0
+    assert policy.sac_update_row_credit == pytest.approx(50.0)
+
+    resumed = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(resumed)
+    resumed.cfg = policy.cfg
+    resumed.sac_update_row_credit = policy.sac_update_row_credit
+    assert resumed._stage2_updates_due(28) == 1
+    assert resumed.sac_update_row_credit == pytest.approx(0.0)
+
+
+def test_latent_tanh_action_is_bounded_and_keeps_finite_gradients():
+    latent = torch.tensor(
+        [[-3.0, 1.0, 5.0, float("inf"), -float("inf")]],
+        requires_grad=True,
+    )
+    low = torch.tensor([-2.0, -2.0, -2.0, -2.0, -2.0])
+    high = torch.tensor([4.0, 4.0, 4.0, 4.0, 4.0])
+
+    action = _fastsac_latent_to_action(latent, low, high)
+
+    assert torch.isfinite(action).all()
+    assert ((action >= low) & (action <= high)).all()
+    expected = torch.tanh(latent.detach()[:, :3]) * 3.0 + 1.0
+    assert torch.allclose(action[:, :3], expected)
+    action[:, :3].sum().backward()
+    assert torch.isfinite(latent.grad).all()
+    assert (latent.grad[:, :3] > 0.0).all()
+    assert torch.equal(latent.grad[:, 3:], torch.zeros(1, 2))
 
 
 def test_stage2_actor_first_eligible_cadence_is_q_update_8064():
@@ -518,13 +589,17 @@ def test_stage2_iteration_actor_start_uses_versioned_resume_schedule():
     policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
     policy.cfg = FastSACVelFinetuneConfig()
 
-    legacy = policy._stage2_schedule_config()
-    assert legacy["version"] == 4
-    assert "sac_actor_learning_starts_finetune_iteration" not in legacy
+    baseline = policy._stage2_schedule_config()
+    assert baseline["version"] == 12
+    assert "sac_actor_learning_starts_finetune_iteration" not in baseline
+    assert "total_replay_rows_sampled" in baseline[
+        "update_to_data_ratio_semantics"
+    ]
+    assert "every_q_update" in baseline["alpha_update_semantics"]
 
     policy.cfg.sac_actor_learning_starts_finetune_iteration = 250
     iteration_schedule = policy._stage2_schedule_config()
-    assert iteration_schedule["version"] == 5
+    assert iteration_schedule["version"] == 12
     assert (
         iteration_schedule["sac_actor_learning_starts_finetune_iteration"]
         == 250
@@ -544,7 +619,7 @@ def test_stage2_transfer_std_is_opt_in_resume_schedule_metadata():
 
     policy.cfg.sac_stage2_initial_action_std = 0.2
     reset_schedule = policy._stage2_schedule_config()
-    assert reset_schedule["version"] == 8
+    assert reset_schedule["version"] == 12
     assert reset_schedule["sac_stage2_initial_action_std"] == pytest.approx(0.2)
     assert "fresh_bc_dagger_transfer_reset_once" in reset_schedule[
         "stage2_initial_action_std_semantics"
@@ -555,15 +630,13 @@ def test_stage2_actor_log_std_lr_is_opt_in_resume_schedule_metadata():
     policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
     policy.cfg = FastSACVelFinetuneConfig()
 
-    # None must preserve the exact legacy schedule so old Stage-2 checkpoints
-    # remain resumable with their original single actor optimizer group.
-    legacy_schedule = policy._stage2_schedule_config()
-    assert legacy_schedule["version"] == 4
-    assert "sac_actor_log_std_lr" not in legacy_schedule
+    baseline_schedule = policy._stage2_schedule_config()
+    assert baseline_schedule["version"] == 12
+    assert "sac_actor_log_std_lr" not in baseline_schedule
 
     policy.cfg.sac_actor_log_std_lr = 3e-5
     split_schedule = policy._stage2_schedule_config()
-    assert split_schedule["version"] == 9
+    assert split_schedule["version"] == 12
     assert split_schedule["sac_actor_log_std_lr"] == pytest.approx(3e-5)
 
     # The strict same-stage schedule guard must distinguish an explicitly
@@ -572,7 +645,7 @@ def test_stage2_actor_log_std_lr_is_opt_in_resume_schedule_metadata():
         policy.load_state_dict({
             "qnet": {},
             "last_phase": "finetune",
-            "stage2_schedule_config": legacy_schedule,
+            "stage2_schedule_config": baseline_schedule,
         })
 
 
@@ -582,11 +655,22 @@ def test_stage2_transfer_std_is_conditional_actor_backend_metadata():
     policy.actor_backend = FASTSAC_BC_DAGGER_ACTOR_BACKEND
     policy._q_actor_dim = 3
     policy.action_dim = 1
-    policy._fastsac_action_low = [-20.0]
-    policy._fastsac_action_high = [20.0]
-    policy._fastsac_action_log_scale_sum = math.log(20.0)
-    policy._fastsac_entropy_reference_log_scale_sum = 0.0
+    policy._fastsac_action_low = [-2.0]
+    policy._fastsac_action_high = [4.0]
+    policy._fastsac_actor_action_center = torch.tensor([1.0])
+    policy._fastsac_actor_action_scale = torch.tensor([3.0])
+    policy._fastsac_q_action_center = torch.tensor([1.0])
+    policy._fastsac_q_action_scale = torch.tensor([3.0])
+    policy._fastsac_action_log_scale_sum = math.log(3.0)
+    policy._fastsac_entropy_reference_log_scale_sum = math.log(3.0)
     policy.joint_names = ["joint"]
+    policy._fastsac_action_contract = _vaic_action_contract_metadata(
+        policy.joint_names,
+        policy._fastsac_action_low,
+        policy._fastsac_action_high,
+        [0.0],
+        [0.0],
+    )
 
     default_metadata = policy._actor_backend_metadata()
     assert "stage2_initial_action_std" not in default_metadata
@@ -595,9 +679,9 @@ def test_stage2_transfer_std_is_conditional_actor_backend_metadata():
     policy.cfg.sac_stage2_initial_action_std = 0.2
     reset_metadata = policy._actor_backend_metadata()
     assert reset_metadata["stage2_initial_action_std"] == pytest.approx(0.2)
-    assert reset_metadata["stage2_initial_log_std"] == pytest.approx(
-        math.log(0.2 / 20.0)
-    )
+    assert reset_metadata["stage2_initial_log_std"] == pytest.approx([
+        math.log(0.2 / 3.0)
+    ])
     assert "fresh_bc_dagger_transfer_reset_once" in reset_metadata[
         "stage2_initial_action_std_semantics"
     ]
@@ -609,20 +693,31 @@ def test_stage2_actor_log_std_lr_does_not_change_actor_backend_metadata():
     policy.actor_backend = FASTSAC_BC_DAGGER_ACTOR_BACKEND
     policy._q_actor_dim = 3
     policy.action_dim = 1
-    policy._fastsac_action_low = [-20.0]
-    policy._fastsac_action_high = [20.0]
-    policy._fastsac_action_log_scale_sum = math.log(20.0)
-    policy._fastsac_entropy_reference_log_scale_sum = 0.0
+    policy._fastsac_action_low = [-2.0]
+    policy._fastsac_action_high = [4.0]
+    policy._fastsac_actor_action_center = torch.tensor([1.0])
+    policy._fastsac_actor_action_scale = torch.tensor([3.0])
+    policy._fastsac_q_action_center = torch.tensor([1.0])
+    policy._fastsac_q_action_scale = torch.tensor([3.0])
+    policy._fastsac_action_log_scale_sum = math.log(3.0)
+    policy._fastsac_entropy_reference_log_scale_sum = math.log(3.0)
     policy.joint_names = ["joint"]
+    policy._fastsac_action_contract = _vaic_action_contract_metadata(
+        policy.joint_names,
+        policy._fastsac_action_low,
+        policy._fastsac_action_high,
+        [0.0],
+        [0.0],
+    )
 
-    legacy_metadata = policy._actor_backend_metadata()
-    assert "sac_actor_log_std_lr" not in legacy_metadata
-    assert "sac_actor_mean_lr" not in legacy_metadata
-    assert "actor_optimizer_semantics" not in legacy_metadata
+    baseline_metadata = policy._actor_backend_metadata()
+    assert "sac_actor_log_std_lr" not in baseline_metadata
+    assert "sac_actor_mean_lr" not in baseline_metadata
+    assert "actor_optimizer_semantics" not in baseline_metadata
 
     policy.cfg.sac_actor_log_std_lr = 3e-5
     split_metadata = policy._actor_backend_metadata()
-    assert split_metadata == legacy_metadata
+    assert split_metadata == baseline_metadata
     assert "sac_actor_log_std_lr" not in split_metadata
     assert "sac_actor_mean_lr" not in split_metadata
     assert "actor_optimizer_semantics" not in split_metadata
@@ -638,7 +733,7 @@ def test_stage2_official_awac_uses_versioned_resume_schedule():
     )
 
     schedule = policy._stage2_schedule_config()
-    assert schedule["version"] == 6
+    assert schedule["version"] == 12
     assert schedule["sac_finetune_actor_objective"] == "awac"
     assert schedule["sac_awac_beta"] == 2.0
     assert schedule["sac_awac_v_samples"] == 3
@@ -650,7 +745,7 @@ def test_stage2_official_awac_uses_versioned_resume_schedule():
 
     policy.cfg.sac_actor_learning_starts_finetune_iteration = 250
     iteration_schedule = policy._stage2_schedule_config()
-    assert iteration_schedule["version"] == 7
+    assert iteration_schedule["version"] == 12
     assert (
         iteration_schedule["sac_actor_learning_starts_finetune_iteration"]
         == 250
@@ -860,26 +955,24 @@ def test_stage2_iteration_start_decays_bc_anchor_from_actual_actor_release():
     assert policy._stage2_bc_anchor_coefficient() == pytest.approx(0.5)
 
 
-def test_stage2_entropy_reference_scale_is_independent_of_safety_clip():
+def test_stage2_entropy_coordinates_use_executable_scale_not_safety_clip():
     policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
     torch.nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(sac_bc_action_clip=20.0)
     physical_log_prob = torch.tensor([3.0])
-    policy._fastsac_action_log_scale_sum = 2.0 * torch.log(
-        torch.tensor(20.0)
-    ).item()
-    policy._fastsac_entropy_reference_log_scale_sum = 0.0
+    policy._fastsac_action_log_scale_sum = math.log(3.0) + math.log(5.0)
 
-    # Raw-unit scale 1.0 adds no density constant even though execution is
-    # guarded by a much wider +/-20 support.
-    assert torch.equal(
-        policy._normalized_action_log_prob(physical_log_prob),
-        physical_log_prob,
-    )
-
-    del policy._fastsac_entropy_reference_log_scale_sum
+    expected = physical_log_prob + policy._fastsac_action_log_scale_sum
     assert torch.allclose(
         policy._normalized_action_log_prob(physical_log_prob),
-        physical_log_prob + policy._fastsac_action_log_scale_sum,
+        expected,
+    )
+
+    # Changing only the final guard cannot change entropy coordinates.
+    policy.cfg.sac_bc_action_clip = 100.0
+    assert torch.allclose(
+        policy._normalized_action_log_prob(physical_log_prob),
+        expected,
     )
 
 
@@ -943,7 +1036,7 @@ def test_student_resume_waits_for_accepted_transition_seen_gate():
     policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
     torch.nn.Module.__init__(policy)
     policy.cfg = SimpleNamespace(
-        sac_updates_per_env_step=1,
+        sac_update_to_data_ratio=2.0,
         sac_policy_frequency=32,
         sac_actor_learning_starts_q_updates=8_000,
         teacher_buffer_ratio=0.5,
@@ -1163,37 +1256,64 @@ def test_bc_dagger_actor_adapter_preserves_mean_and_has_sac_gradients():
     policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
     torch.nn.Module.__init__(policy)
     policy.actor_adapt = _BCActor()
+    policy.bc_dagger_actor_anchor = copy.deepcopy(
+        policy.actor_adapt
+    ).requires_grad_(False)
     policy.cfg = SimpleNamespace(
         sac_bc_action_clip=1.0,
         sac_bc_log_std_min=-8.0,
         sac_bc_log_std_max=-2.0,
     )
+    nominal_half_range = torch.tensor([0.5, 0.4])
     policy.bc_dagger_sac_adapter = torch.nn.Module()
     policy.bc_dagger_sac_adapter.log_std = torch.nn.Parameter(
-        torch.full((2,), float(torch.tensor(0.05).log()))
+        torch.log(torch.full((2,), 0.05) / nominal_half_range)
     )
     low = torch.tensor([-1.0, -1.0])
     high = torch.tensor([1.0, 1.0])
     policy._fastsac_action_low = low.tolist()
     policy._fastsac_action_high = high.tolist()
+    policy._fastsac_q_action_scale = nominal_half_range
     policy.dist_cls = functools.partial(
         FastSACTanhNormal, low=low, high=high, event_dims=1
     )
     td = TensorDict({}, batch_size=[4])
 
+    anchor_action = policy._bc_dagger_behavior_action(
+        td, actor=policy.bc_dagger_actor_anchor
+    )
+    fresh_dist = policy._bc_dagger_actor_dist_from_td(td)
+    assert torch.equal(fresh_dist.loc, torch.zeros_like(fresh_dist.loc))
+    # The zero residual is the frozen BC behavior; the affine reconstruction
+    # can differ by one float32 ULP after forming the symmetric residual box.
+    torch.testing.assert_close(
+        fresh_dist.mean, anchor_action, rtol=0.0, atol=torch.finfo(torch.float32).eps
+    )
+
+    with torch.no_grad():
+        policy.actor_adapt.core.actor_mean.bias.add_(
+            torch.tensor([0.4, -0.2])
+        )
     dist = policy._bc_dagger_actor_dist_from_td(td)
     action, log_prob = dist.rsample_with_log_prob(
         generator=torch.Generator().manual_seed(0)
     )
 
-    assert torch.allclose(
-        dist.mean, torch.tensor([0.2, -0.3]).expand(4, -1), atol=1e-6
-    )
+    expected_delta = torch.tensor([0.4, -0.2]).expand(4, -1)
+    assert torch.allclose(dist.loc, expected_delta)
+    assert not torch.equal(dist.mean, anchor_action)
+    assert ((dist.mean > dist.low) & (dist.mean < dist.high)).all()
+    assert ((dist.mean > low) & (dist.mean < high)).all()
     assert ((action > low) & (action < high)).all()
     (-log_prob.mean()).backward()
     assert policy.actor_adapt.core.actor_mean.weight.grad is not None
+    assert policy.actor_adapt.core.actor_mean.bias.grad is not None
     assert policy.bc_dagger_sac_adapter.log_std.grad is not None
     assert policy.actor_adapt.core.actor_std.grad is None
+    assert all(
+        parameter.grad is None
+        for parameter in policy.bc_dagger_actor_anchor.parameters()
+    )
     assert torch.equal(
         policy.actor_adapt.core.actor_std.detach(), torch.full((2,), 0.5)
     )
@@ -1418,18 +1538,15 @@ def test_fastsac_rejects_second_actor_optimizer_from_distillation():
         ("sac_deterministic_rollout", "true"),
         ("sac_freeze_perception", False),
         ("sac_bc_action_clip", 0.0),
-        ("sac_entropy_reference_scale", 0.0),
         ("sac_bc_initial_action_std", 0.0),
         ("sac_stage2_initial_action_std", 0.0),
         ("sac_stage2_initial_action_std", True),
         ("sac_stage2_initial_action_std", float("nan")),
         ("sac_stage2_initial_action_std", float("inf")),
-        ("sac_stage2_initial_action_std", 1e-4),
-        # With action_clip=20 and log_std_max=-2, this maps above the
-        # executable BC-adapter log-standard-deviation support.
-        ("sac_stage2_initial_action_std", 3.0),
         ("sac_bc_log_std_min", -1.0),
-        ("sac_updates_per_env_step", 0),
+        ("sac_update_to_data_ratio", 0.0),
+        ("sac_update_to_data_ratio", True),
+        ("sac_update_to_data_ratio", float("nan")),
         ("sac_policy_frequency", 0),
         ("sac_actor_log_std_lr", 0.0),
         ("sac_actor_log_std_lr", -1.0),
@@ -1966,14 +2083,15 @@ def test_stage2_confidence_gate_failure_updates_q_but_not_actor_or_alpha():
     actor_after_pass = policy.actor_adapt.action.detach().clone()
 
     # The release marker is telemetry/ramp origin, not a sticky bypass: a
-    # later disagreement skips the complete actor+alpha tick again.
+    # later disagreement skips only the actor; the already-released entropy
+    # controller continues updating on every Q batch.
     policy.qnet.slopes.copy_(torch.tensor([1.0, -1.0]))
     result = policy._sac_update(batch, update_actor=True)
     assert result[11]["skipped"].item() == 1.0
     assert result[11]["actor_update_applied"].item() == 0.0
     assert policy.q_update_count == 3
     assert policy.sac_actor_update_count == 1
-    assert policy.sac_alpha_update_count == 0
+    assert policy.sac_alpha_update_count == 1
     assert policy._stage2_actor_release_q_update == 2
     assert torch.equal(policy.actor_adapt.action, actor_after_pass)
 
@@ -2058,7 +2176,7 @@ def test_stage2_target_current_and_actor_q_paths_normalize_actions():
         # This option is Stage-1-only and must be ignored by the RLPD update.
         sac_teacher_actor_uncertainty_gate=True,
     )
-    policy._fastsac_q_action_low = torch.tensor([-2.0])
+    policy._fastsac_q_action_center = torch.tensor([0.0])
     policy._fastsac_q_action_scale = torch.tensor([2.0])
     policy.sac_action_rng = torch.Generator().manual_seed(1)
     policy.actor_adapt = _Stage2Actor()
@@ -2109,9 +2227,9 @@ def test_stage2_target_current_and_actor_q_paths_normalize_actions():
 
     policy._sac_update(batch, update_actor=False)
 
-    # Temperature is tied to actor cadence, not the more frequent Q cadence.
+    # After release, temperature follows every Q batch, not actor cadence.
     assert policy.sac_actor_update_count == 1
-    assert policy.sac_alpha_update_count == 0
+    assert policy.sac_alpha_update_count == 1
 
 
 def test_stage2_q_uses_current_and_next_reference_residual_coordinates():
@@ -2185,7 +2303,7 @@ def test_stage2_reference_dueling_q_receives_current_and_next_references():
         q_reference_dueling=True,
         sac_q_normalize_actions=True,
     )
-    policy._fastsac_q_action_low = torch.tensor([-2.0])
+    policy._fastsac_q_action_center = torch.tensor([0.0])
     policy._fastsac_q_action_scale = torch.tensor([2.0])
     policy.sac_action_rng = torch.Generator().manual_seed(1)
     policy.actor_adapt = _Stage2Actor()
@@ -2305,11 +2423,13 @@ def test_student_resume_does_not_require_previous_offline_replay_manifest(
         "last_phase": "finetune",
         "stage2_schedule_config": policy._stage2_schedule_config(),
         "stage2_actor_release_q_update": 12,
+        "sac_update_row_credit": 0.0,
     })
 
     assert policy.q_update_count == 77
     assert policy.sac_update_count == 19
     assert policy._stage2_actor_release_q_update == 12
+    assert policy.sac_update_row_credit == 0.0
 
 
 def test_stage2_accepts_compatible_h5_from_different_replay_and_snapshot(tmp_path):

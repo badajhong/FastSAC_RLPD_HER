@@ -11,6 +11,7 @@ from tensordict import TensorDict
 from active_adaptation.learning.ppo.fastsac_vel import (
     BC_DAGGER_ACTOR_BACKEND,
     BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
+    BC_DAGGER_FRESH_ACTOR_INITIALIZATION_SEMANTICS,
     BC_DAGGER_STAGING_FINAL_ONLY_REPLAY_SEMANTICS,
     BC_DAGGER_SAC_CRITIC_SEMANTICS,
     BC_DAGGER_LEGACY_TRAINING_ALGORITHM,
@@ -27,10 +28,11 @@ from active_adaptation.learning.ppo.fastsac_vel import (
     _BCDaggerSACRolloutActor,
     _validate_complete_bc_dagger_staging_source,
     _validate_fastsac_finetune_config,
+    _vaic_action_contract_metadata,
 )
 from active_adaptation.learning.ppo.common import ACTION_KEY
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
-    _ClippedStudentRolloutPolicy,
+    _LatentStudentRolloutPolicy,
 )
 from active_adaptation.learning.ppo.ppo_vel import PPOVEL
 from scripts.helpers import _apply_direct_sac_dagger_q_transfer
@@ -201,7 +203,6 @@ def _stage2_policy(*, load_pretrained_q=True):
         sac_stage2_initial_action_std=None,
         sac_bc_log_std_min=-8.0,
         sac_bc_log_std_max=-2.0,
-        sac_entropy_reference_scale=1.0,
         latent_dim=1,
         q_seed=17,
         q_lr=3e-5,
@@ -214,11 +215,15 @@ def _stage2_policy(*, load_pretrained_q=True):
     policy.bc_dagger_actor_anchor = copy.deepcopy(
         policy.actor_adapt
     ).requires_grad_(False)
+    action_low = torch.tensor([-2.0])
+    action_high = torch.tensor([4.0])
+    action_center = (action_low + action_high) * 0.5
+    action_scale = (action_high - action_low) * 0.5
     policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
         action_dim=1,
-        initial_log_std=math.log(
-            policy.cfg.sac_bc_initial_action_std
-            / policy.cfg.sac_bc_action_clip
+        initial_log_std=torch.log(
+            torch.full_like(action_scale, policy.cfg.sac_bc_initial_action_std)
+            / action_scale
         ),
         device="cpu",
     )
@@ -239,6 +244,26 @@ def _stage2_policy(*, load_pretrained_q=True):
     policy._q_critic_dim = 1
     policy._q_input_dim = 1
     policy.action_dim = 1
+    policy.joint_names = ["joint"]
+    policy._fastsac_action_low = action_low.tolist()
+    policy._fastsac_action_high = action_high.tolist()
+    policy._fastsac_actor_action_center = action_center
+    policy._fastsac_actor_action_scale = action_scale
+    policy._fastsac_q_action_center = action_center
+    policy._fastsac_q_action_scale = action_scale
+    policy._fastsac_action_log_scale_sum = float(torch.log(action_scale).sum())
+    policy._fastsac_entropy_reference_log_scale_sum = float(
+        torch.log(action_scale).sum()
+    )
+    policy._fastsac_action_contract = _vaic_action_contract_metadata(
+        policy.joint_names,
+        action_low,
+        action_high,
+        torch.zeros_like(action_low),
+        torch.zeros_like(action_high),
+    )
+    policy._vaic_action_bounds = lambda: (action_low, action_high)
+    policy.sac_update_row_credit = 0.0
     policy.reward_groups = ["task"]
     policy.cfg.gamma = 0.99
     policy.observation_spec = {
@@ -438,8 +463,23 @@ def test_bc_pretrained_q_backend_accepts_normalized_late_unit_gain(
     assert policy.cfg.sac_q_normalize_actions is True
     assert policy.cfg.sac_q_action_input_gain == pytest.approx(1.0)
     assert policy.cfg.sac_clipped_double_q is True
-    assert torch.equal(policy._fastsac_q_action_low, torch.tensor([-20.0]))
-    assert torch.equal(policy._fastsac_q_action_scale, torch.tensor([20.0]))
+    assert policy._fastsac_action_low == [-20.0]
+    assert policy._fastsac_action_high == [20.0]
+    assert torch.equal(
+        policy._fastsac_actor_action_scale, torch.tensor([20.0])
+    )
+    assert torch.equal(policy._fastsac_q_action_center, torch.tensor([1.0]))
+    assert torch.equal(policy._fastsac_q_action_scale, torch.tensor([3.0]))
+    assert policy.bc_dagger_sac_adapter.log_std.item() == pytest.approx(
+        math.log(policy.cfg.sac_bc_initial_action_std / 3.0)
+    )
+    assert policy._fastsac_entropy_reference_log_scale_sum == pytest.approx(
+        math.log(3.0)
+    )
+    assert policy._fastsac_action_contract["q_action_clamp"] is None
+    assert policy._fastsac_action_contract[
+        "q_action_transform_fingerprint"
+    ].startswith("sha256:")
     assert actor_core.load_noise_scale is None
 
 
@@ -453,7 +493,7 @@ def _v3_bc_critic_checkpoint(policy):
             "stochastic_next_action_q_only_effective_alpha_zero_v1"
         ),
         "pretrain_target_policy": (
-            "dedicated_small_noise_stochastic_current_bc_student_v1"
+            "dedicated_small_noise_bc_centered_nominal_bounded_residual_v3"
         ),
         "replay_mix_semantics": (
             "beta_independent_teacher_executed_0.5_"
@@ -466,8 +506,12 @@ def _v3_bc_critic_checkpoint(policy):
         "critic_learning_semantics": BC_DAGGER_SAC_CRITIC_SEMANTICS,
         "actor_learning_semantics": BC_DAGGER_ACTOR_LEARNING_SEMANTICS,
         "vecnorm_fingerprint": "frozen-vecnorm",
+        "action_contract": copy.deepcopy(policy._fastsac_action_contract),
         "dagger_backend_config": {
             "dagger_action_clip": 20.0,
+            "fresh_ppo_actor_initialization_semantics": (
+                BC_DAGGER_FRESH_ACTOR_INITIALIZATION_SEMANTICS
+            ),
             "q_hidden_dim": 8,
             "q_num_atoms": 501,
             "q_v_min": -2.0,
@@ -482,6 +526,11 @@ def _v3_bc_critic_checkpoint(policy):
             "q_weight_decay": 1e-3,
             "q_tau": 0.001,
             "q_max_grad_norm": 1.0,
+            "sac_bc_initial_action_std": float(
+                policy.cfg.sac_bc_initial_action_std
+            ),
+            "sac_bc_log_std_min": float(policy.cfg.sac_bc_log_std_min),
+            "sac_bc_log_std_max": float(policy.cfg.sac_bc_log_std_max),
         },
         # BC pretraining must expose the same complete Q contract consumed by
         # FastSAC checkpoints, rather than relying on a few coincidentally equal
@@ -720,7 +769,7 @@ def test_stage2_direct_v3_transfer_can_reset_dedicated_action_std(
     # checkpoint tensor or a constructor-only initial value.
     assert adapter_values_during_copy == [pytest.approx(-6.0)]
     assert policy.bc_dagger_sac_adapter.log_std.item() == pytest.approx(
-        math.log(0.2 / policy.cfg.sac_bc_action_clip)
+        math.log(0.2 / policy._fastsac_actor_action_scale.item())
     )
     assert checkpoint["bc_dagger_sac_adapter"]["log_std"].item() == (
         pytest.approx(-6.0)
@@ -753,6 +802,7 @@ def test_stage2_resume_restores_learned_adapter_without_reapplying_std_reset(
         "last_phase": "finetune",
         "stage2_schedule_config": policy._stage2_schedule_config(),
         "stage2_actor_release_q_update": None,
+        "sac_update_row_credit": 0.0,
         "sac_rollout_rng_state": torch.Generator().manual_seed(9).get_state(),
         "bc_dagger_sac_adapter": {"log_std": learned_log_std.clone()},
     }
@@ -917,7 +967,7 @@ def test_fresh_q_option_still_requires_pure_bc_actor_provenance(monkeypatch):
         policy.load_state_dict(state)
 
 
-def test_stage2_rejects_dagger_action_support_mismatch_before_module_copy(
+def test_stage2_rejects_safety_clip_that_does_not_contain_action_contract(
     monkeypatch,
 ):
     policy = _stage2_policy()
@@ -927,13 +977,16 @@ def test_stage2_rejects_dagger_action_support_mismatch_before_module_copy(
 
     monkeypatch.setattr(PPOVEL, "load_state_dict", unexpected_copy)
     state = _v3_bc_critic_checkpoint(policy)
-    state["dagger_backend_config"]["dagger_action_clip"] = 10.0
+    state["dagger_backend_config"]["dagger_action_clip"] = 2.0
 
-    with pytest.raises(ValueError, match="action clip does not match"):
+    with pytest.raises(
+        ValueError,
+        match="safety clip|safety envelope|contain every executable",
+    ):
         policy.load_state_dict(state)
 
 
-def test_stage2_deterministic_rollout_exactly_matches_dagger_clipping():
+def test_stage2_deterministic_rollout_exactly_matches_dagger_latent_tanh():
     raw_action = torch.tensor(
         [[-25.0, -1.5, 0.25, 30.0, float("nan"), float("inf"), -float("inf")]]
     )
@@ -949,8 +1002,10 @@ def test_stage2_deterministic_rollout_exactly_matches_dagger_clipping():
             return SimpleNamespace(mean=raw_action.expand(*td.batch_size, -1))
 
     source_td = TensorDict({}, batch_size=[1])
-    _ClippedStudentRolloutPolicy(
-        _RawActionPolicy(), action_clip=action_clip
+    low = torch.tensor([-2.0, -2.0, -1.0, -4.0, -5.0, -6.0, -7.0])
+    high = torch.tensor([3.0, 2.0, 1.0, 4.0, 5.0, 6.0, 7.0])
+    _LatentStudentRolloutPolicy(
+        _RawActionPolicy(), low, high, action_clip=action_clip
     )(source_td)
 
     stage2 = FastSACVelFinetune.__new__(FastSACVelFinetune)
@@ -962,17 +1017,21 @@ def test_stage2_deterministic_rollout_exactly_matches_dagger_clipping():
         sac_bc_log_std_max=-2.0,
     )
     stage2.actor_adapt = _MeanDistActor()
+    stage2.bc_dagger_actor_anchor = copy.deepcopy(
+        stage2.actor_adapt
+    ).requires_grad_(False)
     stage2.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
         action_dim=raw_action.shape[-1],
-        initial_log_std=math.log(
-            stage2.cfg.sac_bc_initial_action_std / action_clip
+        initial_log_std=torch.log(
+            torch.full_like(low, stage2.cfg.sac_bc_initial_action_std)
+            / ((high - low) * 0.5)
         ),
         device="cpu",
     )
-    low = torch.full((raw_action.shape[-1],), -action_clip)
-    high = torch.full_like(low, action_clip)
     stage2._fastsac_action_low = low.tolist()
     stage2._fastsac_action_high = high.tolist()
+    stage2._fastsac_q_action_center = (low + high) * 0.5
+    stage2._fastsac_q_action_scale = (high - low) * 0.5
     stage2.dist_cls = functools.partial(
         FastSACTanhNormal,
         low=low,
@@ -983,26 +1042,34 @@ def test_stage2_deterministic_rollout_exactly_matches_dagger_clipping():
     stage2_td = TensorDict({}, batch_size=[1])
     _BCDaggerSACRolloutActor(stage2)(stage2_td)
 
-    assert torch.equal(stage2_td[ACTION_KEY], source_td[ACTION_KEY])
-    assert torch.equal(
-        stage2_td[ACTION_KEY],
-        torch.tensor([[-20.0, -1.5, 0.25, 20.0, 0.0, 20.0, -20.0]]),
+    # A BC action rounded onto an execution endpoint is moved inward by the
+    # residual distribution's documented bijectivity epsilon. Everywhere else
+    # the fresh zero-residual Stage-2 policy is the transferred DAgger policy.
+    parity_error = (stage2_td[ACTION_KEY] - source_td[ACTION_KEY]).abs()
+    assert torch.all(
+        parity_error
+        <= (high - low) * (1e-6 + torch.finfo(torch.float32).eps)
     )
+    assert ((stage2_td[ACTION_KEY] >= low) & (
+        stage2_td[ACTION_KEY] <= high
+    )).all()
     assert torch.isfinite(stage2_td["loc"]).all()
     assert torch.isfinite(stage2_td["scale"]).all()
     assert torch.allclose(
         stage2_td["scale"],
-        torch.full_like(stage2_td["scale"], 0.05 / action_clip),
+        torch.exp(stage2.bc_dagger_sac_adapter.log_std).expand_as(
+            stage2_td["scale"]
+        ),
     )
 
 
 def test_stage2_stochastic_rollout_sample_is_exact_online_replay_action():
-    mean_action = torch.tensor([[0.2, -0.3]])
+    actor_latent = torch.tensor([[0.2, -0.3]])
     action_clip = 1.0
 
     class _MeanDistActor(torch.nn.Module):
         def get_dist(self, td):
-            return SimpleNamespace(mean=mean_action.expand(*td.batch_size, -1))
+            return SimpleNamespace(mean=actor_latent.expand(*td.batch_size, -1))
 
     stage2 = FastSACVelFinetune.__new__(FastSACVelFinetune)
     torch.nn.Module.__init__(stage2)
@@ -1017,6 +1084,9 @@ def test_stage2_stochastic_rollout_sample_is_exact_online_replay_action():
         sac_bc_log_std_max=-2.0,
     )
     stage2.actor_adapt = _MeanDistActor()
+    stage2.bc_dagger_actor_anchor = copy.deepcopy(
+        stage2.actor_adapt
+    ).requires_grad_(False)
     stage2.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
         action_dim=2,
         initial_log_std=math.log(stage2.cfg.sac_bc_initial_action_std),
@@ -1026,6 +1096,8 @@ def test_stage2_stochastic_rollout_sample_is_exact_online_replay_action():
     high = torch.full_like(low, action_clip)
     stage2._fastsac_action_low = low.tolist()
     stage2._fastsac_action_high = high.tolist()
+    stage2._fastsac_q_action_center = (low + high) * 0.5
+    stage2._fastsac_q_action_scale = (high - low) * 0.5
     stage2.dist_cls = functools.partial(
         FastSACTanhNormal,
         low=low,
@@ -1036,7 +1108,9 @@ def test_stage2_stochastic_rollout_sample_is_exact_online_replay_action():
     stage2.sac_rollout_rng = torch.Generator().manual_seed(42)
 
     actor_td = TensorDict({}, batch_size=[1])
-    _, expected_dist = stage2._bc_dagger_behavior_action_and_dist(actor_td)
+    expected_mean, expected_dist = stage2._bc_dagger_behavior_action_and_dist(
+        actor_td
+    )
     expected_action, _ = expected_dist.rsample_with_log_prob(
         generator=torch.Generator().manual_seed(42)
     )
@@ -1046,9 +1120,9 @@ def test_stage2_stochastic_rollout_sample_is_exact_online_replay_action():
     _BCDaggerSACRolloutActor(stage2, deterministic=False)(actor_td)
 
     assert torch.equal(actor_td[ACTION_KEY], expected_action)
-    assert not torch.equal(actor_td[ACTION_KEY], mean_action)
+    assert not torch.equal(actor_td[ACTION_KEY], expected_mean)
     assert ((actor_td[ACTION_KEY] > low) & (actor_td[ACTION_KEY] < high)).all()
-    expected_deviation = (expected_action - mean_action).abs()
+    expected_deviation = (expected_action - expected_mean).abs()
     assert torch.equal(
         actor_td[STAGE2_BEHAVIOR_MEAN_ABS_DEVIATION_KEY],
         expected_deviation.mean(dim=-1),
@@ -1063,7 +1137,7 @@ def test_stage2_stochastic_rollout_sample_is_exact_online_replay_action():
     rollout_rng_before_eval = stage2.sac_rollout_rng.get_state().clone()
     eval_td = TensorDict({}, batch_size=[1])
     _BCDaggerSACRolloutActor(stage2, deterministic=True)(eval_td)
-    assert torch.equal(eval_td[ACTION_KEY], mean_action)
+    assert torch.equal(eval_td[ACTION_KEY], expected_mean)
     assert torch.equal(
         stage2.sac_rollout_rng.get_state(), rollout_rng_before_eval
     )

@@ -5,6 +5,8 @@ This file owns only DAgger-specific defaults and fail-fast validation so the
 two entrypoints cannot develop different training semantics.
 """
 
+import hashlib
+import json
 import math
 import os
 
@@ -30,14 +32,28 @@ EXPECTED_ALGO_TARGET = (
     "active_adaptation.learning.ppo.ppo_bc_dagger.PPOBCDaggerFinetune"
 )
 EXPECTED_TRAINING_ALGORITHM = (
-    "vaic_ppo_bc_dagger_student_sac_critic_v3"
+    "vaic_ppo_bc_dagger_student_sac_critic_v6"
 )
+EXPECTED_ACTOR_BACKEND = "vaic_ppo_latent_tanh_bc_dagger_v4"
 EXPECTED_CRITIC_SEMANTICS = (
-    "beta_independent_half_teacher_half_student_executed_action_"
-    "stochastic_student_q_only_c51_clipped_double_q_v1"
+    "beta_independent_half_teacher_half_student_safety_envelope_action_"
+    "unclipped_nominal_joint_q_coordinates_bc_centered_bounded_residual_"
+    "stochastic_student_q_only_c51_clipped_double_q_v5"
 )
 EXPECTED_CONTROL_SEMANTICS = (
-    "clipped_deterministic_mean_normalized_rms_safe_hysteresis_or_beta_v1"
+    "safety_envelope_latent_tanh_mean_envelope_normalized_safe_or_beta_v5"
+)
+EXPECTED_REPLAY_FORMAT = "vaic_ppo_bc_dagger_teacher_buffer"
+EXPECTED_REPLAY_FORMAT_VERSION = 5
+EXPECTED_REPLAY_OBSERVATION_SEMANTICS = "raw_pre_vecnorm_sample_current_v1"
+EXPECTED_ACTION_PARAMETERIZATION = (
+    "absolute_safety_envelope_teacher_or_latent_tanh_student_v5"
+)
+EXPECTED_FRESH_ACTOR_INITIALIZATION_SEMANTICS = (
+    "physical_absolute_head_safety_tanh_linearized_at_zero_v2"
+)
+EXPECTED_ACTION_CONTRACT_SEMANTICS = (
+    "separate_execution_support_q_and_entropy_coordinates_v2"
 )
 REQUIRED_RESUME_OPTIMIZERS = {
     "bc_optimizer",
@@ -53,6 +69,83 @@ REQUIRED_RESUME_STATE = {
     "q_update_count",
     "sac_action_rng_state",
 }
+
+
+def _validate_action_contract(contract, *, context: str) -> dict:
+    """Validate separated execution, Q, and entropy action coordinates."""
+    if not isinstance(contract, dict):
+        raise ValueError(f"{context} has no executable action contract")
+    if contract.get("semantics") != EXPECTED_ACTION_CONTRACT_SEMANTICS:
+        raise ValueError(f"{context} has incompatible action-contract semantics")
+    fingerprint = str(contract.get("fingerprint", ""))
+    payload = dict(contract)
+    payload.pop("fingerprint", None)
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    expected_fingerprint = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    if fingerprint != expected_fingerprint:
+        raise ValueError(f"{context} action-contract fingerprint is invalid")
+
+    joint_names = contract.get("joint_names")
+    action_low = contract.get("action_low")
+    action_high = contract.get("action_high")
+    q_action_center = contract.get("q_action_center")
+    q_action_scale = contract.get("q_action_scale")
+    if (
+        not isinstance(joint_names, list)
+        or not joint_names
+        or not isinstance(action_low, list)
+        or not isinstance(action_high, list)
+        or len(action_low) != len(joint_names)
+        or len(action_high) != len(joint_names)
+        or not isinstance(q_action_center, list)
+        or not isinstance(q_action_scale, list)
+        or len(q_action_center) != len(joint_names)
+        or len(q_action_scale) != len(joint_names)
+    ):
+        raise ValueError(f"{context} action contract has invalid joint bounds")
+    for low, high in zip(action_low, action_high):
+        low = float(low)
+        high = float(high)
+        if not (math.isfinite(low) and math.isfinite(high) and low < high):
+            raise ValueError(
+                f"{context} action contract has invalid executable bounds"
+            )
+    if any(
+        not math.isfinite(float(center))
+        or not math.isfinite(float(scale))
+        or float(scale) <= 0.0
+        for center, scale in zip(q_action_center, q_action_scale)
+    ):
+        raise ValueError(f"{context} action contract has invalid Q coordinates")
+    if contract.get("q_action_clamp", "missing") is not None:
+        raise ValueError(f"{context} Q action transform must be unclipped")
+    if not str(contract.get("execution_support_fingerprint", "")).startswith(
+        "sha256:"
+    ):
+        raise ValueError(f"{context} lacks an execution-support fingerprint")
+    if not str(contract.get("q_action_transform_fingerprint", "")).startswith(
+        "sha256:"
+    ):
+        raise ValueError(f"{context} lacks a Q-transform fingerprint")
+    if not str(contract.get("entropy_reference_fingerprint", "")).startswith(
+        "sha256:"
+    ):
+        raise ValueError(f"{context} lacks an entropy-reference fingerprint")
+    return contract
+
+
+def _decode_h5_action_contract(value, *, context: str) -> dict:
+    if value is None:
+        raise ValueError(f"{context} is missing its action_contract attribute")
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    try:
+        contract = json.loads(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} action_contract is not valid JSON") from exc
+    return _validate_action_contract(contract, context=context)
 
 
 def _resolve_bc_dagger_checkpoint(
@@ -94,6 +187,34 @@ def _validate_frozen_teacher_replay(
         raise ValueError(
             "BC-DAgger checkpoint has no teacher replay lineage metadata"
         )
+    checkpoint_action_contract = _validate_action_contract(
+        policy_state.get("action_contract"), context="BC-DAgger checkpoint"
+    )
+    if expected.get("action_contract") != checkpoint_action_contract:
+        raise ValueError(
+            "Checkpoint teacher replay lineage action contract does not match "
+            "the policy action contract"
+        )
+    expected_generation = {
+        "format": EXPECTED_REPLAY_FORMAT,
+        "format_version": EXPECTED_REPLAY_FORMAT_VERSION,
+        "actor_backend": EXPECTED_ACTOR_BACKEND,
+        "dagger_control_semantics": EXPECTED_CONTROL_SEMANTICS,
+        "replay_observation_semantics": (
+            EXPECTED_REPLAY_OBSERVATION_SEMANTICS
+        ),
+        "action_parameterization": EXPECTED_ACTION_PARAMETERIZATION,
+    }
+    generation_mismatches = {
+        name: (expected.get(name), value)
+        for name, value in expected_generation.items()
+        if expected.get(name) != value
+    }
+    if generation_mismatches:
+        raise ValueError(
+            "BC-DAgger checkpoint teacher replay lineage uses an unsupported "
+            f"format generation: {generation_mismatches}"
+        )
     required = (
         "format",
         "format_version",
@@ -101,6 +222,8 @@ def _validate_frozen_teacher_replay(
         "dagger_control_semantics",
         "replay_observation_semantics",
         "vecnorm_fingerprint",
+        "actor_backend",
+        "action_parameterization",
     )
     with h5py.File(source_path, "r") as replay:
         for name in required:
@@ -115,52 +238,52 @@ def _validate_frozen_teacher_replay(
                     f"Teacher replay {name}={actual_value!r} does not match "
                     f"checkpoint lineage {expected_value!r}"
                 )
+        replay_action_contract = _decode_h5_action_contract(
+            replay.attrs.get("action_contract"), context="Teacher replay"
+        )
+        if replay_action_contract != checkpoint_action_contract:
+            raise ValueError(
+                "Teacher replay executable action contract does not match "
+                "checkpoint lineage"
+            )
         expected_action_clip = expected.get("action_clip")
         if expected_action_clip is None:
             backend = policy_state.get("dagger_backend_config")
             if isinstance(backend, dict):
                 expected_action_clip = backend.get("dagger_action_clip")
-        if expected_action_clip is not None:
-            expected_action_clip = float(expected_action_clip)
-            if (
-                not math.isfinite(expected_action_clip)
-                or expected_action_clip <= 0.0
-            ):
-                raise ValueError(
-                    "Checkpoint teacher replay action clip is invalid"
-                )
-            actual_action_clip = replay.attrs.get("action_clip")
-            if actual_action_clip is not None:
-                if not math.isclose(
-                    float(actual_action_clip),
-                    expected_action_clip,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                ):
-                    raise ValueError(
-                        "Teacher replay action_clip does not match checkpoint "
-                        "lineage"
-                    )
-            else:
-                # Legacy files did not record the support explicitly. Retain
-                # compatibility only after proving every stored action lies in
-                # the checkpoint's configured coordinates.
-                actions = replay.get("actions")
-                if actions is None:
-                    raise ValueError("Teacher replay has no actions dataset")
-                chunk_rows = 4096
-                for start in range(0, int(actions.shape[0]), chunk_rows):
-                    values = torch.as_tensor(
-                        actions[start : start + chunk_rows]
-                    )
-                    if (
-                        not torch.isfinite(values).all()
-                        or (values.abs() > expected_action_clip).any()
-                    ):
-                        raise ValueError(
-                            "Legacy teacher replay actions do not fit the "
-                            "checkpoint action clip"
-                        )
+        if expected_action_clip is None:
+            raise ValueError(
+                "Checkpoint teacher replay lineage lacks its final action "
+                "safety clip"
+            )
+        expected_action_clip = float(expected_action_clip)
+        if not math.isfinite(expected_action_clip) or expected_action_clip <= 0.0:
+            raise ValueError(
+                "Checkpoint teacher replay action safety clip is invalid"
+            )
+        support_max = max(
+            abs(float(value))
+            for key in ("action_low", "action_high")
+            for value in checkpoint_action_contract[key]
+        )
+        if not math.isclose(
+            expected_action_clip, support_max, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "Checkpoint action safety clip does not exactly match the "
+                "serialized actor execution support"
+            )
+        actual_action_clip = replay.attrs.get("action_clip")
+        if actual_action_clip is None or not math.isclose(
+            float(actual_action_clip),
+            expected_action_clip,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "Teacher replay action_clip safety guard does not match "
+                "checkpoint lineage"
+            )
 
 
 def prepare_bc_dagger_checkpoint(cfg: DictConfig) -> dict | None:
@@ -210,8 +333,12 @@ def prepare_bc_dagger_checkpoint(cfg: DictConfig) -> dict | None:
         raise ValueError("BC-DAgger resume checkpoint has no VecNorm state")
     if policy_state.get("training_algorithm") != EXPECTED_TRAINING_ALGORITHM:
         raise ValueError(
-            "bc_dagger_checkpoint must be a SAC-critic-v3 PPO-BC DAgger "
+            "bc_dagger_checkpoint must be a SAC-critic-v6 PPO-BC DAgger "
             "checkpoint"
+        )
+    if policy_state.get("actor_backend") != EXPECTED_ACTOR_BACKEND:
+        raise ValueError(
+            "BC-DAgger resume checkpoint has an incompatible actor backend"
         )
     if policy_state.get("critic_learning_semantics") != (
         EXPECTED_CRITIC_SEMANTICS
@@ -225,9 +352,27 @@ def prepare_bc_dagger_checkpoint(cfg: DictConfig) -> dict | None:
         raise ValueError(
             "BC-DAgger resume checkpoint has incompatible control semantics"
         )
+    backend_config = policy_state.get("dagger_backend_config")
+    if not isinstance(backend_config, dict) or backend_config.get(
+        "fresh_ppo_actor_initialization_semantics"
+    ) != EXPECTED_FRESH_ACTOR_INITIALIZATION_SEMANTICS:
+        raise ValueError(
+            "BC-DAgger resume checkpoint lacks the fresh PPO physical-to-latent "
+            "actor migration contract"
+        )
     if not isinstance(policy_state.get("q_backend_config"), dict):
         raise ValueError(
             "BC-DAgger resume checkpoint lacks its Q backend contract"
+        )
+    action_contract = _validate_action_contract(
+        policy_state.get("action_contract"), context="BC-DAgger checkpoint"
+    )
+    if policy_state["q_backend_config"].get(
+        "q_action_transform_fingerprint"
+    ) != action_contract["q_action_transform_fingerprint"]:
+        raise ValueError(
+            "BC-DAgger resume checkpoint Q-transform fingerprints do not "
+            "match"
         )
     optimizer_state = policy_state.get("optimizer_resume_state")
     if not isinstance(optimizer_state, dict):
@@ -459,10 +604,18 @@ def apply_inline_finalization_controls(cfg: DictConfig) -> dict | None:
     return controls
 
 
-def prepare_inline_bc_dagger_source(cfg: DictConfig) -> dict | None:
-    """Require a fresh PPO teacher for the non-resumable inline schedule."""
-    if not bool(cfg.get("bc_dagger_inline_finalization", False)):
+def prepare_fresh_bc_dagger_source(cfg: DictConfig) -> dict | None:
+    """Validate and mark any new BC-DAgger run's fresh PPO source."""
+    if cfg.get("bc_dagger_checkpoint", None) is not None:
         return None
+    if (
+        cfg.get("teacher_replay_buffer_path", None) is not None
+        or cfg.algo.get("teacher_buffer_path", None) is not None
+    ):
+        raise ValueError(
+            "A fresh BC-DAgger run must collect a new replay lineage; remove "
+            "teacher_replay_buffer_path and algo.teacher_buffer_path"
+        )
     try:
         from .stage_bc_dagger import (
             _resolve_source_checkpoint,
@@ -481,14 +634,23 @@ def prepare_inline_bc_dagger_source(cfg: DictConfig) -> dict | None:
     policy_state = _validate_source_checkpoint(checkpoint, cfg)
     with open_dict(cfg):
         cfg.checkpoint_path = source_path
-        cfg._bc_dagger_staging_source = True
+        cfg._bc_dagger_fresh_source = True
         cfg._bc_dagger_model_only_resume = False
-        cfg._bc_dagger_finalization_source = False
-        cfg._bc_dagger_finalize = False
+        if bool(cfg.get("bc_dagger_inline_finalization", False)):
+            cfg._bc_dagger_staging_source = True
+            cfg._bc_dagger_finalization_source = False
+            cfg._bc_dagger_finalize = False
     return {
         "path": source_path,
         "source_last_iter": int(policy_state.get("last_iter", -1)),
     }
+
+
+def prepare_inline_bc_dagger_source(cfg: DictConfig) -> dict | None:
+    """Require a fresh PPO teacher for the non-resumable inline schedule."""
+    if not bool(cfg.get("bc_dagger_inline_finalization", False)):
+        return None
+    return prepare_fresh_bc_dagger_source(cfg)
 
 
 def apply_bc_dagger_iteration_controls(cfg: DictConfig) -> None:
@@ -765,9 +927,12 @@ def validate_bc_dagger_config(cfg: DictConfig) -> None:
 def main(cfg: DictConfig):
     inline = apply_inline_finalization_controls(cfg)
     apply_bc_dagger_iteration_controls(cfg)
-    if inline is not None:
-        prepare_inline_bc_dagger_source(cfg)
     resume = prepare_bc_dagger_checkpoint(cfg)
+    if resume is None:
+        if inline is not None:
+            prepare_inline_bc_dagger_source(cfg)
+        else:
+            prepare_fresh_bc_dagger_source(cfg)
     validate_bc_dagger_config(cfg)
     schedule = bc_dagger_rollout_schedule(cfg)
     control_mode = str(cfg.algo.get("dagger_control_mode", "beta"))
@@ -838,7 +1003,8 @@ def main(cfg: DictConfig):
     if control_mode in ("safe", "hybrid"):
         print(
             "SafeDAgger control: "
-            f"mode={control_mode}, normalized RMS takeover>"
+            f"mode={control_mode}, safety-envelope-normalized RMS "
+            "takeover>"
             f"{float(cfg.algo.dagger_safe_takeover_rms):g}, release<"
             f"{float(cfg.algo.dagger_safe_release_rms):g}, minimum teacher "
             f"hold={int(cfg.algo.dagger_safe_min_teacher_steps)} steps, "

@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 
 import h5py
@@ -10,14 +12,79 @@ from scripts import bc_dagger
 from scripts.train import run_training as shared_run_training
 
 
+_EXECUTION_PAYLOAD = {
+    "semantics": "bounded_policy_and_replay_command_support_v1",
+    "source": "scalar_dagger_safety_envelope",
+    "joint_names": ["joint_a", "joint_b"],
+    "action_low": [-20.0, -20.0],
+    "action_high": [20.0, 20.0],
+}
+_Q_TRANSFORM_PAYLOAD = {
+    "semantics": "affine_nominal_joint_coordinates_unclipped_then_fixed_gain_v3",
+    "source": "soft_joint_limits_at_default_pose",
+    "joint_names": ["joint_a", "joint_b"],
+    "action_center": [0.0, 1.0],
+    "action_scale": [2.0, 2.0],
+    "clamp": None,
+}
+_ENTROPY_PAYLOAD = {
+    "semantics": "nominal_joint_action_density_coordinates_v1",
+    "source": "nominal_joint_action_coordinates",
+    "joint_names": ["joint_a", "joint_b"],
+    "action_scale": [2.0, 2.0],
+}
+
+
+def _sha256(payload):
+    return "sha256:" + hashlib.sha256(json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+_ACTION_CONTRACT_PAYLOAD = {
+    "semantics": bc_dagger.EXPECTED_ACTION_CONTRACT_SEMANTICS,
+    "action_bound_source": "scalar_dagger_safety_envelope",
+    "execution_support_semantics": _EXECUTION_PAYLOAD["semantics"],
+    "execution_support_fingerprint": _sha256(_EXECUTION_PAYLOAD),
+    "joint_names": ["joint_a", "joint_b"],
+    "action_low": [-20.0, -20.0],
+    "action_high": [20.0, 20.0],
+    "action_center": [0.0, 0.0],
+    "action_scale": [20.0, 20.0],
+    "q_action_coordinate_source": "soft_joint_limits_at_default_pose",
+    "nominal_action_low": [-2.0, -1.0],
+    "nominal_action_high": [2.0, 3.0],
+    "q_action_center": [0.0, 1.0],
+    "q_action_scale": [2.0, 2.0],
+    "q_action_clamp": None,
+    "q_action_transform_semantics": _Q_TRANSFORM_PAYLOAD["semantics"],
+    "q_action_transform_fingerprint": _sha256(_Q_TRANSFORM_PAYLOAD),
+    "entropy_reference_source": "nominal_joint_action_coordinates",
+    "entropy_reference_scale": [2.0, 2.0],
+    "entropy_reference_semantics": _ENTROPY_PAYLOAD["semantics"],
+    "entropy_reference_fingerprint": _sha256(_ENTROPY_PAYLOAD),
+    "joint_offset_low": [0.0, 0.0],
+    "joint_offset_high": [0.0, 0.0],
+}
+ACTION_CONTRACT = {
+    **_ACTION_CONTRACT_PAYLOAD,
+    "fingerprint": _sha256(_ACTION_CONTRACT_PAYLOAD),
+}
+
 REPLAY_LINEAGE = {
-    "format": "vaic_bc_dagger_teacher_replay",
-    "format_version": 2,
+    "format": bc_dagger.EXPECTED_REPLAY_FORMAT,
+    "format_version": bc_dagger.EXPECTED_REPLAY_FORMAT_VERSION,
     "replay_id": "frozen-replay-id",
     "dagger_control_semantics": bc_dagger.EXPECTED_CONTROL_SEMANTICS,
-    "replay_observation_semantics": "raw_pre_vecnorm_v1",
+    "replay_observation_semantics": "raw_pre_vecnorm_sample_current_v1",
     "vecnorm_fingerprint": "sha256:" + "a" * 64,
+    "actor_backend": bc_dagger.EXPECTED_ACTOR_BACKEND,
+    "action_parameterization": bc_dagger.EXPECTED_ACTION_PARAMETERIZATION,
     "action_clip": 20.0,
+    "action_contract": ACTION_CONTRACT,
 }
 
 
@@ -40,8 +107,8 @@ def _cfg(
     beta_decay=1800,
     beta_zero_iteration=None,
     control_mode="safe",
-    safe_takeover=0.006,
-    safe_release=0.004,
+    safe_takeover=0.05,
+    safe_release=0.03,
     safe_hold=8,
     safe_zero_iteration=None,
     raw_replay=True,
@@ -132,9 +199,21 @@ def _write_resume_checkpoint(
     }
     policy = {
         "training_algorithm": algorithm,
+        "actor_backend": bc_dagger.EXPECTED_ACTOR_BACKEND,
         "critic_learning_semantics": bc_dagger.EXPECTED_CRITIC_SEMANTICS,
         "dagger_control_semantics": bc_dagger.EXPECTED_CONTROL_SEMANTICS,
-        "q_backend_config": {},
+        "action_contract": ACTION_CONTRACT,
+        "dagger_backend_config": {
+            "dagger_action_clip": 20.0,
+            "fresh_ppo_actor_initialization_semantics": (
+                bc_dagger.EXPECTED_FRESH_ACTOR_INITIALIZATION_SEMANTICS
+            ),
+        },
+        "q_backend_config": {
+            "q_action_transform_fingerprint": ACTION_CONTRACT[
+                "q_action_transform_fingerprint"
+            ]
+        },
         "actor_adapt": {},
         "bc_dagger_sac_adapter": {},
         "qnet": {},
@@ -160,7 +239,11 @@ def _write_resume_checkpoint(
     torch.save(checkpoint, path)
     with h5py.File(path.with_name("teacher_replay_buffer.h5"), "w") as replay:
         for key, value in REPLAY_LINEAGE.items():
-            replay.attrs[key] = value
+            replay.attrs[key] = (
+                json.dumps(value, sort_keys=True, separators=(",", ":"))
+                if key == "action_contract"
+                else value
+            )
     return path
 
 
@@ -182,6 +265,7 @@ def _write_fresh_ppo_checkpoint(path: Path, *, task_name="G1Skateboard"):
                 "name": "ppo_vel",
                 "_target_": "active_adaptation.learning.ppo.ppo_vel.PPOVEL",
                 "phase": "train",
+                "enable_residual_distillation": True,
                 "use_object_adapt": False,
             },
         }
@@ -219,6 +303,7 @@ def test_bc_dagger_config_inherits_train_and_selects_dedicated_defaults():
     assert cfg.algo.dagger_control_mode == "safe"
     assert cfg.algo.dagger_safe_takeover_rms == pytest.approx(0.006)
     assert cfg.algo.dagger_safe_release_rms == pytest.approx(0.004)
+    assert cfg.algo.dagger_action_clip == pytest.approx(20.0)
     assert cfg.algo.dagger_safe_min_teacher_steps == 8
     assert cfg.algo.dagger_safe_zero_iteration is None
     assert cfg.algo.dagger_replay_raw_observations is True
@@ -399,6 +484,7 @@ def test_inline_source_accepts_fresh_ppo_and_canonicalizes_runtime_flags(
         "source_last_iter": 6000,
     }
     assert cfg.checkpoint_path == str(checkpoint.resolve())
+    assert cfg._bc_dagger_fresh_source is True
     assert cfg._bc_dagger_staging_source is True
     assert cfg._bc_dagger_model_only_resume is False
 
@@ -414,6 +500,28 @@ def test_inline_source_rejects_bc_checkpoint_through_generic_path(tmp_path):
 
     with pytest.raises(ValueError, match="fresh PPO teacher|resume"):
         bc_dagger.prepare_inline_bc_dagger_source(cfg)
+
+
+def test_noninline_fresh_source_is_validated_and_marked(tmp_path):
+    checkpoint = _write_fresh_ppo_checkpoint(tmp_path / "fresh_noninline.pt")
+    cfg = _cfg(checkpoint=str(checkpoint))
+
+    prepared = bc_dagger.prepare_fresh_bc_dagger_source(cfg)
+
+    assert prepared["path"] == str(checkpoint.resolve())
+    assert cfg._bc_dagger_fresh_source is True
+    assert not bool(cfg.get("_bc_dagger_staging_source", False))
+
+
+def test_noninline_fresh_source_rejects_explicit_old_replay(tmp_path):
+    checkpoint = _write_fresh_ppo_checkpoint(tmp_path / "fresh_with_h5.pt")
+    cfg = _cfg(
+        checkpoint=str(checkpoint),
+        teacher_replay_buffer_path="/tmp/old_teacher_replay.h5",
+    )
+
+    with pytest.raises(ValueError, match="fresh.*replay|remove"):
+        bc_dagger.prepare_fresh_bc_dagger_source(cfg)
 
 
 def test_hydra_accepts_inline_tail_overrides_without_plus_prefix():
@@ -573,7 +681,7 @@ def test_resume_rejects_any_mutable_teacher_replay_path(
 @pytest.mark.parametrize(
     ("checkpoint_kwargs", "message"),
     (
-        ({"algorithm": "old-dagger"}, "SAC-critic-v3"),
+        ({"algorithm": "old-dagger"}, "SAC-critic-v6"),
         ({"include_vecnorm": False}, "VecNorm"),
         ({"missing_optimizer": "q_optimizer"}, "optimizer state"),
         ({"missing_module": "bc_dagger_sac_adapter"}, "trained modules"),
@@ -600,6 +708,11 @@ def test_bc_dagger_entrypoint_reuses_shared_training_engine(monkeypatch):
         bc_dagger,
         "run_training",
         lambda actual: received.append(actual) or "shared-result",
+    )
+    monkeypatch.setattr(
+        bc_dagger,
+        "prepare_fresh_bc_dagger_source",
+        lambda actual: {"path": "/fresh/ppo.pt"},
     )
 
     result = bc_dagger.main.__wrapped__(cfg)
@@ -696,7 +809,7 @@ def test_iteration_budget_matches_shared_trainer_on_multiple_ranks(monkeypatch):
             "cumulative end rollout",
         ),
         (_cfg(control_mode="unknown"), "control_mode"),
-        (_cfg(safe_release=0.007), "release_rms"),
+        (_cfg(safe_release=0.06), "release_rms"),
         (_cfg(safe_hold=0), "positive integer"),
         (_cfg(iterations=0), "bc_dagger_iterations"),
         (_cfg(iterations=True), "bc_dagger_iterations"),

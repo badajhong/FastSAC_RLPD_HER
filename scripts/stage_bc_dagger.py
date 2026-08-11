@@ -261,6 +261,14 @@ def _validate_source_checkpoint(
         raise ValueError("checkpoint saved config has the wrong PPO target")
     if source_algo.get("phase") != "train":
         raise ValueError("checkpoint saved config must use algo.phase=train")
+    if source_algo.get("enable_residual_distillation") is not True:
+        raise ValueError(
+            "PPO teacher checkpoint must use "
+            "algo.enable_residual_distillation=true. BC-DAgger reconstructs "
+            "the absolute privileged teacher action by adding ref_joint_pos "
+            "to that residual head; an absolute-output PPO teacher would be "
+            "added twice."
+        )
 
     required_modules = {
         "actor",

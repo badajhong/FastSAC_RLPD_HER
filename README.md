@@ -294,11 +294,12 @@ unused; choose `beta` mode instead if SafeDAgger itself should be disabled.
 W&B logs the zero-based index as `dagger/rollout_index`; the completed-rollout
 counter `dagger/rollout_count` is therefore one larger.
 
-The dedicated script defaults to SafeDAgger. It compares the clipped,
-deterministic student action with the clipped PPO teacher mean in normalized
-action coordinates. Normalized RMS error above `0.006` gives control to the
-teacher; after at least eight control steps, error below `0.004` releases it
-back to the student. Hysteresis is tracked independently for every environment.
+The dedicated script defaults to SafeDAgger. It compares the executable
+latent-tanh student mean with the projected PPO teacher mean after dividing
+their physical-action difference by the shared `dagger_action_clip=20`
+envelope. Normalized RMS error above `0.006` gives control to the teacher;
+after at least eight control steps, error below `0.004` releases it back to the
+student. Hysteresis is tracked independently for every environment.
 `algo.dagger_control_mode=beta` retains the legacy Bernoulli schedule, while
 `hybrid` applies SafeDAgger and uses beta only on otherwise-safe rows.
 
@@ -344,7 +345,7 @@ beta is fixed to `calibration_teacher_probability` (default `0.5`). Only valid,
 actually teacher-executed calibration transitions are retained for export;
 the Q learning replay still contains both executed teacher and student
 transitions. Those teacher rows stay in the CPU FIFO during calibration, and
-`teacher_replay_buffer.h5` is materialized exactly once with
+`teacher_replay_buffer.h5` format version 5 is materialized exactly once with
 `checkpoint_final`. Observations are stored before VecNorm and normalized with
 the checkpoint's fixed statistics when sampled. The `fastsac_vel_finetune`
 loader accepts this paired DAgger schema and transfers the BC actor and
@@ -429,24 +430,58 @@ not the input joint checkpoint, for Stage 2. Finalization currently starts only
 from the original completed joint BC-DAgger checkpoint and rejects a partially
 finalized checkpoint rather than risking a mixed replay lineage.
 
-For this BC-DAgger bridge, Stage-2 **training** collection samples the same
-bounded tanh-Gaussian distribution used by the SAC targets and actor loss. Its
-dedicated log-standard-deviation starts at `0.01` raw action units, independently
-of the unused PPO/DAgger `actor_std=0.5`. The exact bounded command sent to the
-environment is retained in `ACTION_KEY` and therefore becomes the online replay
-action paired with its observed reward and next state. Evaluation and deployment
-remain the finite, clipped deterministic BC/SAC mean. A dedicated checkpointed
-rollout RNG keeps behavior sampling independent of SAC gradient sampling and the
-global environment RNG.
+For this BC-DAgger bridge, the student head is trained as an unconstrained
+pre-tanh latent. Teacher commands are projected into the symmetric
+`[-dagger_action_clip, +dagger_action_clip]` execution envelope and
+inverse-transformed into latent BC labels; deterministic DAgger rollout maps the
+student latent back through that same safety-envelope tanh. This avoids a hard
+action clamp's zero gradient and leaves no inverse-tanh operation on the later
+SAC actor-gradient path. PPO/DAgger `actor_std=0.5` remains unused. The dedicated
+small-noise Q-target adapter instead interprets `sac_bc_initial_action_std=0.01`
+relative to each joint's nominal residual half-range and centers its stochastic
+action exactly on the current BC mean.
 
-The DAgger safety clip and SAC entropy coordinates are deliberately separate.
-The offline H5, rollout actor, environment, replay, and pretrained Q retain the
-symmetric executable safety support `[-20, 20]` (from `dagger_action_clip`),
-whereas entropy uses the fixed raw-action reference scale `1`. The safety bound
-therefore cannot inject a `log(20)` density offset into every action dimension
-or change the temperature merely because the emergency clip is wide. Set
-`algo.sac_deterministic_rollout=true` only for the deterministic collection
-ablation.
+A fresh PPO checkpoint still stores its student mean in physical action units.
+BC-DAgger migrates that final mean layer exactly once, immediately after load,
+using the safety-envelope inverse-tanh transform linearized at raw action zero
+(`z ~= action / 20`). This preserves the neutral command and a unit local
+physical-action Jacobian. Same-stage BC-DAgger resumes never repeat the
+migration. The source PPO must have `enable_residual_distillation=true`;
+otherwise its privileged head is already absolute and BC-DAgger's reference
+reconstruction would add the reference twice, so that source is rejected before
+training.
+
+Execution support, Q coordinates, and entropy coordinates are deliberately
+separate. `dagger_action_clip=20` defines the BC actor, environment, replay, and
+H5 execution envelope; changing it changes the action contract and requires a
+fresh BC-DAgger/H5 generation. Q alone receives the unclipped affine coordinate
+`(action - nominal_center) / nominal_half_range`, where the nominal joint range
+comes from the default pose, action scaling, and soft joint limits. Per-episode
+random joint offsets are recorded as provenance but do not move this coordinate
+system. Entropy log density uses the same nominal half-ranges, not the `20`
+safety scale, so the envelope cannot inject a `log(20)` offset into every action
+dimension.
+
+Stage 2 additionally freezes an exact copy of the transferred BC actor as its
+behavior anchor. The trainable proposal begins as the same actor and supplies
+only the latent difference `z_res = z_proposal - z_anchor`. For joint `j`, the
+deterministic and stochastic SAC actions are therefore bounded by
+`a_j = a_BC,j + r_j * tanh(z_res,j)`, with
+`r_j = min(nominal_half_range_j, a_BC,j - low_j, high_j - a_BC,j)` and
+`[low_j, high_j]=[-20, 20]`. On a fresh transfer `z_res=0`, so deterministic
+behavior is exactly the pretrained BC policy. Later actor/Q queries remain
+within one nominal joint half-range of that frozen policy and inside the safety
+envelope. Training collection samples this exact residual tanh-Gaussian;
+evaluation uses its deterministic mean, and the executed physical command in
+`ACTION_KEY` is the action stored in online replay. A dedicated checkpointed
+rollout RNG keeps behavior sampling independent of SAC-gradient sampling and
+environment randomization. Set `algo.sac_deterministic_rollout=true` only for
+the deterministic collection ablation.
+
+The compatible artifact generation is strict: BC-DAgger algorithm
+`vaic_ppo_bc_dagger_student_sac_critic_v6`, teacher H5 format version 5, and
+Stage-2 adapter `vaic_fastsac_bc_dagger_adapter_v6`. Older coordinate or
+unbounded-actor generations are intentionally rejected rather than migrated.
 
 Stage 2 first collects 98,304 accepted online transitions, then performs 8,000
 Q-only updates with actor, alpha, and perception optimizers frozen. The target
@@ -461,11 +496,14 @@ positive and larger than the twins' disagreement. Effective alpha starts at
 zero on the first confidence-approved actor tick and increases linearly to its
 learned value over the next 20,000 Q updates; the Q target, actor objective, and
 temperature update use that same effective alpha. Raw alpha starts at `1e-5`,
-and the raw-unit entropy target is the standard `-action_dim`
+and the nominal joint action-density entropy target is `-action_dim`
 (`sac_target_entropy_ratio=1`). There is no BC-loss anchor in this no-anchor SAC
-path. The guarded Stage-2 defaults are `sac_batch_size=512`,
+path. After the first successful actor release, alpha is updated on every Q
+batch rather than only on delayed actor ticks. The guarded Stage-2 defaults are
+`sac_batch_size=512`, `sac_update_to_data_ratio=1`,
 `q_lr=3e-5`, `sac_tau=0.001`, `sac_actor_lr=3e-7`, and
-`sac_policy_frequency=128`.
+`sac_policy_frequency=128`. `sac_update_to_data_ratio` is the only Stage-2 UTD
+control; the removed `sac_updates_per_env_step` key is not a valid override.
 
 Stage 2 can instead use the official AWAC actor update from the
 [AWAC paper](https://arxiv.org/abs/2006.09359) and the authors'
@@ -480,7 +518,7 @@ python scripts/train.py \
   algo.sac_actor_confidence_gate=false \
   algo.sac_use_autotune=false \
   algo.sac_awac_beta=1.0 \
-  algo.sac_updates_per_env_step=4 \
+  algo.sac_update_to_data_ratio=4 \
   algo.sac_policy_frequency=64 \
   algo.sac_actor_lr=3e-7
 ```
@@ -497,7 +535,7 @@ general implementation: `sac_awac_beta=1`, one current-policy value sample
 AWAC uses a stochastic current-policy next action and a hard, clipped-double-Q
 Bellman target: effective alpha, alpha autotuning, the Stage-2 confidence gate,
 and the BC anchor are absent. Q/Q-target are **not frozen or restarted**: the
-compatible BC-DAgger v3 Q weights warm-start Stage 2, receive the configured
+compatible BC-DAgger v6 Q weights warm-start Stage 2, receive the configured
 Q-only bridge, and continue training from the mixed offline/online replay while
 the AWAC actor improves. The distributional C51 critic and the explicit 50/50
 RLPD replay mix are project integrations; the advantage and weighted-likelihood
@@ -509,12 +547,14 @@ critics: their 101-atom/raw-action topology and expectile backup do not match th
 current 501-atom/normalized-action policy-evaluation critic. For such a legacy
 checkpoint use `algo.load_pretrained_q=false` to keep the BC actor but train a
 fresh AWAC Q. Current `scripts/bc_dagger.py` checkpoints use the compatible
-`vaic_ppo_bc_dagger_student_sac_critic_v3` critic and can retain the default
+`vaic_ppo_bc_dagger_student_sac_critic_v6` critic and can retain the default
 `algo.load_pretrained_q=true`.
 
 The last three command overrides are a conservative VAIC starting profile, not
-paper defaults: UTD 4 yields 128 Q updates and two AWAC actor updates per
-32-step rollout while retaining the small BC-preserving actor learning rate.
+paper defaults. UTD is defined as total replay rows sampled per newly accepted
+online row, independent of `num_envs` and minibatch size. UTD 4 yields 128 Q
+updates and two AWAC actor updates per 32-step, 512-environment rollout while
+retaining the small BC-preserving actor learning rate.
 The authors' much larger `3e-4` actor learning rate and every-Q-step policy
 update should not be copied directly into this 23-action recurrent system. Do
 not add the earlier `sac_actor_learning_starts_finetune_iteration=32` override;
@@ -522,9 +562,12 @@ leaving it null retains the 8,000-Q-update calibration bridge. If AWAC weights
 collapse (`fastsac/awac_weight_ess_fraction` near zero), increase beta before
 increasing actor learning rate or update frequency.
 
-A v3 BC-DAgger source normally transfers its dedicated `0.01` physical-action
-standard deviation exactly. Changing `sac_bc_initial_action_std` does not reset
-that saved adapter. For an intentional offline-to-online exploration experiment,
+A v6 BC-DAgger source normally transfers its dedicated Stage-2 adapter state
+exactly. Its `0.01` setting denotes centre-local, first-order physical-action
+standard deviation divided by the nominal residual half-range, not a
+state-independent physical std near the safety envelope.
+Changing `sac_bc_initial_action_std` does not reset that saved adapter. For an
+intentional offline-to-online exploration experiment,
 use the Stage-2 boundary option below on a **fresh BC-DAgger transfer**:
 
 ```bash

@@ -1,6 +1,7 @@
 # Dedicated defaults for scripts/bc_dagger.py. The complete training schema is
 # inherited from train.yaml so rollout, replay, checkpoint, and W&B behavior
-# remain identical to scripts/train.py.
+# remain identical to scripts/train.py. Current compatible artifacts are
+# BC-DAgger algorithm v6, Stage-2 adapter v6, and teacher H5 format v5.
 defaults:
   - train
   - override /algo: ppo_bc_dagger_finetune
@@ -42,7 +43,8 @@ save_interval: 100
 
 # Optional same-stage continuation checkpoint. Unlike checkpoint_path (which
 # normally bootstraps a fresh DAgger stage from the PPO teacher), this must be a
-# PPO-BC DAgger SAC-critic-v3 checkpoint. It restores actor/perception/EMA,
+# PPO-BC DAgger SAC-critic-v6 checkpoint paired with H5 format v5. It restores
+# actor/perception/EMA,
 # Q1/Q2, target Q1/Q2, all training optimizers, and the dedicated
 # DAgger/replay/stochastic-target RNG streams,
 # and stage counters while deliberately leaving the previously exported
@@ -62,15 +64,25 @@ bc_dagger_copy_teacher_replay: true
 _bc_dagger_model_only_resume: false
 _bc_dagger_teacher_replay_copy_source: null
 _bc_dagger_teacher_replay_copy_path: null
+# Set only after the dedicated entrypoint validates a fresh train-phase PPO
+# source. It prevents generic replay auto-discovery from importing an adjacent
+# H5 into a brand-new BC-DAgger collection.
+_bc_dagger_fresh_source: false
 
 algo:
-  # Oracle-discrepancy SafeDAgger: compare clipped deterministic teacher/student
-  # actions in normalized coordinates. RMS > 0.006 takes over; after an
-  # 8-control-step minimum hold, RMS < 0.004 releases back to the student.
+  # Oracle-discrepancy SafeDAgger: project deterministic teacher/student means
+  # into the shared +/-20 behavior envelope, then divide their difference by
+  # 20. RMS > 0.006 takes over; after an 8-control-step minimum hold, RMS <
+  # 0.004 releases back to the student.
   dagger_control_mode: safe
   dagger_safe_takeover_rms: 0.006
   dagger_safe_release_rms: 0.004
   dagger_safe_min_teacher_steps: 8
+  # Defines the BC actor/environment/replay/H5 execution envelope. It is also
+  # the /20 SafeDAgger discrepancy scale, but it is not the Q or entropy scale.
+  # Stage 2 further restricts every action to a frozen-BC-centered residual of
+  # at most one nominal joint half-range while remaining inside this envelope.
+  dagger_action_clip: 20.0
   # Optional project-specific safety override. With K, rollout indices 0..K-1
   # retain SafeDAgger and index K onward disables safe teacher execution. The
   # frozen teacher is still queried for DAgger labels and discrepancy logging.
@@ -84,8 +96,9 @@ algo:
   dagger_beta_zero_iteration: null
   dagger_beta_decay_rollouts: 1800
   # Actor training remains pure DAgger BC. Q uses the exact Stage-2 critic
-  # topology/operator with deterministic executed actions, a dedicated
-  # small-noise stochastic next action, and beta-independent 50/50 replay.
+  # topology/operator with physical actions, unclipped nominal-joint Q
+  # coordinates, a BC-centered bounded-residual stochastic next action, and
+  # beta-independent 50/50 replay. Entropy density uses the same nominal scale.
   q_num_atoms: 501
   # Separate 2,341-D state and 23-D action stems; with q_hidden_dim=768 the
   # action branch is 128-D before the shared distributional-Q trunk.
@@ -98,13 +111,19 @@ algo:
   q_tau: 0.001
   q_batch_size: 512
   q_updates_per_rollout: 128
+  # This is the fixed BC-DAgger Q-calibration cadence. Stage-2 UTD instead uses
+  # algo.sac_update_to_data_ratio; sac_updates_per_env_step has been removed.
   q_teacher_replay_ratio: 0.5
   # Standard replay warm-up, not a critic-confidence gate. Both execution
   # sources must contain this many rows before exact 50/50 critic updates start.
   q_learning_starts_per_source: 8192
+  # Centre-local physical std. The stored latent std is this value divided by
+  # each joint's nominal residual half-range. State-dependent support can shrink
+  # it further only when the BC anchor approaches the +/-20 safety envelope.
   sac_bc_initial_action_std: 0.01
-  # Saved for the Stage-2 alpha process. BC critic Q-only targets use
-  # effective alpha=0 while retaining stochastic next-action sampling.
+  # Saved for the Stage-2 alpha process. BC critic Q-only targets use effective
+  # alpha=0 while retaining BC-centered residual next-action sampling. Later
+  # entropy density is expressed in nominal joint action coordinates.
   sac_alpha_init: 1.0e-5
   # Teacher-executed raw pre-VecNorm FIFO for the later FastSAC stage (about
   # 22 GiB when full with the current skateboard observation dimensions).

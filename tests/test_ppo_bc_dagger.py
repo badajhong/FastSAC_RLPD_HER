@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import copy
+import functools
 import importlib
+import json
+import math
 from types import MethodType, SimpleNamespace
 
 import h5py
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -14,7 +18,7 @@ from tensordict import TensorDict
 bc_dagger_module = importlib.import_module(
     "active_adaptation.learning.ppo.ppo_bc_dagger"
 )
-from active_adaptation.learning.ppo.common import ACTION_KEY
+from active_adaptation.learning.ppo.common import ACTION_KEY, Actor
 from active_adaptation.learning.ppo.ppo_vel import (
     CMD_KEY,
     DEPTH_KEY,
@@ -60,8 +64,12 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
 )
 from active_adaptation.learning.ppo.fastsac_vel import (
     BCDaggerOfflineReplayH5,
+    FASTSAC_REFERENCE_EPS,
     FASTSAC_Q_LATE_FUSION_SEMANTICS,
+    FastSACTanhNormal,
     TEACHER_REPLAY_FIELDS,
+    _fastsac_action_center_to_latent,
+    _vaic_action_contract_metadata,
 )
 
 
@@ -75,6 +83,61 @@ def _bare_policy(**cfg):
     policy = PPOBCDaggerFinetune.__new__(PPOBCDaggerFinetune)
     nn.Module.__init__(policy)
     policy.cfg = SimpleNamespace(**cfg)
+    return policy
+
+
+def _test_action_contract(
+    action_dim=1, low=-10.0, high=10.0, execution_clip=None
+):
+    joint_names = [f"joint_{index}" for index in range(int(action_dim))]
+    lows = [float(low)] * int(action_dim)
+    highs = [float(high)] * int(action_dim)
+    zeros = [0.0] * int(action_dim)
+    kwargs = {}
+    if execution_clip is not None:
+        kwargs = {
+            "execution_action_low": [
+                -float(execution_clip)
+            ] * int(action_dim),
+            "execution_action_high": [
+                float(execution_clip)
+            ] * int(action_dim),
+            "execution_support_source": "scalar_dagger_safety_envelope",
+        }
+    return _vaic_action_contract_metadata(
+        joint_names, lows, highs, zeros, zeros, **kwargs
+    )
+
+
+def _install_test_action_contract(
+    policy, action_dim=1, low=-10.0, high=10.0, execution_clip=None
+):
+    contract = _test_action_contract(
+        action_dim, low, high, execution_clip=execution_clip
+    )
+    policy.action_dim = int(action_dim)
+    policy.joint_names = list(contract["joint_names"])
+    policy._fastsac_action_contract = contract
+    policy._fastsac_action_low = torch.tensor(contract["action_low"])
+    policy._fastsac_action_high = torch.tensor(contract["action_high"])
+    policy._fastsac_actor_action_center = torch.tensor(
+        contract["action_center"]
+    )
+    policy._fastsac_actor_action_scale = torch.tensor(
+        contract["action_scale"]
+    )
+    policy._fastsac_q_action_center = torch.tensor(
+        contract["q_action_center"]
+    )
+    policy._fastsac_q_action_scale = torch.tensor(
+        contract["q_action_scale"]
+    )
+    policy._fastsac_action_log_scale_sum = float(
+        torch.log(policy._fastsac_actor_action_scale).sum().item()
+    )
+    policy._fastsac_entropy_reference_log_scale_sum = float(
+        torch.log(policy._fastsac_q_action_scale).sum().item()
+    )
     return policy
 
 
@@ -188,7 +251,6 @@ def test_config_dataclass_has_stage_local_beta_and_separate_q_targets():
         "sac_bc_log_std_min",
         "sac_bc_log_std_max",
         "sac_alpha_init",
-        "sac_entropy_reference_scale",
     ):
         assert hasattr(cfg, name), name
 
@@ -249,6 +311,7 @@ def test_bc_critic_checkpoint_metadata_matches_fastsac_q_contract():
     policy._q_input_dim = 5
     policy.action_dim = 23
     policy.reward_groups = ["task"]
+    _install_test_action_contract(policy, action_dim=23)
 
     dagger_backend = policy._checkpoint_config()
     assert "dagger_beta_zero_iteration" not in dagger_backend
@@ -284,10 +347,10 @@ def test_bc_critic_normalizes_only_q_input_and_keeps_executed_action_physical():
         sac_q_action_input_gain=1.0,
         dagger_action_clip=20.0,
     )
-    policy._fastsac_q_action_low = torch.tensor([-20.0, -20.0])
-    policy._fastsac_q_action_scale = torch.tensor([20.0, 20.0])
+    policy._fastsac_q_action_center = torch.tensor([1.0, -2.0])
+    policy._fastsac_q_action_scale = torch.tensor([3.0, 4.0])
     executed = torch.tensor(
-        [[-20.0, 0.0], [10.0, 20.0]], dtype=torch.float32
+        [[-2.0, -2.0], [2.5, 2.0]], dtype=torch.float32
     )
     physical_copy = executed.clone()
 
@@ -306,7 +369,7 @@ def test_bc_critic_normalizes_only_q_input_and_keeps_executed_action_physical():
         (
             [[0.0, 1.0], [20.0, -20.0], [20.01, 0.0]],
             20.0,
-            [True, True, False],
+            [True, False, False],
         ),
         (
             [[float("nan"), 0.0], [float("inf"), 0.0], [1.0, 2.0]],
@@ -370,7 +433,22 @@ def _safe_rollout_fixture(*, envs=1, hold=3):
     policy.dagger_rng = torch.Generator().manual_seed(123)
     policy.test_student_action = torch.zeros(envs, 1)
     policy.test_teacher_action = torch.zeros(envs, 1)
-    policy._student_action = lambda td: policy.test_student_action.clone()
+    policy._fastsac_action_low = torch.tensor([-10.0])
+    policy._fastsac_action_high = torch.tensor([10.0])
+    policy._fastsac_q_action_scale = torch.tensor([10.0])
+    def student_latent(td):
+        action = policy.test_student_action.clone()
+        return _fastsac_action_center_to_latent(
+            action,
+            policy._fastsac_q_action_scale,
+            torch.zeros_like(policy._fastsac_q_action_scale),
+            FASTSAC_REFERENCE_EPS,
+        )
+
+    policy._student_latent = student_latent
+    policy._student_action_from_latent = MethodType(
+        PPOBCDaggerFinetune._student_action_from_latent, policy
+    )
     policy._teacher_action = lambda td: policy.test_teacher_action.clone()
     return policy, _DaggerRolloutPolicy(policy)
 
@@ -414,6 +492,11 @@ def test_safe_dagger_release_boundary_and_episode_reset_clear_latch():
 
     # Equality with the release threshold retains the current controller.
     policy.test_student_action = torch.tensor([[1.0], [1.0]])
+    boundary_latent = policy._student_latent(TensorDict({}, batch_size=[2]))
+    boundary_action = policy._student_action_from_latent(boundary_latent)
+    policy.cfg.dagger_safe_release_rms = float(
+        (boundary_action[0, 0].abs() / policy._fastsac_q_action_scale[0]).item()
+    )
     boundary = _safe_step(wrapper)
     assert boundary[DAGGER_IS_STUDENT_ACTION_KEY].tolist() == [False, False]
 
@@ -629,6 +712,208 @@ def test_teacher_oracle_restores_absolute_ppo_action_and_is_detached():
     assert policy.actor.residual.grad is None
 
 
+class _LearnableLatentActor(nn.Module):
+    def __init__(self, initial_latent):
+        super().__init__()
+        self.latent = nn.Parameter(torch.as_tensor(initial_latent).float())
+
+    def mean_for(self, rows):
+        # Multiplication creates an ordinary forward tensor rather than a view
+        # of the parameter, matching the real actor MLP's metric semantics.
+        return torch.ones(rows, self.latent.numel()) * self.latent
+
+
+def test_bc_update_supervises_inverse_tanh_latent_and_reports_physical_mae():
+    policy = _bare_policy(
+        dagger_actor_huber_delta=0.2,
+        dagger_action_clip=20.0,
+        max_grad_norm=10.0,
+    )
+    _install_test_action_contract(policy, action_dim=1, low=-2.0, high=4.0)
+    policy.device = torch.device("cpu")
+    policy.actor_adapt = _LearnableLatentActor([-1.0])
+    policy._actor_dist_from_flat = lambda obs: SimpleNamespace(
+        mean=policy.actor_adapt.mean_for(obs.shape[0])
+    )
+    policy._student_action_from_latent = MethodType(
+        PPOBCDaggerFinetune._student_action_from_latent, policy
+    )
+    policy.bc_optimizer = torch.optim.SGD(
+        policy.actor_adapt.parameters(), lr=0.1
+    )
+    policy.bc_update_count = 0
+    teacher_action = torch.tensor([[2.5], [4.0]])
+    batch = {
+        "observations": torch.zeros(2, 1),
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.ones(2, dtype=torch.bool),
+        DAGGER_REPLAY_TEACHER_ACTIONS: teacher_action,
+    }
+    initial_latent = policy.actor_adapt.latent.detach().clone()
+    target_latent = torch.atanh(torch.tensor([
+        0.5,
+        1.0 - FASTSAC_REFERENCE_EPS,
+    ])).unsqueeze(-1)
+    expected_loss = torch.nn.functional.smooth_l1_loss(
+        initial_latent.expand_as(target_latent),
+        target_latent,
+        beta=policy.cfg.dagger_actor_huber_delta,
+    )
+    initial_action = torch.tanh(initial_latent) * 3.0 + 1.0
+    expected_mae = (initial_action.expand_as(teacher_action) - teacher_action).abs(
+    ).mean()
+
+    loss, mae, grad = policy._bc_update(batch)
+
+    assert torch.isfinite(target_latent).all()
+    assert loss.item() == pytest.approx(expected_loss.item())
+    assert mae.item() == pytest.approx(expected_mae.item())
+    assert grad.item() > 0.0
+    assert policy.actor_adapt.latent.item() > initial_latent.item()
+    assert policy.bc_update_count == 1
+
+
+def test_bc_actor_q_and_entropy_coordinates_remain_separate():
+    policy = _bare_policy(
+        dagger_actor_huber_delta=100.0,
+        dagger_action_clip=20.0,
+        max_grad_norm=10.0,
+        sac_q_action_input_gain=1.0,
+    )
+    _install_test_action_contract(
+        policy,
+        action_dim=1,
+        low=-2.0,
+        high=4.0,
+        execution_clip=20.0,
+    )
+    policy.device = torch.device("cpu")
+    policy.actor_adapt = _LearnableLatentActor([0.0])
+    policy._actor_dist_from_flat = lambda obs: SimpleNamespace(
+        mean=policy.actor_adapt.mean_for(obs.shape[0])
+    )
+    policy._student_action_from_latent = MethodType(
+        PPOBCDaggerFinetune._student_action_from_latent, policy
+    )
+    policy.bc_optimizer = torch.optim.SGD(
+        policy.actor_adapt.parameters(), lr=0.0
+    )
+    policy.bc_update_count = 0
+    teacher_action = torch.tensor([[9.0]])
+    batch = {
+        "observations": torch.zeros(1, 1),
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.ones(1, dtype=torch.bool),
+        DAGGER_REPLAY_TEACHER_ACTIONS: teacher_action,
+    }
+
+    loss, _, _ = policy._bc_update(batch)
+    expected_actor_target = torch.atanh(torch.tensor(9.0 / 20.0))
+    expected_loss = torch.nn.functional.smooth_l1_loss(
+        torch.tensor([0.0]),
+        expected_actor_target.reshape(1),
+        beta=100.0,
+    )
+    assert loss.item() == pytest.approx(expected_loss.item())
+
+    q_action = teacher_action.clone().requires_grad_(True)
+    q_coordinate = policy._q_action_input(q_action)
+    # Nominal center/scale are 1 and 3. Values outside [-1, 1] are retained.
+    assert q_coordinate.item() == pytest.approx(8.0 / 3.0)
+    q_coordinate.sum().backward()
+    assert q_action.grad.item() == pytest.approx(1.0 / 3.0)
+
+    physical_log_prob = torch.tensor(2.0)
+    assert policy._normalized_action_log_prob(
+        physical_log_prob
+    ).item() == pytest.approx(2.0 + math.log(3.0))
+
+
+def test_bc_critic_distribution_is_small_noise_around_bc_action():
+    policy = _bare_policy(
+        sac_bc_log_std_min=-8.0,
+        sac_bc_log_std_max=-2.0,
+    )
+    _install_test_action_contract(policy, action_dim=2, low=-2.0, high=4.0)
+    actor_latent = torch.tensor([0.7, -1.2])
+    policy.actor_adapt = _LearnableLatentActor(actor_latent)
+    policy._actor_dist_from_flat = lambda obs: SimpleNamespace(
+        mean=policy.actor_adapt.mean_for(obs.shape[0])
+    )
+    policy.bc_dagger_sac_adapter = nn.Module()
+    policy.bc_dagger_sac_adapter.log_std = nn.Parameter(
+        torch.full((2,), -4.0)
+    )
+    low = policy._fastsac_action_low
+    high = policy._fastsac_action_high
+    policy.sac_dist_cls = functools.partial(
+        FastSACTanhNormal,
+        low=low,
+        high=high,
+        event_dims=1,
+    )
+
+    mean_action, dist = policy._sac_critic_dist_from_flat(torch.zeros(3, 1))
+
+    assert torch.equal(dist.loc, torch.zeros(3, 2))
+    expected_mean = torch.tanh(actor_latent).expand(3, -1) * 3.0 + 1.0
+    assert torch.allclose(mean_action, expected_mean)
+    assert torch.allclose(dist.mean, expected_mean)
+    assert torch.all(dist.low >= low)
+    assert torch.all(dist.high <= high)
+
+
+def test_fresh_ppo_physical_head_migration_preserves_zero_and_jacobian():
+    policy = _bare_policy()
+    _install_test_action_contract(policy, action_dim=2)
+    low = torch.tensor([-2.0, -5.0])
+    high = torch.tensor([4.0, 3.0])
+    policy._fastsac_action_low = low
+    policy._fastsac_action_high = high
+    policy._fastsac_actor_action_center = (low + high) * 0.5
+    policy._fastsac_actor_action_scale = (high - low) * 0.5
+    core = Actor(2, init_noise_scale=0.5)
+    core(torch.zeros(1, 3))
+    old_weight = torch.tensor([
+        [0.4, -0.2, 0.1],
+        [-0.3, 0.5, 0.2],
+    ])
+    with torch.no_grad():
+        core.actor_mean.weight.copy_(old_weight)
+        core.actor_mean.bias.zero_()
+    policy.actor_adapt = nn.Sequential(core)
+
+    normalized_zero = -policy._fastsac_actor_action_center / (
+        policy._fastsac_actor_action_scale
+    )
+    latent_zero = torch.atanh(normalized_zero)
+    inverse_slope = (
+            policy._fastsac_actor_action_scale
+        * (1.0 - normalized_zero.square())
+    ).reciprocal()
+
+    policy._migrate_fresh_ppo_student_actor_to_latent()
+
+    assert torch.allclose(
+        core.actor_mean.weight,
+        inverse_slope.unsqueeze(-1) * old_weight,
+    )
+    assert torch.allclose(core.actor_mean.bias, latent_zero)
+    zero_features = torch.zeros(1, 3, requires_grad=True)
+    migrated_latent, _ = core(zero_features)
+    migrated_action = bc_dagger_module._fastsac_latent_to_action(
+        migrated_latent, low, high
+    )
+    assert torch.allclose(migrated_action, torch.zeros_like(migrated_action))
+    jacobian = torch.autograd.functional.jacobian(
+        lambda features: bc_dagger_module._fastsac_latent_to_action(
+            core(features)[0], low, high
+        ),
+        torch.zeros(3),
+    )
+    assert torch.allclose(jacobian, old_weight, atol=1e-6, rtol=1e-6)
+    with pytest.raises(RuntimeError, match="applied twice"):
+        policy._migrate_fresh_ppo_student_actor_to_latent()
+
+
 def test_rollout_uses_exact_source_choice_clips_actions_and_falls_back():
     policy = _bare_policy(
         dagger_beta_start=1.0,
@@ -639,19 +924,31 @@ def test_rollout_uses_exact_source_choice_clips_actions_and_falls_back():
     )
     policy.dagger_rollout_count = 0
     policy.dagger_rng = torch.Generator().manual_seed(0)
-    policy._student_action = lambda td: torch.tensor(
-        [[30.0, float("nan")], [-3.0, 4.0]]
+    fallback_action = torch.tensor([[-3.0, 4.0]])
+    fallback_latent = _fastsac_action_center_to_latent(
+        fallback_action,
+        torch.full((2,), 20.0),
+        torch.zeros(2),
+        FASTSAC_REFERENCE_EPS,
     )
+    policy._student_latent = lambda td: torch.cat((
+        torch.tensor([[30.0, float("nan")]]),
+        fallback_latent,
+    ))
     # Row zero is valid and must be executed exactly. Row one is an outlier,
     # so beta=1 still falls back to the bounded student action.
     policy._teacher_action = lambda td: torch.tensor(
         [[1.5, -2.5], [20.01, 0.0]]
     )
+    _install_test_action_contract(policy, action_dim=2, low=-20.0, high=20.0)
+    policy._student_action_from_latent = MethodType(
+        PPOBCDaggerFinetune._student_action_from_latent, policy
+    )
     td = TensorDict({}, batch_size=[2])
 
     _DaggerRolloutPolicy(policy)(td)
 
-    assert torch.equal(
+    assert torch.allclose(
         td[ACTION_KEY], torch.tensor([[1.5, -2.5], [-3.0, 4.0]])
     )
     assert torch.equal(
@@ -848,6 +1145,7 @@ def test_resume_refills_persistent_teacher_critic_partition_from_h5(tmp_path):
         ).view(row_count, 3) + 100.0,
     }
     fingerprint = "sha256:" + "b" * 64
+    action_contract = _test_action_contract()
     with h5py.File(path, "w") as replay:
         replay.attrs.update({
             "format": bc_dagger_module.DAGGER_TEACHER_REPLAY_FORMAT,
@@ -868,6 +1166,9 @@ def test_resume_refills_persistent_teacher_critic_partition_from_h5(tmp_path):
             ),
             "vecnorm_fingerprint": fingerprint,
             "action_clip": 20.0,
+            "action_contract": json.dumps(
+                action_contract, sort_keys=True, separators=(",", ":")
+            ),
             "num_transitions": row_count,
         })
         for key in TEACHER_REPLAY_FIELDS:
@@ -880,6 +1181,8 @@ def test_resume_refills_persistent_teacher_critic_partition_from_h5(tmp_path):
     policy._q_actor_dim = 2
     policy._q_critic_dim = 3
     policy.action_dim = 1
+    _install_test_action_contract(policy, action_dim=1)
+    assert policy._fastsac_action_contract == action_contract
     policy._replay_vecnorm_fingerprint = fingerprint
     policy.q_teacher_replay = _DeviceReplay(capacity=3, device="cpu")
 
@@ -1329,6 +1632,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
         critic_obs_keys=["c"],
         vecnorm_fingerprint=fingerprint,
         action_clip=20.0,
+        action_contract=_test_action_contract(),
     )
     rows = {
         "observations": torch.arange(8, dtype=torch.float32).reshape(4, 2),
@@ -1360,6 +1664,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
         critic_obs_keys=["c"],
         vecnorm_fingerprint=fingerprint,
         action_clip=20.0,
+        action_contract=_test_action_contract(),
     )
     restored.restore(path, expected_metadata=metadata)
 
@@ -1370,7 +1675,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
     assert metadata["replay_observation_semantics"] == (
         "raw_pre_vecnorm_sample_current_v1"
     )
-    assert metadata["format_version"] == 2
+    assert metadata["format_version"] == 5
     assert metadata["vecnorm_fingerprint"] == fingerprint
     assert metadata["action_clip"] == pytest.approx(20.0)
 
@@ -1383,6 +1688,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
         expected_critic_obs_keys=["c"],
         expected_vecnorm_fingerprint=fingerprint,
         expected_action_clip=20.0,
+        expected_action_contract=_test_action_contract(),
         expected_replay_metadata=metadata,
     )
     assert offline.size == 4
@@ -1400,6 +1706,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
             expected_critic_obs_keys=["c"],
             expected_vecnorm_fingerprint=fingerprint,
             expected_action_clip=20.0,
+            expected_action_contract=_test_action_contract(),
             expected_replay_metadata=wrong_snapshot,
         )
     with pytest.raises(ValueError, match="fingerprint"):
@@ -1409,6 +1716,7 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
             critic_dim=3,
             action_dim=1,
             expected_vecnorm_fingerprint="sha256:" + "f" * 64,
+            expected_action_contract=_test_action_contract(),
         )
 
     import h5py
@@ -1425,6 +1733,65 @@ def test_teacher_h5_roundtrip_has_truthful_dagger_manifest(tmp_path):
             expected_critic_obs_keys=["c"],
             expected_vecnorm_fingerprint=fingerprint,
             expected_action_clip=20.0,
+            expected_action_contract=_test_action_contract(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_dtype", "expected_dtype"),
+    (
+        ("observations", np.float64, "float32"),
+        ("dones", np.uint8, "bool"),
+    ),
+)
+def test_stage2_rejects_bc_dagger_h5_field_dtype_mismatch(
+    tmp_path, field, invalid_dtype, expected_dtype
+):
+    path = tmp_path / f"bad_{field}_dtype.h5"
+    fingerprint = "sha256:" + "d" * 64
+    replay = _DaggerTeacherReplayBuffer(
+        path,
+        capacity=2,
+        actor_dim=2,
+        critic_dim=3,
+        action_dim=1,
+        seed=0,
+        device="cpu",
+        actor_obs_keys=["actor"],
+        critic_obs_keys=["critic"],
+        vecnorm_fingerprint=fingerprint,
+        action_clip=20.0,
+        action_contract=_test_action_contract(),
+    )
+    replay.append({
+        "observations": torch.zeros(2, 2),
+        "critic_observations": torch.zeros(2, 3),
+        "actions": torch.zeros(2, 1),
+        "rewards": torch.zeros(2),
+        "dones": torch.zeros(2, dtype=torch.bool),
+        "truncations": torch.zeros(2, dtype=torch.bool),
+        "discounts": torch.ones(2),
+        "next_observations": torch.ones(2, 2),
+        "next_critic_observations": torch.ones(2, 3),
+    })
+    replay.snapshot(iteration=1, checkpoint_name="checkpoint_1")
+
+    with h5py.File(path, "r+") as h5:
+        invalid_values = h5[field][...].astype(invalid_dtype)
+        del h5[field]
+        h5.create_dataset(field, data=invalid_values)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"field {field!r} has dtype .*expected {expected_dtype}",
+    ):
+        BCDaggerOfflineReplayH5(
+            path,
+            actor_dim=2,
+            critic_dim=3,
+            action_dim=1,
+            expected_vecnorm_fingerprint=fingerprint,
+            expected_action_contract=_test_action_contract(),
         )
 
 
@@ -1443,6 +1810,7 @@ def test_teacher_h5_reuses_unchanged_snapshot_and_rewrites_after_append(tmp_path
         critic_obs_keys=["critic"],
         vecnorm_fingerprint="sha256:" + "c" * 64,
         action_clip=20.0,
+        action_contract=_test_action_contract(),
     )
 
     def row(value):
@@ -1494,6 +1862,7 @@ def test_teacher_h5_rejects_action_outside_manifest_support(tmp_path):
         critic_obs_keys=["critic"],
         vecnorm_fingerprint="sha256:" + "c" * 64,
         action_clip=20.0,
+        action_contract=_test_action_contract(),
     )
     rows = {
         "observations": torch.zeros(1, 1),
@@ -1515,7 +1884,7 @@ def test_teacher_h5_rejects_action_outside_manifest_support(tmp_path):
     assert replay.data == {}
 
 
-def test_stage2_accepts_legacy_normalized_dagger_h5_but_rejects_mixed_schema(
+def test_stage2_rejects_legacy_and_mixed_dagger_h5_schemas(
     tmp_path,
 ):
     import h5py
@@ -1534,6 +1903,7 @@ def test_stage2_accepts_legacy_normalized_dagger_h5_but_rejects_mixed_schema(
         critic_obs_keys=["critic"],
         vecnorm_fingerprint=fingerprint,
         action_clip=20.0,
+        action_contract=_test_action_contract(),
     )
     replay.append(
         {
@@ -1556,15 +1926,15 @@ def test_stage2_accepts_legacy_normalized_dagger_h5_but_rejects_mixed_schema(
         )
         del h5.attrs["vecnorm_fingerprint"]
 
-    legacy = BCDaggerOfflineReplayH5(
-        path,
-        actor_dim=1,
-        critic_dim=1,
-        action_dim=1,
-        expected_actor_obs_keys=["actor"],
-        expected_critic_obs_keys=["critic"],
-    )
-    assert legacy.observations_pre_normalized is True
+    with pytest.raises(ValueError, match="Unsupported.*schema"):
+        BCDaggerOfflineReplayH5(
+            path,
+            actor_dim=1,
+            critic_dim=1,
+            action_dim=1,
+            expected_actor_obs_keys=["actor"],
+            expected_critic_obs_keys=["critic"],
+        )
 
     with h5py.File(path, "r+") as h5:
         h5.attrs["format_version"] = 2
@@ -1630,7 +2000,9 @@ def test_sac_critic_update_matches_q_only_target_and_timeout_bootstrap():
         sac_clipped_double_q=True,
     )
     policy.device = torch.device("cpu")
-    policy.action_dim = 1
+    _install_test_action_contract(
+        policy, action_dim=1, low=-20.0, high=20.0
+    )
     policy.qnet = _TinyTwinC51()
     policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
     policy.opt_q = torch.optim.SGD(policy.qnet.parameters(), lr=0.2)
@@ -1712,6 +2084,10 @@ def test_legacy_ppo_bootstrap_accepts_fresh_q_but_same_stage_requires_both_qs(
     policy.q_rng = torch.Generator().manual_seed(99)
     policy.sac_action_rng = torch.Generator().manual_seed(98)
     policy.dagger_rng = torch.Generator().manual_seed(100)
+    migration_calls = []
+    policy._migrate_fresh_ppo_student_actor_to_latent = (
+        lambda: migration_calls.append("fresh")
+    )
 
     monkeypatch.setattr(
         PPOVEL,
@@ -1727,6 +2103,7 @@ def test_legacy_ppo_bootstrap_accepts_fresh_q_but_same_stage_requires_both_qs(
 
     failed = policy.load_state_dict({"last_phase": "train"})
 
+    assert migration_calls == ["fresh"]
     assert set(failed).issuperset({"qnet", "qnet_target"})
     assert policy.q_update_count == 0
     assert policy.dagger_rollout_count == 0
@@ -1763,6 +2140,7 @@ def test_same_stage_resume_restores_learning_state_without_teacher_h5(
     policy._q_critic_dim = 2
     policy.action_dim = 1
     policy.reward_groups = ["task"]
+    _install_test_action_contract(policy, action_dim=1)
     policy.qnet = nn.Linear(2, 1, bias=False)
     policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
     policy.bc_module = nn.Linear(2, 1, bias=False)
@@ -1779,6 +2157,9 @@ def test_same_stage_resume_restores_learning_state_without_teacher_h5(
     policy.sac_action_rng = torch.Generator().manual_seed(3)
     progress = []
     policy.env = SimpleNamespace(set_progress=progress.append)
+    policy._migrate_fresh_ppo_student_actor_to_latent = lambda: pytest.fail(
+        "same-stage resume must not repeat fresh PPO actor migration"
+    )
 
     source_modules = [
         nn.Linear(2, 1, bias=False),
@@ -1834,6 +2215,7 @@ def test_same_stage_resume_restores_learning_state_without_teacher_h5(
         "teacher_replay_id": "original-frozen-replay",
         "teacher_replay_state": replay_metadata,
         "next_iter": 6_801,
+        "action_contract": copy.deepcopy(policy._fastsac_action_contract),
     }
     checkpoint["dagger_backend_config"] = policy._checkpoint_config()
     checkpoint["dagger_backend_config"].pop("dagger_safe_zero_iteration")
@@ -1904,7 +2286,7 @@ def test_sac_critic_checkpoint_markers_keep_actor_bc_only():
     policy = _bare_policy(**vars(PPOBCDaggerFinetuneConfig()))
     checkpoint_config = policy._checkpoint_config()
 
-    assert EXPECTED_DAGGER_ALGORITHM.endswith("_sac_critic_v3")
+    assert EXPECTED_DAGGER_ALGORITHM.endswith("_sac_critic_v6")
     assert "half_teacher_half_student" in (
         PPO_BC_DAGGER_SAC_CRITIC_SEMANTICS
     )
@@ -1934,6 +2316,7 @@ def _finalization_policy(
     policy.cfg = cfg
     policy.finalization_rollout_count = 0
     policy._finalization_last_phase = None
+    _install_test_action_contract(policy, action_dim=1)
     return policy
 
 
@@ -2076,7 +2459,10 @@ def test_finalization_runtime_beta_half_does_not_mutate_source_controller():
     policy.dagger_rng = torch.Generator().manual_seed(87)
     policy.test_student_action = torch.ones(envs, 1)
     policy.test_teacher_action = torch.zeros(envs, 1)
-    policy._student_action = lambda td: policy.test_student_action.clone()
+    policy._student_latent = lambda td: policy.test_student_action.clone()
+    policy._student_action_from_latent = MethodType(
+        PPOBCDaggerFinetune._student_action_from_latent, policy
+    )
     policy._teacher_action = lambda td: policy.test_teacher_action.clone()
     source_backend = policy._checkpoint_config().copy()
 
@@ -2324,8 +2710,11 @@ def test_finalization_resume_restores_local_stage_counter_and_source_state(
             bc_dagger_module.DAGGER_TEACHER_ACTION_SEMANTICS
         ),
         "dagger_control_semantics": DAGGER_CONTROL_SEMANTICS,
-        "dagger_backend_config": policy._checkpoint_config(),
-        "q_backend_config": {"contract": "v3"},
+            "dagger_backend_config": policy._checkpoint_config(),
+            "q_backend_config": {"contract": "v3"},
+            "action_contract": copy.deepcopy(
+                policy._fastsac_action_contract
+            ),
         "actor": {},
         "actor_adapt": {},
         "encoder_priv": {},

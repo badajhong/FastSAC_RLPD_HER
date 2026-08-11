@@ -117,7 +117,7 @@ def _validate_source_checkpoint(
 
     if policy_state.get("training_algorithm") != EXPECTED_TRAINING_ALGORITHM:
         raise ValueError(
-            "checkpoint_path must be a SAC-critic-v3 PPO-BC DAgger checkpoint"
+            "checkpoint_path must be a SAC-critic-v6 PPO-BC DAgger checkpoint"
         )
     if policy_state.get("bc_dagger_finalization_state") is not None:
         raise ValueError(

@@ -181,6 +181,17 @@ def run_training(cfg: DictConfig):
 
     env, policy, vecnorm = make_env_policy(cfg, configure_replay=True)
 
+    # Checkpoint-source detection and replay/Q contract materialization happen
+    # inside make_env_policy. Persist that resolved runtime configuration so
+    # W&B/cfg.yaml reproduce the policy that was actually constructed rather
+    # than the earlier auto/null placeholders.
+    if aa.is_main_process():
+        run.config.update(
+            OmegaConf.to_container(cfg), allow_val_change=True
+        )
+        OmegaConf.save(cfg, cfg_save_path)
+        run.save(cfg_save_path, policy="now")
+
     if freeze_bc_dagger_teacher_replay and hasattr(
         policy, "restore_q_teacher_replay"
     ):
