@@ -12,7 +12,7 @@ nohup env \
   algo.dagger_beta_start=1 \
   algo.dagger_beta_end=0 \
   algo.dagger_beta_zero_iteration=500 \
-  algo.eta_td3=0.0001 \
+  algo.eta_td3=1e-5 \
   algo.lambda_bc=1.0 \
   algo.dagger_bc_lr=3e-4 \
   algo.collector_exploration_noise_std=0.0 \

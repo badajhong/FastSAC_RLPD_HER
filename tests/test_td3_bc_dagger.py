@@ -177,6 +177,18 @@ def test_raw_perception_replay_public_field_contract_has_no_priv_pred_latent():
     )
 
 
+def test_teacher_prefill_config_defaults_to_disabled_and_rejects_negative_or_bool():
+    cfg = DistributionalTD3TeacherBCConfig()
+    assert cfg.teacher_prefill_rollouts == 0
+
+    for invalid in (-1, True):
+        cfg.teacher_prefill_rollouts = invalid
+        with pytest.raises(ValueError, match="teacher_prefill_rollouts.*non-negative"):
+            DistributionalTD3TeacherBC._validate_td3_config(cfg)
+    cfg.teacher_prefill_rollouts = 0
+    DistributionalTD3TeacherBC._validate_td3_config(cfg)
+
+
 def _raw_transition_policy(*, train_every: int = 10):
     policy = _bare_policy(
         train_every=train_every,
@@ -414,6 +426,262 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
     assert {"observations", "next_observations", "priv_pred"}.isdisjoint(
         _Q_REPLAY_FIELDS
     )
+
+
+def test_teacher_prefill_train_op_populates_only_q_teacher_and_touches_no_optimizer():
+    policy = _bare_policy(
+        teacher_prefill_rollouts=1,
+        train_every=10,
+        td3_learning_starts=3,
+        dagger_beta_start=0.8,
+        dagger_beta_end=0.0,
+        dagger_beta_decay_rollouts=100,
+    )
+    policy.teacher_prefill_rollout_count = 0
+    policy.teacher_prefill_environment_steps = 0
+    policy.dagger_rollout_count = 0
+    policy.dagger_environment_steps = 0
+    policy.actor_update_count = 4
+    policy.critic_update_count = 6
+    policy.num_updates = 9
+    policy.q_teacher_replay = _TD3DeviceReplay(16, "cpu")
+    policy.dagger_replay = _TD3DeviceReplay(16, "cpu")
+
+    chunk = _replay_rows(4, 100)
+    chunk[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.tensor([True, False, True, True])
+    chunk[DAGGER_IS_STUDENT_ACTION_KEY] = torch.tensor([False, True, False, False])
+    chunk[TD3_COLLECTOR_NOISE_KEY] = torch.zeros(4, 1)
+    policy._dagger_transition_chunks = MethodType(
+        lambda owner, rollout: iter((chunk,)), policy
+    )
+
+    actor_parameter = nn.Parameter(torch.tensor([1.0]))
+    critic_parameter = nn.Parameter(torch.tensor([2.0]))
+    adapt_parameter = nn.Parameter(torch.tensor([3.0]))
+    policy.actor_optimizer = _CountingSGD([actor_parameter], lr=0.1)
+    policy.critic_optimizer = _CountingSGD([critic_parameter], lr=0.1)
+    policy.opt_adapt = _CountingSGD([adapt_parameter], lr=0.1)
+    parameter_values_before = (
+        actor_parameter.detach().clone(),
+        critic_parameter.detach().clone(),
+        adapt_parameter.detach().clone(),
+    )
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("Teacher prefill must not run a training update")
+
+    policy.train_adapt = forbidden
+    policy._critic_update = forbidden
+    policy._actor_update = forbidden
+
+    info = policy.train_op(TensorDict({}, batch_size=[]))
+
+    assert policy.teacher_prefill_rollout_count == 1
+    assert policy.teacher_prefill_environment_steps == 10
+    assert policy.dagger_rollout_count == 0
+    assert policy.dagger_environment_steps == 0
+    assert policy.num_updates == 9
+    assert policy.actor_update_count == 4
+    assert policy.critic_update_count == 6
+    assert policy.dagger_replay.size == 0
+    assert policy.dagger_replay.seen == 0
+    assert policy.q_teacher_replay.size == 3
+    assert policy.q_teacher_replay.seen == 3
+    assert set(policy.q_teacher_replay.data) == set(_Q_REPLAY_FIELDS)
+    assert torch.equal(
+        policy.q_teacher_replay.data["actions"][:3],
+        chunk["actions"][[0, 2, 3]],
+    )
+    for optimizer in (
+        policy.actor_optimizer,
+        policy.critic_optimizer,
+        policy.opt_adapt,
+    ):
+        assert optimizer.step_calls == 0
+        assert optimizer.zero_grad_calls == 0
+    for parameter, before in zip(
+        (actor_parameter, critic_parameter, adapt_parameter),
+        parameter_values_before,
+    ):
+        assert torch.equal(parameter, before)
+        assert parameter.grad is None
+
+    assert info["td3/prefill_active"] == pytest.approx(1.0)
+    assert info["td3/prefill_rollout_count"] == 1
+    assert info["td3/prefill_target_rollouts"] == 1
+    assert info["td3/prefill_environment_steps"] == 10
+    assert info["td3/prefill_rows_this_rollout"] == 3
+    assert info["td3/prefill_forced_teacher_fraction"] == pytest.approx(0.75)
+    assert info["td3/replay_size"] == 0
+    assert info["td3/teacher_replay_size"] == 3
+    assert info["td3/actor_updates_this_rollout"] == 0
+    assert info["td3/critic_updates_this_rollout"] == 0
+    assert info["td3/rollout_count"] == 0
+    assert info["td3/beta"] == pytest.approx(policy.cfg.dagger_beta_start)
+    assert policy._teacher_prefill_active() is False
+    assert policy._teacher_mixture_probability() == pytest.approx(
+        policy.cfg.dagger_beta_start
+    )
+
+
+def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
+    policy = _bare_policy(
+        teacher_prefill_rollouts=1,
+        train_every=10,
+        td3_learning_starts=2,
+        q_updates_per_rollout=1,
+        q_batch_size=4,
+        dagger_batch_size=4,
+        policy_delay=1,
+        dagger_beta_start=0.0,
+        dagger_beta_end=0.0,
+        dagger_beta_decay_rollouts=1,
+    )
+    policy.teacher_prefill_rollout_count = 0
+    policy.teacher_prefill_environment_steps = 0
+    policy.dagger_rollout_count = 0
+    policy.dagger_environment_steps = 0
+    policy.actor_update_count = 0
+    policy.critic_update_count = 0
+    policy.num_updates = 0
+    policy._last_truncation_finals_used = 0
+    policy._last_td3_diagnostics = {}
+    # The ordinary replay implementation keeps this test on the sequential
+    # sampling path, making the source rows directly observable by the stubs.
+    policy.q_teacher_replay = _DeviceReplay(16, "cpu")
+    policy.dagger_replay = _DeviceReplay(16, "cpu")
+    policy.q_rng = torch.Generator().manual_seed(619)
+
+    prefill = _replay_rows(3, 100)
+    prefill[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.tensor([True, False, True])
+    prefill[DAGGER_IS_STUDENT_ACTION_KEY] = torch.tensor([False, True, False])
+    prefill[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.tensor([[801.0], [802.0], [803.0]])
+    prefill[TD3_COLLECTOR_NOISE_KEY] = torch.zeros(3, 1)
+    policy._dagger_transition_chunks = MethodType(
+        lambda owner, rollout: iter((prefill,)), policy
+    )
+    policy.train_adapt = lambda rollout: (_ for _ in ()).throw(
+        AssertionError("prefill must not train perception")
+    )
+
+    prefill_info = policy.train_op(TensorDict({}, batch_size=[]))
+
+    assert prefill_info["td3/prefill_active"] == pytest.approx(1.0)
+    assert policy.q_teacher_replay.size == 2
+    assert policy.dagger_replay.size == 0
+    frozen_teacher_state = (
+        policy.q_teacher_replay.ptr,
+        policy.q_teacher_replay.size,
+        policy.q_teacher_replay.seen,
+        {
+            key: value.detach().clone()
+            for key, value in policy.q_teacher_replay.data.items()
+        },
+    )
+
+    main = _replay_rows(4, 1_000)
+    # Include teacher-executed rows deliberately: they remain useful DAgger BC
+    # examples, but must no longer mutate the frozen prefill Q partition.
+    main[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(4, dtype=torch.bool)
+    main[DAGGER_IS_STUDENT_ACTION_KEY] = torch.tensor([True, False, True, False])
+    main_teacher_labels = torch.tensor([[901.0], [902.0], [903.0], [904.0]])
+    main[DAGGER_REPLAY_TEACHER_ACTIONS] = main_teacher_labels
+    main[TD3_COLLECTOR_NOISE_KEY] = torch.zeros(4, 1)
+    policy._dagger_transition_chunks = MethodType(
+        lambda owner, rollout: iter((main,)), policy
+    )
+
+    critic_batches = []
+    actor_batches = []
+    perception_updates = []
+    policy._prepare_dagger_learning_batch = MethodType(
+        lambda owner, batch: batch, policy
+    )
+
+    def critic_update(batch):
+        critic_batches.append(
+            {key: value.detach().clone() for key, value in batch.items()}
+        )
+        policy.critic_update_count += 1
+        return {}
+
+    def actor_and_targets(batch):
+        actor_batches.append(
+            {key: value.detach().clone() for key, value in batch.items()}
+        )
+        policy.actor_update_count += 1
+        return {}
+
+    policy._critic_update = critic_update
+    policy._maybe_delayed_actor_and_targets = actor_and_targets
+    policy._mean_metric_dict = lambda metrics, keys: {key: 0.0 for key in keys}
+    policy.train_adapt = lambda rollout: perception_updates.append(rollout) or {}
+
+    main_info = policy.train_op(TensorDict({}, batch_size=[]))
+
+    frozen_ptr, frozen_size, frozen_seen, frozen_data = frozen_teacher_state
+    assert (
+        policy.q_teacher_replay.ptr,
+        policy.q_teacher_replay.size,
+        policy.q_teacher_replay.seen,
+    ) == (frozen_ptr, frozen_size, frozen_seen)
+    assert policy.q_teacher_replay.data.keys() == frozen_data.keys()
+    for key, frozen_value in frozen_data.items():
+        assert torch.equal(
+            policy.q_teacher_replay.data[key][:frozen_size],
+            frozen_value[:frozen_size],
+        )
+
+    # Every main transition, including teacher-executed transitions, belongs to
+    # DAgger replay and retains its current teacher label for Actor BC.
+    assert policy.dagger_replay.size == 4
+    assert policy.dagger_replay.seen == 4
+    assert torch.equal(policy.dagger_replay.data["actions"][:4], main["actions"])
+    assert torch.equal(
+        policy.dagger_replay.data[DAGGER_IS_STUDENT_ACTION_KEY][:4],
+        main[DAGGER_IS_STUDENT_ACTION_KEY],
+    )
+    assert torch.equal(
+        policy.dagger_replay.data[DAGGER_REPLAY_TEACHER_ACTIONS][:4],
+        main_teacher_labels,
+    )
+    assert torch.equal(
+        policy.dagger_replay.data[DAGGER_TEACHER_ACTION_VALID_KEY][:4],
+        main[DAGGER_TEACHER_ACTION_VALID_KEY],
+    )
+
+    assert main_info["td3/prefill_active"] == pytest.approx(0.0)
+    assert main_info["td3/teacher_replay_frozen"] == pytest.approx(1.0)
+    assert main_info["td3/teacher_replay_rows_this_rollout"] == 0
+    assert main_info["td3/replay_ready"] == pytest.approx(1.0)
+    assert main_info["td3/teacher_replay_size"] == frozen_size
+    assert main_info["td3/student_replay_rows"] == 2
+    assert main_info["td3/critic_updates_this_rollout"] == 1
+    assert main_info["td3/actor_updates_this_rollout"] == 1
+    assert len(critic_batches) == 1
+    assert len(actor_batches) == 1
+    assert len(perception_updates) == 1
+
+    # The critic receives an exact split: immutable prefill teacher actions and
+    # only student-executed main actions. The Actor batch comes entirely from
+    # main DAgger replay and therefore carries labels usable by exact BC.
+    critic_batch = critic_batches[0]
+    teacher_source = critic_batch[DAGGER_Q_TEACHER_SOURCE_KEY]
+    assert teacher_source.sum().item() == 2
+    assert (~teacher_source).sum().item() == 2
+    assert set(critic_batch["actions"][teacher_source, 0].tolist()) <= {101.0, 103.0}
+    assert set(critic_batch["actions"][~teacher_source, 0].tolist()) <= {
+        1_001.0,
+        1_003.0,
+    }
+    assert set(actor_batches[0][DAGGER_REPLAY_TEACHER_ACTIONS][:, 0].tolist()) <= {
+        901.0,
+        902.0,
+        903.0,
+        904.0,
+    }
+    assert actor_batches[0][DAGGER_TEACHER_ACTION_VALID_KEY].all()
 
 
 def _sampling_policy(replay_type, seed: int, device):
@@ -1232,6 +1500,65 @@ def test_disabled_collector_noise_is_bitwise_noop_and_does_not_advance_rng():
     assert torch.equal(generator.get_state(), generator_before)
 
 
+def test_teacher_prefill_forces_only_valid_teacher_without_advancing_replay_rngs():
+    latent = torch.tensor([[0.1, -0.2], [0.3, 0.4], [-0.5, 0.6]])
+    teacher = torch.tensor([[2.0, -3.0], [25.0, 0.0], [-6.0, 7.0]])
+    policy = _bare_policy(
+        teacher_prefill_rollouts=1,
+        dagger_control_mode="beta",
+        dagger_beta_start=0.25,
+        dagger_beta_end=0.0,
+        dagger_beta_decay_rollouts=100,
+        dagger_teacher_action_threshold=20.0,
+        dagger_action_clip=20.0,
+        collector_exploration_noise_std=0.9,
+        collector_exploration_noise_clip=0.5,
+        q_action_input_gain=1.0,
+    )
+    policy.teacher_prefill_rollout_count = 0
+    policy.dagger_rollout_count = 0
+    policy.dagger_rng = torch.Generator().manual_seed(71)
+    policy.collector_exploration_rng = torch.Generator().manual_seed(72)
+    policy._student_latent = lambda td: latent.clone()
+    policy._teacher_action = lambda td: teacher.clone()
+    policy._project_execution_action = lambda action: action.clamp(-20.0, 20.0)
+    policy._student_action_from_latent = lambda value: value.tanh() * 20.0
+    policy._fastsac_action_low = torch.full((2,), -20.0)
+    policy._fastsac_action_high = torch.full((2,), 20.0)
+    policy._fastsac_q_action_center = torch.zeros(2)
+    policy._fastsac_q_action_scale = torch.ones(2)
+    rollout_policy = _DistributionalTD3DaggerRolloutPolicy(policy)
+    rollout = TensorDict({"is_init": torch.zeros(3, dtype=torch.bool)}, batch_size=[3])
+    dagger_rng_before = policy.dagger_rng.get_state().clone()
+    collector_rng_before = policy.collector_exploration_rng.get_state().clone()
+
+    prefill = rollout_policy(rollout.clone())
+
+    valid = torch.tensor([True, False, True])
+    student_action = latent.tanh() * 20.0
+    assert torch.equal(prefill[DAGGER_TEACHER_ACTION_VALID_KEY], valid)
+    assert torch.equal(prefill[DAGGER_IS_STUDENT_ACTION_KEY], ~valid)
+    assert torch.equal(prefill[ACTION_KEY][valid], teacher[valid])
+    assert torch.equal(prefill[ACTION_KEY][~valid], student_action[~valid])
+    assert torch.equal(prefill[TD3_NOISE_FREE_STUDENT_ACTION_KEY], student_action)
+    assert torch.equal(prefill[TD3_EXPLORATORY_STUDENT_ACTION_KEY], student_action)
+    assert torch.equal(
+        prefill[TD3_COLLECTOR_NOISE_KEY], torch.zeros_like(student_action)
+    )
+    assert not prefill[DAGGER_BETA_TEACHER_KEY].any()
+    assert torch.equal(policy.dagger_rng.get_state(), dagger_rng_before)
+    assert torch.equal(
+        policy.collector_exploration_rng.get_state(), collector_rng_before
+    )
+
+    # Completing prefill exposes the untouched main DAgger schedule. Its first
+    # rollout reports beta_start and consumes the DAgger RNG normally.
+    policy.teacher_prefill_rollout_count = 1
+    main = rollout_policy(rollout.clone())
+    assert torch.all(main[TD3_BETA_KEY] == policy.cfg.dagger_beta_start)
+    assert not torch.equal(policy.dagger_rng.get_state(), dagger_rng_before)
+
+
 def test_eta_zero_and_disabled_noise_preserve_seeded_baseline_dagger_actions():
     latent = torch.tensor([[0.25, -0.5], [0.75, 0.1], [-0.2, 0.4], [0.0, -0.8]])
     teacher = torch.tensor([[2.0, -3.0], [4.0, 5.0], [-6.0, 7.0], [8.0, -9.0]])
@@ -1255,6 +1582,7 @@ def test_eta_zero_and_disabled_noise_preserve_seeded_baseline_dagger_actions():
         value._teacher_action = lambda td: teacher.clone()
         value._project_execution_action = lambda action: action.clamp(-20.0, 20.0)
         value._student_action_from_latent = lambda value: value.tanh() * 20.0
+        value._teacher_prefill_active = lambda: False
         value._effective_control_mode = lambda: "beta"
         value._teacher_mixture_probability = lambda: 0.5
         value._fastsac_action_low = torch.full((2,), -20.0)
@@ -1365,6 +1693,8 @@ def _checkpoint_test_policy(seed: int, *, with_actor_target: bool):
     policy.critic_update_count = 0
     policy.dagger_rollout_count = 0
     policy.dagger_environment_steps = 0
+    policy.teacher_prefill_rollout_count = 0
+    policy.teacher_prefill_environment_steps = 0
     policy.dagger_rng = torch.Generator().manual_seed(seed + 1)
     policy.q_rng = torch.Generator().manual_seed(seed + 2)
     policy.collector_exploration_rng = torch.Generator().manual_seed(seed + 3)
@@ -1382,6 +1712,8 @@ def test_td3_checkpoint_seam_round_trips_all_owned_training_state():
     source.critic_update_count = 39
     source.dagger_rollout_count = 11
     source.dagger_environment_steps = 12_345
+    source.teacher_prefill_rollout_count = 7
+    source.teacher_prefill_environment_steps = 224
     source._last_td3_diagnostics = {
         "td3/left_support_projection_clipping_fraction": 0.125,
         "td3/right_support_projection_clipping_fraction": 0.25,
@@ -1418,6 +1750,8 @@ def test_td3_checkpoint_seam_round_trips_all_owned_training_state():
     assert restored.critic_update_count == 39
     assert restored.dagger_rollout_count == 11
     assert restored.dagger_environment_steps == 12_345
+    assert restored.teacher_prefill_rollout_count == 7
+    assert restored.teacher_prefill_environment_steps == 224
     assert restored._last_td3_diagnostics == source._last_td3_diagnostics
 
     for name in (

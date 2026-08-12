@@ -51,6 +51,7 @@ def _cfg(
                 "dagger_buffer_capacity": 131_072,
                 "dagger_buffer_device": "cpu",
                 "dagger_batch_size": 4096,
+                "teacher_prefill_rollouts": 0,
                 "dagger_replay_raw_observations": True,
                 "replay_raw_observation_keys": list(
                     td3_entry.EXPECTED_REPLAY_RAW_OBSERVATION_KEYS
@@ -172,6 +173,7 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.algo.q_tau == pytest.approx(0.005)
     assert cfg.algo.dagger_buffer_capacity == 131_072
     assert cfg.algo.q_teacher_buffer_capacity == 131_072
+    assert cfg.algo.teacher_prefill_rollouts == 0
     assert list(cfg.algo.replay_raw_observation_keys) == [
         "vel_command",
         "policy",
@@ -191,13 +193,17 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.wandb.project == "vaic_dagger"
 
     schedule = td3_entry.td3_dagger_rollout_schedule(cfg)
+    prefill = int(cfg.algo.teacher_prefill_rollouts)
     assert schedule == {
         "frames_per_rollout": 16_384,
-        "total_rollouts": 2400,
+        "total_rollouts": 2400 - prefill,
+        "main_rollouts": 2400 - prefill,
+        "prefill_rollouts": prefill,
+        "physical_rollouts": 2400,
         "start_rollout": 0,
-        "end_rollout": 2400,
+        "end_rollout": 2400 - prefill,
         "decay_rollouts": 1800,
-        "beta_zero_rollouts": 600,
+        "beta_zero_rollouts": 600 - prefill,
         "safe_zero_rollouts": 0,
     }
 
@@ -234,12 +240,53 @@ def test_recommended_3000_rollout_command_composes_raw_perception_replay():
     assert td3_entry.td3_dagger_rollout_schedule(cfg) == {
         "frames_per_rollout": 16_384,
         "total_rollouts": 3000,
+        "main_rollouts": 3000,
+        "prefill_rollouts": 0,
+        "physical_rollouts": 3000,
         "start_rollout": 0,
         "end_rollout": 3000,
         "decay_rollouts": 1800,
         "beta_zero_rollouts": 1200,
         "safe_zero_rollouts": 0,
     }
+
+
+def test_teacher_prefill_adds_physical_rollouts_without_shortening_main_beta_schedule():
+    cfg = _cfg(iterations=3000, total_frames=1, control_mode="beta")
+    cfg.algo.teacher_prefill_rollouts = 10
+
+    td3_entry.validate_td3_bc_dagger_config(cfg)
+    schedule = td3_entry.td3_dagger_rollout_schedule(cfg)
+
+    frames_per_rollout = 512 * 32
+    assert cfg.total_frames == 3010 * frames_per_rollout
+    assert schedule["prefill_rollouts"] == 10
+    assert schedule["main_rollouts"] == 3000
+    assert schedule["physical_rollouts"] == 3010
+    assert schedule["start_rollout"] == 0
+    assert schedule["end_rollout"] == 3000
+    assert schedule["decay_rollouts"] == 1800
+    assert schedule["beta_zero_rollouts"] == 1200
+
+
+def test_teacher_prefill_requires_an_explicit_main_rollout_budget():
+    cfg = _cfg(iterations=None, control_mode="beta")
+    cfg.algo.teacher_prefill_rollouts = 10
+
+    with pytest.raises(ValueError, match="explicit td3_dagger_iterations"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_pure_student_beta_requires_separate_teacher_prefill():
+    cfg = _cfg(iterations=3000, control_mode="beta")
+    cfg.algo.dagger_beta_start = 0.0
+    cfg.algo.dagger_beta_end = 0.0
+
+    with pytest.raises(ValueError, match="teacher_prefill_rollouts > 0"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+    cfg.algo.teacher_prefill_rollouts = 10
+    td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
 def test_yaml_adds_no_forbidden_stochastic_policy_fields():
@@ -308,6 +355,7 @@ def test_config_rejects_forbidden_stochastic_policy_fields(field):
         ("perception_replay_burn_in", 7, "burn_in=8"),
         ("perception_encode_microbatch_size", 0, "positive"),
         ("perception_depth_codec", "float16", "uint8_div_100_v1"),
+        ("teacher_prefill_rollouts", -1, "non-negative"),
         ("lambda_bc", float("nan"), "non-negative"),
         ("policy_delay", 0, "positive"),
         ("target_policy_noise_std", -0.1, "non-negative"),
@@ -344,6 +392,14 @@ def test_both_actor_objective_weights_cannot_be_zero():
         td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
+def test_teacher_q_ring_must_cover_learning_start_threshold():
+    cfg = _cfg()
+    cfg.algo.q_teacher_buffer_capacity = cfg.algo.td3_learning_starts - 1
+
+    with pytest.raises(ValueError, match="must cover"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
 def test_residual_distillation_fails_before_training():
     cfg = _cfg()
     cfg.algo.enable_residual_distillation = True
@@ -374,6 +430,9 @@ def test_iteration_alias_preserves_existing_categorical_beta_schedule():
     assert schedule == {
         "frames_per_rollout": 16_384,
         "total_rollouts": 1200,
+        "main_rollouts": 1200,
+        "prefill_rollouts": 0,
+        "physical_rollouts": 1200,
         "start_rollout": 0,
         "end_rollout": 1200,
         "decay_rollouts": 900,

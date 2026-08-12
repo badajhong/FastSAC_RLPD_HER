@@ -107,6 +107,9 @@ TD3_NOISE_FREE_STUDENT_ACTION_KEY = "td3_noise_free_student_action"
 TD3_EXPLORATORY_STUDENT_ACTION_KEY = "td3_exploratory_student_action"
 TD3_COLLECTOR_NOISE_KEY = "td3_collector_q_noise"
 TD3_BETA_KEY = "td3_beta_probability"
+TEACHER_PREFILL_SEMANTICS = (
+    "forced_valid_teacher_q_replay_only_then_frozen_before_main_dagger_v2"
+)
 
 # Authoritative perception replay fields.  These contain only sensor/model
 # inputs; collection-time priv_pred/depth_hx/adapt_hx are deliberately absent.
@@ -690,6 +693,10 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     dagger_buffer_capacity: int = 131_072
     dagger_buffer_device: str = "cpu"
     dagger_batch_size: int = 4096
+    # Optional collection-only phase before main DAgger.  These rollouts force
+    # every valid Teacher action and populate only q_teacher_replay; they never
+    # enter dagger_replay or advance the main beta/training counters.
+    teacher_prefill_rollouts: int = 0
     dagger_replay_raw_observations: bool = True
     replay_raw_observation_keys: tuple[str, ...] = (
         VEL_CMD_KEY,
@@ -758,6 +765,7 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
     @torch.no_grad()
     def forward(self, td: TensorDict):
         owner = self._owner
+        teacher_prefill_active = owner._teacher_prefill_active()
         raw_student_latent = owner._student_latent(td)
         for scratch_key in (
             "_depth_feature",
@@ -806,7 +814,14 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
         safe_unsafe = torch.zeros_like(valid)
         safe_takeover = torch.zeros_like(valid)
         safe_release = torch.zeros_like(valid)
-        if control_mode in ("safe", "hybrid"):
+        if teacher_prefill_active:
+            # Prefill is an algorithm-local phase, not beta=1 DAgger.  Force
+            # every valid Teacher row without advancing the DAgger RNG or the
+            # SafeDAgger hysteresis.  Invalid Teacher rows use the deterministic
+            # Student only as a safe environment fallback and are not retained.
+            choose_teacher = valid
+            beta_teacher = torch.zeros_like(valid)
+        elif control_mode in ("safe", "hybrid"):
             if owner._safe_teacher_control_enabled():
                 (
                     safe_teacher_mask,
@@ -825,27 +840,32 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
             raise RuntimeError(f"Unsupported dagger_control_mode={control_mode!r}")
 
         scheduled_beta = owner._teacher_mixture_probability()
-        beta_teacher = torch.zeros_like(valid)
-        if control_mode in ("beta", "hybrid"):
-            beta_teacher = (
-                (
-                    torch.rand(
-                        valid.shape,
-                        device=valid.device,
-                        generator=owner.dagger_rng,
+        if not teacher_prefill_active:
+            beta_teacher = torch.zeros_like(valid)
+            if control_mode in ("beta", "hybrid"):
+                beta_teacher = (
+                    (
+                        torch.rand(
+                            valid.shape,
+                            device=valid.device,
+                            generator=owner.dagger_rng,
+                        )
+                        < scheduled_beta
                     )
-                    < scheduled_beta
+                    & valid
+                    & ~safe_teacher_mask
                 )
-                & valid
-                & ~safe_teacher_mask
-            )
-        choose_teacher = safe_teacher_mask | beta_teacher
+            choose_teacher = safe_teacher_mask | beta_teacher
         issued_action, exploratory_student, collector_noise = (
             _apply_student_collector_noise(
                 bounded_student_action,
                 clipped_teacher_action,
                 ~choose_teacher,
-                float(owner.cfg.collector_exploration_noise_std),
+                (
+                    0.0
+                    if teacher_prefill_active
+                    else float(owner.cfg.collector_exploration_noise_std)
+                ),
                 float(owner.cfg.collector_exploration_noise_clip),
                 owner._fastsac_action_low,
                 owner._fastsac_action_high,
@@ -1024,6 +1044,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
         self.dagger_rollout_count = 0
         self.dagger_environment_steps = 0
+        self.teacher_prefill_rollout_count = 0
+        self.teacher_prefill_environment_steps = 0
         self.critic_update_count = 0
         self.actor_update_count = 0
 
@@ -1109,6 +1131,21 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             value = getattr(cfg, name)
             if isinstance(value, bool) or int(value) < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        prefill_rollouts = cfg.teacher_prefill_rollouts
+        if isinstance(prefill_rollouts, bool) or int(prefill_rollouts) < 0:
+            raise ValueError("teacher_prefill_rollouts must be a non-negative integer")
+        if (
+            str(cfg.dagger_control_mode) == "beta"
+            and float(cfg.dagger_beta_start) == 0.0
+            and float(cfg.dagger_beta_end) == 0.0
+            and int(prefill_rollouts) == 0
+        ):
+            raise ValueError(
+                "pure Student beta control requires teacher_prefill_rollouts > 0 "
+                "so the 50/50 Q replay can become ready"
+            )
+        if int(cfg.q_teacher_buffer_capacity) < int(cfg.td3_learning_starts):
+            raise ValueError("q_teacher_buffer_capacity must cover td3_learning_starts")
         if int(cfg.q_batch_size) % 2:
             raise ValueError("q_batch_size must be even for exact 50/50 replay")
         if not math.isclose(
@@ -1192,6 +1229,24 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         if self.actor_target is None:
             raise RuntimeError("actor_target is initialized only after source loading")
         return self._actor_dist_from_flat_module(self.actor_target, actor_obs)
+
+    def _teacher_prefill_active(self) -> bool:
+        """Whether collection is still in the separate Teacher-only phase."""
+        return int(self.teacher_prefill_rollout_count) < int(
+            self.cfg.teacher_prefill_rollouts
+        )
+
+    def _collect_teacher_q_replay_this_rollout(self) -> bool:
+        """Collect Teacher Q rows online only when no prefill was requested."""
+        return int(self.cfg.teacher_prefill_rollouts) == 0 or (
+            self._teacher_prefill_active()
+        )
+
+    def _teacher_q_replay_frozen(self) -> bool:
+        """Whether a completed prefill now owns the immutable Teacher partition."""
+        return int(self.cfg.teacher_prefill_rollouts) > 0 and not (
+            self._teacher_prefill_active()
+        )
 
     def get_rollout_policy(self, mode="train"):
         if mode == "train":
@@ -1760,7 +1815,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "target_semantics": CRITIC_SEMANTICS,
             "actor_q_reduction": "online_q1_expectation_only",
             "replay_mix_semantics": (
-                "beta_independent_teacher_executed_0.5_student_executed_0.5_v1"
+                "frozen_prefill_teacher_0.5_student_executed_0.5_v2"
+                if int(self.cfg.teacher_prefill_rollouts) > 0
+                else "online_teacher_executed_0.5_student_executed_0.5_v1"
             ),
         }
 
@@ -1782,6 +1839,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "dagger_buffer_capacity",
             "dagger_buffer_device",
             "dagger_batch_size",
+            "teacher_prefill_rollouts",
             "eta_td3",
             "lambda_bc",
             "policy_delay",
@@ -1885,9 +1943,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     def train_op(self, tensordict):
         """Collect locked transitions and run Phase-1 TD3/BC updates only."""
+        teacher_prefill_active = self._teacher_prefill_active()
+        collect_teacher_q = self._collect_teacher_q_replay_this_rollout()
         rollout = tensordict.exclude("stats")
         transition_chunks = tuple(self._dagger_transition_chunks(rollout))
         appended = 0
+        teacher_rows_appended = 0
         teacher_selected = 0
         valid_labels = 0
         student_selected = 0
@@ -1907,25 +1968,78 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 )
                 for key, value in transitions.items()
             }
-            appended = self.dagger_replay.extend(staged)
             valid = staged[DAGGER_TEACHER_ACTION_VALID_KEY].bool()
             is_student = staged[DAGGER_IS_STUDENT_ACTION_KEY].bool()
-            teacher_executed = valid & ~is_student
             valid_labels = int(valid.sum().item())
             teacher_selected = int((~is_student).sum().item())
             student_selected = int(is_student.sum().item())
             collector_noise_norm = (
                 staged[TD3_COLLECTOR_NOISE_KEY].float().norm(dim=-1).mean().item()
             )
-            if teacher_executed.any():
-                teacher_indices = teacher_executed.nonzero(as_tuple=False).squeeze(-1)
-                q_teacher = {
-                    key: staged[key].index_select(0, teacher_indices)
-                    for key in _Q_REPLAY_FIELDS
-                }
-                self.q_teacher_replay.extend(q_teacher)
-                del q_teacher, teacher_indices
-            del valid, is_student, teacher_executed, staged, transitions
+            if collect_teacher_q:
+                teacher_executed = valid & ~is_student
+                if teacher_executed.any():
+                    teacher_indices = teacher_executed.nonzero(as_tuple=False).squeeze(
+                        -1
+                    )
+                    q_teacher = {
+                        key: staged[key].index_select(0, teacher_indices)
+                        for key in _Q_REPLAY_FIELDS
+                    }
+                    teacher_rows_appended += self.q_teacher_replay.extend(q_teacher)
+                    del q_teacher, teacher_indices
+                del teacher_executed
+            if not teacher_prefill_active:
+                appended = self.dagger_replay.extend(staged)
+            del valid, is_student, staged, transitions
+
+        if teacher_prefill_active:
+            # This phase deliberately owns no optimizer and no main replay.
+            # Keeping the raw recurrent history built above makes the first
+            # main-rollout windows temporally continuous with prefill.
+            self.teacher_prefill_rollout_count += 1
+            self.teacher_prefill_environment_steps += int(self.cfg.train_every)
+            if not self._teacher_prefill_active() and self.q_teacher_replay.size < int(
+                self.cfg.td3_learning_starts
+            ):
+                raise RuntimeError(
+                    "Teacher-only prefill ended before q_teacher_replay reached "
+                    "td3_learning_starts; increase teacher_prefill_rollouts"
+                )
+            info = {
+                "td3/method_distributional_td3_teacher_bc_v1": 1.0,
+                "td3/prefill_active": 1.0,
+                "td3/prefill_rollout_count": self.teacher_prefill_rollout_count,
+                "td3/prefill_target_rollouts": int(self.cfg.teacher_prefill_rollouts),
+                "td3/prefill_environment_steps": (
+                    self.teacher_prefill_environment_steps
+                ),
+                "td3/prefill_rows_this_rollout": teacher_rows_appended,
+                "td3/teacher_replay_rows_this_rollout": teacher_rows_appended,
+                "td3/teacher_replay_frozen": float(self._teacher_q_replay_frozen()),
+                "td3/prefill_forced_teacher_fraction": teacher_selected
+                / max(valid_labels + student_selected, 1),
+                "td3/teacher_replay_size": self.q_teacher_replay.size,
+                "td3/replay_size": self.dagger_replay.size,
+                "td3/replay_seen": self.dagger_replay.seen,
+                "td3/replay_ready": 0.0,
+                "td3/actor_update_count": self.actor_update_count,
+                "td3/critic_update_count": self.critic_update_count,
+                "td3/actor_updates_this_rollout": 0,
+                "td3/critic_updates_this_rollout": 0,
+                "td3/collector_exploration_noise_norm": collector_noise_norm,
+                "td3/valid_teacher_fraction": valid_labels
+                / max(valid_labels + student_selected, 1),
+                "td3/beta": float(self._teacher_mixture_probability()),
+                "td3/rollout_count": self.dagger_rollout_count,
+                "td3/environment_steps": self.dagger_environment_steps,
+            }
+            self._last_td3_diagnostics = {
+                key: float(value)
+                for key, value in info.items()
+                if key.startswith("td3/") and isinstance(value, (int, float))
+            }
+            return info
 
         critic_metrics: list[dict[str, torch.Tensor]] = []
         actor_metrics: list[dict[str, torch.Tensor]] = []
@@ -2028,6 +2142,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
         info = {
             "td3/method_distributional_td3_teacher_bc_v1": 1.0,
+            "td3/prefill_active": 0.0,
+            "td3/prefill_rollout_count": self.teacher_prefill_rollout_count,
+            "td3/prefill_target_rollouts": int(self.cfg.teacher_prefill_rollouts),
+            "td3/prefill_environment_steps": self.teacher_prefill_environment_steps,
+            "td3/teacher_replay_frozen": float(self._teacher_q_replay_frozen()),
+            "td3/teacher_replay_rows_this_rollout": teacher_rows_appended,
             "td3/critic_loss": critic["critic_loss"],
             "td3/critic_loss_1": critic["critic_loss_1"],
             "td3/critic_loss_2": critic["critic_loss_2"],
@@ -2111,6 +2231,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "critic_update_count": int(self.critic_update_count),
             "dagger_rollout_count": int(self.dagger_rollout_count),
             "dagger_environment_steps": int(self.dagger_environment_steps),
+            "teacher_prefill_rollout_count": int(self.teacher_prefill_rollout_count),
+            "teacher_prefill_environment_steps": int(
+                self.teacher_prefill_environment_steps
+            ),
             "dagger_rng_state": self.dagger_rng.get_state(),
             "q_rng_state": self.q_rng.get_state(),
             "collector_exploration_rng_state": (
@@ -2142,6 +2266,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self.critic_update_count = int(state["critic_update_count"])
         self.dagger_rollout_count = int(state["dagger_rollout_count"])
         self.dagger_environment_steps = int(state["dagger_environment_steps"])
+        self.teacher_prefill_rollout_count = int(state["teacher_prefill_rollout_count"])
+        self.teacher_prefill_environment_steps = int(
+            state["teacher_prefill_environment_steps"]
+        )
         self.dagger_rng.set_state(state["dagger_rng_state"])
         self.q_rng.set_state(state["q_rng_state"])
         self.collector_exploration_rng.set_state(
@@ -2172,6 +2300,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     "fresh_only_online_raw_perception_rings_not_serialized_v2"
                 ),
                 "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
+                "teacher_prefill_semantics": TEACHER_PREFILL_SEMANTICS,
                 "perception_object_geo_fingerprint": (
                     self._replay_object_geo_fingerprint
                 ),
@@ -2219,6 +2348,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self.critic_update_count = 0
             self.dagger_rollout_count = 0
             self.dagger_environment_steps = 0
+            self.teacher_prefill_rollout_count = 0
+            self.teacher_prefill_environment_steps = 0
             self.dagger_rng.manual_seed(int(self.cfg.dagger_seed))
             self.q_rng.manual_seed(int(self.cfg.q_seed))
             self.collector_exploration_rng.manual_seed(int(self.cfg.q_seed) + 1)

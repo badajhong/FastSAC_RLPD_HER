@@ -110,6 +110,7 @@ DAGGER_BACKEND_CONFIG_FIELDS = (
     "dagger_buffer_capacity",
     "dagger_buffer_device",
     "dagger_batch_size",
+    "teacher_prefill_rollouts",
     "perception_replay_burn_in",
     "perception_encode_microbatch_size",
     "perception_depth_codec",
@@ -217,11 +218,20 @@ def apply_td3_dagger_iteration_controls(cfg: DictConfig) -> None:
     iterations = cfg.get("td3_dagger_iterations", None)
     if iterations is not None:
         iterations = _positive_int("td3_dagger_iterations", iterations)
+        prefill_rollouts = _positive_int(
+            "algo.teacher_prefill_rollouts",
+            cfg.algo.teacher_prefill_rollouts,
+            allow_zero=True,
+        )
         num_envs = _positive_int("task.num_envs", cfg.task.num_envs)
         train_every = _positive_int("algo.train_every", cfg.algo.train_every)
         world_size = _positive_int("distributed world size", aa.get_world_size())
         with open_dict(cfg):
-            cfg.total_frames = iterations * num_envs * train_every * world_size
+            # Prefill is physically collected before, and excluded from, the
+            # requested number of main DAgger rollouts.
+            cfg.total_frames = (
+                (iterations + prefill_rollouts) * num_envs * train_every * world_size
+            )
 
     beta_zero_iteration = cfg.algo.get("dagger_beta_zero_iteration", None)
     if beta_zero_iteration is not None:
@@ -246,12 +256,23 @@ def td3_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
     total_frames = _positive_int("total_frames", cfg.total_frames)
     world_size = _positive_int("distributed world size", aa.get_world_size())
     frames_per_rollout = num_envs * train_every
-    additional_rollouts = (total_frames // world_size) // frames_per_rollout
-    if additional_rollouts < 1:
+    physical_rollouts = (total_frames // world_size) // frames_per_rollout
+    if physical_rollouts < 1:
         raise ValueError("total_frames does not contain one complete rollout")
 
+    prefill_rollouts = _positive_int(
+        "algo.teacher_prefill_rollouts",
+        cfg.algo.teacher_prefill_rollouts,
+        allow_zero=True,
+    )
+    main_rollouts = physical_rollouts - prefill_rollouts
+    if main_rollouts < 1:
+        raise ValueError(
+            "total_frames must include at least one main DAgger rollout after prefill"
+        )
+
     start_rollout = 0
-    end_rollout = start_rollout + additional_rollouts
+    end_rollout = start_rollout + main_rollouts
     decay_rollouts = _positive_int(
         "algo.dagger_beta_decay_rollouts",
         cfg.algo.dagger_beta_decay_rollouts,
@@ -269,7 +290,10 @@ def td3_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
     )
     return {
         "frames_per_rollout": frames_per_rollout,
-        "total_rollouts": additional_rollouts,
+        "total_rollouts": main_rollouts,
+        "main_rollouts": main_rollouts,
+        "prefill_rollouts": prefill_rollouts,
+        "physical_rollouts": physical_rollouts,
         "start_rollout": start_rollout,
         "end_rollout": end_rollout,
         "decay_rollouts": decay_rollouts,
@@ -402,6 +426,19 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         "perception_encode_microbatch_size",
     ):
         _positive_int(f"algo.{name}", cfg.algo.get(name, None))
+    _positive_int(
+        "algo.teacher_prefill_rollouts",
+        cfg.algo.get("teacher_prefill_rollouts", None),
+        allow_zero=True,
+    )
+    if (
+        int(cfg.algo.teacher_prefill_rollouts) > 0
+        and cfg.get("td3_dagger_iterations", None) is None
+    ):
+        raise ValueError(
+            "algo.teacher_prefill_rollouts > 0 requires an explicit "
+            "td3_dagger_iterations main-rollout budget"
+        )
     if int(cfg.algo.perception_replay_burn_in) != 8:
         raise ValueError(
             "raw-perception replay v2 requires algo.perception_replay_burn_in=8"
@@ -440,6 +477,10 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         )
     if int(cfg.algo.q_batch_size) % 2:
         raise ValueError("algo.q_batch_size must be even for exact 50/50 replay")
+    if int(cfg.algo.q_teacher_buffer_capacity) < int(cfg.algo.td3_learning_starts):
+        raise ValueError(
+            "algo.q_teacher_buffer_capacity must cover algo.td3_learning_starts"
+        )
     for name in (
         "dagger_bc_lr",
         "dagger_actor_huber_delta",
@@ -497,6 +538,16 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         and 0.0 <= beta_end <= 1.0
     ):
         raise ValueError("DAgger beta endpoints must lie in [0, 1]")
+    if (
+        control_mode == "beta"
+        and beta_start == 0.0
+        and beta_end == 0.0
+        and int(cfg.algo.teacher_prefill_rollouts) == 0
+    ):
+        raise ValueError(
+            "pure Student beta control requires algo.teacher_prefill_rollouts > 0 "
+            "so the 50/50 Q replay can become ready"
+        )
     release = float(cfg.algo.get("dagger_safe_release_rms", math.nan))
     takeover = float(cfg.algo.get("dagger_safe_takeover_rms", math.nan))
     if not (
@@ -592,8 +643,10 @@ def main(cfg: DictConfig):
     schedule = td3_dagger_rollout_schedule(cfg)
     print(
         "Distributional TD3 + Teacher-BC schedule: "
+        f"prefill={schedule['prefill_rollouts']}, "
         f"start={schedule['start_rollout']}, "
-        f"additional={schedule['total_rollouts']}, "
+        f"main={schedule['main_rollouts']}, "
+        f"physical={schedule['physical_rollouts']}, "
         f"end={schedule['end_rollout']}, "
         f"frames/rollout={schedule['frames_per_rollout']}; "
         f"method={EXPECTED_TRAINING_ALGORITHM}"
