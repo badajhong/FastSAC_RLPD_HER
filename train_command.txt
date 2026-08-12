@@ -1,16 +1,33 @@
-# RL_DAgger
-nohup python scripts/rl_bc_dagger.py \
+# Distributional TD3 + Teacher BC
+td3_run_stamp="$(date +%Y%m%d_%H%M%S_%N)"
+td3_run_log="/home/hcc/research/VAIC/TD3_bc_dagger_3000_${td3_run_stamp}.log"
+
+nohup env \
+  CUDA_VISIBLE_DEVICES=0 \
+  WANDB_MODE=online \
+  PYTHONUNBUFFERED=1 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /home/hcc/anaconda3/envs/vaic/bin/python scripts/TD3_bc_dagger.py \
   task=G1/vaic/skateboard_stu \
-  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
-  bc_dagger_iterations=6000 \
-  algo.dagger_control_mode=beta
-  > bc_dagger_nohup.log 2>&1 &
+  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/run-20260805_151350-7tsje71w/files/checkpoint_final.pt \
+  td3_dagger_iterations=6000 \
+  algo.dagger_beta_zero_iteration=1000 \
+  algo.dagger_control_mode=beta \
+  algo.dagger_beta_start=1 \
+  algo.dagger_beta_end=0 \
+  algo.collector_exploration_noise_std=0.1 \
+  algo.teacher_buffer_capacity=131072 \
+  save_interval=100 \
+  wandb.mode=online \
+  >"${td3_run_log}" 2>&1 < /dev/null &
+
+echo "PID=$! LOG=${td3_run_log}"
 
 # DAgger
 nohup python scripts/bc_dagger.py \
   task=G1/vaic/skateboard_stu \
   checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/latest-run/files/checkpoint_6000.pt \
-  bc_dagger_iterations=6000 \
+  bc_dagger_iterations=3000 \
   algo.dagger_control_mode=beta \
   algo.dagger_beta_zero_iteration=500 \
   perception_consolidation_iterations=200 \

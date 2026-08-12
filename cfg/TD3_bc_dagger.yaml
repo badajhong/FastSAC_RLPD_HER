@@ -1,0 +1,94 @@
+# Dedicated Phase-1 defaults for scripts/TD3_bc_dagger.py. The shared trainer
+# owns rollout, environment, normalization, checkpoint writing, and evaluation.
+# The algorithm is C51 distributional TD3 plus the exact existing Teacher-BC
+# auxiliary objective; controller/source selection remains unchanged.
+defaults:
+  - train
+  - override /algo: td3_bc_dagger_finetune
+  - _self_
+
+# Default 2,400-rollout skateboard budget at 512 environments and 32 steps.
+total_frames: 39_321_600
+td3_dagger_iterations: null
+save_interval: 100
+
+# Fresh runs use checkpoint_path from train.yaml. Same-stage continuation uses
+# this distinct alias and never accepts an existing BC-only checkpoint.
+td3_bc_dagger_checkpoint: null
+td3_bc_dagger_copy_teacher_replay: true
+td3_dagger_resume_rollout_count: 0
+td3_dagger_resume_environment_steps: 0
+_td3_bc_dagger_same_stage_resume: false
+_bc_dagger_fresh_source: false
+_bc_dagger_model_only_resume: false
+_bc_dagger_teacher_replay_copy_source: null
+_bc_dagger_teacher_replay_copy_path: null
+
+algo:
+  # Existing state-wise safety controller. Beta remains available for the
+  # exact beta/hybrid categorical-source ablations.
+  dagger_control_mode: safe
+  dagger_safe_takeover_rms: 0.006
+  dagger_safe_release_rms: 0.004
+  dagger_safe_min_teacher_steps: 8
+  dagger_safe_zero_iteration: null
+  dagger_beta_start: 1.0
+  dagger_beta_end: 0.0
+  dagger_beta_zero_iteration: null
+  dagger_beta_decay_rollouts: 1800
+  dagger_seed: 0
+  dagger_teacher_action_threshold: 20.0
+  dagger_action_clip: 20.0
+
+  # Exact existing valid-Teacher latent-coordinate SmoothL1 objective.
+  dagger_bc_lr: 3.0e-4
+  dagger_actor_huber_delta: 1.0
+  dagger_buffer_capacity: 131_072
+  dagger_buffer_device: cpu
+  dagger_batch_size: 4096
+  dagger_replay_raw_observations: true
+  replay_raw_observation_keys:
+    - vel_command
+    - policy
+    - priv
+    - command
+
+  # Locked twin 501-atom critic topology and exact replay cadence.
+  q_hidden_dim: 768
+  q_num_atoms: 501
+  q_v_min: -20.0
+  q_v_max: 20.0
+  q_layer_norm: true
+  q_action_fusion: late
+  q_normalize_actions: true
+  q_action_input_gain: 1.0
+  q_lr: 3.0e-5
+  q_weight_decay: 1.0e-3
+  q_seed: 0
+  q_tau: 0.005
+  q_max_grad_norm: 1.0
+  q_batch_size: 512
+  q_updates_per_rollout: 128
+  q_teacher_replay_ratio: 0.5
+  q_teacher_buffer_capacity: 131_072
+
+  # Fixed Phase-1 objective and delayed deterministic update controls.
+  eta_td3: 1.0
+  lambda_bc: 1.0
+  policy_delay: 2
+  target_policy_noise_std: 0.2
+  target_policy_noise_clip: 0.5
+  collector_exploration_noise_std: 0.1
+  collector_exploration_noise_clip: 0.5
+  td3_learning_starts: 8192
+
+  save_teacher_buffer: true
+  teacher_buffer_filename: teacher_replay_buffer.h5
+  teacher_buffer_path: null
+  # Export/checkpoint-only FIFO. Matching the online Teacher ring preserves a
+  # complete same-stage refill while bounding host storage at about 2.81 GiB.
+  teacher_buffer_capacity: 131_072
+  teacher_buffer_snapshot_chunk_rows: 4096
+
+wandb:
+  project: vaic_dagger
