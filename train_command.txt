@@ -17,6 +17,22 @@ python scripts/TD3_bc_dagger.py \
   save_interval=100 \
   > TD3_bc_dagger_eta1e-4_3000.log 2>&1 < /dev/null &
 
+nohup env \
+  python scripts/fastSAC_bc_dagger.py \
+  task=G1/vaic/skateboard_stu \
+  checkpoint_path=/home/hcc/research/VAIC/outputs/15-13-46-G1Skateboard-ppo_vel/wandb/run-20260805_151350-7tsje71w/files/checkpoint_final.pt \
+  fastsac_dagger_iterations=3000 \
+  algo.teacher_prefill_rollouts=10 \
+  algo.dagger_control_mode=beta \
+  algo.dagger_beta_start=0 \
+  algo.dagger_beta_end=0 \
+  algo.eta_sac=0.0001 \
+  algo.lambda_bc=1.0 \
+  algo.sac_initial_action_std=0.1 \
+  algo.q_updates_per_rollout=32 \
+  save_interval=100 \
+  > fastSAC_bc_dagger_3000.log 2>&1 < /dev/null &
+
 # DAgger
 nohup python scripts/bc_dagger.py \
   task=G1/vaic/skateboard_stu \

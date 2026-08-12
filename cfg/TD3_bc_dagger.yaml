@@ -7,8 +7,13 @@ defaults:
   - override /algo: td3_bc_dagger_finetune
   - _self_
 
-# Default 2,400-rollout skateboard budget at 512 environments and 32 steps.
-total_frames: 39_321_600
+# Number of parallel simulator environments. Override from the command line
+# with `task.num_envs=<count>` when a different rollout batch size is needed.
+task:
+  num_envs: 256
+
+# Default 2,400-rollout skateboard budget at 256 environments and 32 steps.
+total_frames: 19_660_800
 td3_dagger_iterations: null
 save_interval: 100
 

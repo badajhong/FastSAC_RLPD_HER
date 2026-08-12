@@ -145,6 +145,7 @@ def test_td3_config_composes_without_simulator_startup():
 
     assert cfg.algo.name == "td3_bc_dagger"
     assert cfg.algo._target_ == td3_entry.EXPECTED_ALGO_TARGET
+    assert cfg.task.num_envs == 512
     assert cfg.algo.phase == "finetune"
     assert cfg.algo.vecnorm == "eval"
     assert list(cfg.algo.in_keys) == [
@@ -249,6 +250,24 @@ def test_recommended_3000_rollout_command_composes_raw_perception_replay():
         "beta_zero_rollouts": 1200,
         "safe_zero_rollouts": 0,
     }
+
+
+def test_td3_yaml_environment_count_can_be_overridden():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TD3_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "task.num_envs=256",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "td3_dagger_iterations=3000",
+            ],
+        )
+
+    td3_entry.validate_td3_bc_dagger_config(cfg)
+    assert cfg.task.num_envs == 256
+    assert cfg.total_frames == 3000 * 256 * 32
 
 
 def test_teacher_prefill_adds_physical_rollouts_without_shortening_main_beta_schedule():

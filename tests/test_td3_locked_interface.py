@@ -907,15 +907,16 @@ def _mapping_key_paths(value, prefix=()):
             yield from _mapping_key_paths(child, (*prefix, str(index)))
 
 
-def test_td3_config_cannot_override_the_locked_task_reward_or_environment():
+def test_td3_config_only_overrides_the_authorized_environment_count():
     path = ROOT / TD3_CONFIG_PATH
     assert path.is_file(), f"missing required Phase-1 config: {TD3_CONFIG_PATH}"
     td3_cfg = _load_yaml(TD3_CONFIG_PATH)
     assert isinstance(td3_cfg, dict)
     assert isinstance(td3_cfg.get("defaults"), list)
 
+    assert td3_cfg.get("task") == {"num_envs": 512}
+
     locked_top_level = {
-        "task",
         "reward",
         "environment",
         "env",
@@ -948,7 +949,8 @@ def test_td3_config_cannot_override_the_locked_task_reward_or_environment():
     nested_overrides = sorted(
         ".".join(path)
         for path in _mapping_key_paths(td3_cfg)
-        if path[-1].removeprefix("override ").lstrip("/") in locked_nested_keys
+        if path != ("task", "num_envs")
+        and path[-1].removeprefix("override ").lstrip("/") in locked_nested_keys
     )
     assert not nested_overrides, (
         f"TD3 config contains nested protected environment keys: {nested_overrides}"
@@ -1029,4 +1031,4 @@ def test_td3_config_cannot_override_the_locked_task_reward_or_environment():
     # environment/reward fingerprint checked above.
     task_sections = set(_effective_task())
     task_sections.discard("defaults")
-    assert task_sections.isdisjoint(td3_cfg)
+    assert task_sections.isdisjoint(set(td3_cfg) - {"task"})

@@ -1,0 +1,114 @@
+# Dedicated fresh-only distributional FastSAC + Teacher-BC DAgger defaults.
+# The shared trainer owns simulation, rollout batching, checkpoint writing, and
+# evaluation.  This method adds a teacher-only replay prefill before the
+# explicitly requested number of main DAgger rollouts.
+defaults:
+  - train
+  - override /algo: fastsac_bc_dagger_finetune
+  - _self_
+
+# Number of parallel simulator environments. Override from the command line
+# with `task.num_envs=<count>` when a different rollout batch size is needed.
+task:
+  num_envs: 256
+
+# This placeholder is always replaced from fastsac_dagger_iterations before
+# simulator startup.  The explicit main-rollout budget avoids accidentally
+# counting the Teacher-only prefill as training.
+total_frames: 19_660_800
+fastsac_dagger_iterations: null
+save_interval: 100
+
+# Same-stage replay/checkpoint continuation is intentionally unsupported.  A
+# run must start from the train-phase PPO checkpoint_path inherited from
+# train.yaml and collect a new raw-perception replay lineage.
+fastsac_bc_dagger_checkpoint: null
+
+algo:
+  # Main rollout defaults to the stochastic Student immediately.  The frozen
+  # Teacher Q ring is populated separately by the prefill below; Teacher labels
+  # are still queried during main rollout for the mean-action BC objective.
+  dagger_control_mode: beta
+  dagger_safe_takeover_rms: 0.006
+  dagger_safe_release_rms: 0.004
+  dagger_safe_min_teacher_steps: 8
+  dagger_safe_zero_iteration: null
+  dagger_beta_start: 0.0
+  dagger_beta_end: 0.0
+  dagger_beta_zero_iteration: null
+  dagger_beta_decay_rollouts: 1800
+  dagger_seed: 0
+  dagger_teacher_action_threshold: 20.0
+  dagger_action_clip: 20.0
+
+  # Exact Teacher BC is applied only to the noise-free tanh mean.  One combined
+  # Actor optimizer handles this term and the reparameterized SAC objective.
+  dagger_bc_lr: 3.0e-4
+  dagger_actor_huber_delta: 1.0
+  dagger_buffer_capacity: 131_072
+  dagger_buffer_device: cpu
+  dagger_batch_size: 4096
+  teacher_prefill_rollouts: 10
+  dagger_replay_raw_observations: true
+  replay_raw_observation_keys:
+    - vel_command
+    - policy
+    - priv
+    - command
+    - depth
+  perception_replay_burn_in: 8
+  perception_encode_microbatch_size: 128
+  perception_depth_codec: uint8_div_100_v1
+
+  # Locked twin 501-atom distributional Critic and exact 50/50 frozen-Teacher /
+  # main-Student replay mixture.
+  q_hidden_dim: 768
+  q_num_atoms: 501
+  q_v_min: -20.0
+  q_v_max: 20.0
+  q_layer_norm: true
+  q_action_fusion: late
+  q_normalize_actions: true
+  q_action_input_gain: 1.0
+  q_lr: 3.0e-5
+  q_weight_decay: 1.0e-3
+  q_seed: 0
+  q_tau: 0.005
+  q_max_grad_norm: 1.0
+  q_batch_size: 512
+  q_updates_per_rollout: 32
+  q_teacher_replay_ratio: 0.5
+  q_teacher_buffer_capacity: 131_072
+
+  # FastSAC owns exploration through its learned squashed Gaussian.  These
+  # inherited TD3 controls are locked inert to prevent a second noise source.
+  eta_td3: 0.0
+  policy_delay: 2
+  target_policy_noise_std: 0.0
+  target_policy_noise_clip: 0.0
+  collector_exploration_noise_std: 0.0
+  collector_exploration_noise_clip: 0.0
+  td3_learning_starts: 8192
+
+  # Reparameterized stochastic Actor/Critic targets and entropy temperature.
+  eta_sac: 1.0e-4
+  lambda_bc: 1.0
+  sac_actor_lr: 3.0e-4
+  sac_initial_action_std: 0.1
+  sac_log_std_min: -10.0
+  sac_log_std_max: -2.0
+  sac_alpha_init: 1.0e-5
+  sac_alpha_lr: 2.0e-5
+  sac_use_autotune: true
+  sac_target_entropy_ratio: 1.0
+  sac_policy_frequency: 2
+  sac_learning_starts: 8192
+  sac_tau: 0.005
+  sac_max_grad_norm: 1.0
+
+  # Raw recurrent windows stay only in the two online learning rings.  No H5
+  # teacher replay is exported, restored, or uploaded.
+  save_teacher_buffer: false
+
+wandb:
+  project: vaic_dagger
