@@ -28,7 +28,7 @@ nohup env \
   algo.perception_checkpoint_path=outputs/2026-08-12/06-30-30-G1Skateboard-ppo_bc_dagger/wandb/run-20260812_063031-h99sh616/files/checkpoint_final.pt \
   algo.train_perception=true \
   fastsac_dagger_iterations=3000 \
-  algo.teacher_prefill_max_rollouts=1000 \
+  algo.teacher_prefill_max_rollouts=300 \
   algo.q_teacher_buffer_capacity=131072 \
   algo.teacher_actor_replay_fraction=0.5 \
   algo.teacher_perception_replay_fraction=0.5 \

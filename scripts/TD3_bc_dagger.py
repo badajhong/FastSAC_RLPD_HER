@@ -811,11 +811,10 @@ def main(cfg: DictConfig):
     schedule = td3_dagger_rollout_schedule(cfg)
     print(
         "Distributional TD3 + Teacher-BC schedule: "
-        f"prefill_target_rows={schedule['prefill_target_rows']}, "
-        f"prefill_max={schedule['prefill_max_rollouts']}, "
+        f"prefill=until {schedule['prefill_target_rows']} Teacher rows "
+        f"(safety ceiling {schedule['prefill_max_rollouts']} rollouts), then "
         f"start={schedule['start_rollout']}, "
         f"main={schedule['main_rollouts']}, "
-        f"max_physical={schedule['max_physical_rollouts']}, "
         f"end={schedule['end_rollout']}, "
         f"frames/rollout={schedule['frames_per_rollout']}; "
         f"method={EXPECTED_TRAINING_ALGORITHM}"

@@ -5,10 +5,13 @@ import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf, open_dict
 
+from scripts import train as train_module
 from scripts import TD3_bc_dagger as td3_entry
 from scripts.train import (
+    _TrainingProgress,
     _bc_dagger_checkpoint_index,
     _bc_dagger_main_budget_complete,
+    _bc_dagger_progress_state,
     run_training as shared_run_training,
 )
 
@@ -779,3 +782,187 @@ def test_dynamic_main_budget_stops_exactly_and_rejects_overshoot():
         _bc_dagger_main_budget_complete(policy, 3000)
 
     assert _bc_dagger_main_budget_complete(policy, None) is False
+
+
+def test_dynamic_progress_state_splits_teacher_rows_from_main_rollouts():
+    policy = type(
+        "Policy",
+        (),
+        {
+            "q_teacher_replay": type(
+                "Replay", (), {"size": 65_536, "capacity": 131_072}
+            )(),
+            "dagger_rollout_count": 0,
+            "is_teacher_prefill_active": lambda self: self.prefill_active,
+            "prefill_active": True,
+        },
+    )()
+
+    assert _bc_dagger_progress_state(policy, 3000) == (
+        "teacher_prefill",
+        65_536,
+        131_072,
+    )
+
+    policy.q_teacher_replay.size = 131_072
+    assert _bc_dagger_progress_state(policy, 3000) == (
+        "teacher_prefill",
+        131_072,
+        131_072,
+    )
+
+    # The synchronized prefill latch opens a distinct main bar at zero. The
+    # physical prefill rollout count must never leak into this coordinate.
+    policy.prefill_active = False
+    assert _bc_dagger_progress_state(policy, 3000) == ("main_dagger", 0, 3000)
+
+    policy.dagger_rollout_count = 1
+    assert _bc_dagger_progress_state(policy, 3000) == ("main_dagger", 1, 3000)
+
+
+def test_dynamic_progress_state_clamps_display_values_and_preserves_legacy():
+    policy = type(
+        "Policy",
+        (),
+        {
+            "q_teacher_replay": type("Replay", (), {"size": -7, "capacity": 100})(),
+            "dagger_rollout_count": -3,
+            "is_teacher_prefill_active": lambda self: self.prefill_active,
+            "prefill_active": True,
+        },
+    )()
+
+    # Algorithms without the exact dynamic-prefill budget keep the original
+    # physical-iteration tqdm path and need no DAgger-specific hooks.
+    assert _bc_dagger_progress_state(object(), None) is None
+    assert _bc_dagger_progress_state(policy, 3000) == ("teacher_prefill", 0, 100)
+
+    policy.q_teacher_replay.size = 101
+    assert _bc_dagger_progress_state(policy, 3000) == (
+        "teacher_prefill",
+        100,
+        100,
+    )
+
+    policy.prefill_active = False
+    assert _bc_dagger_progress_state(policy, 3000) == ("main_dagger", 0, 3000)
+    policy.dagger_rollout_count = 3001
+    assert _bc_dagger_progress_state(policy, 3000) == (
+        "main_dagger",
+        3000,
+        3000,
+    )
+
+
+def test_dynamic_progress_requires_prefill_phase_hook():
+    policy = type("Policy", (), {"dagger_rollout_count": 0})()
+
+    with pytest.raises(RuntimeError, match="requires is_teacher_prefill_active"):
+        _bc_dagger_progress_state(policy, 3000)
+
+
+def test_training_progress_closes_prefill_at_100_percent_then_opens_main_at_zero(
+    monkeypatch,
+):
+    bars = []
+
+    class FakeTqdm:
+        def __init__(
+            self,
+            iterable=None,
+            *,
+            total=None,
+            initial=0,
+            desc=None,
+            unit=None,
+        ):
+            self.iterable = iterable
+            self.total = total
+            self.n = initial
+            self.desc = desc
+            self.unit = unit
+            self.closed = False
+            self.refresh_count = 0
+            self.postfix = None
+            bars.append(self)
+
+        def __iter__(self):
+            yield from self.iterable
+
+        def refresh(self):
+            self.refresh_count += 1
+
+        def set_postfix_str(self, value):
+            self.postfix = value
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(train_module, "tqdm", FakeTqdm)
+    replay = type("Replay", (), {"size": 32, "capacity": 100})()
+    policy = type(
+        "Policy",
+        (),
+        {
+            "q_teacher_replay": replay,
+            "dagger_rollout_count": 0,
+            "is_teacher_prefill_active": lambda self: self.prefill_active,
+            "prefill_active": True,
+        },
+    )()
+
+    progress = _TrainingProgress(4000, policy, 3000, enabled=True)
+    assert len(bars) == 1
+    assert (bars[0].desc, bars[0].n, bars[0].total, bars[0].unit) == (
+        "Teacher prefill buffer",
+        32,
+        100,
+        "rows",
+    )
+
+    replay.size = 100
+    progress.update(policy)
+    assert bars[0].n == 100
+    assert bars[0].postfix == "local full; waiting for all ranks"
+
+    policy.prefill_active = False
+    progress.update(policy)
+    assert bars[0].closed is True
+    assert bars[0].n == 100
+    assert len(bars) == 2
+    assert (bars[1].desc, bars[1].n, bars[1].total, bars[1].unit) == (
+        "Main DAgger rollouts",
+        0,
+        3000,
+        "rollout",
+    )
+
+    policy.dagger_rollout_count = 1
+    progress.update(policy)
+    assert bars[1].n == 1
+
+    progress.close()
+    assert bars[1].closed is True
+
+
+def test_training_progress_keeps_legacy_physical_iteration_bar(monkeypatch):
+    calls = []
+
+    class FakeTqdm:
+        def __init__(self, iterable):
+            self.iterable = iterable
+            self.closed = False
+            calls.append(self)
+
+        def __iter__(self):
+            yield from self.iterable
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(train_module, "tqdm", FakeTqdm)
+    progress = _TrainingProgress(4, object(), None, enabled=True)
+
+    assert list(progress) == [0, 1, 2, 3]
+    assert len(calls) == 1
+    assert calls[0].closed is True

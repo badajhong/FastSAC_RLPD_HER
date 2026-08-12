@@ -88,6 +88,112 @@ def _bc_dagger_main_budget_complete(policy, main_rollout_budget: int | None) -> 
     return completed_main == int(main_rollout_budget)
 
 
+def _bc_dagger_progress_state(
+    policy, main_rollout_budget: int | None
+) -> tuple[str, int, int] | None:
+    """Return the user-facing dynamic-prefill phase and absolute progress."""
+    if main_rollout_budget is None:
+        return None
+    if not hasattr(policy, "is_teacher_prefill_active"):
+        raise RuntimeError(
+            "dynamic DAgger progress requires is_teacher_prefill_active()"
+        )
+    if policy.is_teacher_prefill_active():
+        replay = policy.q_teacher_replay
+        total = int(replay.capacity)
+        current = min(max(int(replay.size), 0), total)
+        return "teacher_prefill", current, total
+    total = int(main_rollout_budget)
+    current = min(max(int(policy.dagger_rollout_count), 0), total)
+    return "main_dagger", current, total
+
+
+class _TrainingProgress:
+    """Keep legacy progress intact while splitting dynamic prefill from main."""
+
+    def __init__(
+        self,
+        total_iterations: int,
+        policy,
+        main_rollout_budget: int | None,
+        *,
+        enabled: bool,
+    ):
+        self.total_iterations = int(total_iterations)
+        self.policy = policy
+        self.main_rollout_budget = main_rollout_budget
+        self.enabled = bool(enabled)
+        self.dynamic = main_rollout_budget is not None
+        self._legacy_bar = None
+        self._phase_bar = None
+        self._phase = None
+        if self.enabled and self.dynamic:
+            self.update(policy)
+
+    @staticmethod
+    def _phase_display(phase: str) -> tuple[str, str]:
+        if phase == "teacher_prefill":
+            return "Teacher prefill buffer", "rows"
+        if phase == "main_dagger":
+            return "Main DAgger rollouts", "rollout"
+        raise RuntimeError(f"unknown training progress phase={phase!r}")
+
+    def __iter__(self):
+        if not self.enabled:
+            yield from range(self.total_iterations)
+            return
+        if not self.dynamic:
+            self._legacy_bar = tqdm(range(self.total_iterations))
+            try:
+                yield from self._legacy_bar
+            finally:
+                self.close()
+            return
+        try:
+            yield from range(self.total_iterations)
+        finally:
+            self.close()
+
+    def update(self, policy) -> None:
+        if not (self.enabled and self.dynamic):
+            return
+        state = _bc_dagger_progress_state(policy, self.main_rollout_budget)
+        if state is None:  # pragma: no cover - guarded by ``dynamic``
+            return
+        phase, current, total = state
+        if phase != self._phase:
+            if self._phase_bar is not None:
+                # The globally synchronized transition is authoritative. Make
+                # the finished prefill visibly reach 100% before opening main.
+                if self._phase == "teacher_prefill":
+                    self._phase_bar.n = int(self._phase_bar.total)
+                    self._phase_bar.refresh()
+                self._phase_bar.close()
+            description, unit = self._phase_display(phase)
+            self._phase_bar = tqdm(
+                total=total,
+                initial=current,
+                desc=description,
+                unit=unit,
+            )
+            self._phase = phase
+            return
+        self._phase_bar.n = current
+        if phase == "teacher_prefill" and current == total:
+            # On distributed runs rank 0 can fill before another rank. The bar
+            # remains in prefill until the core's synchronized phase latch.
+            self._phase_bar.set_postfix_str("local full; waiting for all ranks")
+        self._phase_bar.refresh()
+
+    def close(self) -> None:
+        if self._phase_bar is not None:
+            self._phase_bar.close()
+            self._phase_bar = None
+        if self._legacy_bar is not None:
+            self._legacy_bar.close()
+            self._legacy_bar = None
+
+
 def maybe_upload_teacher_replay(
     run,
     cfg: DictConfig,
@@ -372,10 +478,12 @@ def run_training(cfg: DictConfig):
         data_buf.set(key, buf)
     logging.info(f"Data buffer size: {data_buf.bytes() / 1e6:.2f} MB")
 
-    if aa.is_main_process():
-        progress = tqdm(range(total_iters))
-    else:
-        progress = range(total_iters)
+    progress = _TrainingProgress(
+        total_iters,
+        policy,
+        main_rollout_budget,
+        enabled=aa.is_main_process(),
+    )
 
     env_frames = 0
     start_iter = env.current_iter
@@ -473,6 +581,7 @@ def run_training(cfg: DictConfig):
                 info[key] = torch.mean(v.float()).item()
         training_start = time.perf_counter()
         info.update(policy.train_op(data_buf))
+        progress.update(policy)
         if (
             prefill_active_before_rollout
             and hasattr(policy, "is_teacher_prefill_active")
