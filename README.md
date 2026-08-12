@@ -37,12 +37,12 @@ cd ..
 git clone git@github.com:isaac-sim/IsaacLab.git
 cd IsaacLab
 git checkout v2.3.2
+python -m pip install --no-build-isolation "flatdict==4.0.1"
 ./isaaclab.sh -i none
 
 # install vaic
 cd ..
-git clone https://github.com/ldt29/VAIC
-cd VAIC
+cd FastSAC_RLPD_HER
 pip install -e .
 ```
 
