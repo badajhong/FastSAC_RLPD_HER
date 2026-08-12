@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
 
-from active_adaptation.learning.ppo.common import ACTION_KEY
+from active_adaptation.learning.ppo.common import ACTION_KEY, OBS_KEY, OBS_PRIV_KEY
 from active_adaptation.learning.ppo.fastsac_vel import (
     FASTSAC_REFERENCE_EPS,
     TwinDistributionalQ,
@@ -27,7 +27,17 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     _DeviceReplay,
     PPOBCDaggerFinetune,
 )
-from active_adaptation.learning.ppo.ppo_vel import PPOVEL
+from active_adaptation.learning.ppo.ppo_vel import (
+    DEPTH_KEY,
+    OBJECT_GEO_KEY,
+    OBJECT_KEY,
+    OBJECT_PRED_KEY,
+    PPOVEL,
+    PRIV_FEATURE_KEY,
+    PRIV_PRED_KEY,
+    VEL_CMD_KEY,
+    set_recurrent_mode,
+)
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     CHECKPOINT_VERSION,
     PERCEPTION_DEPTH_U8_KEY,
@@ -180,6 +190,8 @@ def test_raw_perception_replay_public_field_contract_has_no_priv_pred_latent():
 def test_teacher_prefill_config_defaults_to_disabled_and_rejects_negative_or_bool():
     cfg = DistributionalTD3TeacherBCConfig()
     assert cfg.teacher_prefill_rollouts == 0
+    assert cfg.teacher_actor_replay_fraction == 0.0
+    assert cfg.teacher_perception_replay_fraction == 0.0
 
     for invalid in (-1, True):
         cfg.teacher_prefill_rollouts = invalid
@@ -187,6 +199,100 @@ def test_teacher_prefill_config_defaults_to_disabled_and_rejects_negative_or_boo
             DistributionalTD3TeacherBC._validate_td3_config(cfg)
     cfg.teacher_prefill_rollouts = 0
     DistributionalTD3TeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("teacher_actor_replay_fraction", "teacher_perception_replay_fraction"),
+)
+@pytest.mark.parametrize("invalid", (-0.01, 1.01, float("nan"), True))
+def test_teacher_replay_fraction_is_a_unit_interval(field, invalid):
+    cfg = DistributionalTD3TeacherBCConfig()
+    setattr(cfg, field, invalid)
+
+    with pytest.raises(ValueError, match=field):
+        DistributionalTD3TeacherBC._validate_td3_config(cfg)
+
+
+def test_actor_batch_optionally_mixes_exact_teacher_replay_labels_and_raw_inputs():
+    policy = _bare_policy(
+        dagger_batch_size=4,
+        teacher_actor_replay_fraction=0.5,
+    )
+    policy.q_rng = torch.Generator().manual_seed(19)
+    policy.q_teacher_replay = _TD3DeviceReplay(16, "cpu")
+    policy.dagger_replay = _TD3DeviceReplay(16, "cpu")
+    teacher = _replay_rows(4, 100)
+    main = _replay_rows(5, 1_000)
+    main[DAGGER_REPLAY_TEACHER_ACTIONS] = (
+        torch.arange(5, dtype=torch.float32)[:, None] + 2_000.0
+    )
+    main[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.tensor(
+        [True, False, True, True, False]
+    )
+    policy.q_teacher_replay.extend(teacher)
+    policy.dagger_replay.extend(main)
+    policy._prepare_dagger_learning_batch = MethodType(
+        lambda owner, batch: batch, policy
+    )
+
+    batch = policy._sample_actor_batch(
+        torch.tensor([1, 3]),
+        torch.tensor([0, 2]),
+    )
+
+    source = batch[DAGGER_Q_TEACHER_SOURCE_KEY]
+    assert torch.equal(source, torch.tensor([True, True, False, False]))
+    assert torch.equal(
+        batch[DAGGER_REPLAY_TEACHER_ACTIONS][source],
+        teacher["actions"][[0, 2]],
+    )
+    assert batch[DAGGER_TEACHER_ACTION_VALID_KEY][source].all()
+    assert torch.equal(
+        batch[DAGGER_REPLAY_TEACHER_ACTIONS][~source],
+        main[DAGGER_REPLAY_TEACHER_ACTIONS][[1, 3]],
+    )
+    assert torch.equal(
+        batch[PERCEPTION_POLICY_RAW_KEY][source],
+        teacher[PERCEPTION_POLICY_RAW_KEY][[0, 2]],
+    )
+
+
+def test_zero_teacher_actor_fraction_preserves_main_only_sampling_and_rng():
+    policy = _bare_policy(
+        dagger_batch_size=4,
+        teacher_actor_replay_fraction=0.0,
+    )
+    policy.q_rng = torch.Generator().manual_seed(37)
+    expected_rng = torch.Generator().set_state(policy.q_rng.get_state())
+    policy.dagger_replay = _TD3DeviceReplay(16, "cpu")
+    main = _replay_rows(7, 1_000)
+    main[DAGGER_REPLAY_TEACHER_ACTIONS] = main["actions"] + 5_000.0
+    main[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(7, dtype=torch.bool)
+    policy.dagger_replay.extend(main)
+    policy._prepare_dagger_learning_batch = MethodType(
+        lambda owner, batch: batch, policy
+    )
+
+    batch = policy._sample_actor_batch()
+    expected = policy.dagger_replay.sample(
+        4,
+        "cpu",
+        expected_rng,
+        fields=(
+            "critic_observations",
+            DAGGER_REPLAY_TEACHER_ACTIONS,
+            DAGGER_TEACHER_ACTION_VALID_KEY,
+            PERCEPTION_DEPTH_U8_KEY,
+            PERCEPTION_POLICY_RAW_KEY,
+            PERCEPTION_VEL_COMMAND_RAW_KEY,
+            PERCEPTION_IS_INIT_KEY,
+        ),
+    )
+
+    _assert_nested_equal(batch, expected)
+    assert DAGGER_Q_TEACHER_SOURCE_KEY not in batch
+    assert torch.equal(policy.q_rng.get_state(), expected_rng.get_state())
 
 
 def _raw_transition_policy(*, train_every: int = 10):
@@ -426,6 +532,143 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
     assert {"observations", "next_observations", "priv_pred"}.isdisjoint(
         _Q_REPLAY_FIELDS
     )
+
+
+class _ReplayDepthStudent(nn.Module):
+    def __init__(self, value: float = 1.0):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(value))
+
+    def forward(self, td):
+        td["_depth_feature"] = (
+            td[DEPTH_KEY].flatten(-3).mean(-1, keepdim=True) * self.scale
+        )
+        return td
+
+
+class _ReplayObjectStudent(nn.Module):
+    def __init__(self, value: float = 1.0):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(value))
+
+    def forward(self, td):
+        td[OBJECT_PRED_KEY] = (td["_depth_feature"] + td[OBS_KEY][..., :1]) * self.scale
+        return td
+
+
+class _ReplayAdaptStudent(nn.Module):
+    def __init__(self, value: float = 1.0):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(value))
+
+    def forward(self, td):
+        td[PRIV_PRED_KEY] = (
+            td[OBJECT_PRED_KEY] + td[VEL_CMD_KEY][..., :1]
+        ) * self.scale
+        return td
+
+
+class _ReplayPrivTarget(nn.Module):
+    def forward(self, td):
+        td[PRIV_FEATURE_KEY] = td[OBS_PRIV_KEY][..., :1] + td[OBJECT_KEY][..., :1]
+        return td
+
+
+def _teacher_perception_policy(fraction: float = 0.5):
+    policy = _bare_policy(
+        teacher_perception_replay_fraction=fraction,
+        perception_encode_microbatch_size=2,
+        teacher_perception_batch_size=2,
+        perception_replay_burn_in=8,
+        latent_dim=1,
+        num_minibatches=1,
+        train_every=2,
+        max_grad_norm=10.0,
+        train_dr_estimator=False,
+    )
+    policy.depth_feature_dim = 1
+    policy.q_critic_keys = [OBS_PRIV_KEY, OBJECT_KEY]
+    policy._q_critic_widths = [1, 1]
+    policy._replay_object_geo = torch.tensor([1.0])
+    policy._vecnorm_snapshot = lambda: None
+    policy._normalize_replay_value = lambda key, value, snapshot: value
+    policy.temporal_depth_gru = _ReplayDepthStudent(0.5)
+    policy.object_adapt = _ReplayObjectStudent(0.75)
+    policy.object_pred_transform = _NoOpPerceptionModule()
+    policy.adapt_module = _ReplayAdaptStudent(1.25)
+    policy.temporal_depth_gru_ema = copy.deepcopy(policy.temporal_depth_gru)
+    policy.object_adapt_ema = copy.deepcopy(policy.object_adapt)
+    policy.adapt_ema = copy.deepcopy(policy.adapt_module)
+    policy.object_transform = _NoOpPerceptionModule()
+    policy.encoder_priv = _ReplayPrivTarget()
+    policy.adapt_loss_fn = nn.MSELoss(reduction="none")
+    parameters = (
+        list(policy.temporal_depth_gru.parameters())
+        + list(policy.object_adapt.parameters())
+        + list(policy.adapt_module.parameters())
+    )
+    policy.opt_adapt = torch.optim.SGD(parameters, lr=0.01)
+    policy.q_rng = torch.Generator().manual_seed(73)
+    policy.teacher_perception_rng = torch.Generator().manual_seed(74)
+    policy.q_teacher_replay = _TD3DeviceReplay(8, "cpu")
+    rows = _replay_rows(4, 0)
+    rows["critic_observations"] = torch.tensor(
+        [[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [4.0, 5.0]]
+    )
+    rows[PERCEPTION_DEPTH_U8_KEY] = torch.full((4, 10, 1, 1, 1), 50, dtype=torch.uint8)
+    rows[PERCEPTION_POLICY_RAW_KEY] = torch.ones(4, 10, 1)
+    rows[PERCEPTION_VEL_COMMAND_RAW_KEY] = torch.full((4, 10, 1), 0.25)
+    rows[PERCEPTION_IS_INIT_KEY] = torch.zeros(4, 10, dtype=torch.bool)
+    policy.q_teacher_replay.extend(rows)
+    return policy
+
+
+def test_teacher_perception_loss_reencodes_raw_window_with_trainable_current_model():
+    policy = _teacher_perception_policy()
+    stored_before = {
+        key: value.clone() for key, value in policy.q_teacher_replay.data.items()
+    }
+
+    with set_recurrent_mode(True):
+        losses = policy._teacher_perception_replay_loss()
+    (losses["priv_loss"] + losses["object_loss"]).backward()
+
+    assert losses["rows"].item() == 2
+    assert losses["valid_fraction"].item() == pytest.approx(1.0)
+    assert policy.temporal_depth_gru.scale.grad.abs().item() > 0
+    assert policy.object_adapt.scale.grad.abs().item() > 0
+    assert policy.adapt_module.scale.grad.abs().item() > 0
+    assert PRIV_PRED_KEY not in policy.q_teacher_replay.data
+    for key, value in stored_before.items():
+        assert torch.equal(policy.q_teacher_replay.data[key], value)
+
+
+def test_teacher_perception_fraction_mixes_losses_in_existing_steps_and_updates_ema_once():
+    policy = _teacher_perception_policy(fraction=0.5)
+    old_ema = policy.temporal_depth_gru_ema.scale.detach().clone()
+    online = TensorDict(
+        {
+            DEPTH_KEY: torch.full((1, 2, 1, 1, 1), 0.25),
+            OBS_KEY: torch.full((1, 2, 1), 0.5),
+            VEL_CMD_KEY: torch.full((1, 2, 1), 0.1),
+            OBS_PRIV_KEY: torch.full((1, 2, 1), 1.0),
+            OBJECT_KEY: torch.full((1, 2, 1), 2.0),
+            OBJECT_GEO_KEY: torch.ones(1, 2, 1),
+            "is_init": torch.zeros(1, 2, 1, dtype=torch.bool),
+            "depth_hx": torch.zeros(1, 2, 1),
+            "adapt_hx": torch.zeros(1, 2, 1),
+        },
+        batch_size=(1, 2),
+    )
+
+    info = policy.train_adapt(online)
+
+    assert info["adapt/teacher_replay_fraction"] == pytest.approx(0.5)
+    assert info["adapt/teacher_replay_rows"] == pytest.approx(2.0)
+    assert "adapt/online_priv_loss" in info
+    assert "adapt/teacher_replay_priv_loss" in info
+    expected_ema = old_ema.lerp(policy.temporal_depth_gru.scale.detach(), 0.04)
+    assert torch.allclose(policy.temporal_depth_gru_ema.scale, expected_ema)
 
 
 def test_teacher_prefill_train_op_populates_only_q_teacher_and_touches_no_optimizer():
@@ -833,6 +1076,46 @@ def test_prefetched_td3_cpu_sampling_matches_sequential_rng_and_batches_exactly(
         torch.rand(16, device=device, generator=prefetched.q_rng),
         torch.rand(16, device=device, generator=restored_rng),
     )
+
+
+def test_prefetched_actor_plan_preserves_mixed_teacher_main_rng_and_labels():
+    seed = 947
+    sequential = _sampling_policy(_DeviceReplay, seed, "cpu")
+    prefetched = _sampling_policy(_TD3DeviceReplay, seed, "cpu")
+    sequential.cfg.teacher_actor_replay_fraction = 0.4
+    prefetched.cfg.teacher_actor_replay_fraction = 0.4
+
+    expected_q = PPOBCDaggerFinetune._sample_balanced_q_batch(sequential)
+    expected_actor = sequential._sample_actor_batch()
+    plan = _prefetch_td3_replay_sample_plans(
+        prefetched.dagger_replay,
+        prefetched.q_teacher_replay,
+        q_batch_size=6,
+        actor_batch_size=5,
+        update_count=1,
+        policy_delay=2,
+        critic_update_count=3,
+        teacher_actor_replay_fraction=0.4,
+        output_device="cpu",
+        generator=prefetched.q_rng,
+    )[0]
+    actual_q = prefetched._sample_balanced_q_batch(plan)
+    actual_actor = prefetched._sample_actor_batch(
+        plan.actor_indices,
+        plan.actor_teacher_indices,
+    )
+
+    _assert_nested_equal(actual_q, expected_q)
+    _assert_nested_equal(actual_actor, expected_actor)
+    assert torch.equal(sequential.q_rng.get_state(), prefetched.q_rng.get_state())
+    source = actual_actor[DAGGER_Q_TEACHER_SOURCE_KEY]
+    assert source.sum().item() == 2
+    assert (~source).sum().item() == 3
+    # q_teacher_replay retained only executed Teacher actions, so synthesizing
+    # Actor labels from its action field is exact and every such label is valid.
+    assert actual_actor[DAGGER_TEACHER_ACTION_VALID_KEY][source].all()
+    assert torch.all(actual_actor[DAGGER_REPLAY_TEACHER_ACTIONS][source] < 1_000.0)
+    assert torch.all(actual_actor[DAGGER_REPLAY_TEACHER_ACTIONS][~source] >= 2_000.0)
 
 
 def test_td3_config_rejects_persistent_teacher_h5_export():
@@ -1259,6 +1542,7 @@ def test_actor_update_combines_td3_and_bc_before_one_backward_and_step():
         "critic_observations": torch.ones(3, 1),
         DAGGER_REPLAY_TEACHER_ACTIONS: torch.tensor([[0.5], [-0.2], [0.1]]),
         DAGGER_TEACHER_ACTION_VALID_KEY: torch.tensor([True, True, False]),
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([True, False, True]),
     }
 
     expected_actor = copy.deepcopy(policy.actor_adapt)
@@ -1303,6 +1587,7 @@ def test_actor_update_combines_td3_and_bc_before_one_backward_and_step():
         metrics["weighted_td3_actor_loss"].item() + metrics["weighted_bc_loss"].item()
     )
     assert policy.actor_update_count == 1
+    assert metrics["actor_teacher_replay_fraction"].item() == pytest.approx(2 / 3)
     assert all(parameter.grad is None for parameter in policy.qnet.parameters())
 
 
@@ -1699,6 +1984,7 @@ def _checkpoint_test_policy(seed: int, *, with_actor_target: bool):
     policy.q_rng = torch.Generator().manual_seed(seed + 2)
     policy.collector_exploration_rng = torch.Generator().manual_seed(seed + 3)
     policy.target_policy_rng = torch.Generator().manual_seed(seed + 4)
+    policy.teacher_perception_rng = torch.Generator().manual_seed(seed + 5)
     policy._last_td3_diagnostics = {}
     return policy
 
@@ -1723,6 +2009,7 @@ def test_td3_checkpoint_seam_round_trips_all_owned_training_state():
         source.q_rng,
         source.collector_exploration_rng,
         source.target_policy_rng,
+        source.teacher_perception_rng,
     )
     for draw_count, generator in enumerate(generators, start=1):
         torch.rand(draw_count, generator=generator)
@@ -1759,6 +2046,7 @@ def test_td3_checkpoint_seam_round_trips_all_owned_training_state():
         "q_rng",
         "collector_exploration_rng",
         "target_policy_rng",
+        "teacher_perception_rng",
     ):
         source_generator = getattr(source, name)
         restored_generator = getattr(restored, name)

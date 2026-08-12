@@ -28,8 +28,11 @@ nohup env \
   algo.dagger_beta_end=0 \
   algo.eta_sac=0.0001 \
   algo.lambda_bc=1.0 \
-  algo.sac_initial_action_std=0.1 \
-  algo.q_updates_per_rollout=32 \
+  algo.sac_initial_action_std=0.05 \
+  algo.q_updates_per_rollout=4 \
+  algo.sac_policy_frequency=1 \
+  algo.policy_delay=1 \
+  task.num_envs=128 \
   save_interval=100 \
   > fastSAC_bc_dagger_3000.log 2>&1 < /dev/null &
 

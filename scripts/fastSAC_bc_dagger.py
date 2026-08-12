@@ -83,6 +83,13 @@ def _finite_positive(name: str, value) -> float:
     return value
 
 
+def _finite_fraction(name: str, value) -> float:
+    value = _finite_nonnegative(name, value)
+    if value > 1.0:
+        raise ValueError(f"{name} must lie in [0, 1]")
+    return value
+
+
 def apply_fastsac_dagger_iteration_controls(cfg: DictConfig) -> None:
     """Convert the explicit main-rollout count to the shared frame budget."""
     iterations = cfg.get("fastsac_dagger_iterations", None)
@@ -409,6 +416,7 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         "dagger_batch_size",
         "perception_replay_burn_in",
         "perception_encode_microbatch_size",
+        "teacher_perception_batch_size",
     ):
         _positive_int(f"algo.{name}", cfg.algo.get(name, None))
     _positive_int(
@@ -416,6 +424,19 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         cfg.algo.get("teacher_prefill_rollouts", None),
         allow_zero=True,
     )
+    for name in (
+        "teacher_actor_replay_fraction",
+        "teacher_perception_replay_fraction",
+    ):
+        _finite_fraction(f"algo.{name}", cfg.algo.get(name, None))
+    if (
+        float(cfg.algo.teacher_actor_replay_fraction) > 0.0
+        or float(cfg.algo.teacher_perception_replay_fraction) > 0.0
+    ) and int(cfg.algo.teacher_prefill_rollouts) == 0:
+        raise ValueError(
+            "Teacher Actor/perception replay fractions require "
+            "algo.teacher_prefill_rollouts > 0"
+        )
     _validate_replay_contract(cfg)
     _validate_sac_controls(cfg)
 

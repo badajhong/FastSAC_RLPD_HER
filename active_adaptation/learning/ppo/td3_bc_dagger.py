@@ -29,6 +29,8 @@ from .common import (
     OBS_PRIV_KEY,
     REWARD_KEY,
     hard_copy_,
+    make_batch,
+    soft_copy_,
 )
 from .fastsac_vel import (
     FASTSAC_Q_DEFAULT_ACTION_FUSION,
@@ -86,6 +88,7 @@ from .ppo_vel import (
     OBJECT_PRED_TRANS_KEY,
     PPOConfig,
     PPOVEL,
+    PRIV_FEATURE_KEY,
     PRIV_PRED_KEY,
     VEL_CMD_KEY,
     set_recurrent_mode,
@@ -554,6 +557,7 @@ class _TD3ReplaySamplePlan:
     student_indices: torch.Tensor
     permutation: torch.Tensor
     actor_indices: torch.Tensor | None
+    actor_teacher_indices: torch.Tensor | None
 
 
 @torch.no_grad()
@@ -566,6 +570,7 @@ def _prefetch_td3_replay_sample_plans(
     update_count: int,
     policy_delay: int,
     critic_update_count: int,
+    teacher_actor_replay_fraction: float = 0.0,
     output_device,
     generator: torch.Generator,
 ) -> tuple[_TD3ReplaySamplePlan, ...]:
@@ -587,6 +592,12 @@ def _prefetch_td3_replay_sample_plans(
         raise ValueError("q_batch_size must be a positive even integer")
     if actor_batch_size < 1 or update_count < 0 or policy_delay < 1:
         raise ValueError("TD3 sample-plan sizes and policy_delay are invalid")
+    teacher_actor_replay_fraction = float(teacher_actor_replay_fraction)
+    if (
+        not math.isfinite(teacher_actor_replay_fraction)
+        or not 0.0 <= teacher_actor_replay_fraction <= 1.0
+    ):
+        raise ValueError("teacher_actor_replay_fraction must be in [0,1]")
     if update_count == 0:
         return ()
     if q_teacher_replay.size < 1:
@@ -606,7 +617,7 @@ def _prefetch_td3_replay_sample_plans(
     teacher_count = q_batch_size // 2
     student_count = q_batch_size - teacher_count
     index_draws: list[torch.Tensor] = []
-    records: list[tuple[int, int, torch.Tensor, int | None]] = []
+    records: list[tuple[int, int, torch.Tensor, int | None, int | None]] = []
     for update_index in range(update_count):
         teacher_draw = len(index_draws)
         index_draws.append(
@@ -632,18 +643,44 @@ def _prefetch_td3_replay_sample_plans(
             q_batch_size, device=generator_device, generator=generator
         )
         actor_draw = None
+        actor_teacher_draw = None
         if (int(critic_update_count) + update_index + 1) % policy_delay == 0:
-            actor_draw = len(index_draws)
-            index_draws.append(
-                torch.randint(
-                    0,
-                    dagger_replay.size,
-                    (actor_batch_size,),
-                    device=generator_device,
-                    generator=generator,
-                )
+            actor_teacher_count = min(
+                actor_batch_size,
+                int(math.floor(actor_batch_size * teacher_actor_replay_fraction + 0.5)),
             )
-        records.append((teacher_draw, student_draw, permutation, actor_draw))
+            actor_main_count = actor_batch_size - actor_teacher_count
+            if actor_teacher_count:
+                actor_teacher_draw = len(index_draws)
+                index_draws.append(
+                    torch.randint(
+                        0,
+                        q_teacher_replay.size,
+                        (actor_teacher_count,),
+                        device=generator_device,
+                        generator=generator,
+                    )
+                )
+            if actor_main_count:
+                actor_draw = len(index_draws)
+                index_draws.append(
+                    torch.randint(
+                        0,
+                        dagger_replay.size,
+                        (actor_main_count,),
+                        device=generator_device,
+                        generator=generator,
+                    )
+                )
+        records.append(
+            (
+                teacher_draw,
+                student_draw,
+                permutation,
+                actor_draw,
+                actor_teacher_draw,
+            )
+        )
 
     lengths = [int(draw.numel()) for draw in index_draws]
     packed_indices = torch.cat(index_draws)
@@ -651,16 +688,26 @@ def _prefetch_td3_replay_sample_plans(
         packed_indices = packed_indices.to("cpu")
     cpu_draws = packed_indices.split(lengths)
     plans = []
-    for teacher_draw, student_draw, permutation, actor_draw in records:
+    for (
+        teacher_draw,
+        student_draw,
+        permutation,
+        actor_draw,
+        actor_teacher_draw,
+    ) in records:
         teacher_indices = cpu_draws[teacher_draw]
         student_indices = valid_student_indices.index_select(0, cpu_draws[student_draw])
         actor_indices = None if actor_draw is None else cpu_draws[actor_draw]
+        actor_teacher_indices = (
+            None if actor_teacher_draw is None else cpu_draws[actor_teacher_draw]
+        )
         plans.append(
             _TD3ReplaySamplePlan(
                 teacher_indices=teacher_indices,
                 student_indices=student_indices,
                 permutation=permutation,
                 actor_indices=actor_indices,
+                actor_teacher_indices=actor_teacher_indices,
             )
         )
     return tuple(plans)
@@ -693,6 +740,14 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     dagger_buffer_capacity: int = 131_072
     dagger_buffer_device: str = "cpu"
     dagger_batch_size: int = 4096
+    # Optional GA-DDPG-style expert-row share in every Actor update.  Teacher
+    # rows come from q_teacher_replay and use their executed action as the exact
+    # BC label; zero preserves the original main-DAgger-only Actor sampling.
+    teacher_actor_replay_fraction: float = 0.0
+    # Loss weight assigned to frozen Teacher raw replay in every existing
+    # adaptation optimizer step; the remainder weights the live rollout loss.
+    # The raw replay stores sensor/model inputs rather than stale latents.
+    teacher_perception_replay_fraction: float = 0.0
     # Optional collection-only phase before main DAgger.  These rollouts force
     # every valid Teacher action and populate only q_teacher_replay; they never
     # enter dagger_replay or advance the main beta/training counters.
@@ -707,6 +762,7 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     )
     perception_replay_burn_in: int = 8
     perception_encode_microbatch_size: int = 128
+    teacher_perception_batch_size: int = 128
     perception_depth_codec: str = PERCEPTION_DEPTH_CODEC
 
     eta_td3: float = 1.0
@@ -1042,6 +1098,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self.target_policy_rng = torch.Generator(device=generator_device).manual_seed(
             int(cfg.q_seed) + 2
         )
+        self.teacher_perception_rng = torch.Generator(
+            device=generator_device
+        ).manual_seed(int(cfg.q_seed) + 3)
         self.dagger_rollout_count = 0
         self.dagger_environment_steps = 0
         self.teacher_prefill_rollout_count = 0
@@ -1126,6 +1185,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_teacher_buffer_capacity",
             "perception_replay_burn_in",
             "perception_encode_microbatch_size",
+            "teacher_perception_batch_size",
         )
         for name in positive_integers:
             value = getattr(cfg, name)
@@ -1152,6 +1212,25 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             float(cfg.q_teacher_replay_ratio), 0.5, rel_tol=0.0, abs_tol=1e-12
         ):
             raise ValueError("Phase 1 keeps exact 50/50 Teacher/Student Q replay")
+        for name in (
+            "teacher_actor_replay_fraction",
+            "teacher_perception_replay_fraction",
+        ):
+            fraction = getattr(cfg, name)
+            if (
+                isinstance(fraction, bool)
+                or not math.isfinite(float(fraction))
+                or not 0.0 <= float(fraction) <= 1.0
+            ):
+                raise ValueError(f"{name} must be in [0,1]")
+        if (
+            float(cfg.teacher_actor_replay_fraction) > 0.0
+            or float(cfg.teacher_perception_replay_fraction) > 0.0
+        ) and int(prefill_rollouts) == 0:
+            raise ValueError(
+                "Teacher Actor/perception replay fractions require "
+                "teacher_prefill_rollouts > 0"
+            )
         for name in (
             "dagger_bc_lr",
             "dagger_actor_huber_delta",
@@ -1757,6 +1836,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise RuntimeError("Critic parameters accumulated Actor-step gradients")
         self.actor_optimizer.step()
         self.actor_update_count += 1
+        teacher_source = batch.get(DAGGER_Q_TEACHER_SOURCE_KEY)
+        actor_teacher_replay_fraction = (
+            prediction_latent.new_zeros(())
+            if teacher_source is None
+            else teacher_source.float().mean()
+        )
         return {
             "td3_actor_loss": td3_actor_loss.detach(),
             "exact_bc_loss": exact_bc_loss.detach(),
@@ -1765,6 +1850,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "total_actor_loss": total_actor_loss.detach(),
             "actor_grad_norm": actor_grad.detach(),
             "actor_expected_q1_mean": expected_q1.detach().mean(),
+            "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
         }
 
     def _maybe_delayed_actor_and_targets(self, actor_batch: dict[str, torch.Tensor]):
@@ -1819,6 +1905,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 if int(self.cfg.teacher_prefill_rollouts) > 0
                 else "online_teacher_executed_0.5_student_executed_0.5_v1"
             ),
+            "actor_teacher_replay_fraction": float(
+                self.cfg.teacher_actor_replay_fraction
+            ),
+            "actor_replay_mix_semantics": (
+                "combined_rl_bc_on_prefill_teacher_and_main_dagger_rows_v1"
+            ),
         }
 
     def _checkpoint_config(self):
@@ -1839,6 +1931,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "dagger_buffer_capacity",
             "dagger_buffer_device",
             "dagger_batch_size",
+            "teacher_actor_replay_fraction",
+            "teacher_perception_replay_fraction",
             "teacher_prefill_rollouts",
             "eta_td3",
             "lambda_bc",
@@ -1868,6 +1962,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_teacher_buffer_capacity",
             "perception_replay_burn_in",
             "perception_encode_microbatch_size",
+            "teacher_perception_batch_size",
             "perception_depth_codec",
             "save_teacher_buffer",
         )
@@ -1906,27 +2001,390 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError("Q replay sample plan has the wrong permutation shape")
         return {key: value[sample_plan.permutation] for key, value in mixed.items()}
 
-    def _sample_actor_batch(self, indices: torch.Tensor | None = None):
-        fields = (
+    def _sample_actor_batch(
+        self,
+        indices: torch.Tensor | None = None,
+        teacher_indices: torch.Tensor | None = None,
+    ):
+        """Sample one mixed Actor batch without changing the zero-share path."""
+        main_fields = (
             "critic_observations",
             DAGGER_REPLAY_TEACHER_ACTIONS,
             DAGGER_TEACHER_ACTION_VALID_KEY,
             *_PERCEPTION_REPLAY_FIELDS,
         )
-        if indices is None:
-            batch = self.dagger_replay.sample(
-                int(self.cfg.dagger_batch_size),
+        batch_size = int(self.cfg.dagger_batch_size)
+        fraction = float(getattr(self.cfg, "teacher_actor_replay_fraction", 0.0))
+        teacher_count = min(
+            batch_size,
+            int(math.floor(batch_size * fraction + 0.5)),
+        )
+        main_count = batch_size - teacher_count
+
+        # Keep the old operation and RNG sequence byte-for-byte at the
+        # backward-compatible default.
+        if teacher_count == 0:
+            if teacher_indices is not None:
+                raise ValueError("Actor replay plan unexpectedly contains Teacher rows")
+            if indices is None:
+                batch = self.dagger_replay.sample(
+                    batch_size,
+                    self.device,
+                    self.q_rng,
+                    fields=main_fields,
+                )
+            else:
+                if indices.numel() != batch_size:
+                    raise ValueError("Actor replay sample plan has the wrong row count")
+                batch = self.dagger_replay.sample_by_indices(
+                    indices, self.device, fields=main_fields
+                )
+            return self._prepare_dagger_learning_batch(batch)
+
+        teacher_fields = (
+            "critic_observations",
+            "actions",
+            *_PERCEPTION_REPLAY_FIELDS,
+        )
+        if teacher_indices is None:
+            teacher = self.q_teacher_replay.sample(
+                teacher_count,
                 self.device,
                 self.q_rng,
-                fields=fields,
+                fields=teacher_fields,
             )
         else:
-            if indices.numel() != int(self.cfg.dagger_batch_size):
-                raise ValueError("Actor replay sample plan has the wrong row count")
-            batch = self.dagger_replay.sample_by_indices(
-                indices, self.device, fields=fields
+            if teacher_indices.numel() != teacher_count:
+                raise ValueError(
+                    "Teacher Actor replay sample plan has the wrong row count"
+                )
+            teacher = self.q_teacher_replay.sample_by_indices(
+                teacher_indices, self.device, fields=teacher_fields
             )
+        teacher[DAGGER_REPLAY_TEACHER_ACTIONS] = teacher.pop("actions")
+        teacher[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(
+            teacher_count, dtype=torch.bool, device=self.device
+        )
+
+        main = None
+        if main_count:
+            if indices is None:
+                main = self.dagger_replay.sample(
+                    main_count,
+                    self.device,
+                    self.q_rng,
+                    fields=main_fields,
+                )
+            else:
+                if indices.numel() != main_count:
+                    raise ValueError("Actor replay sample plan has the wrong row count")
+                main = self.dagger_replay.sample_by_indices(
+                    indices, self.device, fields=main_fields
+                )
+        elif indices is not None and indices.numel() != 0:
+            raise ValueError("Actor replay sample plan has the wrong row count")
+
+        if main is None:
+            batch = teacher
+        else:
+            batch = {
+                key: torch.cat((teacher[key], main[key]), dim=0) for key in main_fields
+            }
+        batch[DAGGER_Q_TEACHER_SOURCE_KEY] = torch.cat(
+            (
+                torch.ones(teacher_count, dtype=torch.bool, device=self.device),
+                torch.zeros(main_count, dtype=torch.bool, device=self.device),
+            )
+        )
         return self._prepare_dagger_learning_batch(batch)
+
+    def _teacher_perception_replay_loss(self) -> dict[str, torch.Tensor]:
+        """Recompute one supervised perception loss from frozen Teacher inputs.
+
+        The replay is authoritative only for model inputs.  Learned recurrent
+        states and ``priv_pred`` are never stored: the online depth/object/adapt
+        modules are rerun from a zero boundary through the raw burn-in window.
+        The privileged target is reconstructed from the current replay state.
+        """
+        if self.q_teacher_replay.size < 1:
+            raise RuntimeError(
+                "teacher_perception_replay_fraction requires non-empty q_teacher_replay"
+            )
+        if self._replay_object_geo is None:
+            raise RuntimeError("Teacher perception replay has no object geometry")
+
+        fields = ("critic_observations", *_PERCEPTION_REPLAY_FIELDS)
+        batch_size = int(self.cfg.teacher_perception_batch_size)
+        batch = self.q_teacher_replay.sample(
+            batch_size,
+            self.device,
+            self.teacher_perception_rng,
+            fields=fields,
+        )
+        batch = PPOBCDaggerFinetune._prepare_dagger_learning_batch(self, batch)
+        critic_chunks = batch["critic_observations"].split(
+            self._q_critic_widths, dim=-1
+        )
+        critic = dict(zip(self.q_critic_keys, critic_chunks))
+        if OBS_PRIV_KEY not in critic or OBJECT_KEY not in critic:
+            raise RuntimeError(
+                "Teacher perception replay lacks privileged/object targets"
+            )
+
+        depth_u8 = batch[PERCEPTION_DEPTH_U8_KEY]
+        policy_raw = batch[PERCEPTION_POLICY_RAW_KEY]
+        vel_raw = batch[PERCEPTION_VEL_COMMAND_RAW_KEY]
+        is_init = batch[PERCEPTION_IS_INIT_KEY]
+        row_count, window_length = depth_u8.shape[:2]
+        expected_length = int(self.cfg.perception_replay_burn_in) + 2
+        if int(window_length) != expected_length:
+            raise ValueError(
+                f"Teacher perception window has length {window_length}; "
+                f"expected {expected_length}"
+            )
+
+        snapshot = self._vecnorm_snapshot()
+        depth = self._normalize_replay_value(
+            DEPTH_KEY, _decode_replay_depth_u8(depth_u8), snapshot
+        )
+        policy = self._normalize_replay_value(OBS_KEY, policy_raw, snapshot)
+        vel = self._normalize_replay_value(VEL_CMD_KEY, vel_raw, snapshot)
+        geometry = self._replay_object_geo.to(device=depth.device, dtype=policy.dtype)
+
+        target = TensorDict(
+            {
+                OBS_PRIV_KEY: critic[OBS_PRIV_KEY],
+                OBJECT_KEY: critic[OBJECT_KEY],
+                OBJECT_GEO_KEY: geometry.view(1, -1).expand(row_count, -1),
+            },
+            batch_size=(row_count,),
+            device=depth.device,
+        )
+        with torch.no_grad():
+            self.object_transform(target)
+            self.encoder_priv(target)
+
+        student = TensorDict(
+            {
+                DEPTH_KEY: depth,
+                OBS_KEY: policy,
+                VEL_CMD_KEY: vel,
+                OBJECT_GEO_KEY: geometry.view(1, 1, -1).expand(
+                    row_count, window_length, -1
+                ),
+                "is_init": is_init,
+                "depth_hx": torch.zeros(
+                    row_count,
+                    window_length,
+                    self.depth_feature_dim,
+                    device=depth.device,
+                    dtype=policy.dtype,
+                ),
+                "adapt_hx": torch.zeros(
+                    row_count,
+                    window_length,
+                    int(self.cfg.latent_dim),
+                    device=depth.device,
+                    dtype=policy.dtype,
+                ),
+            },
+            batch_size=(row_count, window_length),
+            device=depth.device,
+        )
+        self.temporal_depth_gru(student)
+        self.object_adapt(student)
+        self.object_pred_transform(student)
+        self.adapt_module(student)
+
+        reset = is_init[:, -2].bool().reshape(row_count, -1).any(dim=-1)
+        valid = (~reset).to(policy.dtype)
+        object_error = self.adapt_loss_fn(
+            student[OBJECT_PRED_KEY][:, -2], target[OBJECT_KEY]
+        )
+        priv_error = self.adapt_loss_fn(
+            student[PRIV_PRED_KEY][:, -2], target[PRIV_FEATURE_KEY]
+        )
+        object_loss = (object_error * valid.unsqueeze(-1)).mean()
+        priv_loss = (priv_error * valid.unsqueeze(-1)).mean()
+        return {
+            "priv_loss": priv_loss,
+            "object_loss": object_loss,
+            "priv_feature_norm": target[PRIV_FEATURE_KEY].norm(p=2, dim=-1).mean(),
+            "priv_pred_norm": student[PRIV_PRED_KEY][:, -2].norm(p=2, dim=-1).mean(),
+            "depth_feature_norm": student["_depth_feature"][:, -2]
+            .norm(p=2, dim=-1)
+            .mean(),
+            "valid_fraction": valid.mean(),
+            "rows": priv_loss.new_tensor(float(row_count)),
+        }
+
+    @set_recurrent_mode(True)
+    def train_adapt(self, tensordict: TensorDict):
+        """Mix frozen-Teacher raw replay into the existing adaptation steps."""
+        fraction = float(self.cfg.teacher_perception_replay_fraction)
+        if fraction == 0.0:
+            # Preserve the original implementation, RNG stream, optimizer
+            # count, and EMA update exactly at the backward-compatible default.
+            return PPOVEL.train_adapt(self, tensordict)
+        if self.q_teacher_replay.size < 1:
+            raise RuntimeError(
+                "teacher_perception_replay_fraction is positive but the "
+                "Teacher replay is empty"
+            )
+
+        if fraction < 1.0:
+            with torch.no_grad():
+                self.object_transform(tensordict)
+                self.encoder_priv(tensordict)
+
+        infos: list[dict[str, torch.Tensor]] = []
+        for _ in range(2):
+            minibatches = (
+                make_batch(tensordict, self.cfg.num_minibatches, self.cfg.train_every)
+                if fraction < 1.0
+                else (None for _ in range(int(self.cfg.num_minibatches)))
+            )
+            for minibatch in minibatches:
+                if minibatch is not None:
+                    self.temporal_depth_gru(minibatch)
+                    self.object_adapt(minibatch)
+                    online_object_loss = (
+                        self.adapt_loss_fn(
+                            minibatch[OBJECT_PRED_KEY], minibatch[OBJECT_KEY]
+                        )
+                        * (~minibatch["is_init"])
+                    ).mean()
+                    self.object_pred_transform(minibatch)
+                    self.adapt_module(minibatch)
+                    online_priv_loss = (
+                        self.adapt_loss_fn(
+                            minibatch[PRIV_PRED_KEY], minibatch[PRIV_FEATURE_KEY]
+                        )
+                        * (~minibatch["is_init"])
+                    ).mean()
+                    online_priv_feature_norm = (
+                        minibatch[PRIV_FEATURE_KEY].norm(p=2, dim=-1).mean()
+                    )
+                    online_priv_pred_norm = (
+                        minibatch[PRIV_PRED_KEY].norm(p=2, dim=-1).mean()
+                    )
+                    online_depth_feature_norm = (
+                        minibatch["_depth_feature"].norm(p=2, dim=-1).mean()
+                    )
+                else:
+                    online_priv_loss = torch.zeros((), device=self.device)
+                    online_object_loss = torch.zeros((), device=self.device)
+                    online_priv_feature_norm = torch.zeros((), device=self.device)
+                    online_priv_pred_norm = torch.zeros((), device=self.device)
+                    online_depth_feature_norm = torch.zeros((), device=self.device)
+
+                self.opt_adapt.zero_grad()
+                online_total = online_priv_loss + online_object_loss
+                if fraction < 1.0:
+                    ((1.0 - fraction) * online_total).backward()
+
+                # Build the replay graph only after releasing the much larger
+                # live-rollout graph.  Two backwards before one optimizer step
+                # are exactly the gradient of the weighted sum while reducing
+                # peak CNN/GRU activation memory.
+                teacher = self._teacher_perception_replay_loss()
+                teacher_total = teacher["priv_loss"] + teacher["object_loss"]
+                (fraction * teacher_total).backward()
+                priv_loss = (
+                    1.0 - fraction
+                ) * online_priv_loss.detach() + fraction * teacher["priv_loss"].detach()
+                object_loss = (
+                    1.0 - fraction
+                ) * online_object_loss.detach() + fraction * teacher[
+                    "object_loss"
+                ].detach()
+                all_params = list(self.adapt_module.parameters())
+                all_params += list(self.object_adapt.parameters())
+                depth_params = list(self.temporal_depth_gru.parameters())
+                depth_parameter_norms = [
+                    parameter.grad.detach().norm(2)
+                    for parameter in depth_params
+                    if parameter.grad is not None
+                ]
+                depth_grad_norm = (
+                    torch.stack(depth_parameter_norms).norm(2)
+                    if depth_parameter_norms
+                    else torch.zeros((), device=self.device)
+                )
+                all_params += depth_params
+                opt_adapt_grad_norm = nn.utils.clip_grad_norm_(
+                    all_params, self.cfg.max_grad_norm
+                )
+                self.opt_adapt.step()
+
+                info = {
+                    "adapt/priv_loss": priv_loss.detach(),
+                    "adapt/object_loss": object_loss.detach(),
+                    "adapt/online_priv_loss": online_priv_loss.detach(),
+                    "adapt/online_object_loss": online_object_loss.detach(),
+                    "adapt/teacher_replay_priv_loss": teacher["priv_loss"].detach(),
+                    "adapt/teacher_replay_object_loss": teacher["object_loss"].detach(),
+                    "adapt/teacher_replay_fraction": priv_loss.new_tensor(fraction),
+                    "adapt/teacher_replay_valid_fraction": teacher[
+                        "valid_fraction"
+                    ].detach(),
+                    "adapt/teacher_replay_rows": teacher["rows"].detach(),
+                    "adapt/grad_norm": torch.as_tensor(opt_adapt_grad_norm).detach(),
+                    "adapt/depth_grad_norm": depth_grad_norm.detach(),
+                    "adapt/priv_feature_norm": online_priv_feature_norm.detach(),
+                    "adapt/priv_pred_norm": online_priv_pred_norm.detach(),
+                    "adapt/depth_feature_norm": online_depth_feature_norm.detach(),
+                    "adapt/teacher_replay_priv_feature_norm": teacher[
+                        "priv_feature_norm"
+                    ].detach(),
+                    "adapt/teacher_replay_priv_pred_norm": teacher[
+                        "priv_pred_norm"
+                    ].detach(),
+                    "adapt/teacher_replay_depth_feature_norm": teacher[
+                        "depth_feature_norm"
+                    ].detach(),
+                }
+
+                if self.cfg.train_dr_estimator and minibatch is not None:
+                    minibatch[PRIV_PRED_KEY] = minibatch[PRIV_PRED_KEY].detach()
+                    self.dr_estimator(minibatch)
+                    dr_est_loss = (
+                        (minibatch["dr_pred"] - minibatch["dr_"]).square().mean()
+                    )
+                    self.opt_dr_estimator.zero_grad()
+                    dr_est_loss.backward()
+                    dr_est_grad_norm = nn.utils.clip_grad_norm_(
+                        self.dr_estimator.parameters(), self.cfg.max_grad_norm
+                    )
+                    self.opt_dr_estimator.step()
+                    info["adapt/dr_est_grad_norm"] = torch.as_tensor(
+                        dr_est_grad_norm
+                    ).detach()
+                    info["adapt/dr_est_loss"] = dr_est_loss.detach()
+                infos.append(info)
+
+        # Exactly one EMA update per main rollout, matching PPOVEL.train_adapt.
+        soft_copy_(self.adapt_module, self.adapt_ema, 0.04)
+        soft_copy_(self.object_adapt, self.object_adapt_ema, 0.04)
+        soft_copy_(self.temporal_depth_gru, self.temporal_depth_gru_ema, 0.04)
+
+        result = {
+            key: torch.stack([item[key].float() for item in infos]).mean().item()
+            for key in sorted(infos[0])
+        }
+        with torch.no_grad():
+            squared_error = torch.zeros((), device=self.device)
+            parameter_count = 0
+            for online, ema in zip(
+                self.temporal_depth_gru.parameters(),
+                self.temporal_depth_gru_ema.parameters(),
+            ):
+                squared_error += (online - ema).square().sum()
+                parameter_count += online.numel()
+            result["adapt/depth_ema_rms_gap"] = (
+                (squared_error / max(parameter_count, 1)).sqrt().item()
+            )
+        return result
 
     @staticmethod
     def _mean_metric_dict(metrics: list[dict[str, torch.Tensor]], keys):
@@ -2027,6 +2485,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "td3/critic_update_count": self.critic_update_count,
                 "td3/actor_updates_this_rollout": 0,
                 "td3/critic_updates_this_rollout": 0,
+                "td3/actor_teacher_replay_fraction": 0.0,
                 "td3/collector_exploration_noise_norm": collector_noise_norm,
                 "td3/valid_teacher_fraction": valid_labels
                 / max(valid_labels + student_selected, 1),
@@ -2066,6 +2525,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     update_count=q_updates,
                     policy_delay=int(self.cfg.policy_delay),
                     critic_update_count=int(self.critic_update_count),
+                    teacher_actor_replay_fraction=float(
+                        self.cfg.teacher_actor_replay_fraction
+                    ),
                     output_device=self.device,
                     generator=self.q_rng,
                 )
@@ -2080,10 +2542,22 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     actor_indices = (
                         None if sample_plan is None else sample_plan.actor_indices
                     )
-                    if sample_plan is not None and actor_indices is None:
+                    actor_teacher_indices = (
+                        None
+                        if sample_plan is None
+                        else sample_plan.actor_teacher_indices
+                    )
+                    if (
+                        sample_plan is not None
+                        and actor_indices is None
+                        and actor_teacher_indices is None
+                    ):
                         raise RuntimeError("delayed Actor replay plan is missing")
                     delayed = self._maybe_delayed_actor_and_targets(
-                        self._sample_actor_batch(actor_indices)
+                        self._sample_actor_batch(
+                            actor_indices,
+                            actor_teacher_indices,
+                        )
                     )
                     if delayed is None:
                         raise RuntimeError("scheduled delayed Actor update was skipped")
@@ -2124,6 +2598,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "total_actor_loss",
             "actor_grad_norm",
             "actor_expected_q1_mean",
+            "actor_teacher_replay_fraction",
         )
         critic = self._mean_metric_dict(critic_metrics, critic_keys)
         actor = self._mean_metric_dict(actor_metrics, actor_keys)
@@ -2161,6 +2636,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "td3/expected_q1_mean": critic["expected_q1_mean"],
             "td3/expected_q2_mean": critic["expected_q2_mean"],
             "td3/actor_expected_q1_mean": actor["actor_expected_q1_mean"],
+            "td3/actor_teacher_replay_fraction": actor["actor_teacher_replay_fraction"],
             "td3/target_expected_q1_mean": critic["target_expected_q1_mean"],
             "td3/target_expected_q2_mean": critic["target_expected_q2_mean"],
             "td3/twin_expected_q_disagreement": critic["twin_expected_q_disagreement"],
@@ -2241,6 +2717,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 self.collector_exploration_rng.get_state()
             ),
             "target_policy_rng_state": self.target_policy_rng.get_state(),
+            "teacher_perception_rng_state": self.teacher_perception_rng.get_state(),
             "last_td3_diagnostics": copy.deepcopy(
                 getattr(self, "_last_td3_diagnostics", {})
             ),
@@ -2276,6 +2753,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             state["collector_exploration_rng_state"]
         )
         self.target_policy_rng.set_state(state["target_policy_rng_state"])
+        self.teacher_perception_rng.set_state(state["teacher_perception_rng_state"])
         self._last_td3_diagnostics = copy.deepcopy(
             state.get("last_td3_diagnostics", {})
         )
@@ -2354,6 +2832,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self.q_rng.manual_seed(int(self.cfg.q_seed))
             self.collector_exploration_rng.manual_seed(int(self.cfg.q_seed) + 1)
             self.target_policy_rng.manual_seed(int(self.cfg.q_seed) + 2)
+            self.teacher_perception_rng.manual_seed(int(self.cfg.q_seed) + 3)
         self._freeze_teacher()
         self.actor_adapt.requires_grad_(True).train()
         self.qnet.requires_grad_(True).train()

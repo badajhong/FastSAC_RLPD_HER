@@ -52,12 +52,15 @@ def _cfg(
                 "dagger_buffer_device": "cpu",
                 "dagger_batch_size": 4096,
                 "teacher_prefill_rollouts": 0,
+                "teacher_actor_replay_fraction": 0.0,
+                "teacher_perception_replay_fraction": 0.0,
                 "dagger_replay_raw_observations": True,
                 "replay_raw_observation_keys": list(
                     td3_entry.EXPECTED_REPLAY_RAW_OBSERVATION_KEYS
                 ),
                 "perception_replay_burn_in": 8,
                 "perception_encode_microbatch_size": 128,
+                "teacher_perception_batch_size": 128,
                 "perception_depth_codec": "uint8_div_100_v1",
                 "eta_td3": 1.0,
                 "lambda_bc": 1.0,
@@ -145,7 +148,7 @@ def test_td3_config_composes_without_simulator_startup():
 
     assert cfg.algo.name == "td3_bc_dagger"
     assert cfg.algo._target_ == td3_entry.EXPECTED_ALGO_TARGET
-    assert cfg.task.num_envs == 512
+    assert cfg.task.num_envs == 256
     assert cfg.algo.phase == "finetune"
     assert cfg.algo.vecnorm == "eval"
     assert list(cfg.algo.in_keys) == [
@@ -174,7 +177,9 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.algo.q_tau == pytest.approx(0.005)
     assert cfg.algo.dagger_buffer_capacity == 131_072
     assert cfg.algo.q_teacher_buffer_capacity == 131_072
-    assert cfg.algo.teacher_prefill_rollouts == 0
+    assert cfg.algo.teacher_prefill_rollouts == 10
+    assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.0)
+    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.0)
     assert list(cfg.algo.replay_raw_observation_keys) == [
         "vel_command",
         "policy",
@@ -184,6 +189,7 @@ def test_td3_config_composes_without_simulator_startup():
     ]
     assert cfg.algo.perception_replay_burn_in == 8
     assert cfg.algo.perception_encode_microbatch_size == 128
+    assert cfg.algo.teacher_perception_batch_size == 128
     assert cfg.algo.perception_depth_codec == "uint8_div_100_v1"
     assert cfg.algo.save_teacher_buffer is False
     assert "teacher_buffer_capacity" not in cfg.algo
@@ -196,7 +202,7 @@ def test_td3_config_composes_without_simulator_startup():
     schedule = td3_entry.td3_dagger_rollout_schedule(cfg)
     prefill = int(cfg.algo.teacher_prefill_rollouts)
     assert schedule == {
-        "frames_per_rollout": 16_384,
+        "frames_per_rollout": 8_192,
         "total_rollouts": 2400 - prefill,
         "main_rollouts": 2400 - prefill,
         "prefill_rollouts": prefill,
@@ -228,22 +234,23 @@ def test_recommended_3000_rollout_command_composes_raw_perception_replay():
         )
 
     td3_entry.validate_td3_bc_dagger_config(cfg)
-    assert cfg.total_frames == 49_152_000
+    assert cfg.total_frames == 3010 * 256 * 32
     assert cfg.algo.dagger_buffer_capacity == 131_072
     assert cfg.algo.q_teacher_buffer_capacity == 131_072
     assert cfg.algo.perception_replay_burn_in == 8
     assert cfg.algo.perception_encode_microbatch_size == 128
+    assert cfg.algo.teacher_perception_batch_size == 128
     assert cfg.algo.perception_depth_codec == "uint8_div_100_v1"
     assert cfg.algo.save_teacher_buffer is False
     assert cfg.algo.q_batch_size == 512
     assert cfg.algo.q_updates_per_rollout == 128
     assert cfg.algo.policy_delay == 2
     assert td3_entry.td3_dagger_rollout_schedule(cfg) == {
-        "frames_per_rollout": 16_384,
+        "frames_per_rollout": 8_192,
         "total_rollouts": 3000,
         "main_rollouts": 3000,
-        "prefill_rollouts": 0,
-        "physical_rollouts": 3000,
+        "prefill_rollouts": 10,
+        "physical_rollouts": 3010,
         "start_rollout": 0,
         "end_rollout": 3000,
         "decay_rollouts": 1800,
@@ -267,7 +274,7 @@ def test_td3_yaml_environment_count_can_be_overridden():
 
     td3_entry.validate_td3_bc_dagger_config(cfg)
     assert cfg.task.num_envs == 256
-    assert cfg.total_frames == 3000 * 256 * 32
+    assert cfg.total_frames == 3010 * 256 * 32
 
 
 def test_teacher_prefill_adds_physical_rollouts_without_shortening_main_beta_schedule():
@@ -324,6 +331,27 @@ def test_valid_config_allows_only_inert_inherited_ppo_fields():
     td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
+@pytest.mark.parametrize(
+    "field",
+    ("teacher_actor_replay_fraction", "teacher_perception_replay_fraction"),
+)
+@pytest.mark.parametrize("value", (-0.1, 1.1, float("nan"), True))
+def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
+    cfg = _cfg()
+    cfg.algo[field] = value
+    with pytest.raises(ValueError, match=r"non-negative|\[0, 1\]"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_teacher_replay_fractions_require_frozen_prefill_source():
+    cfg = _cfg()
+    cfg.algo.teacher_prefill_rollouts = 0
+    cfg.algo.teacher_actor_replay_fraction = 0.25
+
+    with pytest.raises(ValueError, match="teacher_prefill_rollouts > 0"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
 def test_persistent_teacher_h5_export_is_rejected():
     cfg = _cfg()
     cfg.algo.save_teacher_buffer = True
@@ -373,6 +401,7 @@ def test_config_rejects_forbidden_stochastic_policy_fields(field):
         ),
         ("perception_replay_burn_in", 7, "burn_in=8"),
         ("perception_encode_microbatch_size", 0, "positive"),
+        ("teacher_perception_batch_size", 0, "positive"),
         ("perception_depth_codec", "float16", "uint8_div_100_v1"),
         ("teacher_prefill_rollouts", -1, "non-negative"),
         ("lambda_bc", float("nan"), "non-negative"),

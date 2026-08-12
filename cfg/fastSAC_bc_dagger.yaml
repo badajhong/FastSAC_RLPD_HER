@@ -49,6 +49,13 @@ algo:
   dagger_buffer_device: cpu
   dagger_batch_size: 4096
   teacher_prefill_rollouts: 10
+  # Optional reuse of the frozen Teacher partition outside Critic updates.
+  # Actor fraction is an exact row share in each combined SAC+BC Actor batch.
+  # Perception fraction weights replay supervision against live-rollout
+  # supervision; replay raw windows are re-encoded by the current model.
+  # Zero preserves the historical main-rollout-only behavior.
+  teacher_actor_replay_fraction: 0.0
+  teacher_perception_replay_fraction: 0.0
   dagger_replay_raw_observations: true
   replay_raw_observation_keys:
     - vel_command
@@ -58,6 +65,7 @@ algo:
     - depth
   perception_replay_burn_in: 8
   perception_encode_microbatch_size: 128
+  teacher_perception_batch_size: 128
   perception_depth_codec: uint8_div_100_v1
 
   # Locked twin 501-atom distributional Critic and exact 50/50 frozen-Teacher /

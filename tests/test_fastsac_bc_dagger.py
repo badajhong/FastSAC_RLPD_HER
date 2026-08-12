@@ -16,6 +16,7 @@ from active_adaptation.learning.ppo.fastsac_vel import (
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_ACTION_DISCREPANCY_RMS_KEY,
     DAGGER_IS_STUDENT_ACTION_KEY,
+    DAGGER_Q_TEACHER_SOURCE_KEY,
     DAGGER_REPLAY_TEACHER_ACTIONS,
     DAGGER_TEACHER_ACTION_KEY,
     DAGGER_TEACHER_ACTION_VALID_KEY,
@@ -366,6 +367,7 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
         "critic_observations": torch.ones(3, 1),
         DAGGER_REPLAY_TEACHER_ACTIONS: torch.tensor([[0.5], [-0.2], [0.1]]),
         DAGGER_TEACHER_ACTION_VALID_KEY: torch.tensor([True, True, False]),
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([True, False, True]),
     }
 
     expected_actor = copy.deepcopy(policy.actor_adapt)
@@ -431,6 +433,7 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
     assert metrics["actor_min_expected_q_mean"].item() == pytest.approx(
         expected_pessimistic_q.mean().item()
     )
+    assert metrics["actor_teacher_replay_fraction"].item() == pytest.approx(2 / 3)
     assert all(parameter.grad is None for parameter in policy.qnet.parameters())
     assert all(parameter.requires_grad for parameter in policy.qnet.parameters())
 
@@ -724,6 +727,7 @@ def _checkpoint_policy(seed: int):
     policy.q_rng = torch.Generator().manual_seed(seed + 2)
     policy.sac_action_rng = torch.Generator().manual_seed(seed + 3)
     policy.sac_rollout_rng = torch.Generator().manual_seed(seed + 4)
+    policy.teacher_perception_rng = torch.Generator().manual_seed(seed + 5)
     policy.actor_target = None
     policy._last_fastsac_diagnostics = {}
     return policy
@@ -753,6 +757,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
             source.q_rng,
             source.sac_action_rng,
             source.sac_rollout_rng,
+            source.teacher_perception_rng,
         ),
         start=1,
     ):
@@ -764,6 +769,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     assert "collector_exploration_rng_state" not in state
     assert "sac_action_rng_state" in state
     assert "sac_rollout_rng_state" in state
+    assert "teacher_perception_rng_state" in state
 
     restored = _checkpoint_policy(900)
     restored._load_fastsac_checkpoint_state(state)
@@ -799,7 +805,13 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     assert restored.teacher_prefill_environment_steps == 23
     assert restored._last_fastsac_diagnostics == source._last_fastsac_diagnostics
 
-    for name in ("dagger_rng", "q_rng", "sac_action_rng", "sac_rollout_rng"):
+    for name in (
+        "dagger_rng",
+        "q_rng",
+        "sac_action_rng",
+        "sac_rollout_rng",
+        "teacher_perception_rng",
+    ):
         source_generator = getattr(source, name)
         restored_generator = getattr(restored, name)
         assert torch.equal(source_generator.get_state(), restored_generator.get_state())

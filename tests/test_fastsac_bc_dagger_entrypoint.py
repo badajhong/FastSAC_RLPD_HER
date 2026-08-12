@@ -43,12 +43,15 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "dagger_buffer_device": "cpu",
                 "dagger_batch_size": 4096,
                 "teacher_prefill_rollouts": 10,
+                "teacher_actor_replay_fraction": 0.0,
+                "teacher_perception_replay_fraction": 0.0,
                 "dagger_replay_raw_observations": True,
                 "replay_raw_observation_keys": list(
                     sac_entry.EXPECTED_REPLAY_RAW_OBSERVATION_KEYS
                 ),
                 "perception_replay_burn_in": 8,
                 "perception_encode_microbatch_size": 128,
+                "teacher_perception_batch_size": 128,
                 "perception_depth_codec": "uint8_div_100_v1",
                 "q_hidden_dim": 768,
                 "q_num_atoms": 501,
@@ -149,8 +152,11 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
 
     assert cfg.algo.name == "fastsac_bc_dagger"
     assert cfg.algo._target_ == sac_entry.EXPECTED_ALGO_TARGET
-    assert cfg.task.num_envs == 512
+    assert cfg.task.num_envs == 256
     assert cfg.algo.teacher_prefill_rollouts == 10
+    assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.0)
+    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.0)
+    assert cfg.algo.teacher_perception_batch_size == 128
     assert cfg.algo.dagger_beta_start == pytest.approx(0.0)
     assert cfg.algo.dagger_beta_end == pytest.approx(0.0)
     assert cfg.algo.eta_sac == pytest.approx(1.0e-4)
@@ -164,9 +170,9 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
     assert cfg.algo.collector_exploration_noise_std == 0.0
 
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
-    assert cfg.total_frames == 3010 * 512 * 32
+    assert cfg.total_frames == 3010 * 256 * 32
     assert sac_entry.fastsac_dagger_rollout_schedule(cfg) == {
-        "frames_per_rollout": 16_384,
+        "frames_per_rollout": 8_192,
         "total_rollouts": 3000,
         "main_rollouts": 3000,
         "prefill_rollouts": 10,
@@ -206,6 +212,27 @@ def test_explicit_main_rollout_budget_is_required():
 def test_pure_student_main_rollout_requires_teacher_prefill():
     cfg = _cfg()
     cfg.algo.teacher_prefill_rollouts = 0
+    with pytest.raises(ValueError, match="teacher_prefill_rollouts > 0"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("teacher_actor_replay_fraction", "teacher_perception_replay_fraction"),
+)
+@pytest.mark.parametrize("value", (-0.1, 1.1, float("nan"), True))
+def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
+    cfg = _cfg()
+    cfg.algo[field] = value
+    with pytest.raises(ValueError, match=r"non-negative|\[0, 1\]"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_teacher_replay_fractions_require_frozen_prefill_source():
+    cfg = _cfg()
+    cfg.algo.teacher_prefill_rollouts = 0
+    cfg.algo.teacher_perception_replay_fraction = 0.5
+
     with pytest.raises(ValueError, match="teacher_prefill_rollouts > 0"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 

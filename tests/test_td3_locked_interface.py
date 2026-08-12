@@ -914,7 +914,7 @@ def test_td3_config_only_overrides_the_authorized_environment_count():
     assert isinstance(td3_cfg, dict)
     assert isinstance(td3_cfg.get("defaults"), list)
 
-    assert td3_cfg.get("task") == {"num_envs": 512}
+    assert td3_cfg.get("task") == {"num_envs": 256}
 
     locked_top_level = {
         "reward",

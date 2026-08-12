@@ -43,6 +43,7 @@ from .ppo_bc_dagger import (
     DAGGER_ACTION_DISCREPANCY_RMS_KEY,
     DAGGER_BETA_TEACHER_KEY,
     DAGGER_IS_STUDENT_ACTION_KEY,
+    DAGGER_Q_TEACHER_SOURCE_KEY,
     DAGGER_REPLAY_TEACHER_ACTIONS,
     DAGGER_SAFE_RELEASE_KEY,
     DAGGER_SAFE_TAKEOVER_KEY,
@@ -725,6 +726,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.sac_actor_update_count = (
             int(getattr(self, "sac_actor_update_count", 0)) + 1
         )
+        teacher_source = batch.get(DAGGER_Q_TEACHER_SOURCE_KEY)
+        actor_teacher_replay_fraction = (
+            prediction_latent.new_zeros(())
+            if teacher_source is None
+            else teacher_source.float().mean()
+        )
         metrics = {
             # Compatibility names consumed by the inherited replay loop.
             "td3_actor_loss": sac_actor_loss.detach(),
@@ -745,6 +752,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_sample_action_abs_mean": sampled_action.detach().abs().mean(),
             "actor_mean_action_abs_mean": dist.mean.detach().abs().mean(),
             "actor_log_std_mean": self.bc_dagger_sac_adapter.log_std.detach().mean(),
+            "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
             "alpha": self.log_alpha.exp().detach(),
         }
         if hasattr(self, "_fastsac_rollout_actor_metrics"):
@@ -912,6 +920,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "q_rng_state": self.q_rng.get_state(),
             "sac_action_rng_state": self.sac_action_rng.get_state(),
             "sac_rollout_rng_state": self.sac_rollout_rng.get_state(),
+            "teacher_perception_rng_state": self.teacher_perception_rng.get_state(),
             "last_fastsac_diagnostics": copy.deepcopy(self._last_fastsac_diagnostics),
         }
 
@@ -953,6 +962,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.q_rng.set_state(state["q_rng_state"])
         self.sac_action_rng.set_state(state["sac_action_rng_state"])
         self.sac_rollout_rng.set_state(state["sac_rollout_rng_state"])
+        self.teacher_perception_rng.set_state(state["teacher_perception_rng_state"])
         self._last_fastsac_diagnostics = copy.deepcopy(
             state.get("last_fastsac_diagnostics", {})
         )
@@ -1016,6 +1026,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.q_rng.manual_seed(int(self.cfg.q_seed))
         self.sac_action_rng.manual_seed(int(self.cfg.q_seed) + 1)
         self.sac_rollout_rng.manual_seed(int(self.cfg.q_seed) + 2)
+        self.teacher_perception_rng.manual_seed(int(self.cfg.q_seed) + 3)
         # Drop deterministic-only streams after the base loader is finished.
         if hasattr(self, "collector_exploration_rng"):
             del self.collector_exploration_rng

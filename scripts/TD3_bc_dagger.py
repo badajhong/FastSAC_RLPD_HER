@@ -111,8 +111,11 @@ DAGGER_BACKEND_CONFIG_FIELDS = (
     "dagger_buffer_device",
     "dagger_batch_size",
     "teacher_prefill_rollouts",
+    "teacher_actor_replay_fraction",
+    "teacher_perception_replay_fraction",
     "perception_replay_burn_in",
     "perception_encode_microbatch_size",
+    "teacher_perception_batch_size",
     "perception_depth_codec",
     "eta_td3",
     "lambda_bc",
@@ -176,6 +179,13 @@ def _finite_positive(name: str, value) -> float:
     value = _finite_nonnegative(name, value)
     if value <= 0.0:
         raise ValueError(f"{name} must be a finite positive number")
+    return value
+
+
+def _finite_fraction(name: str, value) -> float:
+    value = _finite_nonnegative(name, value)
+    if value > 1.0:
+        raise ValueError(f"{name} must lie in [0, 1]")
     return value
 
 
@@ -430,6 +440,23 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         "algo.teacher_prefill_rollouts",
         cfg.algo.get("teacher_prefill_rollouts", None),
         allow_zero=True,
+    )
+    for name in (
+        "teacher_actor_replay_fraction",
+        "teacher_perception_replay_fraction",
+    ):
+        _finite_fraction(f"algo.{name}", cfg.algo.get(name, None))
+    if (
+        float(cfg.algo.teacher_actor_replay_fraction) > 0.0
+        or float(cfg.algo.teacher_perception_replay_fraction) > 0.0
+    ) and int(cfg.algo.teacher_prefill_rollouts) == 0:
+        raise ValueError(
+            "Teacher Actor/perception replay fractions require "
+            "algo.teacher_prefill_rollouts > 0"
+        )
+    _positive_int(
+        "algo.teacher_perception_batch_size",
+        cfg.algo.get("teacher_perception_batch_size", None),
     )
     if (
         int(cfg.algo.teacher_prefill_rollouts) > 0
