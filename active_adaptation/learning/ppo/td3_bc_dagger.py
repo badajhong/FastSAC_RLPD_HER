@@ -146,7 +146,7 @@ PERCEPTION_REPLAY_SEMANTICS = (
 )
 PERCEPTION_DEPTH_CODEC = "uint8_div_100_v1"
 PERCEPTION_WARMSTART_SEMANTICS = (
-    "strict_seven_module_student_perception_overlay_online_plus_ema_v1"
+    "strict_full_student_or_ppovel_train_partial_perception_overlay_v2"
 )
 PRETRAINED_PERCEPTION_MODULES = (
     "depth_cnn",
@@ -157,6 +157,20 @@ PRETRAINED_PERCEPTION_MODULES = (
     "adapt_module",
     "adapt_ema",
 )
+PPOVEL_PARTIAL_PERCEPTION_MODULES = (
+    "object_adapt",
+    "object_adapt_ema",
+    "adapt_module",
+    "adapt_ema",
+)
+PPOVEL_PARTIAL_FRESH_DEPTH_MODULES = (
+    "depth_cnn",
+    "temporal_depth_gru",
+    "temporal_depth_gru_ema",
+)
+PERCEPTION_WARMSTART_MODE_FULL_STUDENT = "strict_full_student"
+PERCEPTION_WARMSTART_MODE_PPOVEL_PARTIAL = "ppo_vel_train_partial"
+PERCEPTION_WARMSTART_MODE_FRESH = "fresh_constructor"
 _ONLINE_PERCEPTION_MODULES = (
     "depth_cnn",
     "temporal_depth_gru",
@@ -899,8 +913,10 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     perception_encode_microbatch_size: int = 128
     teacher_perception_batch_size: int = 128
     perception_depth_codec: str = PERCEPTION_DEPTH_CODEC
-    # Optional overlay from a separately trained Student-perception checkpoint.
-    # The main checkpoint remains the privileged PPO Teacher source.
+    # Optional perception warm start. A complete Student checkpoint overlays
+    # all seven online/EMA children. A phase=train PPOVEL checkpoint may instead
+    # provide only object/adaptation children while depth remains freshly
+    # initialized and trainable, matching PPOVEL finetune initialization.
     load_pretrained_perception: bool = False
     perception_checkpoint_path: str | None = None
     train_perception: bool = True
@@ -1278,12 +1294,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._perception_optimizer = self.opt_adapt
         self._perception_initialization = {
             "semantics": PERCEPTION_WARMSTART_SEMANTICS,
+            "mode": PERCEPTION_WARMSTART_MODE_FRESH,
             "loaded": False,
             "source_path": None,
             "source_algorithm": None,
             "source_phase": None,
             "source_iter": None,
             "modules": (),
+            "fresh_modules": PRETRAINED_PERCEPTION_MODULES,
             "trainable": bool(cfg.train_perception),
         }
 
@@ -1537,7 +1555,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 )
 
     def _load_pretrained_perception_checkpoint(self, path) -> dict:
-        """Strictly overlay only Student perception children from ``path``."""
+        """Strictly overlay a full Student or partial PPOVEL perception source.
+
+        A phase=train PPOVEL checkpoint has no depth stack: PPOVEL finetune
+        creates that stack in its constructor, then trains it jointly with the
+        four object/adaptation children loaded from the train checkpoint.  The
+        partial mode below deliberately reproduces that behavior.  Any other
+        subset is rejected instead of silently treating a damaged Student
+        checkpoint as a valid partial warm start.
+        """
         resolved_path = Path(path).expanduser().resolve(strict=True)
         checkpoint = torch.load(
             resolved_path,
@@ -1554,8 +1580,40 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "pretrained perception checkpoint must contain a policy mapping"
             )
 
+        all_names = set(PRETRAINED_PERCEPTION_MODULES)
+        partial_names = set(PPOVEL_PARTIAL_PERCEPTION_MODULES)
+        present_names = {name for name in all_names if name in policy_state}
+        if present_names == all_names:
+            mode = PERCEPTION_WARMSTART_MODE_FULL_STUDENT
+            selected_modules = PRETRAINED_PERCEPTION_MODULES
+            fresh_modules: tuple[str, ...] = ()
+        elif present_names == partial_names:
+            if policy_state.get("last_phase") != "train":
+                raise ValueError(
+                    "partial PPOVEL perception checkpoint requires "
+                    "policy.last_phase='train'"
+                )
+            if not bool(self.cfg.train_perception):
+                raise ValueError(
+                    "partial PPOVEL perception warm start requires "
+                    "train_perception=true because its depth modules are "
+                    "freshly initialized"
+                )
+            mode = PERCEPTION_WARMSTART_MODE_PPOVEL_PARTIAL
+            selected_modules = PPOVEL_PARTIAL_PERCEPTION_MODULES
+            fresh_modules = PPOVEL_PARTIAL_FRESH_DEPTH_MODULES
+        else:
+            missing = sorted(all_names.difference(present_names))
+            present = sorted(present_names)
+            raise ValueError(
+                "pretrained perception checkpoint must contain either all "
+                "seven Student perception modules or exactly the four PPOVEL "
+                "train-phase object/adaptation modules; "
+                f"present={present}, missing={missing}"
+            )
+
         validated: list[tuple[str, nn.Module, Mapping]] = []
-        for name in PRETRAINED_PERCEPTION_MODULES:
+        for name in selected_modules:
             module = getattr(self, name, None)
             if not isinstance(module, nn.Module):
                 raise RuntimeError(
@@ -1573,9 +1631,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 source_state,
             )
             validated.append((name, module, source_state))
-        self._validate_depth_checkpoint_aliases(policy_state)
+        if mode == PERCEPTION_WARMSTART_MODE_FULL_STUDENT:
+            self._validate_depth_checkpoint_aliases(policy_state)
 
-        # No target module is mutated until all seven mappings pass validation.
+        # No target module is mutated until every selected mapping passes
+        # strict key/shape/dtype validation. In partial mode this also leaves
+        # all three constructor-created depth children untouched.
         for name, module, source_state in validated:
             try:
                 module.load_state_dict(source_state, strict=True)
@@ -1587,12 +1648,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         policy_algorithm = policy_state.get("training_algorithm")
         metadata = {
             "semantics": PERCEPTION_WARMSTART_SEMANTICS,
+            "mode": mode,
             "loaded": True,
             "source_path": str(resolved_path),
             "source_algorithm": policy_algorithm,
             "source_phase": policy_state.get("last_phase"),
             "source_iter": policy_state.get("last_iter"),
-            "modules": PRETRAINED_PERCEPTION_MODULES,
+            "modules": selected_modules,
+            "fresh_modules": fresh_modules,
             "trainable": bool(self.cfg.train_perception),
         }
         self._perception_initialization = metadata
@@ -1636,9 +1699,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "_perception_initialization",
                 {
                     "semantics": PERCEPTION_WARMSTART_SEMANTICS,
+                    "mode": PERCEPTION_WARMSTART_MODE_FRESH,
                     "loaded": False,
                     "source_path": None,
                     "modules": (),
+                    "fresh_modules": PRETRAINED_PERCEPTION_MODULES,
                 },
             )
         )
@@ -4286,12 +4351,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if not bool(self.cfg.load_pretrained_perception):
                 self._perception_initialization = {
                     "semantics": PERCEPTION_WARMSTART_SEMANTICS,
+                    "mode": PERCEPTION_WARMSTART_MODE_FRESH,
                     "loaded": False,
                     "source_path": None,
                     "source_algorithm": None,
                     "source_phase": None,
                     "source_iter": None,
                     "modules": (),
+                    "fresh_modules": PRETRAINED_PERCEPTION_MODULES,
                     "trainable": bool(self.cfg.train_perception),
                 }
             self._apply_perception_initialization_policy()

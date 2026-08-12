@@ -67,6 +67,17 @@ REQUIRED_PRETRAINED_PERCEPTION_MODULES = (
     "adapt_module",
     "adapt_ema",
 )
+PPOVEL_TRAIN_PHASE_FRESH_DEPTH_MODULES = (
+    "depth_cnn",
+    "temporal_depth_gru",
+    "temporal_depth_gru_ema",
+)
+PPOVEL_TRAIN_PHASE_PARTIAL_PERCEPTION_MODULES = (
+    "object_adapt",
+    "object_adapt_ema",
+    "adapt_module",
+    "adapt_ema",
+)
 
 
 def _positive_int(name: str, value, *, allow_zero: bool = False) -> int:
@@ -101,7 +112,7 @@ def _finite_fraction(name: str, value) -> float:
 
 
 def _validate_perception_training_controls(cfg: DictConfig) -> str | None:
-    """Validate and canonicalize the optional local perception warm start."""
+    """Validate and canonicalize a full or PPOVEL-style perception warm start."""
     load_pretrained = cfg.algo.get("load_pretrained_perception", False)
     train_perception = cfg.algo.get("train_perception", True)
     if not isinstance(load_pretrained, bool):
@@ -159,15 +170,48 @@ def _validate_perception_training_controls(cfg: DictConfig) -> str | None:
         raise ValueError(
             "pretrained perception checkpoint must contain a policy mapping"
         )
-    missing_modules = [
+
+    invalid_modules = [
         name
         for name in REQUIRED_PRETRAINED_PERCEPTION_MODULES
-        if not isinstance(policy_state.get(name), Mapping)
+        if name in policy_state and not isinstance(policy_state[name], Mapping)
     ]
-    if missing_modules:
+    if invalid_modules:
         raise ValueError(
-            "pretrained perception checkpoint is missing required perception "
-            f"module mappings: {missing_modules}"
+            "pretrained perception checkpoint contains invalid perception "
+            f"module mappings: {invalid_modules}"
+        )
+
+    present_modules = {
+        name for name in REQUIRED_PRETRAINED_PERCEPTION_MODULES if name in policy_state
+    }
+    required_modules = set(REQUIRED_PRETRAINED_PERCEPTION_MODULES)
+    ppo_partial_modules = set(PPOVEL_TRAIN_PHASE_PARTIAL_PERCEPTION_MODULES)
+    ppo_fresh_depth_modules = set(PPOVEL_TRAIN_PHASE_FRESH_DEPTH_MODULES)
+
+    if present_modules == required_modules:
+        pass
+    elif (
+        present_modules == ppo_partial_modules
+        and ppo_fresh_depth_modules.isdisjoint(policy_state)
+        and policy_state.get("last_phase") == "train"
+    ):
+        if not train_perception:
+            raise ValueError(
+                "PPOVEL train-phase partial perception warm start requires "
+                "algo.train_perception=true because its depth perception "
+                "modules are freshly initialized"
+            )
+    else:
+        missing_modules = [
+            name
+            for name in REQUIRED_PRETRAINED_PERCEPTION_MODULES
+            if name not in present_modules
+        ]
+        raise ValueError(
+            "pretrained perception checkpoint must contain either the complete "
+            "perception stack or a PPOVEL train-phase partial stack; missing "
+            f"required perception module mappings: {missing_modules}"
         )
     with open_dict(cfg.algo):
         cfg.algo.perception_checkpoint_path = resolved

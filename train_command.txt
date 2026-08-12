@@ -4,9 +4,14 @@ nohup env \
   task=G1/vaic/skateboard_stu \
   checkpoint_path=outputs/15-13-46-G1Skateboard-ppo_vel/wandb/run-20260805_151350-7tsje71w/files/checkpoint_final.pt \
   algo.load_pretrained_perception=true \
-  algo.perception_checkpoint_path=outputs/2026-08-12/06-30-30-G1Skateboard-ppo_bc_dagger/wandb/run-20260812_063031-h99sh616/files/checkpoint_final.pt \
+  algo.perception_checkpoint_path=outputs/15-13-46-G1Skateboard-ppo_vel/wandb/run-20260805_151350-7tsje71w/files/checkpoint_final.pt \
   algo.train_perception=true \
-  td3_dagger_iterations=3000 \
+  fastsac_dagger_iterations=3000 \
+  algo.teacher_prefill_max_rollouts=300 \
+  algo.q_teacher_buffer_capacity=131072 \
+  algo.teacher_actor_replay_fraction=0.5 \
+  algo.teacher_perception_replay_fraction=0.5 \
+  algo.failure_phase_teacher_fraction=0.3 \
   algo.dagger_control_mode=beta \
   algo.dagger_beta_start=1 \
   algo.dagger_beta_end=0 \
@@ -15,8 +20,8 @@ nohup env \
   algo.lambda_bc=1.0 \
   algo.dagger_bc_lr=3e-4 \
   algo.collector_exploration_noise_std=0.0 \
-  algo.q_updates_per_rollout=32 \
-  algo.policy_delay=2 \
+  algo.q_updates_per_rollout=16 \
+  algo.policy_delay=1 \
   save_interval=100 \
   > TD3_bc_dagger_eta1e-4_3000.log 2>&1 < /dev/null &
 
@@ -25,7 +30,7 @@ nohup env \
   task=G1/vaic/skateboard_stu \
   checkpoint_path=outputs/15-13-46-G1Skateboard-ppo_vel/wandb/run-20260805_151350-7tsje71w/files/checkpoint_final.pt \
   algo.load_pretrained_perception=true \
-  algo.perception_checkpoint_path=outputs/2026-08-12/06-30-30-G1Skateboard-ppo_bc_dagger/wandb/run-20260812_063031-h99sh616/files/checkpoint_final.pt \
+  algo.perception_checkpoint_path=outputs/15-13-46-G1Skateboard-ppo_vel/wandb/run-20260805_151350-7tsje71w/files/checkpoint_final.pt \
   algo.train_perception=true \
   fastsac_dagger_iterations=3000 \
   algo.teacher_prefill_max_rollouts=300 \

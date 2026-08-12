@@ -16,6 +16,9 @@ from active_adaptation.learning.ppo.fastsac_vel import (
     _fastsac_action_center_to_latent,
     _sac_bootstrap_mask,
 )
+from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+    DistributionalFastSACTeacherBC,
+)
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_BETA_TEACHER_KEY,
     DAGGER_IS_STUDENT_ACTION_KEY,
@@ -891,13 +894,21 @@ class _WarmstartTemporal(nn.Module):
         self.recurrent = nn.Linear(recurrent_input, 2)
 
 
-def _perception_warmstart_policy(seed: int = 1):
-    policy = _bare_policy(
+def _perception_warmstart_policy(
+    seed: int = 1,
+    *,
+    policy_cls=DistributionalTD3TeacherBC,
+    train_perception: bool = True,
+):
+    policy = policy_cls.__new__(policy_cls)
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
         load_pretrained_perception=True,
         perception_checkpoint_path="/unused/student.pt",
-        train_perception=True,
+        train_perception=train_perception,
         lr=3e-4,
     )
+    policy.device = torch.device("cpu")
     with torch.random.fork_rng():
         torch.manual_seed(seed)
         depth_cnn = nn.Linear(2, 2)
@@ -961,17 +972,128 @@ def _write_perception_warmstart_checkpoint(
     return modules
 
 
+def _write_ppo_vel_partial_perception_checkpoint(
+    path,
+    *,
+    seed: int = 100,
+    missing_object_adapt: str | None = None,
+):
+    modules = _write_perception_warmstart_checkpoint(path, seed=seed)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint["policy"]["last_phase"] = "train"
+    for name in (
+        "depth_cnn",
+        "temporal_depth_gru",
+        "temporal_depth_gru_ema",
+    ):
+        checkpoint["policy"].pop(name)
+    if missing_object_adapt is not None:
+        checkpoint["policy"].pop(missing_object_adapt)
+    torch.save(checkpoint, path)
+    return modules
+
+
 def test_pretrained_perception_loads_all_online_and_ema_modules_strictly(tmp_path):
     policy = _perception_warmstart_policy()
     checkpoint_path = tmp_path / "student_perception.pt"
     source = _write_perception_warmstart_checkpoint(checkpoint_path)
 
-    policy._load_pretrained_perception_checkpoint(checkpoint_path)
+    metadata = policy._load_pretrained_perception_checkpoint(checkpoint_path)
 
     for name in _PERCEPTION_WARMSTART_MODULES:
         _assert_nested_equal(
             getattr(policy, name).state_dict(), source[name].state_dict()
         )
+    assert metadata["mode"] == "strict_full_student"
+    assert tuple(metadata["modules"]) == _PERCEPTION_WARMSTART_MODULES
+    assert tuple(metadata["fresh_modules"]) == ()
+
+
+@pytest.mark.parametrize(
+    "policy_cls",
+    (DistributionalTD3TeacherBC, DistributionalFastSACTeacherBC),
+)
+def test_ppo_vel_train_partial_warmstart_loads_four_and_trains_fresh_depth(
+    tmp_path, policy_cls
+):
+    policy = _perception_warmstart_policy(policy_cls=policy_cls)
+    checkpoint_path = tmp_path / f"{policy_cls.__name__}_ppo_train.pt"
+    source = _write_ppo_vel_partial_perception_checkpoint(checkpoint_path)
+    fresh_depth = {
+        name: copy.deepcopy(getattr(policy, name).state_dict())
+        for name in (
+            "depth_cnn",
+            "temporal_depth_gru",
+            "temporal_depth_gru_ema",
+        )
+    }
+
+    metadata = policy._load_pretrained_perception_checkpoint(checkpoint_path)
+    policy._set_perception_trainable(True)
+
+    loaded_modules = (
+        "object_adapt",
+        "object_adapt_ema",
+        "adapt_module",
+        "adapt_ema",
+    )
+    fresh_modules = (
+        "depth_cnn",
+        "temporal_depth_gru",
+        "temporal_depth_gru_ema",
+    )
+    for name in loaded_modules:
+        _assert_nested_equal(
+            getattr(policy, name).state_dict(), source[name].state_dict()
+        )
+    for name, expected in fresh_depth.items():
+        _assert_nested_equal(getattr(policy, name).state_dict(), expected)
+    assert metadata["mode"] == "ppo_vel_train_partial"
+    assert tuple(metadata["modules"]) == loaded_modules
+    assert tuple(metadata["fresh_modules"]) == fresh_modules
+    assert metadata["source_phase"] == "train"
+    assert metadata["trainable"] is True
+    assert isinstance(policy.opt_adapt, torch.optim.Optimizer)
+    for name in ("temporal_depth_gru", "object_adapt", "adapt_module"):
+        module = getattr(policy, name)
+        assert module.training
+        assert all(parameter.requires_grad for parameter in module.parameters())
+    for name in ("temporal_depth_gru_ema", "object_adapt_ema", "adapt_ema"):
+        module = getattr(policy, name)
+        assert not module.training
+        assert all(not parameter.requires_grad for parameter in module.parameters())
+
+
+def test_ppo_vel_train_partial_warmstart_rejects_frozen_fresh_depth_atomically(
+    tmp_path,
+):
+    policy = _perception_warmstart_policy(train_perception=False)
+    checkpoint_path = tmp_path / "ppo_train_frozen.pt"
+    _write_ppo_vel_partial_perception_checkpoint(checkpoint_path)
+    before = {
+        name: copy.deepcopy(getattr(policy, name).state_dict())
+        for name in _PERCEPTION_WARMSTART_MODULES
+    }
+
+    with pytest.raises(ValueError, match="partial.*train_perception=true"):
+        policy._load_pretrained_perception_checkpoint(checkpoint_path)
+
+    for name, expected in before.items():
+        _assert_nested_equal(getattr(policy, name).state_dict(), expected)
+
+
+def test_ppo_vel_train_partial_warmstart_rejects_missing_object_adapt_mapping(
+    tmp_path,
+):
+    policy = _perception_warmstart_policy()
+    checkpoint_path = tmp_path / "ppo_train_missing_adapt_ema.pt"
+    _write_ppo_vel_partial_perception_checkpoint(
+        checkpoint_path,
+        missing_object_adapt="adapt_ema",
+    )
+
+    with pytest.raises(ValueError, match="adapt_ema"):
+        policy._load_pretrained_perception_checkpoint(checkpoint_path)
 
 
 def test_pretrained_perception_loader_reads_nested_policy_and_not_actor_q(tmp_path):

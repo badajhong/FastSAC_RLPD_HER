@@ -290,6 +290,43 @@ def test_pretrained_perception_path_is_canonicalized_without_replacing_teacher_s
     assert cfg.checkpoint_path == "/tmp/train_ppo_teacher.pt"
 
 
+def test_ppo_vel_train_checkpoint_can_be_the_same_partial_perception_source(tmp_path):
+    teacher = _write_fresh_ppo_checkpoint(tmp_path / "ppo_vel_train.pt")
+    cfg = _cfg(checkpoint=str(teacher))
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(teacher)
+    cfg.algo.train_perception = True
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    assert cfg.checkpoint_path == str(teacher)
+    assert cfg.algo.perception_checkpoint_path == str(teacher.resolve())
+
+
+def test_ppo_vel_train_partial_perception_source_cannot_freeze_fresh_depth(tmp_path):
+    teacher = _write_fresh_ppo_checkpoint(tmp_path / "ppo_vel_train.pt")
+    cfg = _cfg(checkpoint=str(teacher))
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(teacher)
+    cfg.algo.train_perception = False
+
+    with pytest.raises(ValueError, match="partial.*train_perception=true"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_ppo_vel_train_partial_perception_requires_all_four_adapt_mappings(tmp_path):
+    teacher = _write_fresh_ppo_checkpoint(tmp_path / "ppo_vel_train.pt")
+    checkpoint = torch.load(teacher, map_location="cpu", weights_only=False)
+    checkpoint["policy"].pop("adapt_ema")
+    torch.save(checkpoint, teacher)
+    cfg = _cfg(checkpoint=str(teacher))
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(teacher)
+
+    with pytest.raises(ValueError, match="adapt_ema"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
 def test_disabled_pretrained_perception_rejects_path_and_freeze_mode(tmp_path):
     cfg = _cfg()
     cfg.algo.perception_checkpoint_path = str(tmp_path / "unused.pt")
