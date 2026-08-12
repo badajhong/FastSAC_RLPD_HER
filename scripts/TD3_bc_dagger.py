@@ -67,6 +67,15 @@ EXPECTED_REPLAY_RAW_OBSERVATION_KEYS = (
     "command",
     "depth",
 )
+REQUIRED_PRETRAINED_PERCEPTION_MODULES = (
+    "depth_cnn",
+    "temporal_depth_gru",
+    "temporal_depth_gru_ema",
+    "object_adapt",
+    "object_adapt_ema",
+    "adapt_module",
+    "adapt_ema",
+)
 EXPECTED_JOINT_NAMES = (
     "left_hip_pitch_joint",
     "right_hip_pitch_joint",
@@ -110,13 +119,20 @@ DAGGER_BACKEND_CONFIG_FIELDS = (
     "dagger_buffer_capacity",
     "dagger_buffer_device",
     "dagger_batch_size",
-    "teacher_prefill_rollouts",
+    "teacher_prefill_max_rollouts",
     "teacher_actor_replay_fraction",
     "teacher_perception_replay_fraction",
+    "failure_phase_teacher_fraction",
+    "failure_phase_lookback_steps",
+    "failure_phase_samples_per_failure",
+    "failure_phase_num_bins",
     "perception_replay_burn_in",
     "perception_encode_microbatch_size",
     "teacher_perception_batch_size",
     "perception_depth_codec",
+    "load_pretrained_perception",
+    "perception_checkpoint_path",
+    "train_perception",
     "eta_td3",
     "lambda_bc",
     "policy_delay",
@@ -189,6 +205,152 @@ def _finite_fraction(name: str, value) -> float:
     return value
 
 
+def _validate_perception_training_controls(cfg: DictConfig) -> str | None:
+    """Validate and canonicalize the optional local perception warm start."""
+    load_pretrained = cfg.algo.get("load_pretrained_perception", False)
+    train_perception = cfg.algo.get("train_perception", True)
+    if not isinstance(load_pretrained, bool):
+        raise ValueError("algo.load_pretrained_perception must be boolean")
+    if not isinstance(train_perception, bool):
+        raise ValueError("algo.train_perception must be boolean")
+
+    configured_path = cfg.algo.get("perception_checkpoint_path", None)
+    if not load_pretrained:
+        if configured_path is not None:
+            raise ValueError(
+                "algo.perception_checkpoint_path must be null when "
+                "algo.load_pretrained_perception=false"
+            )
+        if not train_perception:
+            raise ValueError(
+                "algo.train_perception=false requires "
+                "algo.load_pretrained_perception=true; freezing a freshly "
+                "initialized perception stack is unsupported"
+            )
+        return None
+
+    if configured_path is None:
+        raise ValueError(
+            "algo.load_pretrained_perception=true requires an explicit local "
+            "algo.perception_checkpoint_path"
+        )
+    try:
+        raw_path = os.fspath(configured_path)
+    except TypeError as exc:
+        raise ValueError(
+            "algo.perception_checkpoint_path must be a local filesystem path"
+        ) from exc
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError(
+            "algo.perception_checkpoint_path must be a non-empty local filesystem path"
+        )
+    raw_path = os.path.expanduser(raw_path)
+    if raw_path.startswith("run:") or "://" in raw_path:
+        raise ValueError(
+            "algo.perception_checkpoint_path must be a local filesystem path"
+        )
+    resolved = os.path.realpath(hydra.utils.to_absolute_path(raw_path))
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(
+            f"pretrained perception checkpoint does not exist: {resolved}"
+        )
+    checkpoint = torch.load(resolved, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(
+            "pretrained perception checkpoint must contain a top-level mapping"
+        )
+    policy_state = checkpoint.get("policy")
+    if not isinstance(policy_state, Mapping):
+        raise ValueError(
+            "pretrained perception checkpoint must contain a policy mapping"
+        )
+    missing_modules = [
+        name
+        for name in REQUIRED_PRETRAINED_PERCEPTION_MODULES
+        if not isinstance(policy_state.get(name), Mapping)
+    ]
+    if missing_modules:
+        raise ValueError(
+            "pretrained perception checkpoint is missing required perception "
+            f"module mappings: {missing_modules}"
+        )
+    with open_dict(cfg.algo):
+        cfg.algo.perception_checkpoint_path = resolved
+    return resolved
+
+
+def _validate_failure_phase_teacher_sampling(cfg: DictConfig) -> None:
+    """Validate the shared live/uniform-Teacher/focused-Teacher source mix."""
+    actor_teacher_fraction = _finite_fraction(
+        "algo.teacher_actor_replay_fraction",
+        cfg.algo.get("teacher_actor_replay_fraction", None),
+    )
+    perception_teacher_fraction = _finite_fraction(
+        "algo.teacher_perception_replay_fraction",
+        cfg.algo.get("teacher_perception_replay_fraction", None),
+    )
+    critic_teacher_fraction = _finite_fraction(
+        "algo.q_teacher_replay_ratio",
+        cfg.algo.get("q_teacher_replay_ratio", None),
+    )
+    focus_fraction = _finite_fraction(
+        "algo.failure_phase_teacher_fraction",
+        cfg.algo.get("failure_phase_teacher_fraction", None),
+    )
+    lookback = _positive_int(
+        "algo.failure_phase_lookback_steps",
+        cfg.algo.get("failure_phase_lookback_steps", None),
+    )
+    samples = _positive_int(
+        "algo.failure_phase_samples_per_failure",
+        cfg.algo.get("failure_phase_samples_per_failure", None),
+    )
+    _positive_int(
+        "algo.failure_phase_num_bins",
+        cfg.algo.get("failure_phase_num_bins", None),
+    )
+    if samples > lookback + 1:
+        raise ValueError(
+            "algo.failure_phase_samples_per_failure cannot exceed the inclusive "
+            "algo.failure_phase_lookback_steps + 1 interval"
+        )
+
+    if (
+        focus_fraction > 0.0
+        and max(
+            actor_teacher_fraction,
+            perception_teacher_fraction,
+            critic_teacher_fraction,
+        )
+        == 0.0
+    ):
+        raise ValueError(
+            "algo.failure_phase_teacher_fraction > 0 requires a positive "
+            "Teacher source fraction"
+        )
+
+
+def _validate_teacher_prefill_reachability(cfg: DictConfig) -> None:
+    """Reject a prefill ceiling that cannot fill the ring even without filtering."""
+    max_rollouts = _positive_int(
+        "algo.teacher_prefill_max_rollouts",
+        cfg.algo.get("teacher_prefill_max_rollouts", None),
+    )
+    num_envs = _positive_int("task.num_envs", cfg.task.get("num_envs", None))
+    train_every = _positive_int("algo.train_every", cfg.algo.get("train_every", None))
+    capacity = _positive_int(
+        "algo.q_teacher_buffer_capacity",
+        cfg.algo.get("q_teacher_buffer_capacity", None),
+    )
+    raw_transition_upper_bound = max_rollouts * num_envs * train_every
+    if raw_transition_upper_bound < capacity:
+        raise ValueError(
+            "algo.teacher_prefill_max_rollouts cannot possibly fill "
+            "algo.q_teacher_buffer_capacity: theoretical raw-transition "
+            f"upper bound {raw_transition_upper_bound} < {capacity}"
+        )
+
+
 def _expected_dagger_backend_config(algo: Mapping) -> dict:
     """Reconstruct the exact runtime-independent checkpoint config lock."""
     return {
@@ -224,23 +386,26 @@ def _forbidden_algo_fields(algo: Mapping) -> list[str]:
 
 
 def apply_td3_dagger_iteration_controls(cfg: DictConfig) -> None:
-    """Map user-facing rollout counts onto train.py's global frame budget."""
+    """Map the exact main budget plus bounded dynamic prefill to total frames."""
     iterations = cfg.get("td3_dagger_iterations", None)
     if iterations is not None:
         iterations = _positive_int("td3_dagger_iterations", iterations)
-        prefill_rollouts = _positive_int(
-            "algo.teacher_prefill_rollouts",
-            cfg.algo.teacher_prefill_rollouts,
-            allow_zero=True,
+        prefill_max_rollouts = _positive_int(
+            "algo.teacher_prefill_max_rollouts",
+            cfg.algo.teacher_prefill_max_rollouts,
         )
         num_envs = _positive_int("task.num_envs", cfg.task.num_envs)
         train_every = _positive_int("algo.train_every", cfg.algo.train_every)
         world_size = _positive_int("distributed world size", aa.get_world_size())
         with open_dict(cfg):
-            # Prefill is physically collected before, and excluded from, the
-            # requested number of main DAgger rollouts.
+            # The shared runner treats this as an upper bound and stops early
+            # after dynamic prefill plus the exact requested main budget.
+            cfg._bc_dagger_main_rollout_budget = iterations
             cfg.total_frames = (
-                (iterations + prefill_rollouts) * num_envs * train_every * world_size
+                (iterations + prefill_max_rollouts)
+                * num_envs
+                * train_every
+                * world_size
             )
 
     beta_zero_iteration = cfg.algo.get("dagger_beta_zero_iteration", None)
@@ -259,27 +424,26 @@ def apply_td3_dagger_iteration_controls(cfg: DictConfig) -> None:
 
 
 def td3_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
-    """Return the additional per-rank rollout schedule for this invocation."""
+    """Return the exact main budget and bounded dynamic-prefill schedule."""
     apply_td3_dagger_iteration_controls(cfg)
     num_envs = _positive_int("task.num_envs", cfg.task.num_envs)
     train_every = _positive_int("algo.train_every", cfg.algo.train_every)
-    total_frames = _positive_int("total_frames", cfg.total_frames)
     world_size = _positive_int("distributed world size", aa.get_world_size())
-    frames_per_rollout = num_envs * train_every
-    physical_rollouts = (total_frames // world_size) // frames_per_rollout
-    if physical_rollouts < 1:
-        raise ValueError("total_frames does not contain one complete rollout")
-
-    prefill_rollouts = _positive_int(
-        "algo.teacher_prefill_rollouts",
-        cfg.algo.teacher_prefill_rollouts,
-        allow_zero=True,
+    main_rollouts = _positive_int(
+        "td3_dagger_iterations", cfg.get("td3_dagger_iterations", None)
     )
-    main_rollouts = physical_rollouts - prefill_rollouts
-    if main_rollouts < 1:
-        raise ValueError(
-            "total_frames must include at least one main DAgger rollout after prefill"
-        )
+    prefill_max_rollouts = _positive_int(
+        "algo.teacher_prefill_max_rollouts",
+        cfg.algo.teacher_prefill_max_rollouts,
+    )
+    prefill_target_rows = _positive_int(
+        "algo.q_teacher_buffer_capacity", cfg.algo.q_teacher_buffer_capacity
+    )
+    frames_per_rollout = num_envs * train_every
+    max_physical_rollouts = main_rollouts + prefill_max_rollouts
+    expected_frames = max_physical_rollouts * frames_per_rollout * world_size
+    if int(cfg.total_frames) != expected_frames:
+        raise RuntimeError("TD3 rollout/frame upper-bound schedule is inconsistent")
 
     start_rollout = 0
     end_rollout = start_rollout + main_rollouts
@@ -302,8 +466,9 @@ def td3_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
         "frames_per_rollout": frames_per_rollout,
         "total_rollouts": main_rollouts,
         "main_rollouts": main_rollouts,
-        "prefill_rollouts": prefill_rollouts,
-        "physical_rollouts": physical_rollouts,
+        "prefill_max_rollouts": prefill_max_rollouts,
+        "prefill_target_rows": prefill_target_rows,
+        "max_physical_rollouts": max_physical_rollouts,
         "start_rollout": start_rollout,
         "end_rollout": end_rollout,
         "decay_rollouts": decay_rollouts,
@@ -402,6 +567,7 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError(
             "distributional TD3 Teacher-BC requires raw replay observations"
         )
+    _validate_perception_training_controls(cfg)
 
     forbidden = _forbidden_algo_fields(cfg.algo)
     if forbidden:
@@ -437,33 +603,18 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
     ):
         _positive_int(f"algo.{name}", cfg.algo.get(name, None))
     _positive_int(
-        "algo.teacher_prefill_rollouts",
-        cfg.algo.get("teacher_prefill_rollouts", None),
-        allow_zero=True,
+        "algo.teacher_prefill_max_rollouts",
+        cfg.algo.get("teacher_prefill_max_rollouts", None),
     )
-    for name in (
-        "teacher_actor_replay_fraction",
-        "teacher_perception_replay_fraction",
-    ):
-        _finite_fraction(f"algo.{name}", cfg.algo.get(name, None))
-    if (
-        float(cfg.algo.teacher_actor_replay_fraction) > 0.0
-        or float(cfg.algo.teacher_perception_replay_fraction) > 0.0
-    ) and int(cfg.algo.teacher_prefill_rollouts) == 0:
-        raise ValueError(
-            "Teacher Actor/perception replay fractions require "
-            "algo.teacher_prefill_rollouts > 0"
-        )
+    _validate_teacher_prefill_reachability(cfg)
+    _validate_failure_phase_teacher_sampling(cfg)
     _positive_int(
         "algo.teacher_perception_batch_size",
         cfg.algo.get("teacher_perception_batch_size", None),
     )
-    if (
-        int(cfg.algo.teacher_prefill_rollouts) > 0
-        and cfg.get("td3_dagger_iterations", None) is None
-    ):
+    if cfg.get("td3_dagger_iterations", None) is None:
         raise ValueError(
-            "algo.teacher_prefill_rollouts > 0 requires an explicit "
+            "dynamic Teacher prefill requires an explicit "
             "td3_dagger_iterations main-rollout budget"
         )
     if int(cfg.algo.perception_replay_burn_in) != 8:
@@ -565,16 +716,6 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         and 0.0 <= beta_end <= 1.0
     ):
         raise ValueError("DAgger beta endpoints must lie in [0, 1]")
-    if (
-        control_mode == "beta"
-        and beta_start == 0.0
-        and beta_end == 0.0
-        and int(cfg.algo.teacher_prefill_rollouts) == 0
-    ):
-        raise ValueError(
-            "pure Student beta control requires algo.teacher_prefill_rollouts > 0 "
-            "so the 50/50 Q replay can become ready"
-        )
     release = float(cfg.algo.get("dagger_safe_release_rms", math.nan))
     takeover = float(cfg.algo.get("dagger_safe_takeover_rms", math.nan))
     if not (
@@ -670,10 +811,11 @@ def main(cfg: DictConfig):
     schedule = td3_dagger_rollout_schedule(cfg)
     print(
         "Distributional TD3 + Teacher-BC schedule: "
-        f"prefill={schedule['prefill_rollouts']}, "
+        f"prefill_target_rows={schedule['prefill_target_rows']}, "
+        f"prefill_max={schedule['prefill_max_rollouts']}, "
         f"start={schedule['start_rollout']}, "
         f"main={schedule['main_rollouts']}, "
-        f"physical={schedule['physical_rollouts']}, "
+        f"max_physical={schedule['max_physical_rollouts']}, "
         f"end={schedule['end_rollout']}, "
         f"frames/rollout={schedule['frames_per_rollout']}; "
         f"method={EXPECTED_TRAINING_ALGORITHM}"

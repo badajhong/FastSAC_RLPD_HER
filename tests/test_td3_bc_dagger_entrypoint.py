@@ -6,14 +6,18 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf, open_dict
 
 from scripts import TD3_bc_dagger as td3_entry
-from scripts.train import run_training as shared_run_training
+from scripts.train import (
+    _bc_dagger_checkpoint_index,
+    _bc_dagger_main_budget_complete,
+    run_training as shared_run_training,
+)
 
 
 def _cfg(
     *,
     checkpoint="/tmp/fresh_ppo.pt",
     resume=None,
-    iterations=None,
+    iterations=2400,
     total_frames=39_321_600,
     control_mode="safe",
     beta_zero_iteration=None,
@@ -51,9 +55,13 @@ def _cfg(
                 "dagger_buffer_capacity": 131_072,
                 "dagger_buffer_device": "cpu",
                 "dagger_batch_size": 4096,
-                "teacher_prefill_rollouts": 0,
+                "teacher_prefill_max_rollouts": 10,
                 "teacher_actor_replay_fraction": 0.0,
                 "teacher_perception_replay_fraction": 0.0,
+                "failure_phase_teacher_fraction": 0.0,
+                "failure_phase_lookback_steps": 50,
+                "failure_phase_samples_per_failure": 10,
+                "failure_phase_num_bins": 1024,
                 "dagger_replay_raw_observations": True,
                 "replay_raw_observation_keys": list(
                     td3_entry.EXPECTED_REPLAY_RAW_OBSERVATION_KEYS
@@ -62,6 +70,9 @@ def _cfg(
                 "perception_encode_microbatch_size": 128,
                 "teacher_perception_batch_size": 128,
                 "perception_depth_codec": "uint8_div_100_v1",
+                "load_pretrained_perception": False,
+                "perception_checkpoint_path": None,
+                "train_perception": True,
                 "eta_td3": 1.0,
                 "lambda_bc": 1.0,
                 "policy_delay": 2,
@@ -138,12 +149,23 @@ def _write_fresh_ppo_checkpoint(path: Path) -> Path:
     return path
 
 
+def _write_perception_checkpoint(path: Path, *, omit: str | None = None) -> Path:
+    policy = {name: {} for name in td3_entry.REQUIRED_PRETRAINED_PERCEPTION_MODULES}
+    if omit is not None:
+        policy.pop(omit)
+    torch.save({"policy": policy}, path)
+    return path
+
+
 def test_td3_config_composes_without_simulator_startup():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg = compose(
             config_name="TD3_bc_dagger",
-            overrides=["task=G1/vaic/skateboard_stu"],
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "td3_dagger_iterations=2400",
+            ],
         )
 
     assert cfg.algo.name == "td3_bc_dagger"
@@ -177,9 +199,21 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.algo.q_tau == pytest.approx(0.005)
     assert cfg.algo.dagger_buffer_capacity == 131_072
     assert cfg.algo.q_teacher_buffer_capacity == 131_072
-    assert cfg.algo.teacher_prefill_rollouts == 10
-    assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.0)
-    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.0)
+    assert cfg.algo.teacher_prefill_max_rollouts == 1000
+    assert "teacher_prefill_rollouts" not in cfg.algo
+    assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.5)
+    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.5)
+    assert cfg.algo.failure_phase_teacher_fraction == pytest.approx(0.3)
+    assert cfg.algo.failure_phase_lookback_steps == 50
+    assert cfg.algo.failure_phase_samples_per_failure == 10
+    assert cfg.algo.failure_phase_num_bins == 1024
+    assert (
+        cfg.algo.teacher_actor_replay_fraction * cfg.algo.failure_phase_teacher_fraction
+        == pytest.approx(0.15)
+    )
+    assert cfg.algo.teacher_actor_replay_fraction * (
+        1.0 - cfg.algo.failure_phase_teacher_fraction
+    ) == pytest.approx(0.35)
     assert list(cfg.algo.replay_raw_observation_keys) == [
         "vel_command",
         "policy",
@@ -191,6 +225,9 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.algo.perception_encode_microbatch_size == 128
     assert cfg.algo.teacher_perception_batch_size == 128
     assert cfg.algo.perception_depth_codec == "uint8_div_100_v1"
+    assert cfg.algo.load_pretrained_perception is False
+    assert cfg.algo.perception_checkpoint_path is None
+    assert cfg.algo.train_perception is True
     assert cfg.algo.save_teacher_buffer is False
     assert "teacher_buffer_capacity" not in cfg.algo
     assert "teacher_buffer_filename" not in cfg.algo
@@ -200,17 +237,18 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.wandb.project == "vaic_dagger"
 
     schedule = td3_entry.td3_dagger_rollout_schedule(cfg)
-    prefill = int(cfg.algo.teacher_prefill_rollouts)
+    assert cfg._bc_dagger_main_rollout_budget == 2400
     assert schedule == {
         "frames_per_rollout": 8_192,
-        "total_rollouts": 2400 - prefill,
-        "main_rollouts": 2400 - prefill,
-        "prefill_rollouts": prefill,
-        "physical_rollouts": 2400,
+        "total_rollouts": 2400,
+        "main_rollouts": 2400,
+        "prefill_max_rollouts": 1000,
+        "prefill_target_rows": 131_072,
+        "max_physical_rollouts": 3400,
         "start_rollout": 0,
-        "end_rollout": 2400 - prefill,
+        "end_rollout": 2400,
         "decay_rollouts": 1800,
-        "beta_zero_rollouts": 600 - prefill,
+        "beta_zero_rollouts": 600,
         "safe_zero_rollouts": 0,
     }
 
@@ -234,7 +272,8 @@ def test_recommended_3000_rollout_command_composes_raw_perception_replay():
         )
 
     td3_entry.validate_td3_bc_dagger_config(cfg)
-    assert cfg.total_frames == 3010 * 256 * 32
+    assert cfg.total_frames == 4000 * 256 * 32
+    assert cfg._bc_dagger_main_rollout_budget == 3000
     assert cfg.algo.dagger_buffer_capacity == 131_072
     assert cfg.algo.q_teacher_buffer_capacity == 131_072
     assert cfg.algo.perception_replay_burn_in == 8
@@ -249,8 +288,9 @@ def test_recommended_3000_rollout_command_composes_raw_perception_replay():
         "frames_per_rollout": 8_192,
         "total_rollouts": 3000,
         "main_rollouts": 3000,
-        "prefill_rollouts": 10,
-        "physical_rollouts": 3010,
+        "prefill_max_rollouts": 1000,
+        "prefill_target_rows": 131_072,
+        "max_physical_rollouts": 4000,
         "start_rollout": 0,
         "end_rollout": 3000,
         "decay_rollouts": 1800,
@@ -274,21 +314,23 @@ def test_td3_yaml_environment_count_can_be_overridden():
 
     td3_entry.validate_td3_bc_dagger_config(cfg)
     assert cfg.task.num_envs == 256
-    assert cfg.total_frames == 3010 * 256 * 32
+    assert cfg.total_frames == 4000 * 256 * 32
 
 
-def test_teacher_prefill_adds_physical_rollouts_without_shortening_main_beta_schedule():
+def test_teacher_prefill_upper_bound_does_not_shorten_main_beta_schedule():
     cfg = _cfg(iterations=3000, total_frames=1, control_mode="beta")
-    cfg.algo.teacher_prefill_rollouts = 10
+    cfg.algo.teacher_prefill_max_rollouts = 10
 
     td3_entry.validate_td3_bc_dagger_config(cfg)
     schedule = td3_entry.td3_dagger_rollout_schedule(cfg)
 
     frames_per_rollout = 512 * 32
     assert cfg.total_frames == 3010 * frames_per_rollout
-    assert schedule["prefill_rollouts"] == 10
+    assert cfg._bc_dagger_main_rollout_budget == 3000
+    assert schedule["prefill_max_rollouts"] == 10
+    assert schedule["prefill_target_rows"] == 131_072
     assert schedule["main_rollouts"] == 3000
-    assert schedule["physical_rollouts"] == 3010
+    assert schedule["max_physical_rollouts"] == 3010
     assert schedule["start_rollout"] == 0
     assert schedule["end_rollout"] == 3000
     assert schedule["decay_rollouts"] == 1800
@@ -297,22 +339,19 @@ def test_teacher_prefill_adds_physical_rollouts_without_shortening_main_beta_sch
 
 def test_teacher_prefill_requires_an_explicit_main_rollout_budget():
     cfg = _cfg(iterations=None, control_mode="beta")
-    cfg.algo.teacher_prefill_rollouts = 10
+    cfg.algo.teacher_prefill_max_rollouts = 10
 
     with pytest.raises(ValueError, match="explicit td3_dagger_iterations"):
         td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
-def test_pure_student_beta_requires_separate_teacher_prefill():
+def test_pure_student_beta_uses_dynamic_teacher_prefill():
     cfg = _cfg(iterations=3000, control_mode="beta")
     cfg.algo.dagger_beta_start = 0.0
     cfg.algo.dagger_beta_end = 0.0
 
-    with pytest.raises(ValueError, match="teacher_prefill_rollouts > 0"):
-        td3_entry.validate_td3_bc_dagger_config(cfg)
-
-    cfg.algo.teacher_prefill_rollouts = 10
     td3_entry.validate_td3_bc_dagger_config(cfg)
+    assert cfg.algo.teacher_prefill_max_rollouts == 10
 
 
 def test_yaml_adds_no_forbidden_stochastic_policy_fields():
@@ -330,10 +369,100 @@ def test_valid_config_allows_only_inert_inherited_ppo_fields():
     cfg = _cfg()
     td3_entry.validate_td3_bc_dagger_config(cfg)
 
+    backend = td3_entry._expected_dagger_backend_config(cfg.algo)
+    assert backend["load_pretrained_perception"] is False
+    assert backend["perception_checkpoint_path"] is None
+    assert backend["train_perception"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("load_pretrained_perception", 1),
+        ("load_pretrained_perception", "true"),
+        ("train_perception", 0),
+        ("train_perception", "false"),
+    ),
+)
+def test_perception_switches_must_be_boolean(field, value):
+    cfg = _cfg()
+    cfg.algo[field] = value
+
+    with pytest.raises(ValueError, match=f"algo.{field} must be boolean"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_pretrained_perception_requires_an_explicit_existing_local_path(tmp_path):
+    cfg = _cfg()
+    cfg.algo.load_pretrained_perception = True
+
+    with pytest.raises(ValueError, match="requires an explicit local"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+    cfg.algo.perception_checkpoint_path = str(tmp_path / "missing.pt")
+    with pytest.raises(FileNotFoundError, match="checkpoint does not exist"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_pretrained_perception_path_is_canonicalized_without_replacing_teacher_source(
+    tmp_path,
+):
+    perception = _write_perception_checkpoint(tmp_path / "student_perception.pt")
+    cfg = _cfg(checkpoint="/tmp/train_ppo_teacher.pt")
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+
+    td3_entry.validate_td3_bc_dagger_config(cfg)
+
+    assert cfg.algo.perception_checkpoint_path == str(perception.resolve())
+    assert cfg.checkpoint_path == "/tmp/train_ppo_teacher.pt"
+
+
+def test_disabled_pretrained_perception_rejects_path_and_freeze_mode(tmp_path):
+    cfg = _cfg()
+    cfg.algo.perception_checkpoint_path = str(tmp_path / "unused.pt")
+    with pytest.raises(ValueError, match="must be null"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+    cfg.algo.perception_checkpoint_path = None
+    cfg.algo.train_perception = False
+    with pytest.raises(ValueError, match="requires.*load_pretrained_perception=true"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize("train_perception", (True, False))
+def test_pretrained_perception_supports_update_and_freeze_modes(
+    tmp_path, train_perception
+):
+    perception = _write_perception_checkpoint(tmp_path / "student_perception.pt")
+    cfg = _cfg()
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+    cfg.algo.train_perception = train_perception
+
+    td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_pretrained_perception_requires_all_module_mappings(tmp_path):
+    missing = td3_entry.REQUIRED_PRETRAINED_PERCEPTION_MODULES[0]
+    perception = _write_perception_checkpoint(
+        tmp_path / "incomplete_perception.pt", omit=missing
+    )
+    cfg = _cfg()
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+
+    with pytest.raises(ValueError, match=f"module mappings.*{missing}"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
 
 @pytest.mark.parametrize(
     "field",
-    ("teacher_actor_replay_fraction", "teacher_perception_replay_fraction"),
+    (
+        "teacher_actor_replay_fraction",
+        "teacher_perception_replay_fraction",
+        "failure_phase_teacher_fraction",
+    ),
 )
 @pytest.mark.parametrize("value", (-0.1, 1.1, float("nan"), True))
 def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
@@ -343,12 +472,44 @@ def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
         td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
-def test_teacher_replay_fractions_require_frozen_prefill_source():
+def test_dynamic_teacher_prefill_requires_positive_safety_ceiling():
     cfg = _cfg()
-    cfg.algo.teacher_prefill_rollouts = 0
+    cfg.algo.teacher_prefill_max_rollouts = 0
     cfg.algo.teacher_actor_replay_fraction = 0.25
 
-    with pytest.raises(ValueError, match="teacher_prefill_rollouts > 0"):
+    with pytest.raises(ValueError, match="teacher_prefill_max_rollouts.*positive"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_teacher_prefill_ceiling_must_theoretically_reach_ring_capacity():
+    cfg = _cfg()
+    cfg.algo.teacher_prefill_max_rollouts = 7
+
+    with pytest.raises(ValueError, match=r"cannot possibly fill.*upper bound"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+    # Equality is a valid static upper bound. Runtime still requires that the
+    # rows belong to successful complete Teacher episodes.
+    cfg.algo.teacher_prefill_max_rollouts = 8
+    td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_failure_phase_focus_requires_an_enabled_teacher_source():
+    cfg = _cfg(iterations=1)
+    cfg.algo.teacher_prefill_max_rollouts = 8
+    cfg.algo.failure_phase_teacher_fraction = 0.3
+    cfg.algo.q_teacher_replay_ratio = 0.0
+
+    with pytest.raises(ValueError, match="positive Teacher source fraction"):
+        td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_failure_phase_samples_fit_in_inclusive_lookback_interval():
+    cfg = _cfg()
+    cfg.algo.failure_phase_lookback_steps = 8
+    cfg.algo.failure_phase_samples_per_failure = 10
+
+    with pytest.raises(ValueError, match=r"cannot exceed.*lookback_steps \+ 1"):
         td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
@@ -403,7 +564,10 @@ def test_config_rejects_forbidden_stochastic_policy_fields(field):
         ("perception_encode_microbatch_size", 0, "positive"),
         ("teacher_perception_batch_size", 0, "positive"),
         ("perception_depth_codec", "float16", "uint8_div_100_v1"),
-        ("teacher_prefill_rollouts", -1, "non-negative"),
+        ("teacher_prefill_max_rollouts", -1, "positive"),
+        ("failure_phase_lookback_steps", 0, "positive"),
+        ("failure_phase_samples_per_failure", 0, "positive"),
+        ("failure_phase_num_bins", 0, "positive"),
         ("lambda_bc", float("nan"), "non-negative"),
         ("policy_delay", 0, "positive"),
         ("target_policy_noise_std", -0.1, "non-negative"),
@@ -473,14 +637,15 @@ def test_iteration_alias_preserves_existing_categorical_beta_schedule():
     td3_entry.validate_td3_bc_dagger_config(cfg)
     schedule = td3_entry.td3_dagger_rollout_schedule(cfg)
 
-    assert cfg.total_frames == 1200 * 512 * 32
+    assert cfg.total_frames == 1210 * 512 * 32
     assert cfg.algo.dagger_beta_decay_rollouts == 900
     assert schedule == {
         "frames_per_rollout": 16_384,
         "total_rollouts": 1200,
         "main_rollouts": 1200,
-        "prefill_rollouts": 0,
-        "physical_rollouts": 1200,
+        "prefill_max_rollouts": 10,
+        "prefill_target_rows": 131_072,
+        "max_physical_rollouts": 1210,
         "start_rollout": 0,
         "end_rollout": 1200,
         "decay_rollouts": 900,
@@ -580,3 +745,37 @@ def test_entrypoint_reuses_shared_training_engine(monkeypatch):
     assert result == "shared-result"
     assert sources == [cfg]
     assert received == [cfg]
+
+
+def test_dynamic_prefill_checkpoint_index_uses_only_completed_main_rollouts():
+    policy = type("Policy", (), {"dagger_rollout_count": 0})()
+
+    # Any number of physical Teacher-prefill rollouts remains at main index 0.
+    assert _bc_dagger_checkpoint_index(policy, 57, 3000, model_only_resume=False) == 0
+
+    policy.dagger_rollout_count = 100
+    assert (
+        _bc_dagger_checkpoint_index(policy, 157, 3000, model_only_resume=False) == 100
+    )
+
+
+def test_checkpoint_index_preserves_legacy_and_model_only_resume_paths():
+    plain = object()
+    assert _bc_dagger_checkpoint_index(plain, 37, None, model_only_resume=False) == 37
+
+    resumed = type("Policy", (), {"dagger_rollout_count": 101})()
+    assert _bc_dagger_checkpoint_index(resumed, 37, None, model_only_resume=True) == 100
+
+
+def test_dynamic_main_budget_stops_exactly_and_rejects_overshoot():
+    policy = type("Policy", (), {"dagger_rollout_count": 2999})()
+    assert _bc_dagger_main_budget_complete(policy, 3000) is False
+
+    policy.dagger_rollout_count = 3000
+    assert _bc_dagger_main_budget_complete(policy, 3000) is True
+
+    policy.dagger_rollout_count = 3001
+    with pytest.raises(RuntimeError, match=r"exceeded.*3001 > 3000"):
+        _bc_dagger_main_budget_complete(policy, 3000)
+
+    assert _bc_dagger_main_budget_complete(policy, None) is False

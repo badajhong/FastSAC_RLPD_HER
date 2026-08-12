@@ -1,8 +1,7 @@
 import torch
+
 # import warp
 import hydra
-import numpy as np
-import einops
 import wandb
 import logging
 import os
@@ -21,6 +20,7 @@ except ImportError:
     from _isaaclab_bootstrap import AppLauncher
 
 import active_adaptation as aa
+
 # from active_adaptation.utils.torchrl import SyncDataCollector
 from torchrl.envs.utils import set_exploration_type, ExplorationType
 from tensordict.nn import TensorDictModuleBase
@@ -58,6 +58,36 @@ FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
 
+def _bc_dagger_checkpoint_index(
+    policy,
+    physical_iteration: int,
+    main_rollout_budget: int | None,
+    *,
+    model_only_resume: bool,
+) -> int:
+    """Return the checkpoint index in main-rollout coordinates when enabled."""
+    if main_rollout_budget is not None:
+        return int(policy.dagger_rollout_count)
+    if model_only_resume and hasattr(policy, "dagger_rollout_count"):
+        # Preserve the original zero-based filename convention while using
+        # the cumulative DAgger stage counter in a resumed W&B run.
+        return max(int(policy.dagger_rollout_count) - 1, 0)
+    return int(physical_iteration)
+
+
+def _bc_dagger_main_budget_complete(policy, main_rollout_budget: int | None) -> bool:
+    """Validate and report completion of an exact dynamic-prefill main budget."""
+    if main_rollout_budget is None:
+        return False
+    completed_main = int(policy.dagger_rollout_count)
+    if completed_main > int(main_rollout_budget):
+        raise RuntimeError(
+            "policy exceeded _bc_dagger_main_rollout_budget: "
+            f"{completed_main} > {int(main_rollout_budget)}"
+        )
+    return completed_main == int(main_rollout_budget)
+
+
 def maybe_upload_teacher_replay(
     run,
     cfg: DictConfig,
@@ -91,9 +121,7 @@ def maybe_upload_teacher_replay(
 def make_wandb_settings(cfg: DictConfig):
     """Prevent W&B's end-of-run directory scan from finding a local H5."""
     replay_filename = cfg.algo.get("teacher_buffer_filename", None)
-    upload_enabled = bool(
-        cfg.wandb.get("upload_teacher_replay", False)
-    )
+    upload_enabled = bool(cfg.wandb.get("upload_teacher_replay", False))
     ignore_globs = ()
     if replay_filename is not None and not upload_enabled:
         ignore_globs = (str(replay_filename),)
@@ -103,9 +131,8 @@ def make_wandb_settings(cfg: DictConfig):
 def run_training(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
-    if (
-        cfg.get("bc_dagger_checkpoint", None) is not None
-        and not bool(cfg.get("_bc_dagger_model_only_resume", False))
+    if cfg.get("bc_dagger_checkpoint", None) is not None and not bool(
+        cfg.get("_bc_dagger_model_only_resume", False)
     ):
         raise ValueError(
             "bc_dagger_checkpoint must be validated by scripts/bc_dagger.py; "
@@ -126,16 +153,10 @@ def run_training(cfg: DictConfig):
     )
     os.makedirs(run.dir, exist_ok=True)
     hydra_output_dir = (
-        HydraConfig.get().runtime.output_dir
-        if HydraConfig.initialized()
-        else None
+        HydraConfig.get().runtime.output_dir if HydraConfig.initialized() else None
     )
-    replay_storage_dir = teacher_replay_storage_dir(
-        run.dir, hydra_output_dir
-    )
-    replay_copy_source = cfg.get(
-        "_bc_dagger_teacher_replay_copy_source", None
-    )
+    replay_storage_dir = teacher_replay_storage_dir(run.dir, hydra_output_dir)
+    replay_copy_source = cfg.get("_bc_dagger_teacher_replay_copy_source", None)
     if (
         freeze_bc_dagger_teacher_replay
         and replay_copy_source is not None
@@ -149,15 +170,15 @@ def run_training(cfg: DictConfig):
         copied_replay = copy_frozen_teacher_replay(
             replay_copy_source,
             replay_storage_dir,
-            cfg.algo.get(
-                "teacher_buffer_filename", "teacher_replay_buffer.h5"
-            ),
+            cfg.algo.get("teacher_buffer_filename", "teacher_replay_buffer.h5"),
         )
         cfg._bc_dagger_teacher_replay_copy_path = copied_replay
         print(f"Teacher replay copy ready: {copied_replay}")
     run.config.update(OmegaConf.to_container(cfg))
-    
-    default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+
+    default_run_name = (
+        f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+    )
     # Recent W&B offline versions may leave ``run.name`` unset until the user
     # assigns it; the stable run id is a safe local fallback.
     run_idx = (run.name or run.id).split("-")[-1]
@@ -171,11 +192,13 @@ def run_training(cfg: DictConfig):
 
     # Materialize a requested 20+ GiB frozen replay before launching Isaac so
     # the simulator and GPU are not held idle during filesystem I/O.
-    print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
+    print(
+        f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}"
+    )
     app_launcher = AppLauncher(
         OmegaConf.to_container(cfg.app),
         distributed=aa.is_distributed(),
-        device=f"cuda:{aa.get_local_rank()}"
+        device=f"cuda:{aa.get_local_rank()}",
     )
     simulation_app = app_launcher.app
 
@@ -186,15 +209,11 @@ def run_training(cfg: DictConfig):
     # W&B/cfg.yaml reproduce the policy that was actually constructed rather
     # than the earlier auto/null placeholders.
     if aa.is_main_process():
-        run.config.update(
-            OmegaConf.to_container(cfg), allow_val_change=True
-        )
+        run.config.update(OmegaConf.to_container(cfg), allow_val_change=True)
         OmegaConf.save(cfg, cfg_save_path)
         run.save(cfg_save_path, policy="now")
 
-    if freeze_bc_dagger_teacher_replay and hasattr(
-        policy, "restore_q_teacher_replay"
-    ):
+    if freeze_bc_dagger_teacher_replay and hasattr(policy, "restore_q_teacher_replay"):
         replay_refill_source = replay_copy_source
         if replay_refill_source is None:
             raise FileNotFoundError(
@@ -217,10 +236,7 @@ def run_training(cfg: DictConfig):
         and hasattr(policy, "configure_teacher_replay")
         and (
             requires_training_replay
-            or (
-                aa.is_main_process()
-                and cfg.algo.get("save_teacher_buffer", False)
-            )
+            or (aa.is_main_process() and cfg.algo.get("save_teacher_buffer", False))
         )
     ):
         replay_name = cfg.algo.teacher_buffer_filename
@@ -246,6 +262,7 @@ def run_training(cfg: DictConfig):
 
     import inspect
     import shutil
+
     source_path = inspect.getfile(policy.__class__)
     target_path = os.path.join(run.dir, source_path.split("/")[-1])
     shutil.copy(source_path, target_path)
@@ -255,22 +272,28 @@ def run_training(cfg: DictConfig):
     total_frames = cfg.get("total_frames", -1) // aa.get_world_size()
     total_frames = total_frames // frames_per_batch * frames_per_batch
     total_iters = total_frames // frames_per_batch
+    main_rollout_budget = cfg.get("_bc_dagger_main_rollout_budget", None)
+    if main_rollout_budget is not None:
+        if isinstance(main_rollout_budget, bool) or int(main_rollout_budget) < 1:
+            raise ValueError("_bc_dagger_main_rollout_budget must be positive")
+        main_rollout_budget = int(main_rollout_budget)
+    main_rollout_budget_complete = False
     save_interval = cfg.get("save_interval", -1)
 
     log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
     logging.info(f"Log interval: {log_interval} steps")
 
     stats_keys = [
-        k for k in env.reward_spec.keys(True, True) 
+        k
+        for k in env.reward_spec.keys(True, True)
         if isinstance(k, tuple) and k[0] == "stats"
     ]
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
-    def save(policy, checkpoint_name: str, artifact: bool=False):
+    def save(policy, checkpoint_name: str, artifact: bool = False):
         replay_snapshot_path = None
-        if (
-            not freeze_bc_dagger_teacher_replay
-            and hasattr(policy, "snapshot_teacher_replay")
+        if not freeze_bc_dagger_teacher_replay and hasattr(
+            policy, "snapshot_teacher_replay"
         ):
             replay_snapshot_path = policy.snapshot_teacher_replay(
                 env.current_iter, checkpoint_name
@@ -286,8 +309,7 @@ def run_training(cfg: DictConfig):
         torch.save(state_dict, ckpt_path)
         if artifact:
             model_artifact = wandb.Artifact(
-                f"{type(env).__name__}-{type(policy).__name__}",
-                type="model"
+                f"{type(env).__name__}-{type(policy).__name__}", type="model"
             )
             model_artifact.add_file(ckpt_path)
             run.log_artifact(model_artifact)
@@ -302,6 +324,7 @@ def run_training(cfg: DictConfig):
         logging.info(f"Saved checkpoint to {str(ckpt_path)}")
 
     assert env.training
+
     def should_save(i):
         if not aa.is_main_process():
             return False
@@ -326,10 +349,17 @@ def run_training(cfg: DictConfig):
             # Stage-1 replay has already consumed one-step raw aliases. Keep
             # them only in carry; retaining them in the N x T diagnostics
             # rollout would duplicate a large fraction of observation memory.
-            tmp_td = tmp_td.exclude(
-                "_fastsac_raw", ("next", "_fastsac_raw")
-            )
-        tmp_td["next"] = tmp_td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
+            tmp_td = tmp_td.exclude("_fastsac_raw", ("next", "_fastsac_raw"))
+        tmp_td["next"] = tmp_td["next"].select(
+            "done",
+            "terminated",
+            "discount",
+            "reward",
+            "stats",
+            "is_init",
+            "adapt_hx",
+            strict=False,
+        )
 
     N = env.num_envs
     T = cfg.algo.train_every
@@ -350,12 +380,16 @@ def run_training(cfg: DictConfig):
     env_frames = 0
     start_iter = env.current_iter
     for i in progress:
+        prefill_active_before_rollout = bool(
+            hasattr(policy, "is_teacher_prefill_active")
+            and policy.is_teacher_prefill_active()
+        )
         if hasattr(policy, "begin_transition_collection"):
             policy.begin_transition_collection()
         rollout_start = time.perf_counter()
         interleaved_training_time = 0.0
         with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
-            torch.compiler.cudagraph_mark_step_begin() # for compiled policy
+            torch.compiler.cudagraph_mark_step_begin()  # for compiled policy
             env.set_progress(start_iter + i)
             for step in range(cfg.algo.train_every):
                 carry = rollout_policy(carry)
@@ -365,9 +399,8 @@ def run_training(cfg: DictConfig):
                     # completed rows. Snapshot the Q-only context while it still
                     # belongs to the action and transition being collected.
                     actuator_context = policy.capture_q_actuator_context()
-                if (
-                    not interleaved_updates
-                    and hasattr(policy, "record_rollout_q_actuator_context")
+                if not interleaved_updates and hasattr(
+                    policy, "record_rollout_q_actuator_context"
                 ):
                     policy.record_rollout_q_actuator_context(actuator_context)
                 td, carry = env.step_and_maybe_reset(carry)
@@ -377,12 +410,8 @@ def run_training(cfg: DictConfig):
                     # can run here even though environment collection is under
                     # inference mode.
                     with torch.inference_mode(False), torch.enable_grad():
-                        policy.collect_environment_step(
-                            td, carry, actuator_context
-                        )
-                    interleaved_training_time += (
-                        time.perf_counter() - update_start
-                    )
+                        policy.collect_environment_step(td, carry, actuator_context)
+                    interleaved_training_time += time.perf_counter() - update_start
                 elif hasattr(policy, "capture_truncation_final_observations"):
                     # The first return still owns the transformed pre-reset
                     # timeout observation; ``carry`` has already reset that
@@ -391,14 +420,20 @@ def run_training(cfg: DictConfig):
                     # task terminal and therefore needs no final-state capture.
                     policy.capture_truncation_final_observations(td, step)
                 if interleaved_updates:
-                    td = td.exclude(
-                        "_fastsac_raw", ("next", "_fastsac_raw")
-                    )
-                td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
+                    td = td.exclude("_fastsac_raw", ("next", "_fastsac_raw"))
+                td["next"] = td["next"].select(
+                    "done",
+                    "terminated",
+                    "discount",
+                    "reward",
+                    "stats",
+                    "is_init",
+                    "adapt_hx",
+                    strict=False,
+                )
                 data_buf[:, step] = td
-            if (
-                not interleaved_updates
-                and hasattr(policy, "capture_rollout_final_observation")
+            if not interleaved_updates and hasattr(
+                policy, "capture_rollout_final_observation"
             ):
                 policy.capture_rollout_final_observation(carry)
             requires_value_bootstrap = (
@@ -410,15 +445,25 @@ def run_training(cfg: DictConfig):
                 values = data_buf["state_value"]
                 data_buf["next", "state_value"] = torch.where(
                     data_buf["next", "done"],
-                    values, # a walkaround to avoid storing the next states
-                    torch.cat([values[:, 1:], policy.critic(carry.copy())["state_value"].unsqueeze(1)], dim=1)
+                    values,  # a walkaround to avoid storing the next states
+                    torch.cat(
+                        [
+                            values[:, 1:],
+                            policy.critic(carry.copy())["state_value"].unsqueeze(1),
+                        ],
+                        dim=1,
+                    ),
                 )
         rollout_time = max(
             time.perf_counter() - rollout_start - interleaved_training_time,
             1e-9,
         )
 
-        episode_stats.add(data_buf)
+        if not prefill_active_before_rollout:
+            # Dynamic Teacher prefill is a collection-only phase, not main
+            # policy training.  Excluding it keeps train/stats/* (especially
+            # success) a clean main-policy metric from its first window.
+            episode_stats.add(data_buf)
         env_frames += data_buf.numel()
 
         info = {}
@@ -428,27 +473,40 @@ def run_training(cfg: DictConfig):
                 info[key] = torch.mean(v.float()).item()
         training_start = time.perf_counter()
         info.update(policy.train_op(data_buf))
-        training_time = (
-            time.perf_counter() - training_start + interleaved_training_time
-        )
+        if (
+            prefill_active_before_rollout
+            and hasattr(policy, "is_teacher_prefill_active")
+            and not policy.is_teacher_prefill_active()
+            and len(episode_stats)
+        ):
+            # Do not let successful Teacher-prefill episodes contaminate the
+            # first main Student train/stats window.
+            episode_stats.pop()
+        training_time = time.perf_counter() - training_start + interleaved_training_time
         info.update(env.extra)
         info.update(env.stats_ema)
 
         if hasattr(policy, "step_schedule"):
-            policy.step_schedule(i / total_iters)
+            schedule_progress = i / total_iters
+            if main_rollout_budget is not None and hasattr(
+                policy, "dagger_rollout_count"
+            ):
+                schedule_progress = min(
+                    int(policy.dagger_rollout_count) / main_rollout_budget,
+                    1.0,
+                )
+            policy.step_schedule(schedule_progress)
 
         info["env_frames"] = env_frames
         info["rollout_fps"] = data_buf.numel() / rollout_time
         info["training_time"] = training_time
 
-        checkpoint_index = i
-        if (
-            bool(cfg.get("_bc_dagger_model_only_resume", False))
-            and hasattr(policy, "dagger_rollout_count")
-        ):
-            # Preserve the original zero-based filename convention while using
-            # the cumulative DAgger stage counter in a resumed W&B run.
-            checkpoint_index = max(int(policy.dagger_rollout_count) - 1, 0)
+        checkpoint_index = _bc_dagger_checkpoint_index(
+            policy,
+            i,
+            main_rollout_budget,
+            model_only_resume=bool(cfg.get("_bc_dagger_model_only_resume", False)),
+        )
         if should_save(checkpoint_index):
             save(policy, f"checkpoint_{checkpoint_index}")
 
@@ -456,12 +514,25 @@ def run_training(cfg: DictConfig):
             # print(OmegaConf.to_yaml({k: v for k, v in info.items() if (isinstance(v, (float, int)) and not k.startswith("performance_reward"))}))
             run.log(info)
 
+        if _bc_dagger_main_budget_complete(policy, main_rollout_budget):
+            main_rollout_budget_complete = True
+            break
+
+    if main_rollout_budget is not None and not main_rollout_budget_complete:
+        raise RuntimeError(
+            "training exhausted the dynamic prefill safety budget before "
+            f"completing {main_rollout_budget} main DAgger rollouts; "
+            f"completed={int(getattr(policy, 'dagger_rollout_count', -1))}"
+        )
+
     # 5. --- Finalization and Cleanup ---
     if aa.is_main_process():
         save(policy, "checkpoint_final", artifact=True)
 
     policy_eval = policy.get_rollout_policy("eval")
-    info, trajs, stats, policy_trajs = evaluate(env, policy_eval, render=cfg.eval_render, seed=cfg.seed)
+    info, trajs, stats, policy_trajs = evaluate(
+        env, policy_eval, render=cfg.eval_render, seed=cfg.seed
+    )
     run.log(info)
 
     wandb.finish()
@@ -473,14 +544,13 @@ def run_training(cfg: DictConfig):
     project = run.project
     entity = run.entity
     run_path = f"{entity}/{project}/{run_id}"
-    
+
     return run_path
 
 
 @hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
 def main(cfg: DictConfig):
     return run_training(cfg)
-
 
 
 if __name__ == "__main__":

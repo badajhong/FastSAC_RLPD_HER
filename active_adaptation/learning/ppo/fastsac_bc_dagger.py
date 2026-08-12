@@ -67,6 +67,7 @@ from .ppo_vel import (
     PPOVEL,
 )
 from .td3_bc_dagger import (
+    FAILURE_PHASE_TEACHER_SOURCE_KEY,
     PERCEPTION_REPLAY_SEMANTICS,
     TD3_BETA_KEY,
     TD3_COLLECTOR_NOISE_KEY,
@@ -104,10 +105,6 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     )
     name: str = "fastsac_bc_dagger"
 
-    # A separate Teacher-only phase seeds and then freezes the Teacher half of
-    # balanced Q replay.  Main rollout can therefore be purely stochastic
-    # Student behavior while still querying a Teacher label for exact BC.
-    teacher_prefill_rollouts: int = 10
     dagger_control_mode: str = "beta"
     dagger_beta_start: float = 0.0
     dagger_beta_end: float = 0.0
@@ -753,6 +750,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_mean_action_abs_mean": dist.mean.detach().abs().mean(),
             "actor_log_std_mean": self.bc_dagger_sac_adapter.log_std.detach().mean(),
             "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
+            "actor_failure_phase_teacher_fraction": batch.get(
+                FAILURE_PHASE_TEACHER_SOURCE_KEY,
+                torch.zeros_like(batch[DAGGER_TEACHER_ACTION_VALID_KEY]),
+            )
+            .float()
+            .mean()
+            .detach(),
             "alpha": self.log_alpha.exp().detach(),
         }
         if hasattr(self, "_fastsac_rollout_actor_metrics"):
@@ -905,7 +909,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     if self.alpha_optimizer is None
                     else self.alpha_optimizer.state_dict()
                 ),
-                "adapt_optimizer": self.opt_adapt.state_dict(),
+                "adapt_optimizer": (
+                    None if self.opt_adapt is None else self.opt_adapt.state_dict()
+                ),
             },
             "actor_update_count": int(self.actor_update_count),
             "critic_update_count": int(self.critic_update_count),
@@ -947,7 +953,18 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             if optimizers.get("alpha_optimizer") is None:
                 raise ValueError("FastSAC checkpoint lacks alpha optimizer state")
             self.alpha_optimizer.load_state_dict(optimizers["alpha_optimizer"])
-        self.opt_adapt.load_state_dict(optimizers["adapt_optimizer"])
+        adapt_optimizer_state = optimizers["adapt_optimizer"]
+        if self.opt_adapt is None:
+            if adapt_optimizer_state is not None:
+                raise ValueError(
+                    "frozen perception checkpoint contains an active optimizer"
+                )
+        else:
+            if adapt_optimizer_state is None:
+                raise ValueError(
+                    "trainable perception checkpoint lacks optimizer state"
+                )
+            self.opt_adapt.load_state_dict(adapt_optimizer_state)
         for name in (
             "actor_update_count",
             "critic_update_count",
@@ -980,6 +997,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "fresh_only_online_raw_perception_rings_not_serialized_v1"
                 ),
                 "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
+                "perception_initialization": copy.deepcopy(
+                    self._perception_initialization
+                ),
                 "perception_object_geo_fingerprint": (
                     self._replay_object_geo_fingerprint
                 ),

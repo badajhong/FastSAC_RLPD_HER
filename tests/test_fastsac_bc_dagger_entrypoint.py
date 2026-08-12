@@ -42,9 +42,13 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "dagger_buffer_capacity": 131_072,
                 "dagger_buffer_device": "cpu",
                 "dagger_batch_size": 4096,
-                "teacher_prefill_rollouts": 10,
-                "teacher_actor_replay_fraction": 0.0,
-                "teacher_perception_replay_fraction": 0.0,
+                "teacher_prefill_max_rollouts": 10,
+                "teacher_actor_replay_fraction": 0.5,
+                "teacher_perception_replay_fraction": 0.5,
+                "failure_phase_teacher_fraction": 0.3,
+                "failure_phase_lookback_steps": 50,
+                "failure_phase_samples_per_failure": 10,
+                "failure_phase_num_bins": 1024,
                 "dagger_replay_raw_observations": True,
                 "replay_raw_observation_keys": list(
                     sac_entry.EXPECTED_REPLAY_RAW_OBSERVATION_KEYS
@@ -53,6 +57,9 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "perception_encode_microbatch_size": 128,
                 "teacher_perception_batch_size": 128,
                 "perception_depth_codec": "uint8_div_100_v1",
+                "load_pretrained_perception": False,
+                "perception_checkpoint_path": None,
+                "train_perception": True,
                 "q_hidden_dim": 768,
                 "q_num_atoms": 501,
                 "q_v_min": -20.0,
@@ -138,6 +145,14 @@ def _write_fresh_ppo_checkpoint(path: Path) -> Path:
     return path
 
 
+def _write_perception_checkpoint(path: Path, *, omit: str | None = None) -> Path:
+    policy = {name: {} for name in sac_entry.REQUIRED_PRETRAINED_PERCEPTION_MODULES}
+    if omit is not None:
+        policy.pop(omit)
+    torch.save({"policy": policy}, path)
+    return path
+
+
 def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
@@ -153,10 +168,25 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
     assert cfg.algo.name == "fastsac_bc_dagger"
     assert cfg.algo._target_ == sac_entry.EXPECTED_ALGO_TARGET
     assert cfg.task.num_envs == 256
-    assert cfg.algo.teacher_prefill_rollouts == 10
-    assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.0)
-    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.0)
+    assert cfg.algo.teacher_prefill_max_rollouts == 1000
+    assert "teacher_prefill_rollouts" not in cfg.algo
+    assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.5)
+    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.5)
+    assert cfg.algo.failure_phase_teacher_fraction == pytest.approx(0.3)
+    assert cfg.algo.failure_phase_lookback_steps == 50
+    assert cfg.algo.failure_phase_samples_per_failure == 10
+    assert cfg.algo.failure_phase_num_bins == 1024
+    assert (
+        cfg.algo.teacher_actor_replay_fraction * cfg.algo.failure_phase_teacher_fraction
+        == pytest.approx(0.15)
+    )
+    assert cfg.algo.teacher_actor_replay_fraction * (
+        1.0 - cfg.algo.failure_phase_teacher_fraction
+    ) == pytest.approx(0.35)
     assert cfg.algo.teacher_perception_batch_size == 128
+    assert cfg.algo.load_pretrained_perception is False
+    assert cfg.algo.perception_checkpoint_path is None
+    assert cfg.algo.train_perception is True
     assert cfg.algo.dagger_beta_start == pytest.approx(0.0)
     assert cfg.algo.dagger_beta_end == pytest.approx(0.0)
     assert cfg.algo.eta_sac == pytest.approx(1.0e-4)
@@ -170,13 +200,15 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
     assert cfg.algo.collector_exploration_noise_std == 0.0
 
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
-    assert cfg.total_frames == 3010 * 256 * 32
+    assert cfg.total_frames == 4000 * 256 * 32
+    assert cfg._bc_dagger_main_rollout_budget == 3000
     assert sac_entry.fastsac_dagger_rollout_schedule(cfg) == {
         "frames_per_rollout": 8_192,
         "total_rollouts": 3000,
         "main_rollouts": 3000,
-        "prefill_rollouts": 10,
-        "physical_rollouts": 3010,
+        "prefill_max_rollouts": 1000,
+        "prefill_target_rows": 131_072,
+        "max_physical_rollouts": 4000,
         "start_rollout": 0,
         "end_rollout": 3000,
         "decay_rollouts": 1800,
@@ -200,7 +232,7 @@ def test_fastsac_yaml_environment_count_can_be_overridden():
 
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
     assert cfg.task.num_envs == 256
-    assert cfg.total_frames == 3010 * 256 * 32
+    assert cfg.total_frames == 4000 * 256 * 32
 
 
 def test_explicit_main_rollout_budget_is_required():
@@ -209,16 +241,100 @@ def test_explicit_main_rollout_budget_is_required():
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
-def test_pure_student_main_rollout_requires_teacher_prefill():
+def test_pure_student_main_rollout_uses_dynamic_teacher_prefill():
     cfg = _cfg()
-    cfg.algo.teacher_prefill_rollouts = 0
-    with pytest.raises(ValueError, match="teacher_prefill_rollouts > 0"):
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+    assert cfg.algo.teacher_prefill_max_rollouts == 10
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("load_pretrained_perception", 1),
+        ("load_pretrained_perception", "true"),
+        ("train_perception", 0),
+        ("train_perception", "false"),
+    ),
+)
+def test_perception_switches_must_be_boolean(field, value):
+    cfg = _cfg()
+    cfg.algo[field] = value
+
+    with pytest.raises(ValueError, match=f"algo.{field} must be boolean"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_pretrained_perception_requires_an_explicit_existing_local_path(tmp_path):
+    cfg = _cfg()
+    cfg.algo.load_pretrained_perception = True
+
+    with pytest.raises(ValueError, match="requires an explicit local"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    cfg.algo.perception_checkpoint_path = str(tmp_path / "missing.pt")
+    with pytest.raises(FileNotFoundError, match="checkpoint does not exist"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_pretrained_perception_path_is_canonicalized_without_replacing_teacher_source(
+    tmp_path,
+):
+    perception = _write_perception_checkpoint(tmp_path / "student_perception.pt")
+    cfg = _cfg(checkpoint="/tmp/train_ppo_teacher.pt")
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    assert cfg.algo.perception_checkpoint_path == str(perception.resolve())
+    assert cfg.checkpoint_path == "/tmp/train_ppo_teacher.pt"
+
+
+def test_disabled_pretrained_perception_rejects_path_and_freeze_mode(tmp_path):
+    cfg = _cfg()
+    cfg.algo.perception_checkpoint_path = str(tmp_path / "unused.pt")
+    with pytest.raises(ValueError, match="must be null"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    cfg.algo.perception_checkpoint_path = None
+    cfg.algo.train_perception = False
+    with pytest.raises(ValueError, match="requires.*load_pretrained_perception=true"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize("train_perception", (True, False))
+def test_pretrained_perception_supports_update_and_freeze_modes(
+    tmp_path, train_perception
+):
+    perception = _write_perception_checkpoint(tmp_path / "student_perception.pt")
+    cfg = _cfg()
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+    cfg.algo.train_perception = train_perception
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_pretrained_perception_requires_all_module_mappings(tmp_path):
+    missing = sac_entry.REQUIRED_PRETRAINED_PERCEPTION_MODULES[0]
+    perception = _write_perception_checkpoint(
+        tmp_path / "incomplete_perception.pt", omit=missing
+    )
+    cfg = _cfg()
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+
+    with pytest.raises(ValueError, match=f"module mappings.*{missing}"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
 @pytest.mark.parametrize(
     "field",
-    ("teacher_actor_replay_fraction", "teacher_perception_replay_fraction"),
+    (
+        "teacher_actor_replay_fraction",
+        "teacher_perception_replay_fraction",
+        "failure_phase_teacher_fraction",
+    ),
 )
 @pytest.mark.parametrize("value", (-0.1, 1.1, float("nan"), True))
 def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
@@ -228,12 +344,44 @@ def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
-def test_teacher_replay_fractions_require_frozen_prefill_source():
+def test_dynamic_teacher_prefill_requires_positive_safety_ceiling():
     cfg = _cfg()
-    cfg.algo.teacher_prefill_rollouts = 0
+    cfg.algo.teacher_prefill_max_rollouts = 0
     cfg.algo.teacher_perception_replay_fraction = 0.5
 
-    with pytest.raises(ValueError, match="teacher_prefill_rollouts > 0"):
+    with pytest.raises(ValueError, match="teacher_prefill_max_rollouts.*positive"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_teacher_prefill_ceiling_must_theoretically_reach_ring_capacity():
+    cfg = _cfg()
+    cfg.algo.teacher_prefill_max_rollouts = 7
+
+    with pytest.raises(ValueError, match=r"cannot possibly fill.*upper bound"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    # Equality is a valid static upper bound. Runtime still requires that the
+    # rows belong to successful complete Teacher episodes.
+    cfg.algo.teacher_prefill_max_rollouts = 8
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_failure_phase_focus_requires_an_enabled_teacher_source():
+    cfg = _cfg()
+    cfg.algo.teacher_actor_replay_fraction = 0.0
+    cfg.algo.teacher_perception_replay_fraction = 0.0
+    cfg.algo.q_teacher_replay_ratio = 0.0
+
+    with pytest.raises(ValueError, match="positive Teacher source fraction"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_failure_phase_samples_fit_in_inclusive_lookback_interval():
+    cfg = _cfg()
+    cfg.algo.failure_phase_lookback_steps = 8
+    cfg.algo.failure_phase_samples_per_failure = 10
+
+    with pytest.raises(ValueError, match=r"cannot exceed.*lookback_steps \+ 1"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
@@ -265,6 +413,9 @@ def test_inherited_td3_noise_must_remain_zero(field):
         ("sac_policy_frequency", 0, "positive"),
         ("sac_learning_starts", 0, "positive"),
         ("sac_tau", 0.0, "sac_tau"),
+        ("failure_phase_lookback_steps", 0, "positive"),
+        ("failure_phase_samples_per_failure", 0, "positive"),
+        ("failure_phase_num_bins", 0, "positive"),
         ("q_num_atoms", 51, "501"),
         ("q_batch_size", 3, "even"),
         ("q_updates_per_rollout", 0, "positive"),

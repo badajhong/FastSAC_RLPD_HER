@@ -12,7 +12,9 @@ defaults:
 task:
   num_envs: 256
 
-# Default 2,400-rollout skateboard budget at 256 environments and 32 steps.
+# Placeholder overwritten from the explicit main-rollout count. Runtime uses
+# an upper bound that also covers teacher_prefill_max_rollouts; the shared
+# runner exits early after the Teacher ring is full and the main budget ends.
 total_frames: 19_660_800
 td3_dagger_iterations: null
 save_interval: 100
@@ -44,20 +46,30 @@ algo:
   dagger_buffer_capacity: 131_072
   dagger_buffer_device: cpu
   dagger_batch_size: 4096
-  # Optional collection-only phase before the requested main DAgger budget.
-  # At the default 256x32, 10 rollouts provide at most 81,920 raw Teacher
-  # transitions before filtering. Use 17 to target a full 131,072-row ring.
+  # Collection-only phase before the requested main DAgger budget. It keeps
+  # collecting successful Teacher episodes until q_teacher_buffer_capacity is
+  # full. This value is only a fail-fast safety ceiling for persistently bad
+  # Teacher collection; it is not the normal prefill duration.
   # Prefill runs no Actor/Critic/perception update and never enters main replay.
-  # Once it ends, this Teacher Q ring is frozen: main DAgger still computes
-  # Teacher labels for BC, but does not copy more rows into the Teacher Q ring.
-  teacher_prefill_rollouts: 10
-  # Optional reuse of the frozen Teacher partition outside Critic updates.
-  # Actor fraction is an exact row share in each combined RL+BC Actor batch.
-  # Perception fraction weights replay supervision against live-rollout
-  # supervision; replay raw windows are re-encoded by the current model.
-  # Zero preserves the historical main-rollout-only behavior.
-  teacher_actor_replay_fraction: 0.0
-  teacher_perception_replay_fraction: 0.0
+  # Once full, this Teacher Q ring is frozen: main DAgger still computes Teacher
+  # labels for BC, but does not copy more rows into the Teacher Q ring.
+  # Rows are committed episode-wise only after command completion; physical
+  # failure and timeout trajectories are discarded.
+  teacher_prefill_max_rollouts: 1000
+  # Shared source mix for Critic, Actor states, and perception supervision:
+  # 50% live Student plus 50% frozen Teacher.  Within that Teacher half, 30%
+  # is phase-focused, yielding total shares Student 50%, uniform Teacher 35%,
+  # and failure-phase Teacher 15%.  Until a Student failure has supplied risk
+  # phases, the focused 15% safely falls back to uniform Teacher sampling.
+  teacher_actor_replay_fraction: 0.5
+  teacher_perception_replay_fraction: 0.5
+  failure_phase_teacher_fraction: 0.3
+  # Each failed Student episode contributes ten evenly spaced reference-phase
+  # samples from the inclusive [done - 50, done] interval.  The histogram is
+  # phase-indexed rather than a second Student pre-failure replay partition.
+  failure_phase_lookback_steps: 50
+  failure_phase_samples_per_failure: 10
+  failure_phase_num_bins: 1024
   dagger_replay_raw_observations: true
   replay_raw_observation_keys:
     - vel_command
@@ -72,6 +84,15 @@ algo:
   perception_encode_microbatch_size: 128
   teacher_perception_batch_size: 128
   perception_depth_codec: uint8_div_100_v1
+  # Optional Student-perception warm start.  Keep this checkpoint separate
+  # from checkpoint_path: the latter remains the train-phase PPO Teacher.
+  # When enabled, the checkpoint must contain the complete online + EMA depth,
+  # object-adaptation, and adaptation-module state expected by the backend.
+  load_pretrained_perception: false
+  perception_checkpoint_path: null
+  # true: continue adapting perception on live/Teacher replay supervision.
+  # false: freeze a successfully loaded pretrained perception stack.
+  train_perception: true
 
   # Locked twin 501-atom critic topology and exact replay cadence.
   q_hidden_dim: 768

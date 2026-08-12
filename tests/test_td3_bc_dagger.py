@@ -24,8 +24,6 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_TEACHER_ACTION_KEY,
     DAGGER_TEACHER_ACTION_VALID_KEY,
     _DaggerRolloutPolicy,
-    _DeviceReplay,
-    PPOBCDaggerFinetune,
 )
 from active_adaptation.learning.ppo.ppo_vel import (
     DEPTH_KEY,
@@ -40,11 +38,13 @@ from active_adaptation.learning.ppo.ppo_vel import (
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     CHECKPOINT_VERSION,
+    FAILURE_PHASE_TEACHER_SOURCE_KEY,
     PERCEPTION_DEPTH_U8_KEY,
     PERCEPTION_IS_INIT_KEY,
     PERCEPTION_POLICY_RAW_KEY,
     PERCEPTION_REPLAY_SEMANTICS,
     PERCEPTION_VEL_COMMAND_RAW_KEY,
+    REFERENCE_PHASE_KEY,
     TD3_BETA_KEY,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
@@ -53,6 +53,10 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     DistributionalTD3TeacherBC,
     DistributionalTD3TeacherBCConfig,
     _DistributionalTD3DaggerRolloutPolicy,
+    _PREFILL_COMMAND_FINISHED_KEY,
+    _PREFILL_ENV_INDEX_KEY,
+    _PREFILL_STEP_INDEX_KEY,
+    _PREFILL_TERMINATED_KEY,
     _Q_REPLAY_FIELDS,
     _TD3DeviceReplay,
     _apply_student_collector_noise,
@@ -60,10 +64,12 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     _exact_teacher_bc_loss,
     _decode_replay_depth_u8,
     _encode_replay_depth_u8,
+    _failure_lookback_offsets,
     _polyak_update_,
     _prefetch_td3_replay_sample_plans,
     _project_c51_probabilities,
     _select_lower_expected_c51_distribution,
+    _source_counts,
     _td3_actor_q1_loss,
 )
 
@@ -131,6 +137,7 @@ def _replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
         "next_critic_observations": torch.stack(
             (row + 4.0, row + 4.5, row + 4.75), dim=-1
         ),
+        REFERENCE_PHASE_KEY: row.div(max(float(offset + count), 1.0)).clamp(0.0, 1.0),
         PERCEPTION_DEPTH_U8_KEY: (
             torch.arange(count * 10).reshape(count, 10, 1, 1, 1) % 101
         ).to(torch.uint8),
@@ -140,6 +147,207 @@ def _replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
         ),
         PERCEPTION_IS_INIT_KEY: torch.zeros(count, 10, dtype=torch.bool),
     }
+
+
+def test_failure_lookback_offsets_span_the_inclusive_fifty_step_window():
+    offsets = _failure_lookback_offsets(50, 10)
+
+    assert offsets.dtype is torch.long
+    assert torch.equal(
+        offsets,
+        torch.tensor([0, 6, 11, 17, 22, 28, 33, 39, 44, 50]),
+    )
+    assert offsets.unique().numel() == 10
+    assert offsets.tolist() == sorted(offsets.tolist())
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "expected"),
+    (
+        (4096, (2048, 1434, 614)),
+        (512, (256, 179, 77)),
+    ),
+)
+def test_shared_source_counts_are_exact_student_uniform_and_focused_shares(
+    batch_size, expected
+):
+    assert _source_counts(batch_size, 0.5, 0.3) == expected
+
+
+def test_shared_replay_schema_carries_reference_phase_but_no_failure_copy():
+    assert REFERENCE_PHASE_KEY == "reference_phase"
+    assert FAILURE_PHASE_TEACHER_SOURCE_KEY == "failure_phase_teacher_source"
+    assert REFERENCE_PHASE_KEY in _Q_REPLAY_FIELDS
+    assert all("pre_failure" not in field for field in _Q_REPLAY_FIELDS)
+
+
+def _failure_rollout() -> TensorDict:
+    """Four episodes: Student failure, Teacher failure, timeout, success."""
+    num_envs, steps = 4, 60
+    phase = torch.stack(
+        (
+            torch.cat((torch.linspace(0.05, 0.15, 20), torch.linspace(0.60, 0.90, 40))),
+            torch.linspace(0.10, 0.80, steps),
+            torch.linspace(0.20, 0.85, steps),
+            torch.linspace(0.30, 1.00, steps),
+        )
+    )
+    student = torch.ones(num_envs, steps, dtype=torch.bool)
+    student[1, -1] = False
+    done = torch.zeros(num_envs, steps, dtype=torch.bool)
+    terminated = torch.zeros_like(done)
+    timeout = torch.zeros_like(done)
+    command_finished = torch.zeros_like(done)
+
+    # Reset env 0 before its later physical failure. Its old low phases must
+    # never leak through the episode boundary into the failure lookback.
+    done[0, 19] = True
+    command_finished[0, 19] = True
+    done[:, -1] = True
+    terminated[0, -1] = True  # eligible Student physical failure
+    terminated[1, -1] = True  # excluded: Teacher executed the terminal action
+    # Pure timeout has no physical termination and is excluded.
+    terminated[3, -1] = True  # command completion still counts as success
+    timeout[2, -1] = True  # excluded: simulator time limit
+    command_finished[3, -1] = True  # excluded: successful motion completion
+
+    return TensorDict(
+        {
+            "ref_motion_phase_": phase.unsqueeze(-1),
+            REFERENCE_PHASE_KEY: phase.unsqueeze(-1),
+            DAGGER_IS_STUDENT_ACTION_KEY: student.unsqueeze(-1),
+            "next": TensorDict(
+                {
+                    "done": done.unsqueeze(-1),
+                    "terminated": terminated.unsqueeze(-1),
+                    "stats": TensorDict(
+                        {
+                            "episode_time_limit": timeout.unsqueeze(-1),
+                            "command_finished": command_finished.unsqueeze(-1),
+                        },
+                        batch_size=(num_envs, steps),
+                    ),
+                },
+                batch_size=(num_envs, steps),
+            ),
+        },
+        batch_size=(num_envs, steps),
+    )
+
+
+def test_failure_histogram_counts_only_student_physical_failure_and_resets_history():
+    policy = _bare_policy(
+        failure_phase_lookback_steps=50,
+        failure_phase_samples_per_failure=10,
+        failure_phase_num_bins=101,
+    )
+    policy._failure_phase_histogram = torch.zeros(101, dtype=torch.float64)
+    policy._failure_phase_history = None
+    policy._failure_phase_history_lengths = None
+    policy._failure_phase_episode_count = 0
+    policy._failure_phase_anchor_count = 0
+
+    policy._update_failure_phase_histogram(_failure_rollout())
+
+    assert policy._failure_phase_histogram.sum().item() == pytest.approx(10.0)
+    occupied = policy._failure_phase_histogram.nonzero(as_tuple=False).squeeze(-1)
+    # Env 0 reset at phase 0.15 and restarted at phase 0.60. No phase from the
+    # previous episode may survive in the focused-Teacher risk distribution.
+    assert occupied.min().item() >= 60
+
+
+def test_physical_termination_wins_over_time_limit_but_pure_timeout_is_excluded():
+    num_envs, steps = 2, 60
+    phase = torch.linspace(0.2, 0.9, steps).view(1, steps, 1).expand(num_envs, -1, -1)
+    done = torch.zeros(num_envs, steps, 1, dtype=torch.bool)
+    terminated = torch.zeros_like(done)
+    timeout = torch.zeros_like(done)
+    command_finished = torch.zeros_like(done)
+    done[:, -1] = True
+    timeout[:, -1] = True
+    terminated[0, -1] = True
+    rollout = TensorDict(
+        {
+            REFERENCE_PHASE_KEY: phase,
+            DAGGER_IS_STUDENT_ACTION_KEY: torch.ones_like(done),
+            "next": TensorDict(
+                {
+                    "done": done,
+                    "terminated": terminated,
+                    "stats": TensorDict(
+                        {
+                            "episode_time_limit": timeout,
+                            "command_finished": command_finished,
+                        },
+                        batch_size=(num_envs, steps),
+                    ),
+                },
+                batch_size=(num_envs, steps),
+            ),
+        },
+        batch_size=(num_envs, steps),
+    )
+    policy = _bare_policy(
+        failure_phase_lookback_steps=50,
+        failure_phase_samples_per_failure=10,
+        failure_phase_num_bins=101,
+    )
+    policy._failure_phase_histogram = torch.zeros(101, dtype=torch.float64)
+    policy._failure_phase_history = None
+    policy._failure_phase_episode_count = 0
+    policy._failure_phase_anchor_count = 0
+
+    anchors = policy._update_failure_phase_histogram(rollout)
+
+    assert anchors == 10
+    assert policy._failure_phase_episode_count == 1
+    assert policy._failure_phase_histogram.sum().item() == pytest.approx(10.0)
+
+
+def _focused_teacher_policy() -> DistributionalTD3TeacherBC:
+    policy = _bare_policy(failure_phase_num_bins=16)
+    policy.q_teacher_replay = _TD3DeviceReplay(16, "cpu")
+    rows = _replay_rows(3, 100)
+    rows[REFERENCE_PHASE_KEY] = torch.tensor([0.10, 0.35, 0.90])
+    policy.q_teacher_replay.extend(rows)
+    policy._failure_phase_histogram = torch.zeros(16, dtype=torch.float64)
+    policy._teacher_phase_bin_rows = ()
+    policy._teacher_phase_index_ready = False
+    policy._failure_phase_uniform_fallback_rows = 0
+    policy._failure_phase_focused_rows = 0
+    policy._build_teacher_phase_index()
+    return policy
+
+
+def test_focused_teacher_sampling_falls_back_to_uniform_without_failures():
+    policy = _focused_teacher_policy()
+
+    indices, focused = policy._sample_teacher_indices(
+        12,
+        torch.Generator().manual_seed(811),
+        focused_count=5,
+    )
+
+    assert indices.shape == focused.shape == (12,)
+    assert indices.dtype is torch.long
+    assert focused.dtype is torch.bool
+    assert ((0 <= indices) & (indices < 3)).all()
+    assert not focused.any()
+
+
+def test_focused_teacher_sampling_uses_nearest_occupied_phase_bin():
+    policy = _focused_teacher_policy()
+    # Risk bin 11 is nearer Teacher phase 0.90 than 0.35 or 0.10.
+    policy._failure_phase_histogram[11] = 1.0
+
+    indices, focused = policy._sample_teacher_indices(
+        10,
+        torch.Generator().manual_seed(812),
+        focused_count=4,
+    )
+
+    assert torch.equal(focused, torch.tensor([False] * 6 + [True] * 4))
+    assert torch.equal(indices[focused], torch.full((4,), 2, dtype=torch.long))
 
 
 def test_depth_uint8_codec_is_lossless_for_every_simulator_bin():
@@ -187,17 +395,18 @@ def test_raw_perception_replay_public_field_contract_has_no_priv_pred_latent():
     )
 
 
-def test_teacher_prefill_config_defaults_to_disabled_and_rejects_negative_or_bool():
+def test_teacher_prefill_and_shared_teacher_mix_defaults_and_validation():
     cfg = DistributionalTD3TeacherBCConfig()
-    assert cfg.teacher_prefill_rollouts == 0
-    assert cfg.teacher_actor_replay_fraction == 0.0
-    assert cfg.teacher_perception_replay_fraction == 0.0
+    assert cfg.teacher_prefill_max_rollouts == 1000
+    assert cfg.teacher_actor_replay_fraction == 0.5
+    assert cfg.teacher_perception_replay_fraction == 0.5
+    assert cfg.failure_phase_teacher_fraction == 0.3
 
-    for invalid in (-1, True):
-        cfg.teacher_prefill_rollouts = invalid
-        with pytest.raises(ValueError, match="teacher_prefill_rollouts.*non-negative"):
+    for invalid in (0, -1, True):
+        cfg.teacher_prefill_max_rollouts = invalid
+        with pytest.raises(ValueError, match="teacher_prefill_max_rollouts.*positive"):
             DistributionalTD3TeacherBC._validate_td3_config(cfg)
-    cfg.teacher_prefill_rollouts = 0
+    cfg.teacher_prefill_max_rollouts = 10
     DistributionalTD3TeacherBC._validate_td3_config(cfg)
 
 
@@ -341,6 +550,7 @@ def _raw_transition_td(
             "depth": (values.remainder(101) / 100.0).reshape(n, t, 1, 1, 1),
             "policy": action + 100.0,
             "vel_command": action + 200.0,
+            REFERENCE_PHASE_KEY: values.div(max(float(t - 1), 1.0)).clamp(0.0, 1.0),
             "object_geo_": torch.tensor([1.0, 2.0]).expand(n, t, 2).clone(),
             "critic_raw": action + 300.0,
             "is_init": is_init,
@@ -378,6 +588,31 @@ def _raw_final_td(value: float, *, is_init: bool = False) -> TensorDict:
         },
         batch_size=(1,),
     )
+
+
+def test_replay_object_geometry_cached_during_inference_is_autograd_safe():
+    policy = _raw_transition_policy()
+    geometry = TensorDict(
+        {
+            OBJECT_GEO_KEY: torch.tensor([[[1.0, 2.0]]]),
+        },
+        batch_size=(1, 1),
+    )
+
+    with torch.inference_mode():
+        policy._register_replay_object_geo(geometry)
+
+    cached = policy._replay_object_geo
+    assert cached is not None
+    assert not cached.is_inference()
+
+    # Regression for the exact Teacher-perception failure: TransformObject's
+    # trainable orientation path must be able to save the cached points for
+    # the backward of torch.matmul.
+    orientation = nn.Parameter(torch.eye(cached.shape[-1]))
+    torch.matmul(cached, orientation.transpose(-1, -2)).sum().backward()
+    assert orientation.grad is not None
+    assert torch.isfinite(orientation.grad).all()
 
 
 def test_raw_replay_window_alignment_reset_markers_and_no_priv_pred_storage():
@@ -524,6 +759,7 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
         "truncations",
         "discounts",
         "next_critic_observations",
+        REFERENCE_PHASE_KEY,
         PERCEPTION_DEPTH_U8_KEY,
         PERCEPTION_POLICY_RAW_KEY,
         PERCEPTION_VEL_COMMAND_RAW_KEY,
@@ -574,17 +810,28 @@ class _ReplayPrivTarget(nn.Module):
         return td
 
 
-def _teacher_perception_policy(fraction: float = 0.5):
+def _teacher_perception_policy(
+    fraction: float = 0.5,
+    *,
+    batch_size: int = 2,
+    row_count: int = 4,
+):
     policy = _bare_policy(
         teacher_perception_replay_fraction=fraction,
         perception_encode_microbatch_size=2,
-        teacher_perception_batch_size=2,
+        teacher_perception_batch_size=batch_size,
+        failure_phase_teacher_fraction=0.3,
+        failure_phase_num_bins=16,
         perception_replay_burn_in=8,
         latent_dim=1,
         num_minibatches=1,
         train_every=2,
         max_grad_norm=10.0,
         train_dr_estimator=False,
+        load_pretrained_perception=False,
+        perception_checkpoint_path=None,
+        train_perception=True,
+        lr=0.01,
     )
     policy.depth_feature_dim = 1
     policy.q_critic_keys = [OBS_PRIV_KEY, OBJECT_KEY]
@@ -593,6 +840,7 @@ def _teacher_perception_policy(fraction: float = 0.5):
     policy._vecnorm_snapshot = lambda: None
     policy._normalize_replay_value = lambda key, value, snapshot: value
     policy.temporal_depth_gru = _ReplayDepthStudent(0.5)
+    policy.depth_cnn = policy.temporal_depth_gru
     policy.object_adapt = _ReplayObjectStudent(0.75)
     policy.object_pred_transform = _NoOpPerceptionModule()
     policy.adapt_module = _ReplayAdaptStudent(1.25)
@@ -610,17 +858,309 @@ def _teacher_perception_policy(fraction: float = 0.5):
     policy.opt_adapt = torch.optim.SGD(parameters, lr=0.01)
     policy.q_rng = torch.Generator().manual_seed(73)
     policy.teacher_perception_rng = torch.Generator().manual_seed(74)
-    policy.q_teacher_replay = _TD3DeviceReplay(8, "cpu")
-    rows = _replay_rows(4, 0)
-    rows["critic_observations"] = torch.tensor(
-        [[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [4.0, 5.0]]
+    policy.q_teacher_replay = _TD3DeviceReplay(max(8, row_count), "cpu")
+    rows = _replay_rows(row_count, 0)
+    row = torch.arange(1, row_count + 1, dtype=torch.float32)
+    rows["critic_observations"] = torch.stack((row, row + 1.0), dim=-1)
+    rows[REFERENCE_PHASE_KEY] = torch.linspace(0.0, 1.0, row_count)
+    rows[PERCEPTION_DEPTH_U8_KEY] = torch.full(
+        (row_count, 10, 1, 1, 1), 50, dtype=torch.uint8
     )
-    rows[PERCEPTION_DEPTH_U8_KEY] = torch.full((4, 10, 1, 1, 1), 50, dtype=torch.uint8)
-    rows[PERCEPTION_POLICY_RAW_KEY] = torch.ones(4, 10, 1)
-    rows[PERCEPTION_VEL_COMMAND_RAW_KEY] = torch.full((4, 10, 1), 0.25)
-    rows[PERCEPTION_IS_INIT_KEY] = torch.zeros(4, 10, dtype=torch.bool)
+    rows[PERCEPTION_POLICY_RAW_KEY] = torch.ones(row_count, 10, 1)
+    rows[PERCEPTION_VEL_COMMAND_RAW_KEY] = torch.full((row_count, 10, 1), 0.25)
+    rows[PERCEPTION_IS_INIT_KEY] = torch.zeros(row_count, 10, dtype=torch.bool)
     policy.q_teacher_replay.extend(rows)
     return policy
+
+
+_PERCEPTION_WARMSTART_MODULES = (
+    "depth_cnn",
+    "temporal_depth_gru",
+    "temporal_depth_gru_ema",
+    "object_adapt",
+    "object_adapt_ema",
+    "adapt_module",
+    "adapt_ema",
+)
+
+
+class _WarmstartTemporal(nn.Module):
+    def __init__(self, depth_cnn: nn.Module, recurrent_input: int = 2):
+        super().__init__()
+        self.depth_cnn = depth_cnn
+        self.recurrent = nn.Linear(recurrent_input, 2)
+
+
+def _perception_warmstart_policy(seed: int = 1):
+    policy = _bare_policy(
+        load_pretrained_perception=True,
+        perception_checkpoint_path="/unused/student.pt",
+        train_perception=True,
+        lr=3e-4,
+    )
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        depth_cnn = nn.Linear(2, 2)
+        policy.depth_cnn = depth_cnn
+        policy.temporal_depth_gru = _WarmstartTemporal(depth_cnn)
+        policy.temporal_depth_gru_ema = _WarmstartTemporal(nn.Linear(2, 2))
+        policy.object_adapt = nn.Linear(2, 2)
+        policy.object_adapt_ema = nn.Linear(2, 2)
+        policy.adapt_module = nn.Linear(2, 2)
+        policy.adapt_ema = nn.Linear(2, 2)
+        policy.actor_adapt = nn.Linear(2, 2)
+        policy.encoder_priv = nn.Linear(2, 2)
+        policy.qnet = nn.Linear(2, 2)
+    online_parameters = []
+    for name in ("temporal_depth_gru", "object_adapt", "adapt_module"):
+        online_parameters.extend(getattr(policy, name).parameters())
+    policy.opt_adapt = torch.optim.Adam(online_parameters, lr=3e-4)
+    return policy
+
+
+def _write_perception_warmstart_checkpoint(
+    path,
+    *,
+    seed: int = 100,
+    missing: str | None = None,
+    incompatible: str | None = None,
+):
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        depth_cnn = nn.Linear(2, 2)
+        modules = {
+            "depth_cnn": depth_cnn,
+            "temporal_depth_gru": _WarmstartTemporal(
+                depth_cnn,
+                recurrent_input=3 if incompatible == "temporal_depth_gru" else 2,
+            ),
+            "temporal_depth_gru_ema": _WarmstartTemporal(nn.Linear(2, 2)),
+            "object_adapt": nn.Linear(2, 2),
+            "object_adapt_ema": nn.Linear(2, 2),
+            "adapt_module": nn.Linear(2, 2),
+            "adapt_ema": nn.Linear(2, 2),
+        }
+        if incompatible is not None and incompatible != "temporal_depth_gru":
+            modules[incompatible] = nn.Linear(3, 2)
+        actor = nn.Linear(2, 2)
+        encoder = nn.Linear(2, 2)
+        qnet = nn.Linear(2, 2)
+    policy = {name: module.state_dict() for name, module in modules.items()}
+    if missing is not None:
+        policy.pop(missing)
+    # Deliberately include unrelated state. The selective loader must ignore it.
+    policy.update(
+        {
+            "actor_adapt": actor.state_dict(),
+            "encoder_priv": encoder.state_dict(),
+            "qnet": qnet.state_dict(),
+            "last_phase": "finetune",
+        }
+    )
+    torch.save({"policy": policy}, path)
+    return modules
+
+
+def test_pretrained_perception_loads_all_online_and_ema_modules_strictly(tmp_path):
+    policy = _perception_warmstart_policy()
+    checkpoint_path = tmp_path / "student_perception.pt"
+    source = _write_perception_warmstart_checkpoint(checkpoint_path)
+
+    policy._load_pretrained_perception_checkpoint(checkpoint_path)
+
+    for name in _PERCEPTION_WARMSTART_MODULES:
+        _assert_nested_equal(
+            getattr(policy, name).state_dict(), source[name].state_dict()
+        )
+
+
+def test_pretrained_perception_loader_reads_nested_policy_and_not_actor_q(tmp_path):
+    policy = _perception_warmstart_policy()
+    checkpoint_path = tmp_path / "student_perception.pt"
+    _write_perception_warmstart_checkpoint(checkpoint_path)
+    untouched = {
+        name: copy.deepcopy(getattr(policy, name).state_dict())
+        for name in ("actor_adapt", "encoder_priv", "qnet")
+    }
+
+    policy._load_pretrained_perception_checkpoint(checkpoint_path)
+
+    for name, expected in untouched.items():
+        _assert_nested_equal(getattr(policy, name).state_dict(), expected)
+
+
+def test_pretrained_perception_loader_rejects_missing_module(tmp_path):
+    policy = _perception_warmstart_policy()
+    checkpoint_path = tmp_path / "missing_perception.pt"
+    _write_perception_warmstart_checkpoint(checkpoint_path, missing="object_adapt_ema")
+
+    with pytest.raises((KeyError, ValueError, RuntimeError), match="object_adapt_ema"):
+        policy._load_pretrained_perception_checkpoint(checkpoint_path)
+
+
+def test_pretrained_perception_loader_rejects_incompatible_shape(tmp_path):
+    policy = _perception_warmstart_policy()
+    checkpoint_path = tmp_path / "incompatible_perception.pt"
+    _write_perception_warmstart_checkpoint(
+        checkpoint_path, incompatible="temporal_depth_gru"
+    )
+
+    with pytest.raises(RuntimeError, match="temporal_depth_gru"):
+        policy._load_pretrained_perception_checkpoint(checkpoint_path)
+
+
+def test_pretrained_perception_loader_rejects_inconsistent_depth_aliases(tmp_path):
+    policy = _perception_warmstart_policy()
+    checkpoint_path = tmp_path / "inconsistent_depth_aliases.pt"
+    _write_perception_warmstart_checkpoint(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint["policy"]["depth_cnn"]["weight"] = (
+        checkpoint["policy"]["depth_cnn"]["weight"].clone() + 1.0
+    )
+    torch.save(checkpoint, checkpoint_path)
+
+    with pytest.raises(RuntimeError, match="depth_cnn.*alias mismatch"):
+        policy._load_pretrained_perception_checkpoint(checkpoint_path)
+
+
+def test_frozen_pretrained_perception_disables_optimizer_and_adaptation_updates():
+    policy = _teacher_perception_policy(fraction=0.5)
+    policy.cfg.train_perception = False
+    policy._set_perception_trainable(False)
+    before = {
+        name: copy.deepcopy(getattr(policy, name).state_dict())
+        for name in _PERCEPTION_WARMSTART_MODULES
+        if hasattr(policy, name)
+    }
+
+    result = policy.train_adapt(TensorDict({}, batch_size=[]))
+
+    assert isinstance(result, dict)
+    assert getattr(policy, "opt_adapt", None) is None
+    for name, expected in before.items():
+        module = getattr(policy, name)
+        assert not module.training
+        assert all(not parameter.requires_grad for parameter in module.parameters())
+        _assert_nested_equal(module.state_dict(), expected)
+
+
+def test_trainable_pretrained_perception_restores_online_optimizer_and_ema_contract():
+    policy = _teacher_perception_policy(fraction=0.5)
+    policy.cfg.train_perception = True
+    policy._set_perception_trainable(True)
+
+    assert isinstance(policy.opt_adapt, torch.optim.Optimizer)
+    for name in ("temporal_depth_gru", "object_adapt", "adapt_module"):
+        module = getattr(policy, name)
+        assert module.training
+        assert all(parameter.requires_grad for parameter in module.parameters())
+    for name in ("temporal_depth_gru_ema", "object_adapt_ema", "adapt_ema"):
+        module = getattr(policy, name)
+        assert not module.training
+        assert all(not parameter.requires_grad for parameter in module.parameters())
+
+
+class _RolloutPerceptionMarker(nn.Module):
+    def __init__(self, name: str, calls: list[str]):
+        super().__init__()
+        self.name = name
+        self.calls = calls
+
+    def forward(self, td):
+        self.calls.append(self.name)
+        return td
+
+
+class _FixedMeanActor:
+    def get_dist(self, td):
+        del td
+        return SimpleNamespace(mean=torch.tensor([[0.25, -0.5]]))
+
+
+def test_frozen_perception_rollout_still_uses_loaded_ema_stack_only():
+    policy = _bare_policy(use_object_adapt=True)
+    calls = []
+    policy.temporal_depth_gru = _RolloutPerceptionMarker("online_depth", calls)
+    policy.object_adapt = _RolloutPerceptionMarker("online_object", calls)
+    policy.adapt_module = _RolloutPerceptionMarker("online_adapt", calls)
+    policy.temporal_depth_gru_ema = _RolloutPerceptionMarker("ema_depth", calls)
+    policy.object_adapt_ema = _RolloutPerceptionMarker("ema_object", calls)
+    policy.adapt_ema = _RolloutPerceptionMarker("ema_adapt", calls)
+    policy.object_pred_transform = _NoOpPerceptionModule()
+    policy.actor_adapt = _FixedMeanActor()
+    policy._set_perception_trainable(False)
+
+    action = policy._student_latent(TensorDict({}, batch_size=[1]))
+
+    assert calls == ["ema_depth", "ema_object", "ema_adapt"]
+    assert torch.equal(action, torch.tensor([[0.25, -0.5]]))
+
+
+@pytest.mark.parametrize(
+    ("load_pretrained", "train_perception", "expected"),
+    (
+        (False, True, ["main_ppo", "actor_migration", "set_trainable_True"]),
+        (
+            True,
+            False,
+            [
+                "main_ppo",
+                "actor_migration",
+                "perception_overlay_/student.pt",
+                "set_trainable_False",
+            ],
+        ),
+    ),
+)
+def test_fresh_source_public_loader_orders_main_ppo_then_optional_perception_overlay(
+    monkeypatch, load_pretrained, train_perception, expected
+):
+    policy = _bare_policy(
+        dagger_seed=3,
+        q_seed=5,
+        load_pretrained_perception=load_pretrained,
+        perception_checkpoint_path="/student.pt" if load_pretrained else None,
+        train_perception=train_perception,
+    )
+    policy.actor_adapt = nn.Linear(2, 2)
+    policy.qnet = nn.Linear(2, 2)
+    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.actor_target = None
+    policy.dagger_rng = torch.Generator().manual_seed(1)
+    policy.q_rng = torch.Generator().manual_seed(2)
+    policy.collector_exploration_rng = torch.Generator().manual_seed(3)
+    policy.target_policy_rng = torch.Generator().manual_seed(4)
+    policy.teacher_perception_rng = torch.Generator().manual_seed(5)
+    policy._perception_initialization = {
+        "loaded": False,
+        "source_path": None,
+    }
+    events = []
+
+    monkeypatch.setattr(
+        PPOVEL,
+        "load_state_dict",
+        lambda owner, state, strict: events.append("main_ppo") or [],
+    )
+    policy._migrate_fresh_ppo_student_actor_to_latent = MethodType(
+        lambda owner: events.append("actor_migration"), policy
+    )
+
+    def overlay(owner, path):
+        events.append(f"perception_overlay_{path}")
+        owner._perception_initialization = {
+            "loaded": True,
+            "source_path": str(path),
+        }
+
+    policy._load_pretrained_perception_checkpoint = MethodType(overlay, policy)
+    policy._set_perception_trainable = MethodType(
+        lambda owner, value: events.append(f"set_trainable_{value}"), policy
+    )
+
+    policy.load_state_dict({"last_phase": "train"})
+
+    assert events == expected
 
 
 def test_teacher_perception_loss_reencodes_raw_window_with_trainable_current_model():
@@ -641,6 +1181,30 @@ def test_teacher_perception_loss_reencodes_raw_window_with_trainable_current_mod
     assert PRIV_PRED_KEY not in policy.q_teacher_replay.data
     for key, value in stored_before.items():
         assert torch.equal(policy.q_teacher_replay.data[key], value)
+
+
+def test_perception_teacher_half_uses_seventy_thirty_uniform_focused_sampling():
+    policy = _teacher_perception_policy(batch_size=10, row_count=10)
+    calls = []
+
+    def sample_teacher_indices(owner, count, generator, *, focused_count):
+        del owner, generator
+        calls.append((count, focused_count))
+        indices = torch.arange(count, dtype=torch.long)
+        focused = torch.zeros(count, dtype=torch.bool)
+        focused[-focused_count:] = True
+        return indices, focused
+
+    policy._sample_teacher_indices = MethodType(sample_teacher_indices, policy)
+
+    with set_recurrent_mode(True):
+        losses = policy._teacher_perception_replay_loss()
+
+    # The overall objective is live .50 + Teacher .50; splitting the Teacher
+    # half 70/30 therefore yields the requested effective .50/.35/.15 weights.
+    assert calls == [(10, 3)]
+    assert policy.cfg.teacher_perception_replay_fraction == pytest.approx(0.5)
+    assert losses["rows"].item() == 10
 
 
 def test_teacher_perception_fraction_mixes_losses_in_existing_steps_and_updates_ema_once():
@@ -671,9 +1235,393 @@ def test_teacher_perception_fraction_mixes_losses_in_existing_steps_and_updates_
     assert torch.allclose(policy.temporal_depth_gru_ema.scale, expected_ema)
 
 
+def _initialize_prefill_episode_state(policy):
+    policy._teacher_prefill_complete = False
+    policy._teacher_prefill_pending = None
+    policy._teacher_prefill_successful_episodes = 0
+    policy._teacher_prefill_failed_episodes = 0
+    policy._teacher_prefill_timeout_episodes = 0
+    policy._teacher_prefill_incomplete_episodes = 0
+    policy._teacher_prefill_discarded_rows = 0
+    return policy
+
+
+def _prefill_episode_policy(capacity: int = 64):
+    policy = _bare_policy()
+    policy.q_teacher_replay = _TD3DeviceReplay(capacity, "cpu")
+    _initialize_prefill_episode_state(policy)
+    return policy
+
+
+def _mark_prefill_stub_as_success(chunk):
+    count = int(chunk["actions"].shape[0])
+    chunk[_PREFILL_ENV_INDEX_KEY] = torch.zeros(count, dtype=torch.long)
+    chunk[_PREFILL_STEP_INDEX_KEY] = torch.arange(count, dtype=torch.long)
+    chunk[_PREFILL_TERMINATED_KEY] = torch.zeros(count, dtype=torch.bool)
+    chunk[_PREFILL_COMMAND_FINISHED_KEY] = torch.zeros(count, dtype=torch.bool)
+    chunk[_PREFILL_COMMAND_FINISHED_KEY][-1] = True
+    chunk["dones"] = torch.zeros(count, dtype=torch.bool)
+    chunk["dones"][-1] = True
+    return chunk
+
+
+def _prefill_train_op_policy(
+    *, rollouts: int, learning_starts: int, capacity: int = 64
+):
+    policy = _bare_policy(
+        teacher_prefill_max_rollouts=rollouts,
+        train_every=10,
+        td3_learning_starts=learning_starts,
+        dagger_beta_start=1.0,
+        dagger_beta_end=0.0,
+        dagger_beta_decay_rollouts=100,
+    )
+    policy.teacher_prefill_rollout_count = 0
+    policy.teacher_prefill_environment_steps = 0
+    policy.dagger_rollout_count = 0
+    policy.dagger_environment_steps = 0
+    policy.actor_update_count = 0
+    policy.critic_update_count = 0
+    policy.num_updates = 0
+    policy._last_td3_diagnostics = {}
+    policy.q_teacher_replay = _TD3DeviceReplay(capacity, "cpu")
+    policy.dagger_replay = _TD3DeviceReplay(64, "cpu")
+    _initialize_prefill_episode_state(policy)
+    policy.train_adapt = lambda rollout: (_ for _ in ()).throw(
+        AssertionError("prefill must not optimize perception")
+    )
+    return policy
+
+
+def _prefill_episode_rows(
+    row_ids,
+    env_indices,
+    *,
+    done=None,
+    terminated=None,
+    command_finished=None,
+    valid=None,
+    is_student=None,
+    is_init=None,
+    step_indices=None,
+):
+    row_ids = torch.as_tensor(row_ids, dtype=torch.float32)
+    count = int(row_ids.numel())
+    rows = _replay_rows(count, 0)
+    rows["actions"] = row_ids[:, None]
+
+    def _bool(value, default=False):
+        if value is None:
+            return torch.full((count,), default, dtype=torch.bool)
+        return torch.as_tensor(value, dtype=torch.bool)
+
+    rows["dones"] = _bool(done)
+    rows["truncations"] = rows["dones"] & ~_bool(terminated)
+    rows[DAGGER_TEACHER_ACTION_VALID_KEY] = _bool(valid, default=True)
+    rows[DAGGER_IS_STUDENT_ACTION_KEY] = _bool(is_student)
+    rows[TD3_COLLECTOR_NOISE_KEY] = torch.zeros(count, 1)
+    rows[_PREFILL_ENV_INDEX_KEY] = torch.as_tensor(env_indices, dtype=torch.long)
+    rows[_PREFILL_STEP_INDEX_KEY] = (
+        torch.arange(count, dtype=torch.long)
+        if step_indices is None
+        else torch.as_tensor(step_indices, dtype=torch.long)
+    )
+    rows[_PREFILL_TERMINATED_KEY] = _bool(terminated)
+    rows[_PREFILL_COMMAND_FINISHED_KEY] = _bool(command_finished)
+    if is_init is not None:
+        rows[PERCEPTION_IS_INIT_KEY][:, -2] = torch.as_tensor(is_init, dtype=torch.bool)
+    return rows
+
+
+def _prefill_event_rollout(
+    steps: int,
+    *,
+    done_steps=(),
+    terminated_steps=(),
+    command_finished_steps=(),
+    init_steps=(),
+):
+    done = torch.zeros(1, steps, 1, dtype=torch.bool)
+    terminated = torch.zeros_like(done)
+    command_finished = torch.zeros_like(done)
+    is_init = torch.zeros_like(done)
+    done[:, list(done_steps)] = True
+    terminated[:, list(terminated_steps)] = True
+    command_finished[:, list(command_finished_steps)] = True
+    is_init[:, list(init_steps)] = True
+    return TensorDict(
+        {
+            "is_init": is_init,
+            "next": TensorDict(
+                {
+                    "done": done,
+                    "terminated": terminated,
+                    "stats": TensorDict(
+                        {"command_finished": command_finished},
+                        batch_size=(1, steps),
+                    ),
+                },
+                batch_size=(1, steps),
+            ),
+        },
+        batch_size=(1, steps),
+    )
+
+
+def test_teacher_prefill_success_commits_episode_across_multiple_train_op_chunks():
+    policy = _prefill_episode_policy()
+
+    first_committed, first_discarded = policy._stage_teacher_prefill_rows(
+        _prefill_episode_rows([101, 102], [0, 0])
+    )
+    second_committed, second_discarded = policy._stage_teacher_prefill_rows(
+        _prefill_episode_rows(
+            [103, 104],
+            [0, 0],
+            done=[False, True],
+            command_finished=[False, True],
+        )
+    )
+
+    assert (first_committed, first_discarded) == (0, 0)
+    assert (second_committed, second_discarded) == (4, 0)
+    assert policy._teacher_prefill_pending_rows() == 0
+    assert policy.q_teacher_replay.size == 4
+    assert torch.equal(
+        policy.q_teacher_replay.data["actions"][:4, 0],
+        torch.tensor([101.0, 102.0, 103.0, 104.0]),
+    )
+    assert policy._teacher_prefill_successful_episodes == 1
+
+
+def test_teacher_prefill_train_op_keeps_episode_pending_across_rollout_calls():
+    policy = _prefill_train_op_policy(rollouts=3, learning_starts=1, capacity=4)
+    chunks = [
+        _prefill_episode_rows([111, 112], [0, 0]),
+        _prefill_episode_rows(
+            [113, 114],
+            [0, 0],
+            done=[False, True],
+            command_finished=[False, True],
+        ),
+    ]
+    policy._dagger_transition_chunks = MethodType(
+        lambda owner, rollout: iter((chunks.pop(0),)), policy
+    )
+
+    first = policy.train_op(TensorDict({}, batch_size=[]))
+    assert first["td3/prefill_rows_this_rollout"] == 0
+    assert policy._teacher_prefill_pending_rows() == 2
+    assert policy.q_teacher_replay.size == 0
+
+    second = policy.train_op(TensorDict({}, batch_size=[]))
+    assert second["td3/prefill_rows_this_rollout"] == 4
+    assert policy._teacher_prefill_pending_rows() == 0
+    assert policy.q_teacher_replay.size == 4
+    assert policy._teacher_prefill_complete is True
+    assert second["td3/prefill_progress"] == pytest.approx(1.0)
+    assert second["td3/teacher_replay_frozen"] == pytest.approx(1.0)
+    assert torch.equal(
+        policy.q_teacher_replay.data["actions"][:4, 0],
+        torch.tensor([111.0, 112.0, 113.0, 114.0]),
+    )
+
+
+def test_failed_prefill_episode_does_not_fill_ring_and_collection_continues():
+    policy = _prefill_train_op_policy(rollouts=2, learning_starts=1, capacity=2)
+    chunks = [
+        _prefill_episode_rows(
+            [201, 202],
+            [0, 0],
+            done=[False, True],
+            terminated=[False, True],
+        ),
+        _prefill_episode_rows(
+            [301, 302],
+            [0, 0],
+            done=[False, True],
+            command_finished=[False, True],
+        ),
+    ]
+    policy._dagger_transition_chunks = MethodType(
+        lambda owner, rollout: iter((chunks.pop(0),)), policy
+    )
+
+    failed = policy.train_op(TensorDict({}, batch_size=[]))
+    assert failed["td3/prefill_progress"] == pytest.approx(0.0)
+    assert policy.q_teacher_replay.size == 0
+    assert policy._teacher_prefill_failed_episodes == 1
+    assert policy._teacher_prefill_active() is True
+
+    succeeded = policy.train_op(TensorDict({}, batch_size=[]))
+    assert succeeded["td3/prefill_progress"] == pytest.approx(1.0)
+    assert policy.q_teacher_replay.size == 2
+    assert policy._teacher_prefill_complete is True
+    assert torch.equal(
+        policy.q_teacher_replay.data["actions"][:2, 0],
+        torch.tensor([301.0, 302.0]),
+    )
+
+
+def test_capacity_completion_discards_other_environments_unresolved_rows():
+    policy = _prefill_train_op_policy(rollouts=2, learning_starts=1, capacity=2)
+    chunk = _prefill_episode_rows(
+        [401, 402, 501],
+        [0, 0, 1],
+        done=[False, True, False],
+        command_finished=[False, True, False],
+    )
+    policy._dagger_transition_chunks = MethodType(
+        lambda owner, rollout: iter((chunk,)), policy
+    )
+
+    info = policy.train_op(TensorDict({}, batch_size=[]))
+
+    assert policy.q_teacher_replay.size == 2
+    assert policy._teacher_prefill_complete is True
+    assert policy._teacher_prefill_pending_rows() == 0
+    assert policy._teacher_prefill_incomplete_episodes == 1
+    assert policy._teacher_prefill_discarded_rows == 1
+    assert info["td3/prefill_unresolved_rows_discarded"] == 1
+    assert info["td3/prefill_discarded_rows_this_rollout"] == 1
+
+
+def test_teacher_prefill_physical_failure_discards_prior_rollout_prefix():
+    policy = _prefill_episode_policy()
+    policy._stage_teacher_prefill_rows(_prefill_episode_rows([201, 202], [0, 0]))
+
+    committed, discarded = policy._stage_teacher_prefill_rows(
+        _prefill_episode_rows(
+            [203],
+            [0],
+            done=[True],
+            terminated=[True],
+            command_finished=[True],
+        )
+    )
+
+    assert (committed, discarded) == (0, 3)
+    assert policy.q_teacher_replay.size == 0
+    assert policy._teacher_prefill_pending_rows() == 0
+    assert policy._teacher_prefill_failed_episodes == 1
+    assert policy._teacher_prefill_successful_episodes == 0
+    assert policy._teacher_prefill_discarded_rows == 3
+
+
+def test_teacher_prefill_interleaved_env_success_and_pure_timeout_are_isolated():
+    policy = _prefill_episode_policy()
+
+    committed, discarded = policy._stage_teacher_prefill_rows(
+        _prefill_episode_rows(
+            [301, 401, 302, 402],
+            [0, 1, 0, 1],
+            done=[False, False, True, True],
+            command_finished=[False, False, True, False],
+        )
+    )
+
+    assert (committed, discarded) == (2, 2)
+    assert policy.q_teacher_replay.size == 2
+    assert torch.equal(
+        policy.q_teacher_replay.data["actions"][:2, 0],
+        torch.tensor([301.0, 302.0]),
+    )
+    assert policy._teacher_prefill_successful_episodes == 1
+    assert policy._teacher_prefill_timeout_episodes == 1
+    assert policy._teacher_prefill_pending_rows() == 0
+
+
+def test_teacher_prefill_invalid_fallback_rows_never_enter_successful_episode():
+    policy = _prefill_episode_policy()
+
+    committed, discarded = policy._stage_teacher_prefill_rows(
+        _prefill_episode_rows(
+            [501, 502, 503],
+            [0, 0, 0],
+            done=[False, False, True],
+            command_finished=[False, False, True],
+            valid=[True, False, True],
+            is_student=[False, True, False],
+        )
+    )
+
+    assert (committed, discarded) == (2, 0)
+    assert policy.q_teacher_replay.size == 2
+    assert torch.equal(
+        policy.q_teacher_replay.data["actions"][:2, 0],
+        torch.tensor([501.0, 503.0]),
+    )
+
+
+def test_teacher_prefill_end_discards_every_unresolved_env_once():
+    policy = _prefill_episode_policy()
+    policy._stage_teacher_prefill_rows(
+        _prefill_episode_rows([601, 701, 602], [0, 1, 0])
+    )
+
+    first = policy._discard_unresolved_teacher_prefill_rows()
+    second = policy._discard_unresolved_teacher_prefill_rows()
+
+    assert (first, second) == (3, 0)
+    assert policy.q_teacher_replay.size == 0
+    assert policy._teacher_prefill_pending_rows() == 0
+    assert policy._teacher_prefill_incomplete_episodes == 2
+    assert policy._teacher_prefill_discarded_rows == 3
+
+
+def test_teacher_prefill_max_rollout_guard_reports_unfilled_success_ring():
+    policy = _prefill_train_op_policy(rollouts=1, learning_starts=1)
+    pending = _prefill_episode_rows([611, 612], [0, 0])
+    policy._dagger_transition_chunks = MethodType(
+        lambda owner, rollout: iter((pending,)), policy
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "teacher_prefill_max_rollouts=1.*local_size=0.*capacity=64.*pending_rows=2"
+        ),
+    ):
+        policy.train_op(TensorDict({}, batch_size=[]))
+
+    assert policy._teacher_prefill_pending_rows() == 2
+    assert policy.q_teacher_replay.size == 0
+    assert policy._teacher_prefill_incomplete_episodes == 0
+    assert policy._teacher_prefill_discarded_rows == 0
+
+
+def test_filtered_terminal_and_reset_cannot_leak_failed_prefix_into_later_success():
+    policy = _prefill_episode_policy()
+    first = _prefill_episode_rows([801], [0], step_indices=[0])
+    policy._stage_teacher_prefill_rows(first, _prefill_event_rollout(steps=2))
+    assert policy._teacher_prefill_pending_rows() == 1
+
+    # The physical terminal at step 0 and reset at step 1 have no corresponding
+    # replay payload rows (e.g. replay filtering removed them). A new valid row
+    # at step 3 belongs to a later successful episode ending at step 5.
+    second = _prefill_episode_rows([901], [0], step_indices=[3])
+    committed, discarded = policy._stage_teacher_prefill_rows(
+        second,
+        _prefill_event_rollout(
+            steps=6,
+            done_steps=(0, 5),
+            terminated_steps=(0,),
+            command_finished_steps=(5,),
+            init_steps=(1,),
+        ),
+    )
+
+    assert (committed, discarded) == (1, 1)
+    assert policy.q_teacher_replay.size == 1
+    assert policy.q_teacher_replay.data["actions"][0, 0].item() == 901.0
+    assert policy._teacher_prefill_failed_episodes == 1
+    assert policy._teacher_prefill_successful_episodes == 1
+    assert policy._teacher_prefill_pending_rows() == 0
+
+
 def test_teacher_prefill_train_op_populates_only_q_teacher_and_touches_no_optimizer():
     policy = _bare_policy(
-        teacher_prefill_rollouts=1,
+        teacher_prefill_max_rollouts=1,
         train_every=10,
         td3_learning_starts=3,
         dagger_beta_start=0.8,
@@ -687,10 +1635,11 @@ def test_teacher_prefill_train_op_populates_only_q_teacher_and_touches_no_optimi
     policy.actor_update_count = 4
     policy.critic_update_count = 6
     policy.num_updates = 9
-    policy.q_teacher_replay = _TD3DeviceReplay(16, "cpu")
+    policy.q_teacher_replay = _TD3DeviceReplay(3, "cpu")
     policy.dagger_replay = _TD3DeviceReplay(16, "cpu")
+    _initialize_prefill_episode_state(policy)
 
-    chunk = _replay_rows(4, 100)
+    chunk = _mark_prefill_stub_as_success(_replay_rows(4, 100))
     chunk[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.tensor([True, False, True, True])
     chunk[DAGGER_IS_STUDENT_ACTION_KEY] = torch.tensor([False, True, False, False])
     chunk[TD3_COLLECTOR_NOISE_KEY] = torch.zeros(4, 1)
@@ -752,7 +1701,9 @@ def test_teacher_prefill_train_op_populates_only_q_teacher_and_touches_no_optimi
 
     assert info["td3/prefill_active"] == pytest.approx(1.0)
     assert info["td3/prefill_rollout_count"] == 1
-    assert info["td3/prefill_target_rollouts"] == 1
+    assert info["td3/prefill_max_rollouts"] == 1
+    assert info["td3/prefill_target_rows"] == 3
+    assert info["td3/prefill_progress"] == pytest.approx(1.0)
     assert info["td3/prefill_environment_steps"] == 10
     assert info["td3/prefill_rows_this_rollout"] == 3
     assert info["td3/prefill_forced_teacher_fraction"] == pytest.approx(0.75)
@@ -770,7 +1721,7 @@ def test_teacher_prefill_train_op_populates_only_q_teacher_and_touches_no_optimi
 
 def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
     policy = _bare_policy(
-        teacher_prefill_rollouts=1,
+        teacher_prefill_max_rollouts=1,
         train_every=10,
         td3_learning_starts=2,
         q_updates_per_rollout=1,
@@ -780,6 +1731,9 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
         dagger_beta_start=0.0,
         dagger_beta_end=0.0,
         dagger_beta_decay_rollouts=1,
+        teacher_actor_replay_fraction=0.0,
+        failure_phase_teacher_fraction=0.0,
+        failure_phase_num_bins=16,
     )
     policy.teacher_prefill_rollout_count = 0
     policy.teacher_prefill_environment_steps = 0
@@ -790,13 +1744,12 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
     policy.num_updates = 0
     policy._last_truncation_finals_used = 0
     policy._last_td3_diagnostics = {}
-    # The ordinary replay implementation keeps this test on the sequential
-    # sampling path, making the source rows directly observable by the stubs.
-    policy.q_teacher_replay = _DeviceReplay(16, "cpu")
-    policy.dagger_replay = _DeviceReplay(16, "cpu")
+    policy.q_teacher_replay = _TD3DeviceReplay(2, "cpu")
+    policy.dagger_replay = _TD3DeviceReplay(16, "cpu")
+    _initialize_prefill_episode_state(policy)
     policy.q_rng = torch.Generator().manual_seed(619)
 
-    prefill = _replay_rows(3, 100)
+    prefill = _mark_prefill_stub_as_success(_replay_rows(3, 100))
     prefill[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.tensor([True, False, True])
     prefill[DAGGER_IS_STUDENT_ACTION_KEY] = torch.tensor([False, True, False])
     prefill[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.tensor([[801.0], [802.0], [803.0]])
@@ -876,22 +1829,31 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
             frozen_value[:frozen_size],
         )
 
-    # Every main transition, including teacher-executed transitions, belongs to
-    # DAgger replay and retains its current teacher label for Actor BC.
-    assert policy.dagger_replay.size == 4
-    assert policy.dagger_replay.seen == 4
-    assert torch.equal(policy.dagger_replay.data["actions"][:4], main["actions"])
+    # Main replay stores only Student-executed transitions. Those rows retain
+    # exact Teacher BC labels and raw perception windows; Teacher-executed main
+    # rows would be dead under the shared 50/35/15 sampling contract.
+    student_indices = torch.tensor([0, 2])
+    assert policy.dagger_replay.size == 2
+    assert policy.dagger_replay.seen == 2
     assert torch.equal(
-        policy.dagger_replay.data[DAGGER_IS_STUDENT_ACTION_KEY][:4],
-        main[DAGGER_IS_STUDENT_ACTION_KEY],
+        policy.dagger_replay.data["actions"][:2],
+        main["actions"].index_select(0, student_indices),
     )
     assert torch.equal(
-        policy.dagger_replay.data[DAGGER_REPLAY_TEACHER_ACTIONS][:4],
-        main_teacher_labels,
+        policy.dagger_replay.data[DAGGER_IS_STUDENT_ACTION_KEY][:2],
+        torch.ones(2, dtype=torch.bool),
     )
     assert torch.equal(
-        policy.dagger_replay.data[DAGGER_TEACHER_ACTION_VALID_KEY][:4],
-        main[DAGGER_TEACHER_ACTION_VALID_KEY],
+        policy.dagger_replay.data[DAGGER_REPLAY_TEACHER_ACTIONS][:2],
+        main_teacher_labels.index_select(0, student_indices),
+    )
+    assert torch.equal(
+        policy.dagger_replay.data[DAGGER_TEACHER_ACTION_VALID_KEY][:2],
+        torch.ones(2, dtype=torch.bool),
+    )
+    assert torch.equal(
+        policy.dagger_replay.data[PERCEPTION_POLICY_RAW_KEY][:2],
+        main[PERCEPTION_POLICY_RAW_KEY].index_select(0, student_indices),
     )
 
     assert main_info["td3/prefill_active"] == pytest.approx(0.0)
@@ -928,7 +1890,15 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
 
 
 def _sampling_policy(replay_type, seed: int, device):
-    policy = _bare_policy(q_batch_size=6, dagger_batch_size=5, policy_delay=2)
+    policy = _bare_policy(
+        q_batch_size=6,
+        q_teacher_replay_ratio=0.5,
+        dagger_batch_size=5,
+        policy_delay=2,
+        teacher_actor_replay_fraction=0.0,
+        failure_phase_teacher_fraction=0.0,
+        failure_phase_num_bins=16,
+    )
     policy.device = torch.device(device)
     policy.q_rng = torch.Generator(device=device).manual_seed(seed)
     policy.critic_update_count = 3
@@ -945,10 +1915,149 @@ def _sampling_policy(replay_type, seed: int, device):
     student[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.arange(11) % 3 != 0
     policy.q_teacher_replay.extend(teacher)
     policy.dagger_replay.extend(student)
+    policy._failure_phase_histogram = torch.zeros(16, dtype=torch.float64)
+    policy._teacher_phase_bin_rows = ()
+    policy._teacher_phase_index_ready = False
+    policy._failure_phase_uniform_fallback_rows = 0
+    policy._failure_phase_focused_rows = 0
     policy._prepare_dagger_learning_batch = MethodType(
         lambda owner, batch: batch, policy
     )
     return policy
+
+
+def _curriculum_sampling_policy(seed: int = 853, device="cpu"):
+    policy = _bare_policy(
+        q_batch_size=20,
+        q_teacher_replay_ratio=0.5,
+        dagger_batch_size=20,
+        teacher_actor_replay_fraction=0.5,
+        failure_phase_teacher_fraction=0.3,
+        failure_phase_num_bins=16,
+        policy_delay=1,
+    )
+    policy.device = torch.device(device)
+    policy.q_rng = torch.Generator(device=device).manual_seed(seed)
+    policy.critic_update_count = 0
+    policy.q_teacher_replay = _TD3DeviceReplay(64, "cpu")
+    policy.dagger_replay = _TD3DeviceReplay(64, "cpu")
+
+    teacher = _replay_rows(30, 100)
+    teacher[REFERENCE_PHASE_KEY] = torch.linspace(0.0, 1.0, 30)
+    student = _replay_rows(40, 1_000)
+    student_mask = torch.arange(40) % 2 == 1
+    student[DAGGER_IS_STUDENT_ACTION_KEY] = student_mask
+    student[DAGGER_REPLAY_TEACHER_ACTIONS] = (
+        torch.arange(40, dtype=torch.float32)[:, None] + 2_000.0
+    )
+    student[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(40, dtype=torch.bool)
+    policy.q_teacher_replay.extend(teacher)
+    policy.dagger_replay.extend(student)
+    policy._prepare_dagger_learning_batch = MethodType(
+        lambda owner, batch: batch, policy
+    )
+    policy._failure_phase_histogram = torch.zeros(16, dtype=torch.float64)
+    policy._failure_phase_histogram[12] = 1.0
+    policy._teacher_phase_bin_rows = ()
+    policy._teacher_phase_index_ready = False
+    policy._failure_phase_uniform_fallback_rows = 0
+    policy._failure_phase_focused_rows = 0
+    policy._build_teacher_phase_index()
+    return policy, student_mask
+
+
+def test_q_and_actor_batches_use_exact_shared_sources_and_student_only_main_rows():
+    policy, student_mask = _curriculum_sampling_policy()
+
+    critic = policy._sample_balanced_q_batch()
+    actor = policy._sample_actor_batch()
+
+    for batch in (critic, actor):
+        teacher = batch[DAGGER_Q_TEACHER_SOURCE_KEY]
+        focused = batch[FAILURE_PHASE_TEACHER_SOURCE_KEY]
+        assert teacher.sum().item() == 10
+        assert (teacher & ~focused).sum().item() == 7
+        assert focused.sum().item() == 3
+        assert not (focused & ~teacher).any()
+
+    critic_teacher = critic[DAGGER_Q_TEACHER_SOURCE_KEY]
+    critic_student_rows = (critic["actions"][~critic_teacher, 0] - 1_001.0).long()
+    assert student_mask.index_select(0, critic_student_rows).all()
+
+    actor_teacher = actor[DAGGER_Q_TEACHER_SOURCE_KEY]
+    actor_student_rows = (
+        actor["critic_observations"][~actor_teacher, 0] - 1_000.0
+    ).long()
+    assert student_mask.index_select(0, actor_student_rows).all()
+
+
+@pytest.mark.parametrize(
+    "device",
+    (
+        "cpu",
+        pytest.param(
+            "cuda:0",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ),
+)
+def test_curriculum_prefetch_matches_direct_rng_batches_sources_and_devices(device):
+    update_count = 3
+    direct, _ = _curriculum_sampling_policy(887, device)
+    prefetched, _ = _curriculum_sampling_policy(887, device)
+
+    expected = []
+    for _ in range(update_count):
+        expected.append(
+            (direct._sample_balanced_q_batch(), direct._sample_actor_batch())
+        )
+
+    plans = prefetched._prefetch_curriculum_sample_plans(update_count)
+    actual = [
+        (
+            prefetched._sample_balanced_q_batch(plan),
+            prefetched._sample_actor_batch(
+                plan.actor_indices,
+                plan.actor_teacher_indices,
+                plan.actor_teacher_focused,
+            ),
+        )
+        for plan in plans
+    ]
+
+    assert torch.equal(direct.q_rng.get_state(), prefetched.q_rng.get_state())
+    assert len(plans) == update_count
+    for plan in plans:
+        assert plan.teacher_indices.device.type == "cpu"
+        assert plan.student_indices.device.type == "cpu"
+        assert plan.actor_indices is not None
+        assert plan.actor_indices.device.type == "cpu"
+        assert plan.actor_teacher_indices is not None
+        assert plan.actor_teacher_indices.device.type == "cpu"
+        assert plan.permutation.device == torch.device(device)
+        assert plan.teacher_focused is not None
+        assert plan.teacher_focused.device == torch.device(device)
+        assert plan.actor_teacher_focused is not None
+        assert plan.actor_teacher_focused.device == torch.device(device)
+
+    for expected_pair, actual_pair in zip(expected, actual):
+        for expected_batch, actual_batch in zip(expected_pair, actual_pair):
+            _assert_nested_equal(expected_batch, actual_batch)
+            teacher = actual_batch[DAGGER_Q_TEACHER_SOURCE_KEY]
+            focused = actual_batch[FAILURE_PHASE_TEACHER_SOURCE_KEY]
+            assert (~teacher).sum().item() == 10
+            assert (teacher & ~focused).sum().item() == 7
+            assert focused.sum().item() == 3
+            assert all(
+                value.device == torch.device(device) for value in actual_batch.values()
+            )
+
+    assert direct.q_teacher_replay.device.type == "cpu"
+    assert direct.dagger_replay.device.type == "cpu"
+    assert prefetched.q_teacher_replay.device.type == "cpu"
+    assert prefetched.dagger_replay.device.type == "cpu"
 
 
 def test_td3_indexed_cpu_replay_preserves_requested_fields_values_and_state():
@@ -993,29 +2102,14 @@ def test_prefetched_td3_cpu_sampling_matches_sequential_rng_and_batches_exactly(
 ):
     seed = 731
     update_count = 5
-    sequential = _sampling_policy(_DeviceReplay, seed, device)
+    sequential = _sampling_policy(_TD3DeviceReplay, seed, device)
     prefetched = _sampling_policy(_TD3DeviceReplay, seed, device)
-    actor_fields = (
-        "critic_observations",
-        DAGGER_REPLAY_TEACHER_ACTIONS,
-        DAGGER_TEACHER_ACTION_VALID_KEY,
-        PERCEPTION_DEPTH_U8_KEY,
-        PERCEPTION_POLICY_RAW_KEY,
-        PERCEPTION_VEL_COMMAND_RAW_KEY,
-        PERCEPTION_IS_INIT_KEY,
-    )
-
     expected = []
     for update_index in range(update_count):
-        q_batch = PPOBCDaggerFinetune._sample_balanced_q_batch(sequential)
+        q_batch = sequential._sample_balanced_q_batch()
         actor_batch = None
         if (sequential.critic_update_count + update_index + 1) % 2 == 0:
-            actor_batch = sequential.dagger_replay.sample(
-                5,
-                sequential.device,
-                sequential.q_rng,
-                fields=actor_fields,
-            )
+            actor_batch = sequential._sample_actor_batch()
         expected.append((q_batch, actor_batch))
 
     plans = _prefetch_td3_replay_sample_plans(
@@ -1080,12 +2174,12 @@ def test_prefetched_td3_cpu_sampling_matches_sequential_rng_and_batches_exactly(
 
 def test_prefetched_actor_plan_preserves_mixed_teacher_main_rng_and_labels():
     seed = 947
-    sequential = _sampling_policy(_DeviceReplay, seed, "cpu")
+    sequential = _sampling_policy(_TD3DeviceReplay, seed, "cpu")
     prefetched = _sampling_policy(_TD3DeviceReplay, seed, "cpu")
     sequential.cfg.teacher_actor_replay_fraction = 0.4
     prefetched.cfg.teacher_actor_replay_fraction = 0.4
 
-    expected_q = PPOBCDaggerFinetune._sample_balanced_q_batch(sequential)
+    expected_q = sequential._sample_balanced_q_batch()
     expected_actor = sequential._sample_actor_batch()
     plan = _prefetch_td3_replay_sample_plans(
         prefetched.dagger_replay,
@@ -1126,6 +2220,7 @@ def test_td3_config_rejects_persistent_teacher_h5_export():
         DistributionalTD3TeacherBC._validate_td3_config(cfg)
 
     cfg.save_teacher_buffer = False
+    cfg.teacher_prefill_max_rollouts = 10
     DistributionalTD3TeacherBC._validate_td3_config(cfg)
 
 
@@ -1789,7 +2884,7 @@ def test_teacher_prefill_forces_only_valid_teacher_without_advancing_replay_rngs
     latent = torch.tensor([[0.1, -0.2], [0.3, 0.4], [-0.5, 0.6]])
     teacher = torch.tensor([[2.0, -3.0], [25.0, 0.0], [-6.0, 7.0]])
     policy = _bare_policy(
-        teacher_prefill_rollouts=1,
+        teacher_prefill_max_rollouts=1,
         dagger_control_mode="beta",
         dagger_beta_start=0.25,
         dagger_beta_end=0.0,
@@ -1838,7 +2933,7 @@ def test_teacher_prefill_forces_only_valid_teacher_without_advancing_replay_rngs
 
     # Completing prefill exposes the untouched main DAgger schedule. Its first
     # rollout reports beta_start and consumes the DAgger RNG normally.
-    policy.teacher_prefill_rollout_count = 1
+    policy._teacher_prefill_complete = True
     main = rollout_policy(rollout.clone())
     assert torch.all(main[TD3_BETA_KEY] == policy.cfg.dagger_beta_start)
     assert not torch.equal(policy.dagger_rng.get_state(), dagger_rng_before)

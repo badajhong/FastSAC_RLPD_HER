@@ -26,6 +26,8 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
     TD3_NOISE_FREE_STUDENT_ACTION_KEY,
     DistributionalTD3TeacherBC,
+    _failure_lookback_offsets,
+    _source_counts,
     _categorical_expected_value,
     _exact_teacher_bc_loss,
     _project_c51_probabilities,
@@ -274,6 +276,8 @@ def test_raw_replay_and_teacher_prefill_implementation_is_inherited_unchanged():
         "_teacher_prefill_active",
         "_collect_teacher_q_replay_this_rollout",
         "_teacher_q_replay_frozen",
+        "_stage_teacher_prefill_rows",
+        "_discard_unresolved_teacher_prefill_rows",
         "configure_teacher_replay",
         "snapshot_teacher_replay",
         "_raw_perception_values",
@@ -285,11 +289,35 @@ def test_raw_replay_and_teacher_prefill_implementation_is_inherited_unchanged():
         "_prepare_dagger_learning_batch",
         "_sample_balanced_q_batch",
         "_sample_actor_batch",
+        "_update_failure_phase_histogram",
+        "_sample_teacher_indices",
+        "_build_teacher_phase_index",
+        "_prefetch_curriculum_sample_plans",
+        "_load_pretrained_perception_checkpoint",
+        "_set_perception_trainable",
+        "train_adapt",
+        "_student_latent",
     )
     for method in inherited_methods:
         assert getattr(DistributionalFastSACTeacherBC, method) is getattr(
             DistributionalTD3TeacherBC, method
         )
+
+
+def test_fastsac_uses_the_shared_td3_failure_phase_curriculum_contract():
+    assert _failure_lookback_offsets(50, 10).tolist() == [
+        0,
+        6,
+        11,
+        17,
+        22,
+        28,
+        33,
+        39,
+        44,
+        50,
+    ]
+    assert _source_counts(4096, 0.5, 0.3) == (2048, 1434, 614)
 
 
 def test_class_does_not_own_a_target_actor_or_any_td3_noise_rng_contract():
@@ -475,7 +503,7 @@ def _rollout_owner(*, prefill: bool, beta: float = 0.5):
     latent = torch.zeros(batch_size, action_dim)
     teacher = torch.zeros_like(latent)
     cfg = SimpleNamespace(
-        teacher_prefill_rollouts=1,
+        teacher_prefill_max_rollouts=1,
         dagger_control_mode="beta",
         dagger_teacher_action_threshold=20.0,
         dagger_action_clip=20.0,
