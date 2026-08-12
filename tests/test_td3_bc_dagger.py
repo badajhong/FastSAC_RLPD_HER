@@ -29,18 +29,27 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
 )
 from active_adaptation.learning.ppo.ppo_vel import PPOVEL
 from active_adaptation.learning.ppo.td3_bc_dagger import (
-    ACTOR_BACKEND,
-    ACTOR_LEARNING_SEMANTICS,
     CHECKPOINT_VERSION,
-    CRITIC_SEMANTICS,
+    PERCEPTION_DEPTH_U8_KEY,
+    PERCEPTION_IS_INIT_KEY,
+    PERCEPTION_POLICY_RAW_KEY,
+    PERCEPTION_REPLAY_SEMANTICS,
+    PERCEPTION_VEL_COMMAND_RAW_KEY,
+    TD3_BETA_KEY,
+    TD3_COLLECTOR_NOISE_KEY,
+    TD3_EXPLORATORY_STUDENT_ACTION_KEY,
+    TD3_NOISE_FREE_STUDENT_ACTION_KEY,
     TRAINING_ALGORITHM,
     DistributionalTD3TeacherBC,
     DistributionalTD3TeacherBCConfig,
     _DistributionalTD3DaggerRolloutPolicy,
+    _Q_REPLAY_FIELDS,
     _TD3DeviceReplay,
     _apply_student_collector_noise,
     _categorical_expected_value,
     _exact_teacher_bc_loss,
+    _decode_replay_depth_u8,
+    _encode_replay_depth_u8,
     _polyak_update_,
     _prefetch_td3_replay_sample_plans,
     _project_c51_probabilities,
@@ -101,19 +110,310 @@ def _take_optimizer_step(module: nn.Module, optimizer) -> None:
 
 def _replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
     row = torch.arange(count, dtype=torch.float32) + float(offset)
+    time = torch.arange(10, dtype=torch.float32)
     return {
-        "observations": torch.stack((row, row + 0.25), dim=-1),
         "critic_observations": torch.stack((row, row + 0.5, row + 0.75), dim=-1),
         "actions": row[:, None] + 1.0,
         "rewards": row + 2.0,
         "dones": torch.arange(count) % 3 == 0,
         "truncations": torch.arange(count) % 4 == 0,
         "discounts": torch.full((count,), 0.95),
-        "next_observations": torch.stack((row + 3.0, row + 3.25), dim=-1),
         "next_critic_observations": torch.stack(
             (row + 4.0, row + 4.5, row + 4.75), dim=-1
         ),
+        PERCEPTION_DEPTH_U8_KEY: (
+            torch.arange(count * 10).reshape(count, 10, 1, 1, 1) % 101
+        ).to(torch.uint8),
+        PERCEPTION_POLICY_RAW_KEY: row[:, None, None] + time[None, :, None],
+        PERCEPTION_VEL_COMMAND_RAW_KEY: (
+            row[:, None, None] + time[None, :, None] + 0.25
+        ),
+        PERCEPTION_IS_INIT_KEY: torch.zeros(count, 10, dtype=torch.bool),
     }
+
+
+def test_depth_uint8_codec_is_lossless_for_every_simulator_bin():
+    depth = (torch.arange(101, dtype=torch.float32) / 100.0).reshape(1, 101, 1, 1)
+
+    encoded = _encode_replay_depth_u8(depth)
+    decoded = _decode_replay_depth_u8(encoded)
+
+    assert encoded.dtype is torch.uint8
+    assert encoded.shape == depth.shape
+    assert torch.equal(encoded.reshape(-1), torch.arange(101, dtype=torch.uint8))
+    assert decoded.dtype is torch.float32
+    assert decoded.shape == depth.shape
+    assert torch.equal(decoded, depth)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    (
+        torch.tensor([0.005]),
+        torch.tensor([-0.01]),
+        torch.tensor([1.01]),
+        torch.tensor([float("nan")]),
+        torch.tensor([float("inf")]),
+    ),
+)
+def test_depth_uint8_codec_rejects_noncanonical_values(invalid):
+    with pytest.raises(ValueError):
+        _encode_replay_depth_u8(invalid)
+
+
+def test_raw_perception_replay_public_field_contract_has_no_priv_pred_latent():
+    assert CHECKPOINT_VERSION == 2
+    assert PERCEPTION_REPLAY_SEMANTICS
+    assert (
+        PERCEPTION_DEPTH_U8_KEY,
+        PERCEPTION_POLICY_RAW_KEY,
+        PERCEPTION_VEL_COMMAND_RAW_KEY,
+        PERCEPTION_IS_INIT_KEY,
+    ) == (
+        "perception_depth_u8",
+        "perception_policy_raw",
+        "perception_vel_command_raw",
+        "perception_is_init",
+    )
+
+
+def _raw_transition_policy(*, train_every: int = 10):
+    policy = _bare_policy(
+        train_every=train_every,
+        perception_replay_burn_in=8,
+    )
+    policy.action_dim = 1
+    policy.q_critic_keys = ("critic_raw",)
+    policy._q_critic_dim = 1
+    policy.observation_spec = {
+        "object_geo_": SimpleNamespace(shape=(2,)),
+    }
+    policy._replay_vecnorm_keys = set()
+    policy._replay_object_geo = None
+    policy._replay_object_geo_fingerprint = None
+    policy._perception_replay_history = None
+    policy._perception_replay_history_count = 0
+    policy._rollout_final_batch = None
+    policy._truncation_final_batches = []
+    policy._last_truncation_finals_used = 0
+    policy._collect_dagger_replay_this_rollout = lambda: True
+    policy._scalarize_q_reward = lambda reward: reward
+    return policy
+
+
+def _raw_transition_td(
+    values: torch.Tensor,
+    *,
+    is_init: torch.Tensor | None = None,
+    truncation_step: int | None = None,
+) -> TensorDict:
+    values = values.float()
+    n, t = values.shape
+    if is_init is None:
+        is_init = torch.zeros(n, t, dtype=torch.bool)
+    done = torch.zeros(n, t, dtype=torch.bool)
+    timeout = torch.zeros(n, t, dtype=torch.bool)
+    if truncation_step is not None:
+        done[:, truncation_step] = True
+        timeout[:, truncation_step] = True
+    zeros_bool = torch.zeros(n, t, dtype=torch.bool)
+    action = values.unsqueeze(-1)
+    td = TensorDict(
+        {
+            "depth": (values.remainder(101) / 100.0).reshape(n, t, 1, 1, 1),
+            "policy": action + 100.0,
+            "vel_command": action + 200.0,
+            "object_geo_": torch.tensor([1.0, 2.0]).expand(n, t, 2).clone(),
+            "critic_raw": action + 300.0,
+            "is_init": is_init,
+            "step_count": torch.full((n, t), 100),
+            ACTION_KEY: action,
+            DAGGER_TEACHER_ACTION_KEY: action + 10.0,
+            DAGGER_TEACHER_ACTION_VALID_KEY: torch.ones(n, t, dtype=torch.bool),
+            DAGGER_IS_STUDENT_ACTION_KEY: zeros_bool,
+            TD3_NOISE_FREE_STUDENT_ACTION_KEY: action + 20.0,
+            TD3_EXPLORATORY_STUDENT_ACTION_KEY: action + 30.0,
+            TD3_COLLECTOR_NOISE_KEY: torch.zeros_like(action),
+            TD3_BETA_KEY: torch.ones(n, t),
+            ("next", "reward"): values,
+            ("next", "done"): done,
+            ("next", "terminated"): zeros_bool,
+            ("next", "discount"): torch.ones(n, t),
+            ("next", "stats", "episode_time_limit"): timeout,
+            ("next", "stats", "command_finished"): zeros_bool,
+        },
+        batch_size=(n, t),
+    )
+    return td
+
+
+def _raw_final_td(value: float, *, is_init: bool = False) -> TensorDict:
+    scalar = torch.tensor([[value]], dtype=torch.float32)
+    return TensorDict(
+        {
+            "depth": torch.tensor([value % 101 / 100.0]).reshape(1, 1, 1, 1),
+            "policy": scalar + 100.0,
+            "vel_command": scalar + 200.0,
+            "object_geo_": torch.tensor([[1.0, 2.0]]),
+            "critic_raw": scalar + 300.0,
+            "is_init": torch.tensor([is_init]),
+        },
+        batch_size=(1,),
+    )
+
+
+def test_raw_replay_window_alignment_reset_markers_and_no_priv_pred_storage():
+    policy = _raw_transition_policy()
+    values = torch.arange(10).reshape(1, 10)
+    resets = torch.zeros(1, 10, dtype=torch.bool)
+    resets[0, 4] = True
+    rollout = _raw_transition_td(values, is_init=resets)
+    policy.capture_rollout_final_observation(_raw_final_td(10.0))
+
+    chunks = list(policy._dagger_transition_chunks(rollout))
+
+    assert len(chunks) == 2
+    first, second = chunks
+    assert first[PERCEPTION_POLICY_RAW_KEY].shape == (1, 10, 1)
+    assert torch.equal(
+        first[PERCEPTION_POLICY_RAW_KEY][0, :, 0], torch.arange(10) + 100.0
+    )
+    assert torch.equal(
+        second[PERCEPTION_POLICY_RAW_KEY][0, :, 0], torch.arange(1, 11) + 100.0
+    )
+    assert first[PERCEPTION_POLICY_RAW_KEY][0, -2, 0].item() == 108.0
+    assert first[PERCEPTION_POLICY_RAW_KEY][0, -1, 0].item() == 109.0
+    assert torch.equal(
+        first[PERCEPTION_IS_INIT_KEY][0],
+        torch.tensor(
+            [False, False, False, False, True, False, False, False, False, False]
+        ),
+    )
+    assert not ({"observations", "next_observations", "priv_pred"} & set(first))
+    assert first[PERCEPTION_DEPTH_U8_KEY].dtype is torch.uint8
+
+
+def test_timeout_replay_next_slot_uses_captured_true_final_raw_state():
+    policy = _raw_transition_policy()
+    rollout = _raw_transition_td(torch.arange(10).reshape(1, 10), truncation_step=8)
+    true_timeout_final = _raw_final_td(77.0)
+    timeout_capture = rollout[:, 8].clone()
+    for key in (
+        "depth",
+        "policy",
+        "vel_command",
+        "object_geo_",
+        "critic_raw",
+        "is_init",
+    ):
+        timeout_capture["next", key] = true_timeout_final[key]
+    policy.capture_truncation_final_observations(timeout_capture, step=8)
+    policy.capture_rollout_final_observation(_raw_final_td(10.0))
+
+    first = next(policy._dagger_transition_chunks(rollout))
+
+    assert first["truncations"].item() is True
+    assert first[PERCEPTION_POLICY_RAW_KEY][0, -2, 0].item() == 108.0
+    assert first[PERCEPTION_POLICY_RAW_KEY][0, -1, 0].item() == 177.0
+    assert first[PERCEPTION_VEL_COMMAND_RAW_KEY][0, -1, 0].item() == 277.0
+    assert first["next_critic_observations"][0, 0].item() == 377.0
+
+
+class _NoOpPerceptionModule(nn.Module):
+    def forward(self, td):
+        return td
+
+
+class _ResetAwareEMAProjection(nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(scale), requires_grad=False)
+
+    def forward(self, td):
+        policy = td["policy"][..., 0]
+        resets = td["is_init"].bool()
+        state = torch.zeros(policy.shape[0], device=policy.device, dtype=policy.dtype)
+        outputs = []
+        for step in range(policy.shape[1]):
+            state = torch.where(resets[:, step], torch.zeros_like(state), state)
+            state = state + policy[:, step] * self.scale
+            outputs.append(state)
+        td["priv_pred"] = torch.stack(outputs, dim=1).unsqueeze(-1)
+        return td
+
+
+def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
+    policy = _bare_policy(
+        perception_replay_burn_in=8,
+        perception_encode_microbatch_size=1,
+        latent_dim=1,
+    )
+    policy.depth_feature_dim = 1
+    policy._replay_object_geo = torch.tensor([1.0, 2.0])
+    policy._vecnorm_snapshot = lambda: None
+    policy._normalize_replay_value = lambda key, value, snapshot: value
+    policy.temporal_depth_gru_ema = _NoOpPerceptionModule()
+    policy.object_adapt_ema = _NoOpPerceptionModule()
+    policy.object_pred_transform = _NoOpPerceptionModule()
+    policy.adapt_ema = _ResetAwareEMAProjection(1.0)
+    raw_policy = torch.arange(1, 11, dtype=torch.float32).reshape(1, 10, 1)
+    raw_vel = raw_policy + 100.0
+    resets = torch.zeros(1, 10, dtype=torch.bool)
+    resets[:, 4] = True
+    batch = {
+        PERCEPTION_DEPTH_U8_KEY: torch.zeros(1, 10, 1, 1, 1, dtype=torch.uint8),
+        PERCEPTION_POLICY_RAW_KEY: raw_policy,
+        PERCEPTION_VEL_COMMAND_RAW_KEY: raw_vel,
+        PERCEPTION_IS_INIT_KEY: resets,
+    }
+    stored_before = {key: value.clone() for key, value in batch.items()}
+
+    first = policy._reencode_perception_windows(
+        batch, include_current=True, include_next=True
+    )
+    with torch.no_grad():
+        policy.adapt_ema.scale.fill_(2.0)
+    second = policy._reencode_perception_windows(
+        batch, include_current=True, include_next=True
+    )
+
+    assert first["observations"].shape == (1, 3)
+    assert first["next_observations"].shape == (1, 3)
+    # Window slot -2 is current. Reset at slot 4 makes recurrent state exact:
+    # sum(policy[4:9]) = 5 + 6 + 7 + 8 + 9 = 35.
+    assert first["observations"][0, -1].item() == pytest.approx(35.0)
+    assert first["next_observations"][0, -1].item() == pytest.approx(45.0)
+    assert second["observations"][0, -1].item() == pytest.approx(70.0)
+    assert second["next_observations"][0, -1].item() == pytest.approx(90.0)
+    assert not torch.equal(first["observations"], second["observations"])
+    assert not first["observations"].requires_grad
+    for key, value in batch.items():
+        assert torch.equal(value, stored_before[key])
+    assert all(
+        "priv_pred" not in field
+        for field in (
+            PERCEPTION_DEPTH_U8_KEY,
+            PERCEPTION_POLICY_RAW_KEY,
+            PERCEPTION_VEL_COMMAND_RAW_KEY,
+            PERCEPTION_IS_INIT_KEY,
+        )
+    )
+    assert set(_Q_REPLAY_FIELDS) == {
+        "critic_observations",
+        "actions",
+        "rewards",
+        "dones",
+        "truncations",
+        "discounts",
+        "next_critic_observations",
+        PERCEPTION_DEPTH_U8_KEY,
+        PERCEPTION_POLICY_RAW_KEY,
+        PERCEPTION_VEL_COMMAND_RAW_KEY,
+        PERCEPTION_IS_INIT_KEY,
+    }
+    assert {"observations", "next_observations", "priv_pred"}.isdisjoint(
+        _Q_REPLAY_FIELDS
+    )
 
 
 def _sampling_policy(replay_type, seed: int, device):
@@ -185,10 +485,13 @@ def test_prefetched_td3_cpu_sampling_matches_sequential_rng_and_batches_exactly(
     sequential = _sampling_policy(_DeviceReplay, seed, device)
     prefetched = _sampling_policy(_TD3DeviceReplay, seed, device)
     actor_fields = (
-        "observations",
         "critic_observations",
         DAGGER_REPLAY_TEACHER_ACTIONS,
         DAGGER_TEACHER_ACTION_VALID_KEY,
+        PERCEPTION_DEPTH_U8_KEY,
+        PERCEPTION_POLICY_RAW_KEY,
+        PERCEPTION_VEL_COMMAND_RAW_KEY,
+        PERCEPTION_IS_INIT_KEY,
     )
 
     expected = []
@@ -264,17 +567,31 @@ def test_prefetched_td3_cpu_sampling_matches_sequential_rng_and_batches_exactly(
     )
 
 
-def test_td3_config_rejects_export_fifo_smaller_than_q_teacher_fifo():
+def test_td3_config_rejects_persistent_teacher_h5_export():
     cfg = DistributionalTD3TeacherBCConfig()
     cfg.save_teacher_buffer = True
-    cfg.q_teacher_buffer_capacity = 128
-    cfg.teacher_buffer_capacity = 127
 
-    with pytest.raises(ValueError, match="teacher_buffer_capacity"):
+    with pytest.raises(ValueError, match="save_teacher_buffer"):
         DistributionalTD3TeacherBC._validate_td3_config(cfg)
 
     cfg.save_teacher_buffer = False
     DistributionalTD3TeacherBC._validate_td3_config(cfg)
+
+
+def test_disabled_teacher_h5_never_materializes_during_configure_or_snapshot(
+    tmp_path,
+):
+    policy = _bare_policy(save_teacher_buffer=False)
+    policy.teacher_replay = object()
+    replay_path = tmp_path / "teacher_replay_buffer.h5"
+
+    policy.configure_teacher_replay(replay_path, restore_path=None)
+    snapshot = policy.snapshot_teacher_replay(100, "checkpoint_100")
+
+    assert snapshot is None
+    assert policy.teacher_replay is None
+    assert not replay_path.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_lower_expected_head_selects_one_complete_c51_distribution_per_row():
@@ -1133,31 +1450,22 @@ def test_td3_checkpoint_seam_round_trips_all_owned_training_state():
     )
 
 
-def test_same_stage_load_rejects_live_vecnorm_fingerprint_mismatch(monkeypatch):
+@pytest.mark.parametrize("version", (1, CHECKPOINT_VERSION))
+def test_public_load_rejects_old_and_current_same_stage_td3_resume(
+    monkeypatch, version
+):
     policy = _bare_policy()
-    policy.actor_adapt = nn.Linear(2, 1)
-    policy._fastsac_action_contract = {"fingerprint": "sha256:action"}
-    policy._replay_vecnorm_fingerprint = "sha256:" + "1" * 64
-    policy._checkpoint_config = lambda: {"method": "td3"}
-    policy._q_backend_metadata = lambda: {"critic": "c51"}
     state = {
         "training_algorithm": TRAINING_ALGORITHM,
-        "checkpoint_version": CHECKPOINT_VERSION,
-        "actor_backend": ACTOR_BACKEND,
-        "critic_learning_semantics": CRITIC_SEMANTICS,
-        "actor_learning_semantics": ACTOR_LEARNING_SEMANTICS,
-        "dagger_backend_config": policy._checkpoint_config(),
-        "q_backend_config": policy._q_backend_metadata(),
-        "action_contract": policy._fastsac_action_contract,
-        "vecnorm_fingerprint": "sha256:" + "2" * 64,
+        "checkpoint_version": version,
     }
     monkeypatch.setattr(
         PPOVEL,
         "load_state_dict",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("fingerprint mismatch must fail before module loading")
+            AssertionError("same-stage rejection must happen before module loading")
         ),
     )
 
-    with pytest.raises(ValueError, match="VecNorm fingerprint mismatch"):
+    with pytest.raises(ValueError, match="fresh-only.*same-stage TD3"):
         policy.load_state_dict(state)

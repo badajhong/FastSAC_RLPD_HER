@@ -1003,7 +1003,12 @@ def test_td3_config_cannot_override_the_locked_task_reward_or_environment():
             "policy",
             "priv",
             "command",
+            "depth",
         ],
+        "perception_replay_burn_in": 8,
+        "perception_encode_microbatch_size": 128,
+        "perception_depth_codec": "uint8_div_100_v1",
+        "save_teacher_buffer": False,
         "q_teacher_replay_ratio": 0.5,
     }
     changed = {
@@ -1012,6 +1017,12 @@ def test_td3_config_cannot_override_the_locked_task_reward_or_environment():
         if key in algo and algo[key] != expected
     }
     assert not changed, json.dumps(changed, indent=2, sort_keys=True)
+    assert {
+        "teacher_buffer_filename",
+        "teacher_buffer_path",
+        "teacher_buffer_capacity",
+        "teacher_buffer_snapshot_chunk_rows",
+    }.isdisjoint(algo), "raw-perception TD3 must not expose teacher H5 controls"
 
     # A structural final guard: no section from the effective task is overlaid
     # by this algorithm-only file, so composing it cannot mutate the semantic

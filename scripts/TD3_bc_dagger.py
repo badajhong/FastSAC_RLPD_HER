@@ -3,7 +3,9 @@
 The method is C51 distributional TD3 with the exact existing Teacher-BC
 auxiliary objective.  Collection, environment stepping, checkpoint writing,
 and evaluation remain owned by :mod:`scripts.train`; this module provides the
-new method's Hydra surface and fail-fast source/resume validation.
+new method's Hydra surface and fail-fast fresh-source validation.  Version 2
+replays raw perception inputs and intentionally does not resume an old TD3
+replay lineage.
 
 ``PPOConfig`` contributes a few legacy exploration-objective configuration
 keys which are retained only because the Actor/checkpoint topology is locked.
@@ -15,7 +17,6 @@ from __future__ import annotations
 
 import math
 import os
-import re
 from collections.abc import Mapping
 
 import hydra
@@ -24,23 +25,18 @@ from omegaconf import DictConfig, open_dict
 
 import active_adaptation as aa
 from active_adaptation.learning.ppo.td3_bc_dagger import (
-    ACTOR_LEARNING_SEMANTICS as EXPECTED_ACTOR_LEARNING_SEMANTICS,
-    CRITIC_SEMANTICS as EXPECTED_CRITIC_SEMANTICS,
+    ACTOR_LEARNING_SEMANTICS,
+    CRITIC_SEMANTICS,
 )
-from active_adaptation.utils.wandb import parse_checkpoint_path
 
 try:
     from . import bc_dagger as _bc_dagger
-    from .helpers import find_local_teacher_replay
     from .train import run_training
 except ImportError:
     import bc_dagger as _bc_dagger  # type: ignore
-    from helpers import find_local_teacher_replay
     from train import run_training
 
 EXPECTED_ACTION_CONTRACT_SEMANTICS = _bc_dagger.EXPECTED_ACTION_CONTRACT_SEMANTICS
-_validate_action_contract = _bc_dagger._validate_action_contract
-_validate_frozen_teacher_replay = _bc_dagger._validate_frozen_teacher_replay
 
 
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -50,8 +46,10 @@ EXPECTED_ALGO_NAME = "td3_bc_dagger"
 EXPECTED_ALGO_TARGET = (
     "active_adaptation.learning.ppo.td3_bc_dagger.DistributionalTD3TeacherBC"
 )
+EXPECTED_ACTOR_LEARNING_SEMANTICS = ACTOR_LEARNING_SEMANTICS
+EXPECTED_CRITIC_SEMANTICS = CRITIC_SEMANTICS
 EXPECTED_TRAINING_ALGORITHM = "distributional_td3_teacher_bc_v1"
-EXPECTED_CHECKPOINT_VERSION = 1
+EXPECTED_CHECKPOINT_VERSION = 2
 EXPECTED_ACTOR_BACKEND = "vaic_ppo_latent_tanh_bc_dagger_v4"
 EXPECTED_ACTOR_IN_KEYS = (
     "command",
@@ -67,6 +65,7 @@ EXPECTED_REPLAY_RAW_OBSERVATION_KEYS = (
     "policy",
     "priv",
     "command",
+    "depth",
 )
 EXPECTED_JOINT_NAMES = (
     "left_hip_pitch_joint",
@@ -94,37 +93,6 @@ EXPECTED_JOINT_NAMES = (
     "right_elbow_joint",
 )
 
-REQUIRED_RESUME_MODULES = {
-    "actor",
-    "actor_adapt",
-    "actor_target",
-    "adapt_ema",
-    "adapt_module",
-    "depth_cnn",
-    "encoder_priv",
-    "object_adapt",
-    "object_adapt_ema",
-    "qnet",
-    "qnet_target",
-    "temporal_depth_gru",
-    "temporal_depth_gru_ema",
-}
-REQUIRED_RESUME_OPTIMIZERS = {
-    "actor_optimizer",
-    "critic_optimizer",
-    "adapt_optimizer",
-}
-REQUIRED_RESUME_STATE = {
-    "actor_update_count",
-    "critic_update_count",
-    "dagger_rollout_count",
-    "dagger_environment_steps",
-    "dagger_rng_state",
-    "q_rng_state",
-    "collector_exploration_rng_state",
-    "target_policy_rng_state",
-}
-
 DAGGER_BACKEND_CONFIG_FIELDS = (
     "dagger_control_mode",
     "dagger_safe_takeover_rms",
@@ -142,6 +110,9 @@ DAGGER_BACKEND_CONFIG_FIELDS = (
     "dagger_buffer_capacity",
     "dagger_buffer_device",
     "dagger_batch_size",
+    "perception_replay_burn_in",
+    "perception_encode_microbatch_size",
+    "perception_depth_codec",
     "eta_td3",
     "lambda_bc",
     "policy_delay",
@@ -168,7 +139,7 @@ DAGGER_BACKEND_CONFIG_FIELDS = (
     "q_updates_per_rollout",
     "q_teacher_replay_ratio",
     "q_teacher_buffer_capacity",
-    "teacher_buffer_capacity",
+    "save_teacher_buffer",
 )
 
 # These fields are inherited from PPOConfig solely to preserve construction
@@ -279,11 +250,7 @@ def td3_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
     if additional_rollouts < 1:
         raise ValueError("total_frames does not contain one complete rollout")
 
-    start_rollout = _positive_int(
-        "td3_dagger_resume_rollout_count",
-        cfg.get("td3_dagger_resume_rollout_count", 0),
-        allow_zero=True,
-    )
+    start_rollout = 0
     end_rollout = start_rollout + additional_rollouts
     decay_rollouts = _positive_int(
         "algo.dagger_beta_decay_rollouts",
@@ -311,233 +278,16 @@ def td3_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
     }
 
 
-def _resolve_checkpoint(path, *, download_replay: bool, replay_filename: str) -> str:
-    if path is None:
-        raise ValueError("a checkpoint path is required")
-    value = os.path.expanduser(os.fspath(path))
-    if value.startswith("run:"):
-        resolved = parse_checkpoint_path(
-            value,
-            download_replay=download_replay,
-            replay_filename=replay_filename,
-        )
-    else:
-        resolved = hydra.utils.to_absolute_path(value)
-    if resolved is None:
-        raise FileNotFoundError("unable to resolve checkpoint")
-    resolved = os.path.realpath(os.path.expanduser(os.fspath(resolved)))
-    if not os.path.isfile(resolved):
-        raise FileNotFoundError(f"checkpoint does not exist: {resolved}")
-    return resolved
-
-
-def _checkpoint_version(policy_state: Mapping) -> int | None:
-    value = policy_state.get("checkpoint_version")
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return int(value)
-
-
 def prepare_td3_bc_dagger_checkpoint(cfg: DictConfig) -> dict | None:
-    """Validate and install a same-stage distributional-TD3 continuation."""
+    """Reject same-stage TD3 continuation for the fresh-only v2 replay."""
     requested = cfg.get("td3_bc_dagger_checkpoint", None)
     if requested is None:
         return None
-    if (
-        cfg.get("teacher_replay_buffer_path", None) is not None
-        or cfg.algo.get("teacher_buffer_path", None) is not None
-    ):
-        raise ValueError(
-            "td3_bc_dagger_checkpoint owns its paired immutable teacher "
-            "replay; remove explicit teacher replay paths"
-        )
-
-    replay_filename = str(
-        cfg.algo.get("teacher_buffer_filename", "teacher_replay_buffer.h5")
+    raise ValueError(
+        "same-stage TD3 resume is intentionally unsupported by the fresh-only "
+        "raw-perception replay v2 contract; leave td3_bc_dagger_checkpoint=null "
+        "and start from a train-phase PPO checkpoint_path"
     )
-    if (
-        not replay_filename
-        or replay_filename in (".", "..")
-        or os.path.basename(replay_filename) != replay_filename
-    ):
-        raise ValueError("algo.teacher_buffer_filename must be a file basename")
-    copy_replay = bool(cfg.get("td3_bc_dagger_copy_teacher_replay", True))
-    resolved = _resolve_checkpoint(
-        requested,
-        download_replay=copy_replay,
-        replay_filename=replay_filename,
-    )
-    checkpoint = torch.load(resolved, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, Mapping):
-        raise ValueError("TD3 checkpoint root must be a mapping")
-    policy_state = checkpoint.get("policy")
-    if not isinstance(policy_state, Mapping):
-        raise ValueError("TD3 checkpoint has no policy state")
-    if not isinstance(checkpoint.get("vecnorm"), Mapping):
-        raise ValueError("TD3 checkpoint has no VecNorm state")
-    if policy_state.get("training_algorithm") != EXPECTED_TRAINING_ALGORITHM:
-        raise ValueError(
-            "td3_bc_dagger_checkpoint must use "
-            f"training_algorithm={EXPECTED_TRAINING_ALGORITHM!r}"
-        )
-    if _checkpoint_version(policy_state) != EXPECTED_CHECKPOINT_VERSION:
-        raise ValueError(
-            "TD3 checkpoint has an incompatible or missing checkpoint_version"
-        )
-    if policy_state.get("actor_backend") != EXPECTED_ACTOR_BACKEND:
-        raise ValueError("TD3 checkpoint has an incompatible actor backend")
-    if policy_state.get("critic_learning_semantics") != EXPECTED_CRITIC_SEMANTICS:
-        raise ValueError("TD3 checkpoint has incompatible Critic semantics")
-    if (
-        policy_state.get("actor_learning_semantics")
-        != EXPECTED_ACTOR_LEARNING_SEMANTICS
-    ):
-        raise ValueError("TD3 checkpoint has incompatible Actor semantics")
-
-    backend_config = policy_state.get("dagger_backend_config")
-    if not isinstance(backend_config, Mapping):
-        raise ValueError("TD3 checkpoint has no DAgger backend config")
-    if dict(backend_config) != _expected_dagger_backend_config(cfg.algo):
-        raise ValueError("TD3 checkpoint DAgger backend config does not match")
-    q_backend_config = policy_state.get("q_backend_config")
-    if not isinstance(q_backend_config, Mapping):
-        raise ValueError("TD3 checkpoint has no Q backend config")
-    expected_q_backend = {
-        "actor_obs_keys": ["vel_command", "policy", "priv_pred"],
-        "critic_obs_keys": ["priv", "policy", "command", "object_"],
-        "actor_obs_dim": 525,
-        "critic_obs_dim": 2341,
-        "action_dim": len(EXPECTED_JOINT_NAMES),
-        "hidden_dim": int(cfg.algo.q_hidden_dim),
-        "q_action_fusion": str(cfg.algo.q_action_fusion),
-        "num_atoms": int(cfg.algo.q_num_atoms),
-        "v_min": float(cfg.algo.q_v_min),
-        "v_max": float(cfg.algo.q_v_max),
-        "layer_norm": bool(cfg.algo.q_layer_norm),
-        "gamma": float(cfg.algo.gamma),
-        "q_action_coordinates": str(cfg.algo.q_action_coordinates),
-        "q_action_normalized": bool(cfg.algo.q_normalize_actions),
-        "q_action_input_gain": float(cfg.algo.q_action_input_gain),
-        "target_semantics": EXPECTED_CRITIC_SEMANTICS,
-        "actor_q_reduction": "online_q1_expectation_only",
-        "replay_mix_semantics": (
-            "beta_independent_teacher_executed_0.5_student_executed_0.5_v1"
-        ),
-    }
-    mismatched_q_backend = {
-        name: (q_backend_config.get(name), expected)
-        for name, expected in expected_q_backend.items()
-        if q_backend_config.get(name) != expected
-    }
-    if mismatched_q_backend:
-        raise ValueError(
-            f"TD3 checkpoint Q backend config does not match: {mismatched_q_backend}"
-        )
-    action_contract = _validate_action_contract(
-        policy_state.get("action_contract"), context="TD3 checkpoint"
-    )
-    if tuple(action_contract["joint_names"]) != EXPECTED_JOINT_NAMES:
-        raise ValueError("TD3 checkpoint has incompatible action joint order")
-    if any(float(value) != -20.0 for value in action_contract["action_low"]):
-        raise ValueError("TD3 checkpoint has incompatible execution lower bounds")
-    if any(float(value) != 20.0 for value in action_contract["action_high"]):
-        raise ValueError("TD3 checkpoint has incompatible execution upper bounds")
-    if (
-        q_backend_config.get("q_action_transform_fingerprint")
-        != (action_contract["q_action_transform_fingerprint"])
-    ):
-        raise ValueError("TD3 checkpoint Q/action-transform fingerprints do not match")
-    # A serialized VecNorm state is an ``_extra_state`` mapping rather than the
-    # live module accepted by ``_vecnorm_state_fingerprint``.  Validate the
-    # checkpoint's immutable identity here; the policy loader later compares
-    # it with the fingerprint of the reconstructed live VecNorm module.
-    vecnorm_fingerprint = policy_state.get("vecnorm_fingerprint")
-    if (
-        not isinstance(vecnorm_fingerprint, str)
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", vecnorm_fingerprint) is None
-    ):
-        raise ValueError("TD3 checkpoint has an invalid VecNorm fingerprint")
-
-    missing_modules = REQUIRED_RESUME_MODULES.difference(policy_state)
-    if missing_modules:
-        raise ValueError(
-            f"TD3 checkpoint is missing trained modules: {sorted(missing_modules)}"
-        )
-    optimizers = policy_state.get("optimizer_resume_state")
-    if not isinstance(optimizers, Mapping):
-        raise ValueError("TD3 checkpoint has no optimizer state")
-    missing_optimizers = REQUIRED_RESUME_OPTIMIZERS.difference(optimizers)
-    if missing_optimizers:
-        raise ValueError(
-            f"TD3 checkpoint is missing optimizer state: {sorted(missing_optimizers)}"
-        )
-    missing_state = REQUIRED_RESUME_STATE.difference(policy_state)
-    if missing_state:
-        raise ValueError(
-            f"TD3 checkpoint is missing continuation state: {sorted(missing_state)}"
-        )
-
-    replay_metadata = policy_state.get(
-        "teacher_replay_state",
-        policy_state.get("frozen_teacher_replay_source_state"),
-    )
-    replay_size = (
-        int(replay_metadata.get("size", 0))
-        if isinstance(replay_metadata, Mapping)
-        else 0
-    )
-    replay_source = None
-    if replay_size > 0:
-        replay_source = find_local_teacher_replay(resolved, replay_filename)
-        if replay_source is None:
-            raise FileNotFoundError(
-                "TD3 resume requires the paired immutable teacher replay to "
-                "restore its fixed teacher Critic partition"
-            )
-        _validate_frozen_teacher_replay(replay_source, dict(policy_state))
-
-    rollout_count = _positive_int(
-        "checkpoint dagger_rollout_count",
-        policy_state.get("dagger_rollout_count", 0),
-        allow_zero=True,
-    )
-    environment_steps = _positive_int(
-        "checkpoint dagger_environment_steps",
-        policy_state.get("dagger_environment_steps", 0),
-        allow_zero=True,
-    )
-    previous_source = cfg.get("checkpoint_path", None)
-    if previous_source is not None and os.fspath(previous_source) != resolved:
-        print(
-            "TD3-BC DAgger resume checkpoint overrides fresh PPO source "
-            f"checkpoint_path={previous_source}"
-        )
-
-    with open_dict(cfg):
-        cfg.td3_bc_dagger_checkpoint = resolved
-        cfg.checkpoint_path = resolved
-        cfg.td3_dagger_resume_rollout_count = rollout_count
-        cfg.td3_dagger_resume_environment_steps = environment_steps
-        cfg._td3_bc_dagger_same_stage_resume = True
-        cfg._bc_dagger_fresh_source = False
-        # These shared-trainer flags preserve the existing immutable-H5 refill
-        # path without changing scripts/train.py.
-        cfg._bc_dagger_model_only_resume = replay_source is not None
-        cfg._bc_dagger_teacher_replay_copy_source = replay_source
-        cfg._bc_dagger_teacher_replay_copy_path = None
-        cfg.bc_dagger_copy_teacher_replay = copy_replay
-        cfg.teacher_replay_buffer_path = None
-    with open_dict(cfg.algo):
-        cfg.algo.teacher_buffer_path = None
-        if replay_source is not None:
-            cfg.algo.save_teacher_buffer = False
-
-    return {
-        "path": resolved,
-        "rollout_count": rollout_count,
-        "environment_steps": environment_steps,
-        "teacher_replay_source": replay_source,
-    }
 
 
 def prepare_fresh_td3_bc_dagger_source(cfg: DictConfig) -> dict | None:
@@ -568,11 +318,10 @@ def prepare_fresh_td3_bc_dagger_source(cfg: DictConfig) -> dict | None:
     policy_state = _validate_source_checkpoint(checkpoint, cfg)
     with open_dict(cfg):
         cfg.checkpoint_path = source_path
-        # helpers.py recognizes this shared flag and therefore cannot import an
-        # unrelated adjacent replay into a fresh collection.
+        # helpers.py recognizes these shared flags and therefore cannot import
+        # an unrelated adjacent replay into this fresh raw-perception lineage.
         cfg._bc_dagger_fresh_source = True
         cfg._bc_dagger_model_only_resume = False
-        cfg._td3_bc_dagger_same_stage_resume = False
     return {
         "path": source_path,
         "source_last_iter": int(policy_state.get("last_iter", -1)),
@@ -649,17 +398,45 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         "q_batch_size",
         "q_updates_per_rollout",
         "q_teacher_buffer_capacity",
-        "teacher_buffer_capacity",
-        "teacher_buffer_snapshot_chunk_rows",
+        "perception_replay_burn_in",
+        "perception_encode_microbatch_size",
     ):
         _positive_int(f"algo.{name}", cfg.algo.get(name, None))
-    if bool(cfg.algo.get("save_teacher_buffer", False)) and int(
-        cfg.algo.teacher_buffer_capacity
-    ) < int(cfg.algo.q_teacher_buffer_capacity):
+    if int(cfg.algo.perception_replay_burn_in) != 8:
         raise ValueError(
-            "algo.teacher_buffer_capacity must be at least "
-            "q_teacher_buffer_capacity so the checkpoint H5 can refill the "
-            "complete online Teacher replay ring"
+            "raw-perception replay v2 requires algo.perception_replay_burn_in=8"
+        )
+    if str(cfg.algo.get("perception_depth_codec", "")) != "uint8_div_100_v1":
+        raise ValueError(
+            "raw-perception replay v2 requires "
+            "algo.perception_depth_codec='uint8_div_100_v1'"
+        )
+    if cfg.algo.get("save_teacher_buffer", None) is not False:
+        raise ValueError(
+            "raw-perception replay v2 requires algo.save_teacher_buffer=false; "
+            "teacher_replay_buffer.h5 export is disabled"
+        )
+    if (
+        cfg.get("teacher_replay_buffer_path", None) is not None
+        or cfg.algo.get("teacher_buffer_path", None) is not None
+    ):
+        raise ValueError(
+            "raw-perception replay v2 does not accept a teacher replay H5 path"
+        )
+    removed_h5_fields = {
+        name
+        for name in (
+            "teacher_buffer_filename",
+            "teacher_buffer_path",
+            "teacher_buffer_capacity",
+            "teacher_buffer_snapshot_chunk_rows",
+        )
+        if name in cfg.algo
+    }
+    if removed_h5_fields:
+        raise ValueError(
+            "raw-perception replay v2 removed H5-only algo fields: "
+            f"{sorted(removed_h5_fields)}"
         )
     if int(cfg.algo.q_batch_size) % 2:
         raise ValueError("algo.q_batch_size must be even for exact 50/50 replay")
@@ -708,13 +485,6 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
     ):
         raise ValueError("Phase 1 requires exact 50/50 Teacher/Student Q replay")
 
-    teacher_buffer_filename = os.fspath(cfg.algo.get("teacher_buffer_filename", ""))
-    if (
-        teacher_buffer_filename in ("", ".", "..")
-        or os.path.basename(teacher_buffer_filename) != teacher_buffer_filename
-    ):
-        raise ValueError("algo.teacher_buffer_filename must be a plain file basename")
-
     control_mode = str(cfg.algo.get("dagger_control_mode", "beta"))
     if control_mode not in ("beta", "safe", "hybrid"):
         raise ValueError("algo.dagger_control_mode must be beta, safe, or hybrid")
@@ -741,18 +511,46 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
             "algo.dagger_safe_zero_iteration requires safe or hybrid control"
         )
 
-    if (
-        cfg.get("checkpoint_path", None) is None
-        and cfg.get("td3_bc_dagger_checkpoint", None) is None
-    ):
+    if cfg.get("td3_bc_dagger_checkpoint", None) is not None:
         raise ValueError(
-            "scripts/TD3_bc_dagger.py requires a fresh PPO checkpoint_path "
-            "or td3_bc_dagger_checkpoint for same-stage resume"
+            "same-stage TD3 resume is unsupported by raw-perception replay v2; "
+            "use only a fresh train-phase PPO checkpoint_path"
+        )
+    obsolete_resume_values = {
+        "td3_bc_dagger_copy_teacher_replay": cfg.get(
+            "td3_bc_dagger_copy_teacher_replay", None
+        ),
+        "td3_dagger_resume_rollout_count": cfg.get(
+            "td3_dagger_resume_rollout_count", None
+        ),
+        "td3_dagger_resume_environment_steps": cfg.get(
+            "td3_dagger_resume_environment_steps", None
+        ),
+        "_bc_dagger_teacher_replay_copy_source": cfg.get(
+            "_bc_dagger_teacher_replay_copy_source", None
+        ),
+        "_bc_dagger_teacher_replay_copy_path": cfg.get(
+            "_bc_dagger_teacher_replay_copy_path", None
+        ),
+    }
+    configured_obsolete = {
+        name: value
+        for name, value in obsolete_resume_values.items()
+        if value is not None
+    }
+    if configured_obsolete:
+        raise ValueError(
+            "raw-perception replay v2 removed TD3/H5 resume controls: "
+            f"{sorted(configured_obsolete)}"
+        )
+    if cfg.get("checkpoint_path", None) is None:
+        raise ValueError(
+            "scripts/TD3_bc_dagger.py requires a fresh train-phase PPO checkpoint_path"
         )
     if cfg.get("bc_dagger_checkpoint", None) is not None:
         raise ValueError(
-            "legacy bc_dagger_checkpoint is not a TD3 checkpoint; use "
-            "td3_bc_dagger_checkpoint"
+            "bc_dagger_checkpoint is not accepted by raw-perception replay v2; "
+            "use a fresh train-phase PPO checkpoint_path"
         )
 
     schedule = td3_dagger_rollout_schedule(cfg)
@@ -788,11 +586,8 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
 )
 def main(cfg: DictConfig):
     apply_td3_dagger_iteration_controls(cfg)
-    resume = prepare_td3_bc_dagger_checkpoint(cfg)
-    if resume is None:
-        prepare_fresh_td3_bc_dagger_source(cfg)
-    # Resume preparation installs the cumulative completed-rollout count used
-    # by beta/safety-tail validation; validate only after that state is known.
+    prepare_td3_bc_dagger_checkpoint(cfg)
+    prepare_fresh_td3_bc_dagger_source(cfg)
     validate_td3_bc_dagger_config(cfg)
     schedule = td3_dagger_rollout_schedule(cfg)
     print(

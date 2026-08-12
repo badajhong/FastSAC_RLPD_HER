@@ -1,18 +1,18 @@
 """C51 distributional TD3 with the exact existing Teacher-BC objective.
 
-This module is the isolated Phase-1 implementation of
-``distributional_td3_teacher_bc_v1``.  It deliberately reuses the locked VAIC
-Actor, observation, DAgger, replay-normalization, timeout, and C51 network
-interfaces without constructing or invoking a stochastic policy path.
+This module implements ``distributional_td3_teacher_bc_v1``.  Version 2 keeps
+the locked VAIC Actor, observation, DAgger, timeout, action, and C51 interfaces,
+but makes replay perception-input authoritative: it stores finite raw recurrent
+windows and re-encodes them with the current EMA perception modules instead of
+persisting collection-time ``priv_pred`` latents.  The duplicate teacher H5
+export is deliberately disabled.
 """
 
 from __future__ import annotations
 
 import copy
 import math
-import os
-import uuid
-import warnings
+import hashlib
 from dataclasses import dataclass
 
 import torch
@@ -21,14 +21,21 @@ import torch.nn.functional as F
 from hydra.core.config_store import ConfigStore
 from tensordict import TensorDict
 
-from .common import ACTION_KEY, CMD_KEY, OBS_KEY, OBS_PRIV_KEY, hard_copy_
+from .common import (
+    ACTION_KEY,
+    CMD_KEY,
+    DONE_KEY,
+    OBS_KEY,
+    OBS_PRIV_KEY,
+    REWARD_KEY,
+    hard_copy_,
+)
 from .fastsac_vel import (
     FASTSAC_Q_DEFAULT_ACTION_FUSION,
     FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
     FASTSAC_Q_LATE_FUSION_SEMANTICS,
     FASTSAC_REFERENCE_EPS,
     REPLAY_OBSERVATION_SEMANTICS,
-    TEACHER_REPLAY_FIELDS,
     TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
     _build_isolated_q_network,
     _fastsac_action_center_to_latent,
@@ -37,6 +44,7 @@ from .fastsac_vel import (
     _project_to_execution_support,
     _q_action_hidden_dim,
     _sac_bootstrap_mask as _bootstrap_mask,
+    _vaic_truncation_mask,
     _vaic_action_contract_metadata,
     _vaic_nominal_action_coordinates,
     _validate_action_safety_clip,
@@ -80,11 +88,12 @@ from .ppo_vel import (
     PPOVEL,
     PRIV_PRED_KEY,
     VEL_CMD_KEY,
+    set_recurrent_mode,
 )
 
 
 TRAINING_ALGORITHM = "distributional_td3_teacher_bc_v1"
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 ACTOR_BACKEND = PPO_BC_DAGGER_ACTOR_BACKEND
 CRITIC_SEMANTICS = (
     "deterministic_target_actor_q_coordinate_clipped_smoothing_"
@@ -98,6 +107,64 @@ TD3_NOISE_FREE_STUDENT_ACTION_KEY = "td3_noise_free_student_action"
 TD3_EXPLORATORY_STUDENT_ACTION_KEY = "td3_exploratory_student_action"
 TD3_COLLECTOR_NOISE_KEY = "td3_collector_q_noise"
 TD3_BETA_KEY = "td3_beta_probability"
+
+# Authoritative perception replay fields.  These contain only sensor/model
+# inputs; collection-time priv_pred/depth_hx/adapt_hx are deliberately absent.
+PERCEPTION_DEPTH_U8_KEY = "perception_depth_u8"
+PERCEPTION_POLICY_RAW_KEY = "perception_policy_raw"
+PERCEPTION_VEL_COMMAND_RAW_KEY = "perception_vel_command_raw"
+PERCEPTION_IS_INIT_KEY = "perception_is_init"
+PERCEPTION_REPLAY_SEMANTICS = (
+    "raw_input_current_ema_reencode_zero_boundary_burn_in_8_v1"
+)
+PERCEPTION_DEPTH_CODEC = "uint8_div_100_v1"
+
+_PERCEPTION_REPLAY_FIELDS = (
+    PERCEPTION_DEPTH_U8_KEY,
+    PERCEPTION_POLICY_RAW_KEY,
+    PERCEPTION_VEL_COMMAND_RAW_KEY,
+    PERCEPTION_IS_INIT_KEY,
+)
+
+_Q_REPLAY_FIELDS = (
+    "critic_observations",
+    "actions",
+    "rewards",
+    "dones",
+    "truncations",
+    "discounts",
+    "next_critic_observations",
+    *_PERCEPTION_REPLAY_FIELDS,
+)
+
+
+@torch.no_grad()
+def _encode_replay_depth_u8(depth: torch.Tensor) -> torch.Tensor:
+    """Losslessly encode the task's 0.01-grid pre-VecNorm depth values."""
+    if not depth.is_floating_point():
+        raise TypeError("raw replay depth must be floating point")
+    if not torch.isfinite(depth).all():
+        raise ValueError("raw replay depth contains non-finite values")
+    scaled = depth * 100.0
+    bins = scaled.round()
+    tolerance = 4.0 * torch.finfo(depth.dtype).eps * 100.0
+    if (
+        (depth < -tolerance).any()
+        or (depth > 1.0 + tolerance).any()
+        or not torch.allclose(scaled, bins, rtol=0.0, atol=tolerance)
+    ):
+        raise ValueError("raw replay depth must lie in [0,1] on the task's 0.01 grid")
+    return bins.clamp_(0, 100).to(torch.uint8)
+
+
+@torch.no_grad()
+def _decode_replay_depth_u8(depth: torch.Tensor) -> torch.Tensor:
+    """Decode ``uint8_div_100_v1`` without applying VecNorm."""
+    if depth.dtype != torch.uint8:
+        raise TypeError("encoded replay depth must be uint8")
+    if (depth > 100).any():
+        raise ValueError("encoded replay depth has bins outside [0,100]")
+    return depth.float().div_(100.0)
 
 
 def _categorical_expected_value(
@@ -629,7 +696,11 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
         OBS_KEY,
         OBS_PRIV_KEY,
         CMD_KEY,
+        DEPTH_KEY,
     )
+    perception_replay_burn_in: int = 8
+    perception_encode_microbatch_size: int = 128
+    perception_depth_codec: str = PERCEPTION_DEPTH_CODEC
 
     eta_td3: float = 1.0
     lambda_bc: float = 1.0
@@ -659,11 +730,9 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     q_teacher_replay_ratio: float = 0.5
     q_teacher_buffer_capacity: int = 131_072
 
-    save_teacher_buffer: bool = True
-    teacher_buffer_filename: str = "teacher_replay_buffer.h5"
-    teacher_buffer_path: str | None = None
-    teacher_buffer_capacity: int = 131_072
-    teacher_buffer_snapshot_chunk_rows: int = 4096
+    # TD3 v2 keeps only the two online learning rings.  The duplicate
+    # teacher_replay_buffer.h5/export FIFO is intentionally unsupported.
+    save_teacher_buffer: bool = False
 
 
 ConfigStore.instance().store(
@@ -929,14 +998,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             cfg.q_teacher_buffer_capacity, replay_device
         )
         self.teacher_replay = None
-        self.teacher_replay_id = str(uuid.uuid4())
-        self._loaded_teacher_replay_metadata = None
         object.__setattr__(self, "_replay_vecnorm", None)
         self._replay_vecnorm_keys = set()
         self._replay_vecnorm_fingerprint = None
         self._rollout_final_batch = None
         self._truncation_final_batches = []
         self._last_truncation_finals_used = 0
+        self._perception_replay_history = None
+        self._perception_replay_history_count = 0
+        self._replay_object_geo = None
+        self._replay_object_geo_fingerprint = None
 
         generator_device = torch.device(device)
         self.dagger_rng = torch.Generator(device=generator_device).manual_seed(
@@ -970,6 +1041,33 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError("TD3 Teacher-BC owns the only Actor optimizer")
         if not bool(cfg.dagger_replay_raw_observations):
             raise ValueError("TD3 replay requires raw pre-VecNorm observations")
+        if not bool(cfg.use_depth) or not bool(cfg.use_object_adapt):
+            raise ValueError(
+                "TD3 raw perception replay requires depth and object adapt"
+            )
+        if str(cfg.adapt_module) != "gru":
+            raise ValueError("TD3 raw perception replay requires recurrent adaptation")
+        expected_raw_keys = (
+            VEL_CMD_KEY,
+            OBS_KEY,
+            OBS_PRIV_KEY,
+            CMD_KEY,
+            DEPTH_KEY,
+        )
+        if tuple(cfg.replay_raw_observation_keys) != expected_raw_keys:
+            raise ValueError(
+                "TD3 raw replay keys must include pre-VecNorm depth in locked order"
+            )
+        if int(cfg.perception_replay_burn_in) != 8:
+            raise ValueError("perception_replay_burn_in is locked to 8")
+        if str(cfg.perception_depth_codec) != PERCEPTION_DEPTH_CODEC:
+            raise ValueError(
+                f"perception_depth_codec must be {PERCEPTION_DEPTH_CODEC!r}"
+            )
+        if bool(cfg.save_teacher_buffer):
+            raise ValueError(
+                "save_teacher_buffer must be false; TD3 v2 never writes a teacher H5"
+            )
         if str(cfg.dagger_control_mode) not in DAGGER_CONTROL_MODES:
             raise ValueError(f"invalid dagger_control_mode={cfg.dagger_control_mode!r}")
         if (
@@ -1004,20 +1102,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_batch_size",
             "q_updates_per_rollout",
             "q_teacher_buffer_capacity",
-            "teacher_buffer_capacity",
-            "teacher_buffer_snapshot_chunk_rows",
+            "perception_replay_burn_in",
+            "perception_encode_microbatch_size",
         )
         for name in positive_integers:
             value = getattr(cfg, name)
             if isinstance(value, bool) or int(value) < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if bool(cfg.save_teacher_buffer) and int(cfg.teacher_buffer_capacity) < int(
-            cfg.q_teacher_buffer_capacity
-        ):
-            raise ValueError(
-                "teacher_buffer_capacity must be at least "
-                "q_teacher_buffer_capacity when export is enabled"
-            )
         if int(cfg.q_batch_size) % 2:
             raise ValueError("q_batch_size must be even for exact 50/50 replay")
         if not math.isclose(
@@ -1058,9 +1149,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         takeover = float(cfg.dagger_safe_takeover_rms)
         if not (0.0 <= release < takeover <= 2.0):
             raise ValueError("SafeDAgger release/takeover thresholds are invalid")
-        filename = os.fspath(cfg.teacher_buffer_filename)
-        if filename in ("", ".", "..") or os.path.basename(filename) != filename:
-            raise ValueError("teacher_buffer_filename must be a plain filename")
 
     def _q_action_input(self, action: torch.Tensor) -> torch.Tensor:
         """Map issued absolute commands into the locked nominal Q coordinates."""
@@ -1116,32 +1204,352 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self.cfg.dagger_action_clip,
         )
 
-    def _dagger_transition_chunks(self, td: TensorDict):
-        """Extend the locked transition with audit-only TD3 metadata."""
-        for step, transitions in enumerate(
-            PPOBCDaggerFinetune._dagger_transition_chunks(self, td)
+    def configure_teacher_replay(self, path, restore_path=None):
+        """Disable the duplicate persistent H5/export FIFO for TD3 v2."""
+        if restore_path is not None:
+            raise ValueError("TD3 v2 raw-perception replay cannot restore a teacher H5")
+        self.teacher_replay = None
+
+    def snapshot_teacher_replay(self, iteration, checkpoint_name):
+        """The two online CPU rings are intentionally not exported to H5."""
+        del iteration, checkpoint_name
+        return None
+
+    def restore_q_teacher_replay(self, source_path):
+        del source_path
+        raise ValueError(
+            "TD3 v2 is fresh-only and cannot refill raw perception windows from H5"
+        )
+
+    @torch.no_grad()
+    def _register_replay_object_geo(self, td: TensorDict) -> None:
+        geometry = td[OBJECT_GEO_KEY]
+        width = int(self.observation_spec[OBJECT_GEO_KEY].shape[-1])
+        flat = geometry.reshape(-1, width)
+        reference = flat[0].detach()
+        if not torch.equal(flat, reference.expand_as(flat)):
+            raise RuntimeError(
+                "TD3 raw replay requires object_geo_ to be constant within a run"
+            )
+        if self._replay_object_geo is None:
+            self._replay_object_geo = reference.clone()
+            payload = reference.float().contiguous().cpu().numpy().tobytes()
+            self._replay_object_geo_fingerprint = hashlib.sha256(payload).hexdigest()
+        elif not torch.equal(
+            reference.to(self._replay_object_geo), self._replay_object_geo
         ):
+            raise RuntimeError("object_geo_ changed after replay initialization")
+
+    @torch.no_grad()
+    def _raw_perception_values(self, td: TensorDict) -> dict[str, torch.Tensor]:
+        self._register_replay_object_geo(td)
+        return {
+            PERCEPTION_DEPTH_U8_KEY: _encode_replay_depth_u8(
+                self._replay_source(td, DEPTH_KEY)
+            ),
+            PERCEPTION_POLICY_RAW_KEY: self._replay_source(td, OBS_KEY).detach(),
+            PERCEPTION_VEL_COMMAND_RAW_KEY: self._replay_source(
+                td, VEL_CMD_KEY
+            ).detach(),
+            PERCEPTION_IS_INIT_KEY: td["is_init"].detach().bool(),
+        }
+
+    @torch.no_grad()
+    def _prepare_raw_final_state(self, td: TensorDict) -> dict[str, torch.Tensor]:
+        return {
+            **self._raw_perception_values(td),
+            "next_critic_observations": self._cat_replay_sources(
+                td, self.q_critic_keys
+            ).clone(),
+        }
+
+    @torch.no_grad()
+    def capture_truncation_final_observations(self, td: TensorDict, step: int):
+        """Capture the true pre-reset timeout input, never the reset carry."""
+        if not self._collect_dagger_replay_this_rollout():
+            self._truncation_final_batches = []
+            self._last_truncation_finals_used = 0
+            return
+        truncations = _vaic_truncation_mask(td).reshape(-1).bool()
+        if not truncations.any():
+            return
+        indices = truncations.nonzero(as_tuple=False).squeeze(-1)
+        values = self._prepare_raw_final_state(td["next"][indices].clone())
+        values["indices"] = indices * int(self.cfg.train_every) + int(step)
+        self._truncation_final_batches.append(values)
+
+    @torch.no_grad()
+    def capture_rollout_final_observation(self, carry: TensorDict):
+        if not self._collect_dagger_replay_this_rollout():
+            self._rollout_final_batch = None
+            self._truncation_final_batches = []
+            self._last_truncation_finals_used = 0
+            return
+        self._rollout_final_batch = self._prepare_raw_final_state(carry.clone())
+
+    def _dagger_transition_chunks(self, td: TensorDict):
+        """Build self-contained raw-input windows for current-EMA re-encoding.
+
+        Each row contains eight preceding inputs, the current input, and the
+        true next input.  GRU hidden states are initialized to zero at the
+        window boundary.  Reconstruction is exact when an episode reset lies
+        in the window and is an explicit finite-burn-in approximation otherwise.
+        """
+        if self._rollout_final_batch is None:
+            raise RuntimeError(
+                "TD3 raw replay requires capture_rollout_final_observation(carry)"
+            )
+        n, t = td.batch_size
+        if int(t) != int(self.cfg.train_every):
+            raise ValueError("rollout length does not match train_every")
+        burn_in = int(self.cfg.perception_replay_burn_in)
+        final_batch = self._rollout_final_batch
+        self._rollout_final_batch = None
+        raw_current = self._raw_perception_values(td)
+
+        history_count = int(self._perception_replay_history_count)
+        if self._perception_replay_history is None:
+            history = {key: value[:, :0] for key, value in raw_current.items()}
+        else:
+            history = self._perception_replay_history
+            if any(value.shape[0] != int(n) for value in history.values()):
+                raise RuntimeError("raw perception replay environment count changed")
+
+        sequence = {}
+        for key, current_value in raw_current.items():
+            final_value = final_batch[key].reshape(int(n), *current_value.shape[2:])
+            sequence[key] = torch.cat(
+                (history[key], current_value, final_value.unsqueeze(1)), dim=1
+            )
+
+        truncation_batches = self._truncation_final_batches
+        self._truncation_final_batches = []
+        truncation_finals = None
+        if truncation_batches:
+            truncation_finals = {
+                key: torch.cat([batch[key] for batch in truncation_batches], 0)
+                for key in truncation_batches[0]
+            }
+            flat_indices = truncation_finals["indices"].long()
+            if (flat_indices < 0).any() or (flat_indices >= int(n * t)).any():
+                raise IndexError("captured truncation index is outside rollout")
+        used_truncation_finals = 0
+
+        for step in range(int(t)):
             current = td[:, step]
-            count = int(current.batch_size[0])
-            metadata = {
+            position = history_count + step
+            if position < burn_in:
+                continue
+            window_values = {
+                key: value[:, position - burn_in : position + 2]
+                for key, value in sequence.items()
+            }
+            if any(value.shape[1] != burn_in + 2 for value in window_values.values()):
+                raise RuntimeError("raw perception replay window has invalid length")
+
+            if step + 1 < int(t):
+                next_critic = self._cat_replay_sources(
+                    td[:, step + 1], self.q_critic_keys
+                ).reshape(int(n), self._q_critic_dim)
+            else:
+                next_critic = final_batch["next_critic_observations"].reshape(
+                    int(n), self._q_critic_dim
+                )
+
+            if truncation_finals is not None:
+                flat_indices = truncation_finals["indices"].long()
+                selected = flat_indices.remainder(int(t)) == step
+                if selected.any():
+                    env_indices = flat_indices[selected].div(
+                        int(t), rounding_mode="floor"
+                    )
+                    next_critic = next_critic.clone()
+                    next_critic.index_copy_(
+                        0,
+                        env_indices,
+                        truncation_finals["next_critic_observations"][selected],
+                    )
+                    for key in _PERCEPTION_REPLAY_FIELDS:
+                        window_values[key] = window_values[key].clone()
+                        window_values[key][env_indices, -1] = truncation_finals[key][
+                            selected
+                        ]
+
+            transitions = {
+                "critic_observations": self._cat_replay_sources(
+                    current, self.q_critic_keys
+                ).reshape(int(n), self._q_critic_dim),
+                "actions": current[ACTION_KEY].reshape(int(n), self.action_dim),
+                DAGGER_REPLAY_TEACHER_ACTIONS: current[
+                    DAGGER_TEACHER_ACTION_KEY
+                ].reshape(int(n), self.action_dim),
+                DAGGER_TEACHER_ACTION_VALID_KEY: current[
+                    DAGGER_TEACHER_ACTION_VALID_KEY
+                ]
+                .reshape(int(n))
+                .bool(),
+                DAGGER_IS_STUDENT_ACTION_KEY: current[DAGGER_IS_STUDENT_ACTION_KEY]
+                .reshape(int(n))
+                .bool(),
+                "rewards": self._scalarize_q_reward(current[REWARD_KEY]).reshape(
+                    int(n)
+                ),
+                "dones": current[DONE_KEY].reshape(int(n)).bool(),
+                "truncations": _vaic_truncation_mask(current).reshape(int(n)).bool(),
+                "discounts": current["next", "discount"].reshape(int(n)),
+                "next_critic_observations": next_critic,
+                **window_values,
                 TD3_NOISE_FREE_STUDENT_ACTION_KEY: current[
                     TD3_NOISE_FREE_STUDENT_ACTION_KEY
-                ].reshape(count, self.action_dim),
+                ].reshape(int(n), self.action_dim),
                 TD3_EXPLORATORY_STUDENT_ACTION_KEY: current[
                     TD3_EXPLORATORY_STUDENT_ACTION_KEY
-                ].reshape(count, self.action_dim),
+                ].reshape(int(n), self.action_dim),
                 TD3_COLLECTOR_NOISE_KEY: current[TD3_COLLECTOR_NOISE_KEY].reshape(
-                    count, self.action_dim
+                    int(n), self.action_dim
                 ),
-                TD3_BETA_KEY: current[TD3_BETA_KEY].reshape(count),
+                TD3_BETA_KEY: current[TD3_BETA_KEY].reshape(int(n)),
             }
-            metadata, _ = _filter_replay_rows(
-                current, metadata, DAGGER_REPLAY_MIN_STEP_COUNT
+            transitions, valid = _filter_replay_rows(
+                current, transitions, DAGGER_REPLAY_MIN_STEP_COUNT
             )
-            if metadata[TD3_BETA_KEY].shape[0] != transitions["actions"].shape[0]:
-                raise RuntimeError("TD3 replay metadata lost transition alignment")
-            transitions.update(metadata)
+            if truncation_finals is not None:
+                flat_indices = truncation_finals["indices"].long()
+                selected = flat_indices.remainder(int(t)) == step
+                if selected.any():
+                    env_indices = flat_indices[selected].div(
+                        int(t), rounding_mode="floor"
+                    )
+                    used_truncation_finals += int(valid[env_indices].sum().item())
             yield transitions
+
+        combined_history = {
+            key: torch.cat((history[key], value), dim=1)[:, -burn_in:].detach()
+            for key, value in raw_current.items()
+        }
+        self._perception_replay_history = combined_history
+        self._perception_replay_history_count = min(burn_in, history_count + int(t))
+        self._last_truncation_finals_used = used_truncation_finals
+
+    @torch.no_grad()
+    def _reencode_perception_windows(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        include_current: bool,
+        include_next: bool,
+    ) -> dict[str, torch.Tensor]:
+        """Rebuild Actor observations with the current EMA perception weights."""
+        if not include_current and not include_next:
+            return {}
+        missing = set(_PERCEPTION_REPLAY_FIELDS).difference(batch)
+        if missing:
+            raise KeyError(
+                f"raw perception replay fields are missing: {sorted(missing)}"
+            )
+        if self._replay_object_geo is None:
+            raise RuntimeError("raw perception replay has no object geometry contract")
+
+        depth_u8 = batch[PERCEPTION_DEPTH_U8_KEY]
+        policy_raw = batch[PERCEPTION_POLICY_RAW_KEY]
+        vel_raw = batch[PERCEPTION_VEL_COMMAND_RAW_KEY]
+        is_init = batch[PERCEPTION_IS_INIT_KEY]
+        row_count, window_length = depth_u8.shape[:2]
+        expected_length = int(self.cfg.perception_replay_burn_in) + 2
+        if int(window_length) != expected_length:
+            raise ValueError(
+                f"perception replay window has length {window_length}; "
+                f"expected {expected_length}"
+            )
+        if policy_raw.shape[:2] != (row_count, window_length) or vel_raw.shape[:2] != (
+            row_count,
+            window_length,
+        ):
+            raise ValueError("raw perception replay fields have inconsistent windows")
+
+        snapshot = self._vecnorm_snapshot()
+        current_chunks: list[torch.Tensor] = []
+        next_chunks: list[torch.Tensor] = []
+        microbatch = int(self.cfg.perception_encode_microbatch_size)
+        geometry = self._replay_object_geo.to(
+            device=depth_u8.device, dtype=policy_raw.dtype
+        )
+        with set_recurrent_mode(True):
+            for start in range(0, int(row_count), microbatch):
+                stop = min(start + microbatch, int(row_count))
+                depth = self._normalize_replay_value(
+                    DEPTH_KEY,
+                    _decode_replay_depth_u8(depth_u8[start:stop]),
+                    snapshot,
+                )
+                policy = self._normalize_replay_value(
+                    OBS_KEY, policy_raw[start:stop], snapshot
+                )
+                vel = self._normalize_replay_value(
+                    VEL_CMD_KEY, vel_raw[start:stop], snapshot
+                )
+                count = stop - start
+                td = TensorDict(
+                    {
+                        DEPTH_KEY: depth,
+                        OBS_KEY: policy,
+                        VEL_CMD_KEY: vel,
+                        OBJECT_GEO_KEY: geometry.view(1, 1, -1).expand(
+                            count, window_length, -1
+                        ),
+                        "is_init": is_init[start:stop],
+                        "depth_hx": torch.zeros(
+                            count,
+                            window_length,
+                            self.depth_feature_dim,
+                            device=depth.device,
+                            dtype=policy.dtype,
+                        ),
+                        "adapt_hx": torch.zeros(
+                            count,
+                            window_length,
+                            int(self.cfg.latent_dim),
+                            device=depth.device,
+                            dtype=policy.dtype,
+                        ),
+                    },
+                    batch_size=(count, window_length),
+                    device=depth.device,
+                )
+                self.temporal_depth_gru_ema(td)
+                self.object_adapt_ema(td)
+                self.object_pred_transform(td)
+                self.adapt_ema(td)
+                priv_pred = td[PRIV_PRED_KEY]
+                if include_current:
+                    current_chunks.append(
+                        torch.cat((vel[:, -2], policy[:, -2], priv_pred[:, -2]), -1)
+                    )
+                if include_next:
+                    next_chunks.append(
+                        torch.cat((vel[:, -1], policy[:, -1], priv_pred[:, -1]), -1)
+                    )
+
+        result = {}
+        if include_current:
+            result["observations"] = torch.cat(current_chunks, 0)
+        if include_next:
+            result["next_observations"] = torch.cat(next_chunks, 0)
+        return result
+
+    def _prepare_dagger_learning_batch(self, batch):
+        """Normalize critic inputs and materialize only needed Actor states."""
+        prepared = PPOBCDaggerFinetune._prepare_dagger_learning_batch(self, batch)
+        include_current = DAGGER_REPLAY_TEACHER_ACTIONS in batch
+        include_next = "next_critic_observations" in batch
+        prepared.update(
+            self._reencode_perception_windows(
+                prepared,
+                include_current=include_current,
+                include_next=include_next,
+            )
+        )
+        return prepared
 
     @torch.no_grad()
     def _smoothed_target_q_action(
@@ -1400,7 +1808,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_updates_per_rollout",
             "q_teacher_replay_ratio",
             "q_teacher_buffer_capacity",
-            "teacher_buffer_capacity",
+            "perception_replay_burn_in",
+            "perception_encode_microbatch_size",
+            "perception_depth_codec",
+            "save_teacher_buffer",
         )
         return {
             **{name: getattr(self.cfg, name) for name in names},
@@ -1439,10 +1850,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     def _sample_actor_batch(self, indices: torch.Tensor | None = None):
         fields = (
-            "observations",
             "critic_observations",
             DAGGER_REPLAY_TEACHER_ACTIONS,
             DAGGER_TEACHER_ACTION_VALID_KEY,
+            *_PERCEPTION_REPLAY_FIELDS,
         )
         if indices is None:
             batch = self.dagger_replay.sample(
@@ -1477,7 +1888,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         rollout = tensordict.exclude("stats")
         transition_chunks = tuple(self._dagger_transition_chunks(rollout))
         appended = 0
-        teacher_exported = 0
         teacher_selected = 0
         valid_labels = 0
         student_selected = 0
@@ -1511,20 +1921,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 teacher_indices = teacher_executed.nonzero(as_tuple=False).squeeze(-1)
                 q_teacher = {
                     key: staged[key].index_select(0, teacher_indices)
-                    for key in TEACHER_REPLAY_FIELDS
+                    for key in _Q_REPLAY_FIELDS
                 }
                 self.q_teacher_replay.extend(q_teacher)
-                if self.teacher_replay is not None:
-                    export = {
-                        key: (
-                            value
-                            if value.device == self.teacher_replay.device
-                            else value.to(self.teacher_replay.device)
-                        )
-                        for key, value in q_teacher.items()
-                    }
-                    teacher_exported = self.teacher_replay.append(export)
-                    del export
                 del q_teacher, teacher_indices
             del valid, is_student, teacher_executed, staged, transitions
 
@@ -1672,7 +2071,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "td3/student_source_fraction": student_selected / max(appended, 1),
             "td3/teacher_source_fraction": teacher_selected / max(appended, 1),
             "td3/valid_teacher_fraction": valid_labels / max(appended, 1),
-            "td3/teacher_exported": teacher_exported,
             "td3/beta": beta_value,
             "td3/rollout_count": self.dagger_rollout_count,
             "td3/environment_steps": self.dagger_environment_steps,
@@ -1771,100 +2169,33 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     "exact_issued_action_with_separate_teacher_student_noise_metadata_v1"
                 ),
                 "replay_resume_semantics": (
-                    "recent_student_ring_omitted_teacher_partition_h5_refill_v1"
+                    "fresh_only_online_raw_perception_rings_not_serialized_v2"
+                ),
+                "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
+                "perception_object_geo_fingerprint": (
+                    self._replay_object_geo_fingerprint
                 ),
                 "vecnorm_fingerprint": self._replay_vecnorm_fingerprint,
-                "teacher_replay_id": self.teacher_replay_id,
                 "next_iter": int(self.env.current_iter) + 1,
             }
         )
-        if self.teacher_replay is not None:
-            state["teacher_replay_state"] = self.teacher_replay.checkpoint_metadata()
-        elif self._loaded_teacher_replay_metadata is not None:
-            state["frozen_teacher_replay_source_state"] = copy.deepcopy(
-                self._loaded_teacher_replay_metadata
-            )
         return state
 
     def load_state_dict(self, state_dict, strict=True):
         algorithm = state_dict.get("training_algorithm")
         same_stage = algorithm == TRAINING_ALGORITHM
         if same_stage:
-            if int(state_dict.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
-                raise ValueError("distributional TD3 checkpoint version mismatch")
-            if state_dict.get("actor_backend") != ACTOR_BACKEND:
-                raise ValueError("distributional TD3 Actor backend mismatch")
-            if state_dict.get("critic_learning_semantics") != CRITIC_SEMANTICS:
-                raise ValueError("distributional TD3 Critic semantics mismatch")
-            if state_dict.get("actor_learning_semantics") != ACTOR_LEARNING_SEMANTICS:
-                raise ValueError("distributional TD3 Actor semantics mismatch")
-            if state_dict.get("dagger_backend_config") != self._checkpoint_config():
-                raise ValueError("distributional TD3 config mismatch")
-            if state_dict.get("q_backend_config") != self._q_backend_metadata():
-                raise ValueError("distributional TD3 Q contract mismatch")
-            if state_dict.get("action_contract") != self._fastsac_action_contract:
-                raise ValueError("distributional TD3 action contract mismatch")
-            checkpoint_vecnorm_fingerprint = state_dict.get("vecnorm_fingerprint")
-            if checkpoint_vecnorm_fingerprint is None:
-                raise ValueError(
-                    "distributional TD3 checkpoint has no VecNorm fingerprint"
-                )
-            if self._replay_vecnorm_fingerprint is None:
-                raise RuntimeError(
-                    "distributional TD3 resume requires "
-                    "configure_replay_vecnorm() before policy loading"
-                )
-            if str(checkpoint_vecnorm_fingerprint) != self._replay_vecnorm_fingerprint:
-                raise ValueError(
-                    "distributional TD3 checkpoint VecNorm fingerprint mismatch"
-                )
-            self.actor_target = copy.deepcopy(self.actor_adapt).requires_grad_(False)
+            raise ValueError(
+                "TD3 v2 raw-perception replay is fresh-only; same-stage TD3 "
+                "checkpoint resume is intentionally unsupported"
+            )
         elif algorithm is not None:
             raise ValueError(f"unsupported TD3 source training_algorithm={algorithm!r}")
         elif state_dict.get("last_phase") != "train":
             raise ValueError("fresh TD3 Teacher-BC requires a PPO train checkpoint")
 
         failed = PPOVEL.load_state_dict(self, state_dict, strict)
-        if same_stage:
-            critical = {
-                "actor",
-                "actor_adapt",
-                "actor_target",
-                "encoder_priv",
-                "adapt_module",
-                "adapt_ema",
-                "qnet",
-                "qnet_target",
-            }
-            if getattr(self.cfg, "use_object_adapt", False):
-                critical.update(("object_adapt", "object_adapt_ema"))
-            if hasattr(self, "temporal_depth_gru"):
-                critical.update(
-                    ("depth_cnn", "temporal_depth_gru", "temporal_depth_gru_ema")
-                )
-            missing = critical.intersection(failed)
-            if missing:
-                raise RuntimeError(f"failed to restore TD3 modules: {sorted(missing)}")
-            self._load_td3_checkpoint_state(state_dict, load_modules=False)
-            self.teacher_replay_id = str(state_dict.get("teacher_replay_id"))
-            self._loaded_teacher_replay_metadata = copy.deepcopy(
-                state_dict.get(
-                    "teacher_replay_state",
-                    state_dict.get("frozen_teacher_replay_source_state"),
-                )
-            )
-            if hasattr(self, "env"):
-                self.env.set_progress(
-                    int(
-                        state_dict.get("next_iter", state_dict.get("last_iter", -1) + 1)
-                    )
-                )
-            warnings.warn(
-                "The recent Student transition ring is intentionally omitted; "
-                "it refills from fresh rollouts while the Teacher partition is "
-                "restored from the paired immutable H5."
-            )
-        else:
+        if not same_stage:
             allowed_fresh = {
                 "depth_cnn",
                 "temporal_depth_gru",

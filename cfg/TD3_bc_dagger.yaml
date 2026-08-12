@@ -12,17 +12,10 @@ total_frames: 39_321_600
 td3_dagger_iterations: null
 save_interval: 100
 
-# Fresh runs use checkpoint_path from train.yaml. Same-stage continuation uses
-# this distinct alias and never accepts an existing BC-only checkpoint.
+# Version 2 starts only from the train-phase PPO checkpoint_path inherited from
+# train.yaml.  A non-null value here is retained solely for a clear fail-fast
+# error; same-stage TD3 replay resume is intentionally unsupported.
 td3_bc_dagger_checkpoint: null
-td3_bc_dagger_copy_teacher_replay: true
-td3_dagger_resume_rollout_count: 0
-td3_dagger_resume_environment_steps: 0
-_td3_bc_dagger_same_stage_resume: false
-_bc_dagger_fresh_source: false
-_bc_dagger_model_only_resume: false
-_bc_dagger_teacher_replay_copy_source: null
-_bc_dagger_teacher_replay_copy_path: null
 
 algo:
   # Existing state-wise safety controller. Beta remains available for the
@@ -52,6 +45,13 @@ algo:
     - policy
     - priv
     - command
+    - depth
+  # Replay stores perception inputs rather than collection-time priv_pred.
+  # Both recurrent perception paths are rebuilt with current EMA weights over
+  # this fixed finite history before Actor/target-Actor evaluation.
+  perception_replay_burn_in: 8
+  perception_encode_microbatch_size: 128
+  perception_depth_codec: uint8_div_100_v1
 
   # Locked twin 501-atom critic topology and exact replay cadence.
   q_hidden_dim: 768
@@ -82,13 +82,9 @@ algo:
   collector_exploration_noise_clip: 0.5
   td3_learning_starts: 8192
 
-  save_teacher_buffer: true
-  teacher_buffer_filename: teacher_replay_buffer.h5
-  teacher_buffer_path: null
-  # Export/checkpoint-only FIFO. Matching the online Teacher ring preserves a
-  # complete same-stage refill while bounding host storage at about 2.81 GiB.
-  teacher_buffer_capacity: 131_072
-  teacher_buffer_snapshot_chunk_rows: 4096
+  # Raw recurrent windows live only in the online learning rings.  No immutable
+  # teacher H5 is exported or restored in this fresh-only version.
+  save_teacher_buffer: false
 
 wandb:
   project: vaic_dagger
