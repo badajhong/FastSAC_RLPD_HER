@@ -29,10 +29,8 @@ algo:
   # Teacher Q ring is populated separately by the prefill below; Teacher labels
   # are still queried during main rollout for the mean-action BC objective.
   dagger_control_mode: beta
-  # RMS discrepancy is measured per joint after nominal center/scale
-  # normalization, not in the removed scalar /20 action coordinates.
-  dagger_safe_takeover_rms: 0.12
-  dagger_safe_release_rms: 0.08
+  dagger_safe_takeover_rms: 0.006
+  dagger_safe_release_rms: 0.004
   dagger_safe_min_teacher_steps: 8
   dagger_safe_zero_iteration: null
   dagger_beta_start: 0.0
@@ -115,7 +113,7 @@ algo:
   q_teacher_replay_ratio: 0.5
   q_teacher_buffer_capacity: 131_072
 
-  # FastSAC owns exploration through its learned raw Gaussian.  These
+  # FastSAC owns exploration through its learned squashed Gaussian.  These
   # inherited TD3 controls are locked inert to prevent a second noise source.
   eta_td3: 0.0
   policy_delay: 2
