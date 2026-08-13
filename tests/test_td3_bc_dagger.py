@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -353,9 +354,12 @@ def test_failure_attribution_preserves_preceding_student_across_rollout_boundary
             batch_size=(1, steps),
         )
 
-    assert policy._update_failure_phase_histogram(
-        rollout([0.20, 0.30, 0.40], [True, True, True])
-    ) == 0
+    assert (
+        policy._update_failure_phase_histogram(
+            rollout([0.20, 0.30, 0.40], [True, True, True])
+        )
+        == 0
+    )
     anchors = policy._update_failure_phase_histogram(
         rollout([0.50], [False], terminal=True)
     )
@@ -366,19 +370,21 @@ def test_failure_attribution_preserves_preceding_student_across_rollout_boundary
 
     # The done boundary clears causal control history.  A new one-step
     # Teacher-controlled failure must not inherit Student attribution.
-    assert policy._update_failure_phase_histogram(
-        rollout([0.10], [False], terminal=True)
-    ) == 0
+    assert (
+        policy._update_failure_phase_histogram(rollout([0.10], [False], terminal=True))
+        == 0
+    )
     assert policy._failure_phase_episode_count == 1
 
     # An explicit reset marker also clears a Student source carried over from
     # the preceding rollout, even if no done row was observed in that chunk.
-    assert policy._update_failure_phase_histogram(
-        rollout([0.20], [True])
-    ) == 0
-    assert policy._update_failure_phase_histogram(
-        rollout([0.05], [False], terminal=True, initial=True)
-    ) == 0
+    assert policy._update_failure_phase_histogram(rollout([0.20], [True])) == 0
+    assert (
+        policy._update_failure_phase_histogram(
+            rollout([0.05], [False], terminal=True, initial=True)
+        )
+        == 0
+    )
     assert policy._failure_phase_episode_count == 1
 
 
@@ -506,7 +512,7 @@ def test_depth_uint8_codec_rejects_noncanonical_values(invalid):
 
 
 def test_raw_perception_replay_public_field_contract_has_no_priv_pred_latent():
-    assert CHECKPOINT_VERSION == 3
+    assert CHECKPOINT_VERSION == 4
     assert PERCEPTION_REPLAY_SEMANTICS
     assert (
         PERCEPTION_DEPTH_U8_KEY,
@@ -1397,6 +1403,7 @@ def test_fresh_source_public_loader_orders_main_ppo_then_optional_perception_ove
     policy._migrate_fresh_ppo_student_actor_to_latent = MethodType(
         lambda owner: pytest.fail("direct raw PPO head must not be migrated"), policy
     )
+
     def overlay(owner, path):
         events.append(f"perception_overlay_{path}")
         owner._perception_initialization = {
@@ -3004,7 +3011,7 @@ def test_integrated_critic_uses_common_detached_target_and_no_sac_path():
     assert all(parameter.grad is None for parameter in policy.actor_target.parameters())
 
 
-def test_td3_target_adds_only_clipped_q_noise_without_clipping_raw_action():
+def test_td3_target_clips_noise_and_result_to_finite_execution_support():
     policy = _bare_policy(
         target_policy_noise_std=0.4,
         target_policy_noise_clip=0.2,
@@ -3012,6 +3019,11 @@ def test_td3_target_adds_only_clipped_q_noise_without_clipping_raw_action():
     )
     policy._fastsac_q_action_center = torch.tensor([1.0])
     policy._fastsac_q_action_scale = torch.tensor([2.0])
+    policy._fastsac_action_low = torch.tensor([-20.0])
+    policy._fastsac_action_high = torch.tensor([20.0])
+    policy._fastsac_actor_action_center = torch.tensor([0.0])
+    policy._fastsac_actor_action_scale = torch.tensor([20.0])
+    policy.cfg.action_support_clip = 20.0
     raw_target = torch.tensor([[101.0], [-79.0]])
     policy._actor_target_dist_from_flat = lambda observations: SimpleNamespace(
         mean=raw_target[: observations.shape[0]]
@@ -3025,17 +3037,45 @@ def test_td3_target_adds_only_clipped_q_noise_without_clipping_raw_action():
     smoothed_q, applied_noise, returned_raw = policy._smoothed_target_q_action(
         torch.zeros(2, 1)
     )
-    noise_free_q = (raw_target - 1.0) / 2.0
+    bounded_target = 20.0 * torch.tanh(raw_target / 20.0)
+    noise_free_q = (bounded_target - 1.0) / 2.0
+    q_low = torch.tensor([-10.5])
+    q_high = torch.tensor([9.5])
+    expected_smoothed = torch.maximum(
+        torch.minimum(noise_free_q + expected_noise, q_high), q_low
+    )
 
-    assert torch.equal(returned_raw, raw_target)
-    assert torch.allclose(applied_noise, expected_noise)
-    assert torch.allclose(smoothed_q, noise_free_q + expected_noise)
-    assert smoothed_q.abs().min() > 1.0
+    assert torch.allclose(returned_raw, bounded_target)
+    assert torch.allclose(applied_noise, expected_smoothed - noise_free_q)
+    assert torch.allclose(smoothed_q, expected_smoothed)
+    assert torch.all(smoothed_q >= q_low) and torch.all(smoothed_q <= q_high)
 
 
 def _install_unit_action_contract(policy: DistributionalTD3TeacherBC) -> None:
     policy._fastsac_q_action_center = torch.tensor([0.0])
     policy._fastsac_q_action_scale = torch.tensor([1.0])
+    policy._fastsac_action_low = torch.tensor([-20.0])
+    policy._fastsac_action_high = torch.tensor([20.0])
+    policy._fastsac_actor_action_center = torch.tensor([0.0])
+    policy._fastsac_actor_action_scale = torch.tensor([20.0])
+    policy.cfg.action_support_clip = 20.0
+
+
+def test_q_action_input_projects_to_execution_support_before_normalization():
+    policy = _bare_policy(q_action_input_gain=0.5, action_support_clip=6.0)
+    policy._fastsac_q_action_center = torch.tensor([1.0, -1.0])
+    policy._fastsac_q_action_scale = torch.tensor([2.0, 4.0])
+    policy._fastsac_action_low = torch.tensor([-5.0, -6.0])
+    policy._fastsac_action_high = torch.tensor([4.0, 3.0])
+
+    transformed = policy._q_action_input(torch.tensor([[-100.0, 100.0], [3.0, -5.0]]))
+
+    bounded = torch.tensor([[-5.0, 3.0], [3.0, -5.0]])
+    expected = (
+        (bounded - policy._fastsac_q_action_center) / policy._fastsac_q_action_scale
+    ) * 0.5
+    assert torch.equal(transformed, expected)
+    assert torch.equal(policy._q_action_to_physical(transformed), bounded)
 
 
 def test_actor_update_combines_td3_and_bc_before_one_backward_and_step():
@@ -3070,7 +3110,8 @@ def test_actor_update_combines_td3_and_bc_before_one_backward_and_step():
 
     expected_actor = copy.deepcopy(policy.actor_adapt)
     expected_critic = copy.deepcopy(policy.qnet)
-    expected_action = expected_actor(batch["observations"])
+    raw_expected_action = expected_actor(batch["observations"])
+    expected_action = 20.0 * torch.tanh(raw_expected_action / 20.0)
     expected_q_action = expected_action
     expected_td3, _ = _td3_actor_q1_loss(
         expected_critic, batch["critic_observations"], expected_q_action
@@ -3259,6 +3300,8 @@ def test_collector_noise_is_q_coordinate_noise_on_student_rows_only():
         student_selected_mask=student_selected,
         noise_std=0.4,
         noise_clip=0.2,
+        action_low=torch.tensor([-2.0, -4.0]),
+        action_high=torch.tensor([2.0, 4.0]),
         q_action_center=center,
         q_action_scale=scale,
         q_action_gain=gain,
@@ -3266,9 +3309,15 @@ def test_collector_noise_is_q_coordinate_noise_on_student_rows_only():
     )
 
     assert torch.equal(teacher, teacher_before)
-    assert torch.equal(issued[~student_selected], teacher[~student_selected])
+    bounded_teacher = teacher.clamp(
+        torch.tensor([-2.0, -4.0]), torch.tensor([2.0, 4.0])
+    )
+    bounded_student = student.clamp(
+        torch.tensor([-2.0, -4.0]), torch.tensor([2.0, 4.0])
+    )
+    assert torch.equal(issued[~student_selected], bounded_teacher[~student_selected])
     assert torch.equal(
-        exploratory_student[~student_selected], student[~student_selected]
+        exploratory_student[~student_selected], bounded_student[~student_selected]
     )
     assert torch.equal(
         applied_q_noise[~student_selected],
@@ -3276,13 +3325,15 @@ def test_collector_noise_is_q_coordinate_noise_on_student_rows_only():
     )
     assert applied_q_noise[student_selected].abs().max().item() <= 0.2
 
-    nominal_q = (student - center) / scale * gain
+    nominal_q = (bounded_student - center) / scale * gain
     exploratory_q = (exploratory_student - center) / scale * gain
     assert torch.allclose(
         exploratory_q[student_selected] - nominal_q[student_selected],
         applied_q_noise[student_selected],
     )
     assert torch.equal(issued[student_selected], exploratory_student[student_selected])
+    assert torch.all(exploratory_student >= torch.tensor([-2.0, -4.0]))
+    assert torch.all(exploratory_student <= torch.tensor([2.0, 4.0]))
     assert torch.equal(target_rng.get_state(), target_rng_before)
 
 
@@ -3299,6 +3350,8 @@ def test_disabled_collector_noise_is_bitwise_noop_and_does_not_advance_rng():
         student_selected_mask=selected,
         noise_std=0.0,
         noise_clip=0.2,
+        action_low=torch.tensor([-5.0, -5.0]),
+        action_high=torch.tensor([5.0, 5.0]),
         q_action_center=torch.tensor([1.0, -1.0]),
         q_action_scale=torch.tensor([2.0, 4.0]),
         q_action_gain=0.5,
@@ -3307,12 +3360,12 @@ def test_disabled_collector_noise_is_bitwise_noop_and_does_not_advance_rng():
 
     assert torch.equal(exploratory_student, student)
     assert torch.equal(issued[selected], student[selected])
-    assert torch.equal(issued[~selected], teacher[~selected])
+    assert torch.equal(issued[~selected], teacher.clamp(-5.0, 5.0)[~selected])
     assert torch.equal(applied_q_noise, torch.zeros_like(student))
     assert torch.equal(generator.get_state(), generator_before)
 
 
-def test_teacher_prefill_accepts_any_finite_raw_teacher_without_clipping():
+def test_teacher_prefill_projects_finite_teacher_and_student_to_support():
     student_action = torch.tensor([[0.1, -0.2], [0.3, 0.4], [-0.5, 0.6]])
     teacher = torch.tensor([[2.0, -3.0], [25.0, 0.0], [float("nan"), 7.0]])
     policy = _bare_policy(
@@ -3324,15 +3377,20 @@ def test_teacher_prefill_accepts_any_finite_raw_teacher_without_clipping():
         collector_exploration_noise_std=0.9,
         collector_exploration_noise_clip=0.5,
         q_action_input_gain=1.0,
+        action_support_clip=20.0,
     )
     policy.teacher_prefill_rollout_count = 0
     policy.dagger_rollout_count = 0
     policy.dagger_rng = torch.Generator().manual_seed(71)
     policy.collector_exploration_rng = torch.Generator().manual_seed(72)
-    policy._student_mean_action = lambda td: student_action.clone()
+    policy._student_raw_action_proposal = lambda td: student_action.clone()
     policy._teacher_action = lambda td: teacher.clone()
     policy._fastsac_q_action_center = torch.zeros(2)
     policy._fastsac_q_action_scale = torch.ones(2)
+    policy._fastsac_action_low = torch.full((2,), -20.0)
+    policy._fastsac_action_high = torch.full((2,), 20.0)
+    policy._fastsac_actor_action_center = torch.zeros(2)
+    policy._fastsac_actor_action_scale = torch.full((2,), 20.0)
     rollout_policy = _DistributionalTD3DaggerRolloutPolicy(policy)
     rollout = TensorDict({"is_init": torch.zeros(3, dtype=torch.bool)}, batch_size=[3])
     dagger_rng_before = policy.dagger_rng.get_state().clone()
@@ -3341,12 +3399,15 @@ def test_teacher_prefill_accepts_any_finite_raw_teacher_without_clipping():
     prefill = rollout_policy(rollout.clone())
 
     valid = torch.tensor([True, True, False])
+    bounded_teacher = torch.nan_to_num(teacher, nan=0.0).clamp(-20.0, 20.0)
+    bounded_student = 20.0 * torch.tanh(student_action / 20.0)
     assert torch.equal(prefill[DAGGER_TEACHER_ACTION_VALID_KEY], valid)
     assert torch.equal(prefill[DAGGER_IS_STUDENT_ACTION_KEY], ~valid)
-    assert torch.equal(prefill[ACTION_KEY][valid], teacher[valid])
-    assert torch.equal(prefill[ACTION_KEY][~valid], student_action[~valid])
-    assert torch.equal(prefill[TD3_NOISE_FREE_STUDENT_ACTION_KEY], student_action)
-    assert torch.equal(prefill[TD3_EXPLORATORY_STUDENT_ACTION_KEY], student_action)
+    assert torch.equal(prefill[ACTION_KEY][valid], bounded_teacher[valid])
+    assert torch.allclose(prefill[ACTION_KEY][~valid], bounded_student[~valid])
+    assert torch.allclose(prefill[DAGGER_TEACHER_ACTION_KEY], bounded_teacher)
+    assert torch.allclose(prefill[TD3_NOISE_FREE_STUDENT_ACTION_KEY], bounded_student)
+    assert torch.allclose(prefill[TD3_EXPLORATORY_STUDENT_ACTION_KEY], bounded_student)
     assert torch.equal(
         prefill[TD3_COLLECTOR_NOISE_KEY], torch.zeros_like(student_action)
     )
@@ -3364,7 +3425,7 @@ def test_teacher_prefill_accepts_any_finite_raw_teacher_without_clipping():
     assert not torch.equal(policy.dagger_rng.get_state(), dagger_rng_before)
 
 
-def test_eta_zero_and_disabled_noise_keep_direct_raw_student_actions():
+def test_eta_zero_and_disabled_noise_keep_bounded_student_actions():
     student_action = torch.tensor([[0.25, -0.5], [0.75, 0.1], [-0.2, 0.4], [0.0, -0.8]])
     teacher = torch.tensor([[2.0, -3.0], [4.0, 5.0], [-6.0, 7.0], [8.0, -9.0]])
     cfg = SimpleNamespace(
@@ -3375,19 +3436,24 @@ def test_eta_zero_and_disabled_noise_keep_direct_raw_student_actions():
         collector_exploration_noise_std=0.0,
         collector_exploration_noise_clip=0.0,
         q_action_input_gain=1.0,
+        action_support_clip=20.0,
     )
 
     def owner(seed: int):
         value = SimpleNamespace(cfg=cfg)
         value.dagger_rng = torch.Generator().manual_seed(seed)
         value.collector_exploration_rng = torch.Generator().manual_seed(seed + 1)
-        value._student_mean_action = lambda td: student_action.clone()
+        value._student_raw_action_proposal = lambda td: student_action.clone()
         value._teacher_action = lambda td: teacher.clone()
         value._teacher_prefill_active = lambda: False
         value._effective_control_mode = lambda: "beta"
         value._teacher_mixture_probability = lambda: 0.5
         value._fastsac_q_action_center = torch.zeros(2)
         value._fastsac_q_action_scale = torch.ones(2)
+        value._fastsac_action_low = torch.full((2,), -20.0)
+        value._fastsac_action_high = torch.full((2,), 20.0)
+        value._bounded_actor_mean = lambda raw: 20.0 * torch.tanh(raw / 20.0)
+        value._project_execution_action = lambda action: action.clamp(-20.0, 20.0)
         return value
 
     td3_owner = owner(123)
@@ -3397,8 +3463,11 @@ def test_eta_zero_and_disabled_noise_keep_direct_raw_student_actions():
 
     td3_out = td3(rollout.clone())
     student_rows = td3_out[DAGGER_IS_STUDENT_ACTION_KEY]
-    assert torch.equal(td3_out[ACTION_KEY][student_rows], student_action[student_rows])
-    assert torch.equal(td3_out[TD3_NOISE_FREE_STUDENT_ACTION_KEY], student_action)
+    bounded_student = 20.0 * torch.tanh(student_action / 20.0)
+    assert torch.allclose(
+        td3_out[ACTION_KEY][student_rows], bounded_student[student_rows]
+    )
+    assert torch.allclose(td3_out[TD3_NOISE_FREE_STUDENT_ACTION_KEY], bounded_student)
     assert torch.equal(td3_owner.collector_exploration_rng.get_state(), collector_state)
 
 
@@ -3452,7 +3521,8 @@ def test_evaluation_is_student_only_deterministic_and_noise_free(monkeypatch):
     second = evaluation_policy(TensorDict({}, batch_size=[3]))[ACTION_KEY]
 
     assert torch.equal(first, second)
-    assert torch.equal(first, torch.full((3, 1), 0.5))
+    expected = torch.full((3, 1), 20.0 * math.tanh(0.5 / 20.0))
+    assert torch.allclose(first, expected)
     assert torch.equal(policy.collector_exploration_rng.get_state(), collector_state)
     assert policy.actor_adapt.get_dist_calls == 2
     assert policy.actor_adapt.training is False
@@ -3647,7 +3717,10 @@ def test_td3_inference_loader_restores_models_without_training_state():
             getattr(restored, name).state_dict(),
             getattr(source, name).state_dict(),
         )
-        assert not any(parameter.requires_grad for parameter in getattr(restored, name).parameters())
+        assert not any(
+            parameter.requires_grad
+            for parameter in getattr(restored, name).parameters()
+        )
     assert progress == [73]
     assert (
         restored.actor_update_count,
@@ -3704,11 +3777,15 @@ def test_public_load_rejects_old_and_current_same_stage_td3_resume(
 @pytest.mark.parametrize(
     ("version", "backend", "message"),
     (
-        (2, ACTOR_BACKEND, "version mismatch"),
-        (CHECKPOINT_VERSION, "vaic_ppo_latent_tanh_bc_dagger_v4", "backend mismatch"),
+        (3, ACTOR_BACKEND, "version mismatch"),
+        (
+            CHECKPOINT_VERSION,
+            "ppo_vel_direct_raw_action_td3_bc_v1",
+            "backend mismatch",
+        ),
     ),
 )
-def test_td3_inference_rejects_legacy_tanh_checkpoint_contract_before_loading(
+def test_td3_inference_rejects_unbounded_checkpoint_contract_before_loading(
     monkeypatch, version, backend, message
 ):
     policy = _bare_policy()
@@ -3735,7 +3812,7 @@ def test_td3_inference_rejects_legacy_tanh_checkpoint_contract_before_loading(
 
 
 @pytest.mark.parametrize("saved_fingerprint", (None, "sha256:different"))
-def test_td3_inference_requires_exact_raw_action_contract_fingerprint(
+def test_td3_inference_requires_exact_bounded_action_contract_fingerprint(
     monkeypatch, saved_fingerprint
 ):
     policy = _bare_policy()
@@ -3760,6 +3837,8 @@ def test_td3_inference_requires_exact_raw_action_contract_fingerprint(
         ),
     )
 
-    message = "lacks a contract fingerprint" if saved_fingerprint is None else "mismatch"
+    message = (
+        "lacks a contract fingerprint" if saved_fingerprint is None else "mismatch"
+    )
     with pytest.raises(ValueError, match=message):
         policy.load_inference_state_dict(state)

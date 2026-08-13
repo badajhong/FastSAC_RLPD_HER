@@ -36,12 +36,11 @@ algo:
   dagger_beta_start: 0.0
   dagger_beta_end: 0.0
   dagger_beta_zero_iteration: null
-  dagger_beta_decay_rollouts: 1800
+  dagger_beta_decay_rollouts: 500
   dagger_seed: 0
-  # Teacher labels are accepted by a finite-value check only.  Teacher actions,
-  # the Student Gaussian sample, and its noise-free mean all use the original
-  # unbounded PPOVEL raw joint-command coordinates.  There is no tanh/atanh
-  # transform, magnitude threshold, or final action clip.
+  # Shared finite raw-command support for behavior, targets, replay, BC, and Q.
+  # Nominal per-joint limits remain normalization/entropy coordinates.
+  action_support_clip: 20.0
 
   # Joint-wise normalized Teacher BC is applied only to the noise-free mean.
   # One optimizer handles this term and the reparameterized SAC objective.
@@ -123,7 +122,8 @@ algo:
   collector_exploration_noise_clip: 0.0
   td3_learning_starts: 8192
 
-  # Reparameterized raw-Gaussian Actor/Critic targets and entropy temperature.
+  # Reparameterized bounded Actor. Standard deviation is dimensionless in the
+  # same per-joint nominal coordinates used by Q, BC, and entropy.
   eta_sac: 1.0e-4
   lambda_bc: 1.0
   sac_actor_lr: 3.0e-4

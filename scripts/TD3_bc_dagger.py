@@ -3,14 +3,14 @@
 The method is C51 distributional TD3 with joint-normalized raw-action
 Teacher BC. Collection, environment stepping, checkpoint writing,
 and evaluation remain owned by :mod:`scripts.train`; this module provides the
-new method's Hydra surface and fail-fast fresh-source validation.  Version 3
-keeps raw perception replay and introduces a fresh direct-raw-action lineage;
+new method's Hydra surface and fail-fast fresh-source validation.  Version 4
+keeps raw perception replay and introduces a finite-action-support lineage;
 it intentionally does not resume an older TD3 lineage.
 
-The Student Actor uses the original PPOVEL unbounded raw joint-command
-coordinates.  Teacher BC and Critic inputs are normalized with the same
-per-joint nominal center/scale, while environment execution remains raw: no
-tanh/atanh transform or final action clip is part of this backend.
+The Student keeps the original PPOVEL physical-command head, then maps its
+executable mean smoothly into an explicit finite support. Teacher labels,
+targets, replay, and Q use that same support; BC and Q retain the same
+per-joint nominal center/scale.
 
 ``PPOConfig`` contributes a few legacy exploration-objective configuration
 keys which are retained only because the Actor/checkpoint topology is locked.
@@ -130,6 +130,7 @@ DAGGER_BACKEND_CONFIG_FIELDS = (
     "dagger_beta_end",
     "dagger_beta_decay_rollouts",
     "dagger_seed",
+    "action_support_clip",
     "dagger_bc_lr",
     "dagger_actor_huber_delta",
     "dagger_buffer_capacity",
@@ -419,13 +420,13 @@ def _expected_dagger_backend_config(algo: Mapping) -> dict:
     return {
         **{name: algo.get(name) for name in DAGGER_BACKEND_CONFIG_FIELDS},
         "method": EXPECTED_TRAINING_ALGORITHM,
-        "actor_output": "direct_unbounded_raw_joint_command",
+        "actor_output": "ppo_physical_proposal_tanh_bounded_raw_joint_command",
         "bc_loss": "joint_normalized_raw_mean_teacher_smooth_l1",
     }
 
 
 def _reject_obsolete_bounded_action_controls(cfg: DictConfig) -> None:
-    """Reject stale knobs that would imply a bounded/tanh action backend."""
+    """Reject legacy controls replaced by the single action_support_clip."""
     obsolete = sorted(
         name
         for name in ("dagger_action_clip", "dagger_teacher_action_threshold")
@@ -433,8 +434,8 @@ def _reject_obsolete_bounded_action_controls(cfg: DictConfig) -> None:
     )
     if obsolete:
         raise ValueError(
-            "the direct unbounded raw-action backend removed bounded-action "
-            f"controls: {obsolete}"
+            "legacy bounded-action controls were replaced by "
+            f"algo.action_support_clip: {obsolete}"
         )
 
 
@@ -555,13 +556,13 @@ def td3_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
 
 
 def prepare_td3_bc_dagger_checkpoint(cfg: DictConfig) -> dict | None:
-    """Reject same-stage continuation across the fresh-only v3 contract."""
+    """Reject same-stage continuation across the fresh-only v4 contract."""
     requested = cfg.get("td3_bc_dagger_checkpoint", None)
     if requested is None:
         return None
     raise ValueError(
         "same-stage TD3 resume is intentionally unsupported by the fresh-only "
-        "direct-raw-action/raw-perception v3 contract; leave "
+        "bounded-action/raw-perception v4 contract; leave "
         "td3_bc_dagger_checkpoint=null "
         "and start from a train-phase PPO checkpoint_path"
     )
@@ -745,6 +746,7 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
             "algo.q_teacher_buffer_capacity must cover algo.td3_learning_starts"
         )
     for name in (
+        "action_support_clip",
         "dagger_bc_lr",
         "dagger_actor_huber_delta",
         "q_lr",
@@ -807,8 +809,8 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
 
     if cfg.get("td3_bc_dagger_checkpoint", None) is not None:
         raise ValueError(
-            "same-stage TD3 resume is unsupported by the direct-raw-action "
-            "raw-perception v3 contract; "
+            "same-stage TD3 resume is unsupported by the bounded-action "
+            "raw-perception v4 contract; "
             "use only a fresh train-phase PPO checkpoint_path"
         )
     obsolete_resume_values = {

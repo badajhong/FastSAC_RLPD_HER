@@ -6,11 +6,9 @@ method-specific Hydra surface and rejects incompatible configuration before
 the simulator starts.
 
 The stochastic policy is intentional: Student collection, the soft Bellman
-target, and the SAC Actor objective sample reparameterized raw-Gaussian
-actions.  Exact Teacher BC is evaluated only on the same policy's noise-free
-raw mean.  Teacher BC and Critic inputs use the same per-joint nominal
-normalization, while environment execution has no tanh/atanh transform or
-final action clip.  Exploration therefore comes from SAC itself; inherited
+target, and the SAC Actor objective sample a bounded reparameterized policy.
+Its standard deviation, Teacher BC, and Critic inputs use the same per-joint
+nominal coordinates. Exploration therefore comes from SAC itself; inherited
 TD3 noise knobs are locked to zero.
 """
 
@@ -133,7 +131,7 @@ def _finite_fraction(name: str, value) -> float:
 
 
 def _reject_obsolete_bounded_action_controls(cfg: DictConfig) -> None:
-    """Reject stale knobs that would imply a bounded/tanh action backend."""
+    """Reject legacy controls replaced by the single action_support_clip."""
     obsolete = sorted(
         name
         for name in ("dagger_action_clip", "dagger_teacher_action_threshold")
@@ -141,8 +139,8 @@ def _reject_obsolete_bounded_action_controls(cfg: DictConfig) -> None:
     )
     if obsolete:
         raise ValueError(
-            "the direct unbounded raw-action backend removed bounded-action "
-            f"controls: {obsolete}"
+            "legacy bounded-action controls were replaced by "
+            f"algo.action_support_clip: {obsolete}"
         )
 
 
@@ -420,13 +418,13 @@ def fastsac_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
 
 
 def prepare_fastsac_bc_dagger_checkpoint(cfg: DictConfig) -> None:
-    """Reject same-stage continuation across the fresh-only v2 contract."""
+    """Reject same-stage continuation across the fresh-only v3 contract."""
     requested = cfg.get("fastsac_bc_dagger_checkpoint", None)
     if requested is None:
         return None
     raise ValueError(
         "same-stage FastSAC resume is intentionally unsupported by the "
-        "fresh-only direct-raw-action/raw-perception v2 contract; leave "
+        "fresh-only normalized-std/bounded-action v3 contract; leave "
         "fastsac_bc_dagger_checkpoint=null and use a train-phase PPO "
         "checkpoint_path"
     )
@@ -553,6 +551,7 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
     ):
         _finite_nonnegative(f"algo.{name}", cfg.algo.get(name, None))
     for name in (
+        "action_support_clip",
         "dagger_bc_lr",
         "dagger_actor_huber_delta",
         "q_lr",

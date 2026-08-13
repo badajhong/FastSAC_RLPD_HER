@@ -6,24 +6,26 @@ nohup env \
   algo.load_pretrained_perception=true \
   algo.perception_checkpoint_path=outputs/15-13-46-G1Skateboard-ppo_vel/wandb/run-20260805_151350-7tsje71w/files/checkpoint_final.pt \
   algo.train_perception=true \
-  td3_dagger_iterations=3000 \
+  td3_dagger_iterations=9000 \
   algo.teacher_prefill_max_rollouts=300 \
   algo.q_teacher_buffer_capacity=131072 \
   algo.teacher_actor_replay_fraction=0.5 \
   algo.teacher_perception_replay_fraction=0.5 \
-  algo.failure_phase_teacher_fraction=0.3 \
+  algo.failure_phase_teacher_fraction=0.1 \
   algo.dagger_control_mode=beta \
   algo.dagger_beta_start=0 \
   algo.dagger_beta_end=0 \
   algo.dagger_beta_zero_iteration=500 \
-  algo.eta_td3=1e-5 \
+  algo.eta_td3=1e-3 \
   algo.lambda_bc=1.0 \
-  algo.dagger_bc_lr=3e-4 \
-  algo.collector_exploration_noise_std=0.0 \
+  algo.dagger_bc_lr=1e-4 \
+  algo.collector_exploration_noise_std=0.01 \
+  algo.collector_exploration_noise_clip=0.03 \
   algo.q_updates_per_rollout=16 \
   algo.policy_delay=1 \
+  task.num_envs=128 \
   save_interval=100 \
-  > TD3_bc_dagger_eta1e-4_3000.log 2>&1 < /dev/null &
+  > ./logs/TD3_bc_dagger_3000.log 2>&1 < /dev/null &
 
 nohup env \
   python scripts/fastSAC_bc_dagger.py \
@@ -47,13 +49,13 @@ nohup env \
   algo.q_updates_per_rollout=4 \
   algo.sac_policy_frequency=1 \
   algo.policy_delay=1 \
-  task.num_envs=128 \
+  task.num_envs=512 \
   save_interval=100 \
   algo.sac_use_autotune=false \
   algo.sac_alpha_init=1e-5 \
   algo.sac_initial_action_std=0.05 \
   algo.sac_log_std_max=-2.9957 \
-  > fastSAC_bc_dagger_dynamic_prefill_3000.log 2>&1 < /dev/null &
+  > ./logs/fastSAC_bc_dagger.log 2>&1 < /dev/null &
 
 # DAgger
 nohup python scripts/bc_dagger.py \

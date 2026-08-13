@@ -42,6 +42,7 @@ def _cfg(
                 "adapt_module": "gru",
                 "latent_dim": 256,
                 "in_keys": list(td3_entry.EXPECTED_ACTOR_IN_KEYS),
+                "action_support_clip": 20.0,
                 "dagger_control_mode": control_mode,
                 "dagger_safe_takeover_rms": 0.006,
                 "dagger_safe_release_rms": 0.004,
@@ -189,6 +190,7 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.algo.q_v_min == pytest.approx(-20.0)
     assert cfg.algo.q_v_max == pytest.approx(20.0)
     assert cfg.algo.q_action_coordinates == "raw_joint_command"
+    assert cfg.algo.action_support_clip == pytest.approx(20.0)
     assert "dagger_teacher_action_threshold" not in cfg.algo
     assert "dagger_action_clip" not in cfg.algo
     assert cfg.algo.dagger_safe_takeover_rms == pytest.approx(0.12)
@@ -595,6 +597,7 @@ def test_config_rejects_forbidden_stochastic_policy_fields(field):
     ("field", "value", "message"),
     (
         ("eta_td3", -1.0, "non-negative"),
+        ("action_support_clip", 0.0, "positive"),
         ("use_depth", False, "depth encoder"),
         ("use_object_adapt", False, "object adaptation"),
         ("adapt_module", "mlp", "adapt_module=gru"),
@@ -679,7 +682,7 @@ def test_removed_bounded_action_controls_are_rejected(removed_field):
     cfg = _cfg()
     with open_dict(cfg.algo):
         cfg.algo[removed_field] = 20.0
-    with pytest.raises(ValueError, match="removed|unbounded raw"):
+    with pytest.raises(ValueError, match="replaced|action_support_clip"):
         td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
@@ -753,9 +756,7 @@ def test_same_stage_td3_resume_is_rejected_for_legacy_and_current_versions(
     )
     cfg = _cfg(checkpoint="/fresh/ppo.pt", resume=str(checkpoint))
 
-    with pytest.raises(
-        ValueError, match="fresh-only direct-raw-action/raw-perception v3"
-    ):
+    with pytest.raises(ValueError, match="fresh-only .* contract"):
         td3_entry.prepare_td3_bc_dagger_checkpoint(cfg)
     with pytest.raises(ValueError, match="same-stage TD3 resume is unsupported"):
         td3_entry.validate_td3_bc_dagger_config(cfg)
@@ -857,9 +858,7 @@ def test_prefill_boundary_resets_episodes_and_all_environment_emas():
             self._perf_ema_reward = {
                 "reward": {"term": (torch.tensor(7.0), torch.tensor(2.0))}
             }
-            self._perf_ema_update = {
-                "update": (torch.tensor(5.0), torch.tensor(1.0))
-            }
+            self._perf_ema_update = {"update": (torch.tensor(5.0), torch.tensor(1.0))}
             for field in train_module._ENV_EMA_SCALAR_FIELDS:
                 setattr(self, field, 9.0)
             self.reset_calls = 0
@@ -902,8 +901,7 @@ def test_prefill_boundary_resets_episodes_and_all_environment_emas():
                 tensors.extend(pair)
         assert all(value.item() == 0.0 for value in tensors)
     assert all(
-        getattr(physical, field) == 0.0
-        for field in train_module._ENV_EMA_SCALAR_FIELDS
+        getattr(physical, field) == 0.0 for field in train_module._ENV_EMA_SCALAR_FIELDS
     )
 
 

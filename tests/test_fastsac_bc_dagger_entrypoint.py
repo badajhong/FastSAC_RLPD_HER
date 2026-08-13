@@ -25,6 +25,7 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "adapt_module": "gru",
                 "latent_dim": 256,
                 "in_keys": list(sac_entry.EXPECTED_ACTOR_IN_KEYS),
+                "action_support_clip": 20.0,
                 "dagger_control_mode": "beta",
                 "dagger_safe_takeover_rms": 0.006,
                 "dagger_safe_release_rms": 0.004,
@@ -152,7 +153,7 @@ def _write_perception_checkpoint(path: Path, *, omit: str | None = None) -> Path
     return path
 
 
-def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
+def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg = compose(
@@ -192,6 +193,7 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
     assert cfg.algo.eta_sac == pytest.approx(1.0e-4)
     assert cfg.algo.lambda_bc == pytest.approx(1.0)
     assert cfg.algo.sac_initial_action_std == pytest.approx(0.1)
+    assert cfg.algo.action_support_clip == pytest.approx(20.0)
     assert cfg.algo.sac_use_autotune is True
     assert cfg.algo.q_batch_size == 512
     assert cfg.algo.q_updates_per_rollout == 32
@@ -201,8 +203,8 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
     assert cfg.algo.q_action_coordinates == "raw_joint_command"
     assert "dagger_teacher_action_threshold" not in cfg.algo
     assert "dagger_action_clip" not in cfg.algo
-    assert cfg.algo.dagger_safe_takeover_rms == pytest.approx(0.12)
-    assert cfg.algo.dagger_safe_release_rms == pytest.approx(0.08)
+    assert cfg.algo.dagger_safe_takeover_rms == pytest.approx(0.006)
+    assert cfg.algo.dagger_safe_release_rms == pytest.approx(0.004)
 
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
     assert cfg.total_frames == 4000 * 256 * 32
@@ -216,7 +218,7 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
         "max_physical_rollouts": 4000,
         "start_rollout": 0,
         "end_rollout": 3000,
-        "decay_rollouts": 1800,
+        "decay_rollouts": 500,
         "beta_zero_rollouts": 3000,
         "safe_zero_rollouts": 0,
     }
@@ -447,6 +449,7 @@ def test_inherited_td3_noise_must_remain_zero(field):
     ("field", "value", "message"),
     (
         ("eta_sac", -1.0, "non-negative"),
+        ("action_support_clip", 0.0, "positive"),
         ("sac_actor_lr", 0.0, "positive"),
         ("sac_initial_action_std", 0.0, "positive"),
         ("sac_log_std_min", -1.0, "below"),
@@ -489,7 +492,7 @@ def test_removed_bounded_action_controls_are_rejected(removed_field):
     with open_dict(cfg.algo):
         cfg.algo[removed_field] = 20.0
 
-    with pytest.raises(ValueError, match="removed|unbounded raw"):
+    with pytest.raises(ValueError, match="replaced|action_support_clip"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 

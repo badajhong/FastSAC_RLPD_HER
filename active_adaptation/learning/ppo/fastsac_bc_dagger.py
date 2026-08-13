@@ -4,9 +4,9 @@ This backend deliberately reuses the raw recurrent replay, Teacher-only
 prefill, DAgger source selection, timeout handling, and twin-C51 topology from
 ``td3_bc_dagger``.  The learning rule itself is SAC:
 
-* Student collection and Actor updates use reparameterized raw-Gaussian
-  samples;
-* exact Teacher BC is applied only to the policy's raw noise-free mean;
+* Student collection and Actor updates use a reparameterized bounded Gaussian
+  whose standard deviation is expressed in nominal joint coordinates;
+* exact Teacher BC is applied only to the bounded noise-free mean;
 * the soft Bellman target contains the next-policy entropy term;
 * both online critics learn from the complete target-C51 head with the lower
   expected return; and
@@ -32,6 +32,7 @@ from tensordict import TensorDict
 
 from .common import ACTION_KEY, CMD_KEY, OBS_KEY, OBS_PRIV_KEY, Actor, hard_copy_
 from .fastsac_vel import (
+    FastSACTanhNormal,
     _BCDaggerSACAdapter,
     _fastsac_target_entropy,
     _reduce_actor_q_values,
@@ -82,21 +83,21 @@ from .td3_bc_dagger import (
 
 
 TRAINING_ALGORITHM = "distributional_fastsac_teacher_bc_v1"
-CHECKPOINT_VERSION = 2
-ACTOR_BACKEND = "ppo_vel_direct_raw_gaussian_fastsac_bc_v1"
+CHECKPOINT_VERSION = 3
+ACTOR_BACKEND = "ppo_vel_normalized_std_tanh_bounded_fastsac_bc_v1"
 ACTION_CONTRACT_SEMANTICS = (
-    "direct_unbounded_raw_joint_action_with_jointwise_normalized_q_bc_v1"
+    "finite_raw_joint_action_support_with_jointwise_normalized_q_bc_v1"
 )
 CRITIC_SEMANTICS = (
     "current_stochastic_actor_entropy_soft_target_lower_expected_complete_"
     "c51_distribution_projection_v1"
 )
 ACTOR_LEARNING_SEMANTICS = (
-    "reparameterized_raw_normal_alpha_logpi_minus_online_twin_min_plus_"
+    "reparameterized_normalized_std_bounded_alpha_logpi_minus_online_twin_min_plus_"
     "joint_normalized_raw_teacher_mean_bc_v1"
 )
 ENTROPY_SEMANTICS = (
-    "unsquashed_raw_normal_nominal_joint_coordinate_log_probability_auto_temperature_v1"
+    "bounded_tanh_normal_nominal_joint_coordinate_log_probability_auto_temperature_v1"
 )
 
 
@@ -159,49 +160,6 @@ ConfigStore.instance().store(
 )
 
 
-class _RawActionNormal:
-    """Independent unsquashed Normal with generator-aware reparameterization."""
-
-    def __init__(self, loc: torch.Tensor, scale: torch.Tensor):
-        if loc.shape != scale.shape:
-            raise ValueError("raw Normal loc/scale shapes must match")
-        if not torch.isfinite(loc).all():
-            raise RuntimeError("FastSAC raw Normal mean contains non-finite values")
-        if not torch.isfinite(scale).all() or not torch.all(scale > 0):
-            raise RuntimeError("FastSAC raw Normal scale must be finite and positive")
-        self.loc = loc
-        self.scale = scale
-
-    @property
-    def mean(self) -> torch.Tensor:
-        return self.loc
-
-    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
-        standardized = (action - self.loc) / self.scale
-        return (
-            -0.5 * standardized.square()
-            - self.scale.log()
-            - 0.5 * math.log(2.0 * math.pi)
-        ).sum(dim=-1)
-
-    def rsample_with_log_prob(
-        self, *, generator: torch.Generator | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        noise = torch.randn(
-            self.loc.shape,
-            device=self.loc.device,
-            dtype=self.loc.dtype,
-            generator=generator,
-        )
-        action = self.loc + self.scale * noise
-        # Use the sampled standardized noise directly for stable density and
-        # preserve the reparameterized gradient through loc and scale.
-        log_prob = (
-            -0.5 * noise.square() - self.scale.log() - 0.5 * math.log(2.0 * math.pi)
-        ).sum(dim=-1)
-        return action, log_prob
-
-
 class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
     """Locked DAgger selection with stochastic Student-only execution."""
 
@@ -209,7 +167,7 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
     def forward(self, td: TensorDict):
         owner = self._owner
         teacher_prefill_active = owner._teacher_prefill_active()
-        raw_student_mean = owner._student_mean_action(td)
+        raw_student_mean = owner._student_raw_action_proposal(td)
         for scratch_key in (
             "_depth_feature",
             OBJECT_PRED_KEY,
@@ -232,6 +190,7 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         finite_teacher_action = torch.nan_to_num(
             teacher_action, nan=0.0, posinf=0.0, neginf=0.0
         )
+        bounded_teacher_action = owner._project_execution_action(finite_teacher_action)
         student_valid = torch.isfinite(raw_student_mean).all(dim=-1)
         finite_student_mean = torch.nan_to_num(
             raw_student_mean, nan=0.0, posinf=0.0, neginf=0.0
@@ -243,7 +202,7 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         # itself must not trigger Teacher takeovers or bias source selection.
         discrepancy_rms, discrepancy_max = _joint_normalized_action_discrepancy(
             mean_student_action,
-            finite_teacher_action,
+            bounded_teacher_action,
             owner._fastsac_q_action_scale,
         )
         discrepancy_rms = torch.where(
@@ -320,15 +279,16 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
 
         issued_action = torch.where(
             choose_teacher.unsqueeze(-1),
-            finite_teacher_action,
+            bounded_teacher_action,
             sampled_student_action,
         )
+        issued_action = owner._project_execution_action(issued_action)
         sample_q_deviation = owner._q_action_input(sampled_student_action) - (
             owner._q_action_input(mean_student_action)
         )
 
         td[ACTION_KEY] = issued_action
-        td[DAGGER_TEACHER_ACTION_KEY] = finite_teacher_action
+        td[DAGGER_TEACHER_ACTION_KEY] = bounded_teacher_action
         td[DAGGER_TEACHER_ACTION_VALID_KEY] = valid
         td[DAGGER_IS_STUDENT_ACTION_KEY] = ~choose_teacher
         td[DAGGER_ACTION_DISCREPANCY_RMS_KEY] = discrepancy_rms
@@ -351,7 +311,7 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
 
 
 class _DeterministicFastSACStudentEvalPolicy(_DeterministicTD3StudentEvalPolicy):
-    """Direct deterministic Student mean; never samples or computes log-prob."""
+    """Bounded deterministic Student mean; never samples or computes log-prob."""
 
 
 class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
@@ -376,7 +336,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             initial_log_std > float(cfg.sac_log_std_max)
         ).any():
             raise ValueError(
-                "sac_initial_action_std maps outside raw Normal log-std bounds"
+                "sac_initial_action_std maps outside normalized log-std bounds"
             )
         self.register_buffer(
             "_fastsac_initial_log_std", initial_log_std.detach().clone()
@@ -522,14 +482,28 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         core.actor_std.requires_grad_(False)
         core.actor_std.grad = None
 
-    def _sac_dist_from_mean(self, mean: torch.Tensor) -> _RawActionNormal:
+    def _sac_dist_from_mean(self, mean: torch.Tensor) -> FastSACTanhNormal:
+        """Build a bounded policy with std in nominal Q-action coordinates."""
         if not torch.isfinite(mean).all():
-            raise RuntimeError("FastSAC Actor mean contains non-finite raw actions")
+            raise RuntimeError("FastSAC Actor proposal contains non-finite raw actions")
         log_std = self.bc_dagger_sac_adapter.log_std.clamp(
             float(self.cfg.sac_log_std_min), float(self.cfg.sac_log_std_max)
         )
-        scale = log_std.exp().expand_as(mean)
-        return _RawActionNormal(mean, scale)
+        actor_center = self._fastsac_actor_action_center.to(mean)
+        actor_scale = self._fastsac_actor_action_scale.to(mean)
+        q_scale = self._fastsac_q_action_scale.to(mean)
+        latent_loc = (mean - actor_center) / actor_scale
+        # log_std is dimensionless in nominal Q coordinates. Converting it to
+        # pre-tanh coordinates makes the unsquashed physical proposal noise
+        # exactly q_scale * exp(log_std) for every joint.
+        latent_scale = (log_std.exp() * q_scale / actor_scale).expand_as(mean)
+        return FastSACTanhNormal(
+            latent_loc,
+            latent_scale,
+            low=self._fastsac_action_low.to(mean),
+            high=self._fastsac_action_high.to(mean),
+            event_dims=1,
+        )
 
     def _actor_mean_from_flat(self, actor_obs: torch.Tensor) -> torch.Tensor:
         # Lightweight unit policies may expose the mean module directly.  The
@@ -539,7 +513,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         legacy_dist = DistributionalTD3TeacherBC._actor_dist_from_flat(self, actor_obs)
         return legacy_dist.mean
 
-    def _actor_dist_from_flat(self, actor_obs: torch.Tensor) -> _RawActionNormal:
+    def _actor_dist_from_flat(self, actor_obs: torch.Tensor) -> FastSACTanhNormal:
         return self._sac_dist_from_mean(self._actor_mean_from_flat(actor_obs))
 
     def _normalized_action_log_prob(self, raw_log_prob: torch.Tensor):
@@ -718,10 +692,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
 
     def _actor_update(self, batch: dict[str, torch.Tensor]):
         """One combined reparameterized SAC plus exact mean-BC Actor step."""
-        prediction_action = self._actor_mean_from_flat(batch["observations"])
-        if not torch.isfinite(prediction_action).all():
+        raw_prediction = self._actor_mean_from_flat(batch["observations"])
+        if not torch.isfinite(raw_prediction).all():
             raise RuntimeError("FastSAC Actor mean contains non-finite raw actions")
-        dist = self._sac_dist_from_mean(prediction_action)
+        dist = self._sac_dist_from_mean(raw_prediction)
+        prediction_action = dist.mean
         sampled_action, raw_log_prob = dist.rsample_with_log_prob(
             generator=self.sac_action_rng
         )
@@ -937,7 +912,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         common.update(
             {
                 "method": TRAINING_ALGORITHM,
-                "actor_output": "global_std_unsquashed_raw_action_normal",
+                "actor_output": "normalized_std_tanh_bounded_raw_action_normal",
                 "bc_loss": "joint_normalized_raw_mean_teacher_smooth_l1",
             }
         )
@@ -1217,5 +1192,4 @@ __all__ = [
     "DistributionalFastSACTeacherBCConfig",
     "_DeterministicFastSACStudentEvalPolicy",
     "_DistributionalFastSACDaggerRolloutPolicy",
-    "_RawActionNormal",
 ]

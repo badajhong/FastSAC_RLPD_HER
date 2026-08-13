@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE_TASK_PATH = Path("cfg/task/base/hdmi-base.yaml")
 SKATEBOARD_TASK_PATH = Path("cfg/task/G1/vaic/skateboard_stu.yaml")
 TD3_CONFIG_PATH = Path("cfg/TD3_bc_dagger.yaml")
+FASTSAC_CONFIG_PATH = Path("cfg/fastSAC_bc_dagger.yaml")
 
 EXPECTED_ENVIRONMENT_FINGERPRINT = (
     "08b5c7764e9ad98a1eae05fe5c5cf16b11606d3dbed1e4f57b7eae84790d0053"
@@ -881,6 +882,66 @@ def test_locked_runtime_source_ast_fingerprints_are_unchanged():
     assert not mismatches, json.dumps(mismatches, indent=2, sort_keys=True)
 
 
+def test_fastsac_normalized_std_and_finite_action_support_are_locked():
+    td3_algo = _load_yaml(TD3_CONFIG_PATH)["algo"]
+    fastsac_algo = _load_yaml(FASTSAC_CONFIG_PATH)["algo"]
+
+    # Both backends share one explicit physical command support.  Nominal
+    # per-joint limits remain coordinates for Q, BC, and FastSAC entropy/std.
+    assert td3_algo["action_support_clip"] == 20.0
+    assert fastsac_algo["action_support_clip"] == 20.0
+    assert np.isfinite(fastsac_algo["action_support_clip"])
+    assert fastsac_algo["action_support_clip"] > 0.0
+    assert fastsac_algo["sac_initial_action_std"] == 0.1
+    assert fastsac_algo["sac_log_std_min"] == -10.0
+    assert fastsac_algo["sac_log_std_max"] == -2.0
+
+    dist_builder = _definition_ast(
+        "active_adaptation/learning/ppo/fastsac_bc_dagger.py",
+        "DistributionalFastSACTeacherBC._sac_dist_from_mean",
+    )
+    assignments = {
+        target.id: node.value
+        for node in ast.walk(dist_builder)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert ast.unparse(assignments["latent_loc"]) == (
+        "(mean - actor_center) / actor_scale"
+    )
+    assert ast.unparse(assignments["latent_scale"]) == (
+        "(log_std.exp() * q_scale / actor_scale).expand_as(mean)"
+    )
+
+    dist_return = next(
+        node for node in dist_builder.body if isinstance(node, ast.Return)
+    )
+    dist_call = dist_return.value
+    assert isinstance(dist_call, ast.Call)
+    assert ast.unparse(dist_call.func) == "FastSACTanhNormal"
+    dist_keywords = {keyword.arg: keyword.value for keyword in dist_call.keywords}
+    assert ast.unparse(dist_keywords["low"]) == "self._fastsac_action_low.to(mean)"
+    assert ast.unparse(dist_keywords["high"]) == "self._fastsac_action_high.to(mean)"
+
+    q_input = _definition_ast(
+        "active_adaptation/learning/ppo/td3_bc_dagger.py",
+        "DistributionalTD3TeacherBC._q_action_input",
+    )
+    bounded_assignment = next(
+        node
+        for node in q_input.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "bounded"
+            for target in node.targets
+        )
+    )
+    assert ast.unparse(bounded_assignment.value) == (
+        "self._project_execution_action(action)"
+    )
+
+
 def _default_group_names(defaults):
     groups = []
     for entry in defaults:
@@ -988,9 +1049,9 @@ def test_td3_config_only_overrides_the_authorized_environment_count():
         "dagger_beta_end": baseline["dagger_beta_end"],
         "dagger_beta_zero_iteration": baseline["dagger_beta_zero_iteration"],
         "dagger_beta_decay_rollouts": baseline["dagger_beta_decay_rollouts"],
-        # Direct-raw SafeDAgger measures joint-wise normalized action error;
-        # these thresholds therefore intentionally differ from the legacy
-        # scalar +/-20 envelope coordinates.
+        # Bounded SafeDAgger measures joint-wise nominal-coordinate error;
+        # these thresholds therefore intentionally differ from the physical
+        # +/-20 execution-support coordinates.
         "dagger_safe_takeover_rms": 0.12,
         "dagger_safe_release_rms": 0.08,
         "dagger_safe_min_teacher_steps": baseline["dagger_safe_min_teacher_steps"],

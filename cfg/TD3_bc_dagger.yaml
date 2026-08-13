@@ -19,7 +19,7 @@ total_frames: 19_660_800
 td3_dagger_iterations: null
 save_interval: 100
 
-# Version 3 starts only from the train-phase PPO checkpoint_path inherited from
+# Version 4 starts only from the train-phase PPO checkpoint_path inherited from
 # train.yaml.  A non-null value here is retained solely for a clear fail-fast
 # error; same-stage TD3 replay resume is intentionally unsupported.
 td3_bc_dagger_checkpoint: null
@@ -39,9 +39,9 @@ algo:
   dagger_beta_zero_iteration: null
   dagger_beta_decay_rollouts: 1800
   dagger_seed: 0
-  # Teacher labels are accepted by a finite-value check only.  Both Teacher
-  # and Student actions remain unbounded raw PPOVEL joint commands: there is
-  # no tanh/atanh transform, magnitude threshold, or final action clip.
+  # Every Actor/Teacher/target/replay/Q action uses this finite raw-command
+  # support. Nominal per-joint limits still define Q/BC coordinates.
+  action_support_clip: 20.0
 
   # Joint-wise normalized raw-action SmoothL1 objective.
   dagger_bc_lr: 3.0e-4

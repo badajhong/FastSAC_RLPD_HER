@@ -1,6 +1,6 @@
-"""C51 distributional TD3 with direct raw-action Teacher BC.
+"""C51 distributional TD3 with bounded raw-action Teacher BC.
 
-This module implements ``distributional_td3_teacher_bc_v1``.  Version 3 keeps
+This module implements ``distributional_td3_teacher_bc_v1``.  Version 4 keeps
 the locked VAIC Actor, observation, DAgger, timeout, action, and C51 interfaces,
 but makes replay perception-input authoritative: it stores finite raw recurrent
 windows and re-encodes them with the current EMA perception modules instead of
@@ -48,7 +48,9 @@ from .fastsac_vel import (
     _filter_replay_rows,
     _measure_or_clip_grad_norm,
     _q_action_hidden_dim,
+    _project_to_execution_support,
     _sac_bootstrap_mask as _bootstrap_mask,
+    _validate_action_safety_clip,
     _vaic_truncation_mask,
     _vaic_nominal_action_coordinates,
 )
@@ -92,20 +94,20 @@ from .ppo_vel import (
 
 
 TRAINING_ALGORITHM = "distributional_td3_teacher_bc_v1"
-CHECKPOINT_VERSION = 3
-ACTOR_BACKEND = "ppo_vel_direct_raw_action_td3_bc_v1"
+CHECKPOINT_VERSION = 4
+ACTOR_BACKEND = "ppo_vel_physical_mean_tanh_bounded_td3_bc_v1"
 ACTION_CONTRACT_SEMANTICS = (
-    "direct_unbounded_raw_joint_action_with_jointwise_normalized_q_bc_v1"
+    "finite_raw_joint_action_support_with_jointwise_normalized_q_bc_v1"
 )
 CRITIC_SEMANTICS = (
-    "deterministic_raw_target_actor_q_coordinate_noise_clipped_smoothing_"
+    "deterministic_bounded_target_actor_q_coordinate_noise_and_support_clipped_"
     "lower_expected_complete_c51_distribution_projection_v1"
 )
 ACTOR_LEARNING_SEMANTICS = (
     "expected_online_q1_plus_joint_normalized_raw_teacher_huber_bc_v1"
 )
 DAGGER_CONTROL_SEMANTICS = (
-    "direct_raw_mean_joint_normalized_safe_or_beta_no_action_projection_v1"
+    "bounded_raw_mean_joint_normalized_safe_or_beta_execution_projection_v1"
 )
 
 TD3_NOISE_FREE_STUDENT_ACTION_KEY = "td3_noise_free_student_action"
@@ -450,14 +452,16 @@ def _polyak_update_(target: nn.Module, source: nn.Module, tau: float) -> None:
         target_parameter.lerp_(source_parameter, tau)
 
 
-def _raw_action_contract_metadata(
+def _bounded_action_contract_metadata(
     joint_names,
     nominal_action_low: torch.Tensor,
     nominal_action_high: torch.Tensor,
     offset_low: torch.Tensor,
     offset_high: torch.Tensor,
+    execution_action_low: torch.Tensor,
+    execution_action_high: torch.Tensor,
 ) -> dict:
-    """Describe unbounded raw execution and its finite normalization frame."""
+    """Describe finite execution support and nominal joint Q/BC coordinates."""
     joint_names = list(joint_names)
     values = {
         "nominal_action_low": torch.as_tensor(nominal_action_low, dtype=torch.float32)
@@ -472,6 +476,12 @@ def _raw_action_contract_metadata(
         "joint_offset_high": torch.as_tensor(offset_high, dtype=torch.float32)
         .detach()
         .cpu(),
+        "action_low": torch.as_tensor(execution_action_low, dtype=torch.float32)
+        .detach()
+        .cpu(),
+        "action_high": torch.as_tensor(execution_action_high, dtype=torch.float32)
+        .detach()
+        .cpu(),
     }
     expected = (len(joint_names),)
     for name, value in values.items():
@@ -481,8 +491,14 @@ def _raw_action_contract_metadata(
     high = values["nominal_action_high"]
     if not torch.all(high > low):
         raise ValueError("nominal raw-action coordinates must have positive width")
-    center = (low + high) * 0.5
-    scale = (high - low) * 0.5
+    action_low = values["action_low"]
+    action_high = values["action_high"]
+    if not torch.all(action_high > action_low):
+        raise ValueError("execution raw-action support must have positive width")
+    action_center = (action_low + action_high) * 0.5
+    action_scale = (action_high - action_low) * 0.5
+    q_center = (low + high) * 0.5
+    q_scale = (high - low) * 0.5
 
     def fingerprint(payload):
         encoded = json.dumps(
@@ -491,43 +507,46 @@ def _raw_action_contract_metadata(
         return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
     execution_payload = {
-        "semantics": "unbounded_raw_joint_command_no_projection_v1",
+        "semantics": "bounded_raw_joint_command_projection_v1",
         "joint_names": joint_names,
+        "action_low": action_low.tolist(),
+        "action_high": action_high.tolist(),
     }
     q_payload = {
-        "semantics": "jointwise_nominal_center_scale_no_clamp_v1",
+        "semantics": "execution_project_then_jointwise_nominal_center_scale_v1",
         "joint_names": joint_names,
-        "action_center": center.tolist(),
-        "action_scale": scale.tolist(),
-        "clamp": None,
+        "action_center": q_center.tolist(),
+        "action_scale": q_scale.tolist(),
+        "physical_clamp_low": action_low.tolist(),
+        "physical_clamp_high": action_high.tolist(),
     }
     entropy_payload = {
-        "semantics": "jointwise_nominal_raw_action_density_v1",
+        "semantics": "jointwise_nominal_bounded_action_density_v1",
         "joint_names": joint_names,
-        "action_scale": scale.tolist(),
+        "action_scale": q_scale.tolist(),
     }
     payload = {
         "semantics": ACTION_CONTRACT_SEMANTICS,
-        "action_bound_source": None,
+        "action_bound_source": "scalar_finite_action_support",
         "execution_support_semantics": execution_payload["semantics"],
         "execution_support_fingerprint": fingerprint(execution_payload),
         "joint_names": joint_names,
-        "action_low": None,
-        "action_high": None,
-        "action_center": None,
-        "action_scale": None,
+        "action_low": action_low.tolist(),
+        "action_high": action_high.tolist(),
+        "action_center": action_center.tolist(),
+        "action_scale": action_scale.tolist(),
         "q_action_coordinate_source": "soft_joint_limits_at_default_pose",
         "nominal_action_low": low.tolist(),
         "nominal_action_high": high.tolist(),
-        "q_action_center": center.tolist(),
-        "q_action_scale": scale.tolist(),
-        "q_action_clamp": None,
+        "q_action_center": q_center.tolist(),
+        "q_action_scale": q_scale.tolist(),
+        "q_action_clamp": "physical_execution_support_before_affine",
         "q_action_transform_semantics": q_payload["semantics"],
         "q_action_transform_fingerprint": fingerprint(q_payload),
         "bc_action_transform_semantics": q_payload["semantics"],
         "bc_action_transform_fingerprint": fingerprint(q_payload),
         "entropy_reference_source": "nominal_joint_action_coordinates",
-        "entropy_reference_scale": scale.tolist(),
+        "entropy_reference_scale": q_scale.tolist(),
         "entropy_reference_semantics": entropy_payload["semantics"],
         "entropy_reference_fingerprint": fingerprint(entropy_payload),
         "joint_offset_low": values["joint_offset_low"].tolist(),
@@ -538,7 +557,7 @@ def _raw_action_contract_metadata(
 
 
 def _valid_raw_action_rows(actions: torch.Tensor) -> torch.Tensor:
-    """Accept every finite raw action; magnitude is deliberately unbounded."""
+    """Validate raw proposals before projecting them to execution support."""
     if actions.ndim < 1 or actions.shape[-1] < 1:
         raise ValueError("raw actions must contain an action dimension")
     return torch.isfinite(actions).all(dim=-1)
@@ -633,12 +652,14 @@ def _apply_student_collector_noise(
     student_selected_mask: torch.Tensor,
     noise_std: float,
     noise_clip: float,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
     q_action_center: torch.Tensor,
     q_action_scale: torch.Tensor,
     q_action_gain: float,
     generator: torch.Generator | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Add clipped noise in Q coordinates without clipping the raw action."""
+    """Add Q-coordinate noise and keep the executable action inside support."""
     if student_action.shape != teacher_action.shape:
         raise ValueError("Teacher and Student action shapes must match")
     selected = student_selected_mask.reshape(student_action.shape[:-1]).bool()
@@ -661,17 +682,37 @@ def _apply_student_collector_noise(
     scale = torch.as_tensor(
         q_action_scale, device=student_action.device, dtype=student_action.dtype
     )
+    low = torch.as_tensor(
+        action_low, device=student_action.device, dtype=student_action.dtype
+    )
+    high = torch.as_tensor(
+        action_high, device=student_action.device, dtype=student_action.dtype
+    )
     if center.shape != student_action.shape[-1:] or scale.shape != center.shape:
         raise ValueError("Q action transform does not match action dimension")
+    if low.shape != center.shape or high.shape != center.shape:
+        raise ValueError("execution support does not match action dimension")
     if not torch.isfinite(scale).all() or not torch.all(scale > 0):
         raise ValueError("Q action scale must be finite and positive")
+    if (
+        not torch.isfinite(low).all()
+        or not torch.isfinite(high).all()
+        or not torch.all(high > low)
+    ):
+        raise ValueError("execution support must be finite with positive width")
+    bounded_student = torch.maximum(torch.minimum(student_action, high), low)
+    bounded_teacher = torch.maximum(torch.minimum(teacher_action, high), low)
     if noise_std == 0.0 or noise_clip == 0.0 or not selected.any():
-        exploratory_student = student_action.clone()
+        exploratory_student = bounded_student
         issued_action = torch.where(
-            selected.unsqueeze(-1), exploratory_student, teacher_action
+            selected.unsqueeze(-1), exploratory_student, bounded_teacher
         )
         return issued_action, exploratory_student, torch.zeros_like(student_action)
-    q_student = ((student_action - center) / scale) * gain
+    q_student = ((bounded_student - center) / scale) * gain
+    q_low = ((low - center) / scale) * gain
+    q_high = ((high - center) / scale) * gain
+    q_min = torch.minimum(q_low, q_high)
+    q_max = torch.maximum(q_low, q_high)
     sampled = (
         torch.randn(
             q_student.shape,
@@ -683,17 +724,18 @@ def _apply_student_collector_noise(
     )
     sampled = sampled.clamp(-noise_clip, noise_clip)
     sampled = torch.where(selected.unsqueeze(-1), sampled, torch.zeros_like(sampled))
-    noisy_q = q_student + sampled
+    noisy_q = torch.maximum(torch.minimum(q_student + sampled, q_max), q_min)
     exploratory_student = (noisy_q / gain) * scale + center
+    exploratory_student = torch.maximum(torch.minimum(exploratory_student, high), low)
     exploratory_student = torch.where(
-        selected.unsqueeze(-1), exploratory_student, student_action
+        selected.unsqueeze(-1), exploratory_student, bounded_student
     )
     actual_noise = (((exploratory_student - center) / scale) * gain) - q_student
     actual_noise = torch.where(
         selected.unsqueeze(-1), actual_noise, torch.zeros_like(actual_noise)
     )
     issued_action = torch.where(
-        selected.unsqueeze(-1), exploratory_student, teacher_action
+        selected.unsqueeze(-1), exploratory_student, bounded_teacher
     )
     if (
         not torch.isfinite(exploratory_student).all()
@@ -978,6 +1020,9 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     dagger_beta_decay_rollouts: int = 1800
     dagger_beta_zero_iteration: int | None = None
     dagger_seed: int = 0
+    # Explicit finite support for every action consumed by the environment,
+    # replay, BC, and Q. Nominal soft-limit coordinates remain the Q/BC scale.
+    action_support_clip: float = 20.0
     dagger_bc_lr: float = 3e-4
     dagger_actor_huber_delta: float = 1.0
     dagger_buffer_capacity: int = 131_072
@@ -1081,7 +1126,7 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
     def forward(self, td: TensorDict):
         owner = self._owner
         teacher_prefill_active = owner._teacher_prefill_active()
-        raw_student_action = owner._student_mean_action(td)
+        raw_student_action = owner._student_raw_action_proposal(td)
         for scratch_key in (
             "_depth_feature",
             OBJECT_PRED_KEY,
@@ -1104,13 +1149,15 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
         finite_teacher_action = torch.nan_to_num(
             teacher_action, nan=0.0, posinf=0.0, neginf=0.0
         )
+        bounded_teacher_action = owner._project_execution_action(finite_teacher_action)
         student_valid = torch.isfinite(raw_student_action).all(dim=-1)
-        finite_student_action = torch.nan_to_num(
+        finite_student_proposal = torch.nan_to_num(
             raw_student_action, nan=0.0, posinf=0.0, neginf=0.0
         )
+        bounded_student_action = owner._bounded_actor_mean(finite_student_proposal)
         discrepancy_rms, discrepancy_max = _joint_normalized_action_discrepancy(
-            finite_student_action,
-            finite_teacher_action,
+            bounded_student_action,
+            bounded_teacher_action,
             owner._fastsac_q_action_scale,
         )
         discrepancy_rms = torch.where(
@@ -1182,8 +1229,8 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
         choose_teacher = choose_teacher | (valid & ~student_valid)
         issued_action, exploratory_student, collector_noise = (
             _apply_student_collector_noise(
-                finite_student_action,
-                finite_teacher_action,
+                bounded_student_action,
+                bounded_teacher_action,
                 ~choose_teacher,
                 (
                     0.0
@@ -1191,6 +1238,8 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
                     else float(owner.cfg.collector_exploration_noise_std)
                 ),
                 float(owner.cfg.collector_exploration_noise_clip),
+                owner._fastsac_action_low,
+                owner._fastsac_action_high,
                 owner._fastsac_q_action_center,
                 owner._fastsac_q_action_scale,
                 float(owner.cfg.q_action_input_gain),
@@ -1199,7 +1248,7 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
         )
 
         td[ACTION_KEY] = issued_action
-        td[DAGGER_TEACHER_ACTION_KEY] = finite_teacher_action
+        td[DAGGER_TEACHER_ACTION_KEY] = bounded_teacher_action
         td[DAGGER_TEACHER_ACTION_VALID_KEY] = valid
         td[DAGGER_IS_STUDENT_ACTION_KEY] = ~choose_teacher
         td[DAGGER_ACTION_DISCREPANCY_RMS_KEY] = discrepancy_rms
@@ -1210,7 +1259,7 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
         td[DAGGER_SAFE_RELEASE_KEY] = safe_release
         td[DAGGER_BETA_TEACHER_KEY] = beta_teacher
         td[DAGGER_STUDENT_ACTION_VALID_KEY] = student_valid
-        td[TD3_NOISE_FREE_STUDENT_ACTION_KEY] = finite_student_action
+        td[TD3_NOISE_FREE_STUDENT_ACTION_KEY] = bounded_student_action
         td[TD3_EXPLORATORY_STUDENT_ACTION_KEY] = exploratory_student
         td[TD3_COLLECTOR_NOISE_KEY] = collector_noise
         td[TD3_BETA_KEY] = torch.full_like(discrepancy_rms, float(scheduled_beta))
@@ -1259,16 +1308,27 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         nominal_low, nominal_high, offset_low, offset_high = (
             _vaic_nominal_action_coordinates(env, device)
         )
+        _validate_action_safety_clip(
+            nominal_low, nominal_high, float(cfg.action_support_clip)
+        )
+        action_low = torch.full_like(nominal_low, -float(cfg.action_support_clip))
+        action_high = torch.full_like(nominal_high, float(cfg.action_support_clip))
+        self._fastsac_action_low = action_low.detach()
+        self._fastsac_action_high = action_high.detach()
+        self._fastsac_actor_action_center = ((action_low + action_high) * 0.5).detach()
+        self._fastsac_actor_action_scale = ((action_high - action_low) * 0.5).detach()
         self._fastsac_q_action_center = ((nominal_low + nominal_high) * 0.5).detach()
         self._fastsac_q_action_scale = ((nominal_high - nominal_low) * 0.5).detach()
         self._fastsac_joint_offset_low = offset_low.detach()
         self._fastsac_joint_offset_high = offset_high.detach()
-        self._fastsac_action_contract = _raw_action_contract_metadata(
+        self._fastsac_action_contract = _bounded_action_contract_metadata(
             self.joint_names,
             nominal_low,
             nominal_high,
             offset_low,
             offset_high,
+            action_low,
+            action_high,
         )
 
         command_key = (
@@ -1573,6 +1633,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "failure_phase_lookback_steps + 1 interval"
             )
         for name in (
+            "action_support_clip",
             "dagger_bc_lr",
             "dagger_actor_huber_delta",
             "q_lr",
@@ -1851,10 +1912,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._set_perception_trainable(bool(self.cfg.train_perception))
 
     def _q_action_input(self, action: torch.Tensor) -> torch.Tensor:
-        """Normalize unbounded raw joint commands without clamping them."""
-        center = self._fastsac_q_action_center.to(action)
-        scale = self._fastsac_q_action_scale.to(action)
-        normalized = (action - center) / scale
+        """Project to execution support, then normalize in nominal coordinates."""
+        torch._assert_async(
+            torch.isfinite(action).all(), "Q received a non-finite raw joint action"
+        )
+        bounded = self._project_execution_action(action)
+        center = self._fastsac_q_action_center.to(bounded)
+        scale = self._fastsac_q_action_scale.to(bounded)
+        normalized = (bounded - center) / scale
         gain = float(self.cfg.q_action_input_gain)
         transformed = normalized if gain == 1.0 else normalized * gain
         # Avoid a host synchronization in this hot replay path while still
@@ -1868,7 +1933,31 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _q_action_to_physical(self, q_action: torch.Tensor) -> torch.Tensor:
         center = self._fastsac_q_action_center.to(q_action)
         scale = self._fastsac_q_action_scale.to(q_action)
-        return (q_action / float(self.cfg.q_action_input_gain)) * scale + center
+        physical = (q_action / float(self.cfg.q_action_input_gain)) * scale + center
+        return self._project_execution_action(physical)
+
+    def _project_execution_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Apply the one authoritative finite physical-command support."""
+        return _project_to_execution_support(
+            action,
+            self._fastsac_action_low,
+            self._fastsac_action_high,
+            float(self.cfg.action_support_clip),
+        )
+
+    def _q_execution_bounds(
+        self, reference: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        low = self._q_action_input(self._fastsac_action_low.to(reference))
+        high = self._q_action_input(self._fastsac_action_high.to(reference))
+        return torch.minimum(low, high), torch.maximum(low, high)
+
+    def _bounded_actor_mean(self, raw_mean: torch.Tensor) -> torch.Tensor:
+        """Map a PPO-compatible physical proposal smoothly into finite support."""
+        center = self._fastsac_actor_action_center.to(raw_mean)
+        scale = self._fastsac_actor_action_scale.to(raw_mean)
+        bounded = center + scale * torch.tanh((raw_mean - center) / scale)
+        return self._project_execution_action(bounded)
 
     def _actor_dist_from_flat_module(self, module: nn.Module, actor_obs: torch.Tensor):
         vel_dim = int(self.observation_spec[VEL_CMD_KEY].shape[-1])
@@ -1885,12 +1974,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         return module.get_dist(td)
 
     @torch.no_grad()
-    def _student_mean_action(self, td: TensorDict) -> torch.Tensor:
-        """Return the PPOVEL-compatible unbounded raw Student mean."""
-        # The inherited helper is named for the old PPO-BC tanh backend, but
-        # actor_adapt itself is an ordinary PPOVEL raw-action head. This class
-        # deliberately performs no source-head migration or nonlinear map.
+    def _student_raw_action_proposal(self, td: TensorDict) -> torch.Tensor:
+        """Return the unchanged PPOVEL physical-command head proposal."""
         return PPOBCDaggerFinetune._student_latent(self, td)
+
+    @torch.no_grad()
+    def _student_mean_action(self, td: TensorDict) -> torch.Tensor:
+        """Return the deterministic Student action inside execution support."""
+        raw_mean = self._student_raw_action_proposal(td)
+        if not torch.isfinite(raw_mean).all():
+            raise RuntimeError("TD3 evaluation Actor produced non-finite raw actions")
+        return self._bounded_actor_mean(raw_mean)
 
     def _actor_dist_from_flat(self, actor_obs: torch.Tensor):
         return self._actor_dist_from_flat_module(self.actor_adapt, actor_obs)
@@ -3058,9 +3152,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _smoothed_target_q_action(
         self, next_actor_observations: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        next_action = self._actor_target_dist_from_flat(next_actor_observations).mean
-        if not torch.isfinite(next_action).all():
+        raw_next_mean = self._actor_target_dist_from_flat(next_actor_observations).mean
+        if not torch.isfinite(raw_next_mean).all():
             raise RuntimeError("TD3 target Actor produced non-finite raw actions")
+        next_action = self._bounded_actor_mean(raw_next_mean)
         next_q = self._q_action_input(next_action)
         std = float(self.cfg.target_policy_noise_std)
         clip = float(self.cfg.target_policy_noise_clip)
@@ -3077,9 +3172,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 * std
             )
             sampled_noise.clamp_(-clip, clip)
-        # TD3 clips the *noise*, not the resulting raw command. The Q transform
-        # is affine and intentionally has no action-support clamp.
-        smoothed_q = next_q + sampled_noise
+        q_low, q_high = self._q_execution_bounds(next_q)
+        smoothed_q = torch.maximum(torch.minimum(next_q + sampled_noise, q_high), q_low)
+        # Round-trip through the physical support so target Q receives exactly
+        # the same finite action variable used by behavior and replay.
+        smoothed_q = self._q_action_input(self._q_action_to_physical(smoothed_q))
         applied_noise = smoothed_q - next_q
         return smoothed_q, applied_noise, next_action
 
@@ -3173,9 +3270,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     def _actor_update(self, batch: dict[str, torch.Tensor]):
         """Apply one backward/step to the weighted TD3 plus exact BC loss."""
-        prediction_action = self._actor_dist_from_flat(batch["observations"]).mean
-        if not torch.isfinite(prediction_action).all():
+        raw_prediction = self._actor_dist_from_flat(batch["observations"]).mean
+        if not torch.isfinite(raw_prediction).all():
             raise RuntimeError("TD3 Actor produced non-finite raw actions")
+        prediction_action = self._bounded_actor_mean(raw_prediction)
         q_action = self._q_action_input(prediction_action)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
@@ -3266,6 +3364,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_action_center": self._fastsac_q_action_center.detach().cpu().tolist(),
             "q_action_scale": self._fastsac_q_action_scale.detach().cpu().tolist(),
             "q_action_joint_names": list(self.joint_names),
+            "action_support_low": self._fastsac_action_low.detach().cpu().tolist(),
+            "action_support_high": self._fastsac_action_high.detach().cpu().tolist(),
+            "q_action_support_projection": "physical_before_affine",
             "q_action_transform_fingerprint": self._fastsac_action_contract[
                 "q_action_transform_fingerprint"
             ],
@@ -3304,6 +3405,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "dagger_beta_end",
             "dagger_beta_decay_rollouts",
             "dagger_seed",
+            "action_support_clip",
             "dagger_bc_lr",
             "dagger_actor_huber_delta",
             "dagger_buffer_capacity",
@@ -3355,7 +3457,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         return {
             **{name: getattr(self.cfg, name) for name in names},
             "method": TRAINING_ALGORITHM,
-            "actor_output": "direct_unbounded_raw_joint_command",
+            "actor_output": "ppo_physical_proposal_tanh_bounded_raw_joint_command",
             "bc_loss": "joint_normalized_raw_mean_teacher_smooth_l1",
         }
 
@@ -4714,8 +4816,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 )
             hard_copy_(self.qnet, self.qnet_target)
             self.qnet_target.requires_grad_(False).eval()
-            # The exact copy is intentionally created only after the raw PPO
-            # Actor head has loaded without any tanh-latent migration.
+            # The PPO physical-command head stays unchanged. Finite support is
+            # supplied by the differentiable runtime wrapper, not weight migration.
             self.actor_target = copy.deepcopy(self.actor_adapt).requires_grad_(False)
             self.actor_target.eval()
             self.actor_update_count = 0
