@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import hydra
 import numpy as np
+import copy
 import random
 import time
 import wandb
@@ -12,6 +13,8 @@ import stat
 import tempfile
 import datetime
 
+from collections.abc import Mapping
+from dataclasses import fields
 from typing import Sequence, List, Tuple, TYPE_CHECKING
 from tensordict import TensorDictBase, TensorDict
 from tensordict.nn import TensorDictModuleBase as ModBase
@@ -20,7 +23,7 @@ from torchrl.envs.transforms import VecNorm
 from termcolor import colored
 from collections import OrderedDict
 import imageio
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import OmegaConf, DictConfig, open_dict
 import active_adaptation.learning
 from active_adaptation.utils.wandb import parse_checkpoint_path
 import active_adaptation
@@ -435,8 +438,124 @@ def _apply_direct_sac_dagger_q_transfer(algo_cfg, source_q_backend):
         algo_cfg[destination] = value
 
 
-def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
+def _load_policy_checkpoint(
+    policy: ModBase,
+    policy_state: dict,
+    *,
+    inference_only: bool,
+):
+    """Load a policy checkpoint without conflating evaluation with resume.
+
+    Distributional TD3/FastSAC DAgger checkpoints intentionally reject
+    same-stage ``load_state_dict`` because their replay rings are not
+    serialized.  During evaluation no replay or optimizer state is needed, so
+    those policies expose a separate, guarded model-only loader.  Other
+    checkpoints continue to use their existing compatibility loader.
+    """
+    algorithm = policy_state.get("training_algorithm")
+    replayless_inference_algorithms = {
+        "distributional_td3_teacher_bc_v1",
+        "distributional_fastsac_teacher_bc_v1",
+    }
+    if inference_only and algorithm in replayless_inference_algorithms:
+        loader = getattr(policy, "load_inference_state_dict", None)
+        if not callable(loader):
+            raise ValueError(
+                "The checkpoint is algorithm-specific "
+                f"({algorithm!r}), but the selected policy does not support "
+                "inference-only reload. Select the matching algo config for "
+                "this checkpoint."
+            )
+        print(colored(
+            "[Info]: Load policy model state for inference only "
+            "(optimizer, replay, RNG, and training counters are ignored).",
+            "green",
+        ))
+        return loader(policy_state, strict=True)
+    return policy.load_state_dict(policy_state)
+
+
+def _fill_replayless_inference_algo_defaults(
+    cfg: DictConfig,
+    policy_state: Mapping,
+    *,
+    inference_only: bool,
+) -> dict[str, tuple[str, ...]]:
+    """Complete legacy TD3/FastSAC configs only for model-only evaluation.
+
+    Older checkpoints predate fields that their current policy dataclasses
+    require during construction.  Preserve the loaded Hydra config exactly
+    where it has a value, then source any missing current field from the
+    checkpoint's own backend contract before falling back to today's default.
+    Training never enters this migration path.
+    """
+    empty = {"checkpoint": (), "defaults": ()}
+    if not inference_only or not isinstance(policy_state, Mapping):
+        return empty
+
+    algorithm = policy_state.get("training_algorithm")
+    if algorithm == "distributional_td3_teacher_bc_v1":
+        from active_adaptation.learning.ppo.td3_bc_dagger import (
+            DistributionalTD3TeacherBCConfig,
+        )
+
+        default_config = DistributionalTD3TeacherBCConfig()
+    elif algorithm == "distributional_fastsac_teacher_bc_v1":
+        from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+            DistributionalFastSACTeacherBCConfig,
+        )
+
+        default_config = DistributionalFastSACTeacherBCConfig()
+    else:
+        return empty
+
+    if "algo" not in cfg or cfg.algo is None:
+        raise ValueError(
+            "inference-only TD3/FastSAC checkpoint reload requires cfg.algo"
+        )
+    current_fields = {
+        field.name: copy.deepcopy(getattr(default_config, field.name))
+        for field in fields(default_config)
+    }
+    backend = policy_state.get("dagger_backend_config")
+    if not isinstance(backend, Mapping):
+        backend = {}
+
+    filled_checkpoint = []
+    filled_defaults = []
+    with open_dict(cfg.algo):
+        for name in current_fields:
+            if name not in cfg.algo and name in backend:
+                cfg.algo[name] = copy.deepcopy(backend[name])
+                filled_checkpoint.append(name)
+        for name, value in current_fields.items():
+            if name not in cfg.algo:
+                cfg.algo[name] = value
+                filled_defaults.append(name)
+
+    result = {
+        "checkpoint": tuple(filled_checkpoint),
+        "defaults": tuple(filled_defaults),
+    }
+    if filled_checkpoint or filled_defaults:
+        print(colored(
+            "[Info]: Completed legacy inference algo config without "
+            "overwriting existing values: "
+            f"checkpoint={len(filled_checkpoint)}, "
+            f"current_defaults={len(filled_defaults)}.",
+            "green",
+        ))
+    return result
+
+
+def make_env_policy(
+    cfg: DictConfig,
+    configure_replay: bool = False,
+    *,
+    inference_only: bool = False,
+):
     OmegaConf.set_struct(cfg, False)
+    cfg._bc_dagger_inference_only = bool(inference_only)
 
     if configure_replay:
         apply_teacher_replay_buffer_path_alias(cfg)
@@ -513,6 +632,12 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
         state_dict = torch.load(checkpoint_path, weights_only=False)
     else:
         state_dict = {}
+
+    _fill_replayless_inference_algo_defaults(
+        cfg,
+        state_dict.get("policy", {}),
+        inference_only=inference_only,
+    )
 
     # Stage-2 can now warm-start directly from the dedicated PPO-BC DAgger
     # checkpoint. Resolve this before constructing transforms/policy because
@@ -972,7 +1097,11 @@ def make_env_policy(cfg: DictConfig, configure_replay: bool=False):
     
     if "policy" in state_dict.keys():
         print(colored("[Info]: Load policy from checkpoint.", "green"))
-        policy.load_state_dict(state_dict["policy"])
+        _load_policy_checkpoint(
+            policy,
+            state_dict["policy"],
+            inference_only=inference_only,
+        )
 
     if (
         configure_replay

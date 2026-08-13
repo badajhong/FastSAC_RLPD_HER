@@ -33,7 +33,7 @@ def main(cfg):
     # print("isaac dir:", ISAAC_NUCLEUS_DIR)
     # breakpoint()
 
-    env, agent, vecnorm = make_env_policy(cfg)
+    env, agent, vecnorm = make_env_policy(cfg, inference_only=True)
     
     policy_eval = agent.get_rollout_policy("eval")
     evaluate(env, policy_eval, render=cfg.eval_render, render_mode=cfg.render_mode, seed=cfg.seed)

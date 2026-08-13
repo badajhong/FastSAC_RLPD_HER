@@ -22,6 +22,7 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_TEACHER_ACTION_VALID_KEY,
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
+    PRETRAINED_PERCEPTION_MODULES,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
     TD3_NOISE_FREE_STUDENT_ACTION_KEY,
@@ -295,6 +296,7 @@ def test_raw_replay_and_teacher_prefill_implementation_is_inherited_unchanged():
         "_prefetch_curriculum_sample_plans",
         "_load_pretrained_perception_checkpoint",
         "_set_perception_trainable",
+        "_run_teacher_perception_warmup",
         "train_adapt",
         "_student_latent",
     )
@@ -711,6 +713,54 @@ def test_temperature_update_has_the_standard_entropy_dual_sign(log_prob, directi
     assert metrics["alpha"].item() == pytest.approx(policy.log_alpha.exp().item())
 
 
+def test_critic_temperature_population_excludes_true_terminals_but_keeps_timeouts():
+    """Alpha learns only from next states for which the target can bootstrap."""
+    policy = _bare_policy(
+        sac_use_autotune=True,
+        sac_max_grad_norm=1.0e6,
+        sac_tau=0.0,
+        q_action_input_gain=1.0,
+    )
+    _install_unit_action_contract(policy)
+    policy.qnet = _ActionSensitiveTwinC51()
+    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.01)
+    policy.log_alpha = nn.Parameter(torch.tensor(0.0))
+    policy.alpha_optimizer = _CountingSGD([policy.log_alpha], lr=0.1)
+    policy.target_entropy = -1.0
+    policy.critic_update_count = 0
+    policy.alpha_update_count = 0
+    policy.sac_alpha_update_count = 0
+
+    target = torch.full((3, 3), 1.0 / 3.0)
+    # The physical terminal has an extreme opposite-sign log probability.  It
+    # would reverse the update if it leaked into the alpha population.
+    target_log_prob = torch.tensor([2.0, -100.0, 2.0])
+    policy._distributional_fastsac_target = MethodType(
+        lambda owner, batch: (target, {}, target_log_prob), policy
+    )
+    before = policy.log_alpha.detach().clone()
+    batch = {
+        "critic_observations": torch.zeros(3, 1),
+        "actions": torch.zeros(3, 1),
+        "dones": torch.tensor([False, True, True]),
+        # Row 2 is a time-limit truncation and therefore has a valid next state.
+        "truncations": torch.tensor([False, False, True]),
+    }
+
+    policy._critic_update(batch)
+
+    assert policy.log_alpha.item() > before.item()
+    assert policy.alpha_update_count == 1
+
+    after_valid_population = policy.log_alpha.detach().clone()
+    batch["dones"] = torch.ones(3, dtype=torch.bool)
+    batch["truncations"] = torch.zeros(3, dtype=torch.bool)
+    policy._critic_update(batch)
+    assert torch.equal(policy.log_alpha, after_valid_population)
+    assert policy.alpha_update_count == 1
+
+
 def test_fixed_temperature_skips_optimizer_but_remains_in_soft_target():
     policy = _bare_policy(sac_use_autotune=False)
     policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.25)))
@@ -758,6 +808,10 @@ def _checkpoint_policy(seed: int):
     policy.teacher_perception_rng = torch.Generator().manual_seed(seed + 5)
     policy.actor_target = None
     policy._last_fastsac_diagnostics = {}
+    policy._fastsac_action_contract = {
+        "joint_names": ["unit_joint"],
+        "execution_support_fingerprint": "sha256:unit-test",
+    }
     return policy
 
 
@@ -847,3 +901,121 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
             torch.rand(8, generator=source_generator),
             torch.rand(8, generator=restored_generator),
         )
+
+
+def _install_tiny_fastsac_inference_perception_stack(policy, seed: int) -> None:
+    with torch.random.fork_rng():
+        torch.manual_seed(seed)
+        for name in PRETRAINED_PERCEPTION_MODULES:
+            setattr(policy, name, nn.Linear(2, 2))
+
+
+def test_fastsac_inference_loader_restores_models_without_training_state():
+    source = _checkpoint_policy(1300)
+    _install_tiny_fastsac_inference_perception_stack(source, 1301)
+    _optimizer_step(
+        tuple(source.actor_adapt.parameters())
+        + tuple(source.bc_dagger_sac_adapter.parameters()),
+        source.actor_optimizer,
+    )
+    _optimizer_step(source.qnet.parameters(), source.critic_optimizer)
+    _optimizer_step((source.log_alpha,), source.alpha_optimizer)
+    _optimizer_step(source.adapt_probe.parameters(), source.opt_adapt)
+    source.actor_update_count = 17
+    source.critic_update_count = 19
+    source.alpha_update_count = 23
+    source.dagger_rollout_count = 29
+    source.dagger_environment_steps = 31
+    source.teacher_prefill_rollout_count = 37
+    source.teacher_prefill_environment_steps = 41
+    for generator in (
+        source.dagger_rng,
+        source.q_rng,
+        source.sac_action_rng,
+        source.sac_rollout_rng,
+        source.teacher_perception_rng,
+    ):
+        torch.rand(7, generator=generator)
+
+    state = {
+        name: copy.deepcopy(module.state_dict())
+        for name, module in source.named_children()
+    }
+    state.update(copy.deepcopy(source._fastsac_checkpoint_state()))
+    state.update(
+        {
+            "last_phase": "finetune",
+            "last_iter": 79,
+            "action_contract": copy.deepcopy(source._fastsac_action_contract),
+            "perception_initialization": {"loaded": True, "mode": "test"},
+        }
+    )
+
+    restored = _checkpoint_policy(2300)
+    _install_tiny_fastsac_inference_perception_stack(restored, 2301)
+    restored._freeze_legacy_actor_std = lambda: None
+    progress = []
+    restored.env = SimpleNamespace(set_progress=progress.append)
+    restored.actor_update_count = 101
+    restored.critic_update_count = 103
+    restored.alpha_update_count = 107
+    restored.dagger_rollout_count = 109
+    restored.dagger_environment_steps = 113
+    restored.teacher_prefill_rollout_count = 127
+    restored.teacher_prefill_environment_steps = 131
+    optimizer_before = {
+        name: copy.deepcopy(getattr(restored, name).state_dict())
+        for name in (
+            "actor_optimizer",
+            "critic_optimizer",
+            "alpha_optimizer",
+            "opt_adapt",
+        )
+    }
+    rng_before = {
+        name: getattr(restored, name).get_state().clone()
+        for name in (
+            "dagger_rng",
+            "q_rng",
+            "sac_action_rng",
+            "sac_rollout_rng",
+            "teacher_perception_rng",
+        )
+    }
+
+    failed = restored.load_inference_state_dict(state)
+
+    assert failed == []
+    for name in (
+        "actor_adapt",
+        "bc_dagger_sac_adapter",
+        "qnet",
+        "qnet_target",
+        *PRETRAINED_PERCEPTION_MODULES,
+    ):
+        _assert_nested_equal(
+            getattr(restored, name).state_dict(),
+            getattr(source, name).state_dict(),
+        )
+        assert not any(parameter.requires_grad for parameter in getattr(restored, name).parameters())
+    assert torch.equal(restored.log_alpha, source.log_alpha)
+    assert progress == [79]
+    assert (
+        restored.actor_update_count,
+        restored.critic_update_count,
+        restored.alpha_update_count,
+        restored.dagger_rollout_count,
+        restored.dagger_environment_steps,
+        restored.teacher_prefill_rollout_count,
+        restored.teacher_prefill_environment_steps,
+    ) == (101, 103, 107, 109, 113, 127, 131)
+    for name, expected in optimizer_before.items():
+        _assert_nested_equal(getattr(restored, name).state_dict(), expected)
+    for name, expected in rng_before.items():
+        assert torch.equal(getattr(restored, name).get_state(), expected)
+    assert restored.actor_target is None
+    assert restored._teacher_prefill_complete is True
+    assert restored._teacher_perception_warmup_complete is True
+
+    with pytest.raises(ValueError, match="same-stage resume"):
+        restored.load_state_dict(state)

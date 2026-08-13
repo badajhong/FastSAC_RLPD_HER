@@ -12,6 +12,7 @@ from scripts.train import (
     _bc_dagger_checkpoint_index,
     _bc_dagger_main_budget_complete,
     _bc_dagger_progress_state,
+    _reset_after_teacher_prefill,
     run_training as shared_run_training,
 )
 
@@ -72,6 +73,7 @@ def _cfg(
                 "perception_replay_burn_in": 8,
                 "perception_encode_microbatch_size": 128,
                 "teacher_perception_batch_size": 128,
+                "teacher_perception_warmup_steps": 128,
                 "perception_depth_codec": "uint8_div_100_v1",
                 "load_pretrained_perception": False,
                 "perception_checkpoint_path": None,
@@ -227,6 +229,7 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.algo.perception_replay_burn_in == 8
     assert cfg.algo.perception_encode_microbatch_size == 128
     assert cfg.algo.teacher_perception_batch_size == 128
+    assert cfg.algo.teacher_perception_warmup_steps == 128
     assert cfg.algo.perception_depth_codec == "uint8_div_100_v1"
     assert cfg.algo.load_pretrained_perception is False
     assert cfg.algo.perception_checkpoint_path is None
@@ -603,6 +606,7 @@ def test_config_rejects_forbidden_stochastic_policy_fields(field):
         ("perception_replay_burn_in", 7, "burn_in=8"),
         ("perception_encode_microbatch_size", 0, "positive"),
         ("teacher_perception_batch_size", 0, "positive"),
+        ("teacher_perception_warmup_steps", -1, "non-negative"),
         ("perception_depth_codec", "float16", "uint8_div_100_v1"),
         ("teacher_prefill_max_rollouts", -1, "positive"),
         ("failure_phase_lookback_steps", 0, "positive"),
@@ -642,6 +646,13 @@ def test_both_actor_objective_weights_cannot_be_zero():
     cfg.algo.lambda_bc = 0.0
     with pytest.raises(ValueError, match="cannot both be zero"):
         td3_entry.validate_td3_bc_dagger_config(cfg)
+
+
+def test_teacher_perception_warmup_can_be_disabled():
+    cfg = _cfg()
+    cfg.algo.teacher_perception_warmup_steps = 0
+
+    td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
 def test_teacher_q_ring_must_cover_learning_start_threshold():
@@ -785,6 +796,106 @@ def test_entrypoint_reuses_shared_training_engine(monkeypatch):
     assert result == "shared-result"
     assert sources == [cfg]
     assert received == [cfg]
+
+
+@pytest.mark.parametrize(
+    ("distributed", "world_size"),
+    ((True, 1), (False, 2)),
+)
+def test_td3_entrypoint_rejects_distributed_before_source_or_training(
+    monkeypatch, distributed, world_size
+):
+    cfg = _cfg()
+    source_calls = []
+    training_calls = []
+    monkeypatch.setattr(td3_entry.aa, "is_distributed", lambda: distributed)
+    monkeypatch.setattr(td3_entry.aa, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(
+        td3_entry,
+        "prepare_fresh_td3_bc_dagger_source",
+        lambda actual: source_calls.append(actual),
+    )
+    monkeypatch.setattr(
+        td3_entry,
+        "run_training",
+        lambda actual: training_calls.append(actual),
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one training process"):
+        td3_entry.main.__wrapped__(cfg)
+
+    assert source_calls == []
+    assert training_calls == []
+
+
+def test_prefill_boundary_resets_episodes_and_all_environment_emas():
+    class EpisodeAccumulator:
+        def __init__(self):
+            self.episodes = 3
+            self.pop_calls = 0
+
+        def __len__(self):
+            return self.episodes
+
+        def pop(self):
+            self.pop_calls += 1
+            self.episodes = 0
+
+    class PhysicalEnv:
+        def __init__(self):
+            self._stats_ema = {
+                "reward": {"term": (torch.tensor(11.0), torch.tensor(3.0))}
+            }
+            self._perf_ema_reward = {
+                "reward": {"term": (torch.tensor(7.0), torch.tensor(2.0))}
+            }
+            self._perf_ema_update = {
+                "update": (torch.tensor(5.0), torch.tensor(1.0))
+            }
+            for field in train_module._ENV_EMA_SCALAR_FIELDS:
+                setattr(self, field, 9.0)
+            self.reset_calls = 0
+
+        def reset(self):
+            self.reset_calls += 1
+            # A real reset updates reset/observation timing.  The helper must
+            # clear even work performed by this boundary reset.
+            self._stats_ema["reward"]["term"][0].add_(100.0)
+            self.reset_time += 100.0
+            return "fresh-main-carry"
+
+    class Wrapper:
+        def __init__(self, base_env):
+            self.base_env = base_env
+
+        def reset(self):
+            return self.base_env.reset()
+
+    physical = PhysicalEnv()
+    env = Wrapper(Wrapper(physical))
+    episodes = EpisodeAccumulator()
+
+    carry = _reset_after_teacher_prefill(env, episodes)
+
+    assert carry == "fresh-main-carry"
+    assert physical.reset_calls == 1
+    assert episodes.pop_calls == 1
+    assert episodes.episodes == 0
+    for accumulator_tree in (
+        physical._stats_ema,
+        physical._perf_ema_reward,
+        physical._perf_ema_update,
+    ):
+        tensors = []
+        for group in accumulator_tree.values():
+            values = group.values() if isinstance(group, dict) else (group,)
+            for pair in values:
+                tensors.extend(pair)
+        assert all(value.item() == 0.0 for value in tensors)
+    assert all(
+        getattr(physical, field) == 0.0
+        for field in train_module._ENV_EMA_SCALAR_FIELDS
+    )
 
 
 def test_dynamic_prefill_checkpoint_index_uses_only_completed_main_rollouts():

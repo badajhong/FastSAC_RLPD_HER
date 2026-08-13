@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -68,7 +69,9 @@ from .ppo_vel import (
 )
 from .td3_bc_dagger import (
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
+    PERCEPTION_PREFILL_WARMUP_SEMANTICS,
     PERCEPTION_REPLAY_SEMANTICS,
+    TEACHER_PREFILL_SEMANTICS,
     TD3_BETA_KEY,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
@@ -589,7 +592,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
 
     def _alpha_update(self, log_prob: torch.Tensor) -> dict[str, torch.Tensor]:
         zero = log_prob.new_zeros(())
-        if not bool(self.cfg.sac_use_autotune):
+        if log_prob.numel() == 0 or not bool(self.cfg.sac_use_autotune):
             return {
                 "alpha_loss": zero,
                 "alpha_grad_norm": zero,
@@ -637,7 +640,20 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.critic_optimizer.step()
         self.critic_update_count += 1
 
-        alpha_metrics = self._alpha_update(target_log_prob)
+        # The sampled next action has no learning meaning after a true
+        # environment terminal.  Time-limit truncations do retain their real
+        # next state and therefore stay in the temperature population, exactly
+        # matching the soft Bellman bootstrap truth table above.
+        alpha_bootstrap = (
+            batch["truncations"].bool() | ~batch["dones"].bool()
+        ).reshape(-1)
+        alpha_log_prob = target_log_prob.reshape(-1)
+        if alpha_bootstrap.numel() != alpha_log_prob.numel():
+            raise ValueError(
+                "FastSAC alpha bootstrap mask and target log-probability "
+                "population are misaligned"
+            )
+        alpha_metrics = self._alpha_update(alpha_log_prob[alpha_bootstrap])
         _polyak_update_(self.qnet_target, self.qnet, float(self.cfg.sac_tau))
         self.qnet_target.requires_grad_(False).eval()
         with torch.no_grad():
@@ -922,6 +938,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "teacher_prefill_environment_steps": int(
                 self.teacher_prefill_environment_steps
             ),
+            "teacher_perception_warmup_complete": bool(
+                getattr(self, "_teacher_perception_warmup_complete", False)
+            ),
+            "teacher_perception_warmup_updates": int(
+                getattr(self, "_teacher_perception_warmup_updates", 0)
+            ),
             "dagger_rng_state": self.dagger_rng.get_state(),
             "q_rng_state": self.q_rng.get_state(),
             "sac_action_rng_state": self.sac_action_rng.get_state(),
@@ -975,6 +997,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "teacher_prefill_environment_steps",
         ):
             setattr(self, name, int(state[name]))
+        self._teacher_perception_warmup_complete = bool(
+            state.get("teacher_perception_warmup_complete", False)
+        )
+        self._teacher_perception_warmup_updates = int(
+            state.get("teacher_perception_warmup_updates", 0)
+        )
         self.dagger_rng.set_state(state["dagger_rng_state"])
         self.q_rng.set_state(state["q_rng_state"])
         self.sac_action_rng.set_state(state["sac_action_rng_state"])
@@ -984,6 +1012,81 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             state.get("last_fastsac_diagnostics", {})
         )
         self.qnet_target.requires_grad_(False).eval()
+
+    def load_inference_state_dict(self, state_dict, strict=True):
+        """Restore FastSAC model tensors without attempting replay resume."""
+        if state_dict.get("training_algorithm") != TRAINING_ALGORITHM:
+            raise ValueError("not a distributional FastSAC Teacher-BC checkpoint")
+        if int(state_dict.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
+            raise ValueError("distributional FastSAC checkpoint version mismatch")
+        if state_dict.get("actor_backend") != ACTOR_BACKEND:
+            raise ValueError("distributional FastSAC actor backend mismatch")
+        saved_action_contract = state_dict.get("action_contract")
+        if not isinstance(saved_action_contract, Mapping):
+            raise ValueError("FastSAC inference checkpoint lacks its action contract")
+        for key in ("joint_names", "execution_support_fingerprint"):
+            if saved_action_contract.get(key) != self._fastsac_action_contract.get(key):
+                raise ValueError(
+                    "FastSAC inference checkpoint action contract mismatch at "
+                    f"{key!r}"
+                )
+
+        failed = PPOVEL.load_state_dict(self, state_dict, strict)
+        critical = {
+            "actor_adapt",
+            "bc_dagger_sac_adapter",
+            "qnet",
+            "qnet_target",
+            "temporal_depth_gru_ema",
+            "object_adapt_ema",
+            "adapt_ema",
+        }
+        missing = critical.intersection(failed)
+        if missing:
+            raise RuntimeError(
+                "FastSAC inference checkpoint failed to restore critical modules: "
+                f"{sorted(missing)}"
+            )
+        for name in (
+            "actor_adapt",
+            "bc_dagger_sac_adapter",
+            "qnet",
+            "qnet_target",
+        ):
+            source = state_dict.get(name)
+            if not isinstance(source, Mapping):
+                raise ValueError(
+                    f"FastSAC inference checkpoint lacks module mapping {name!r}"
+                )
+            getattr(self, name).load_state_dict(source, strict=True)
+        log_alpha = state_dict.get("log_alpha")
+        if not torch.is_tensor(log_alpha) or log_alpha.numel() != 1:
+            raise ValueError("FastSAC inference checkpoint lacks scalar log_alpha")
+        self.log_alpha.data.copy_(log_alpha.to(self.log_alpha))
+
+        initialization = state_dict.get("perception_initialization")
+        if isinstance(initialization, Mapping):
+            self._perception_initialization = copy.deepcopy(dict(initialization))
+        self.actor_target = None
+        self._teacher_prefill_complete = True
+        self._teacher_perception_warmup_complete = True
+        self._freeze_teacher()
+        self.actor_adapt.requires_grad_(False).eval()
+        self.bc_dagger_sac_adapter.requires_grad_(False).eval()
+        self.qnet.requires_grad_(False).eval()
+        self.qnet_target.requires_grad_(False).eval()
+        for name in (
+            "depth_cnn",
+            "temporal_depth_gru",
+            "temporal_depth_gru_ema",
+            "object_adapt",
+            "object_adapt_ema",
+            "adapt_module",
+            "adapt_ema",
+        ):
+            getattr(self, name).requires_grad_(False).eval()
+        self._freeze_legacy_actor_std()
+        return failed
 
     def state_dict(self):
         state = PPOVEL.state_dict(self)
@@ -997,6 +1100,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "fresh_only_online_raw_perception_rings_not_serialized_v1"
                 ),
                 "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
+                "perception_prefill_warmup_semantics": (
+                    PERCEPTION_PREFILL_WARMUP_SEMANTICS
+                ),
+                "teacher_prefill_semantics": TEACHER_PREFILL_SEMANTICS,
                 "perception_initialization": copy.deepcopy(
                     self._perception_initialization
                 ),

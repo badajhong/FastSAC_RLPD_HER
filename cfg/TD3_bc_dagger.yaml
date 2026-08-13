@@ -50,7 +50,9 @@ algo:
   # collecting successful Teacher episodes until q_teacher_buffer_capacity is
   # full. This value is only a fail-fast safety ceiling for persistently bad
   # Teacher collection; it is not the normal prefill duration.
-  # Prefill runs no Actor/Critic/perception update and never enters main replay.
+  # Collection runs no optimizer and never enters main replay. Exactly once at
+  # capacity, perception is warmed from frozen Teacher replay before Student
+  # control; Actor/Critic updates still wait for main Student transitions.
   # Once full, this Teacher Q ring is frozen: main DAgger still computes Teacher
   # labels for BC, but does not copy more rows into the Teacher Q ring.
   # Rows are committed episode-wise only after command completion; physical
@@ -83,6 +85,9 @@ algo:
   perception_replay_burn_in: 8
   perception_encode_microbatch_size: 128
   teacher_perception_batch_size: 128
+  # One-shot Teacher-only perception updates at the prefill/main boundary.
+  # Set 0 to disable. Online weights are hard-synchronized to EMA afterward.
+  teacher_perception_warmup_steps: 128
   perception_depth_codec: uint8_div_100_v1
   # Optional perception warm start.  A Student checkpoint must contain the
   # complete online + EMA depth/object/adaptation stack.  Alternatively this

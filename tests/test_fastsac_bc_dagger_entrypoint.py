@@ -56,6 +56,7 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "perception_replay_burn_in": 8,
                 "perception_encode_microbatch_size": 128,
                 "teacher_perception_batch_size": 128,
+                "teacher_perception_warmup_steps": 128,
                 "perception_depth_codec": "uint8_div_100_v1",
                 "load_pretrained_perception": False,
                 "perception_checkpoint_path": None,
@@ -184,6 +185,7 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
         1.0 - cfg.algo.failure_phase_teacher_fraction
     ) == pytest.approx(0.35)
     assert cfg.algo.teacher_perception_batch_size == 128
+    assert cfg.algo.teacher_perception_warmup_steps == 128
     assert cfg.algo.load_pretrained_perception is False
     assert cfg.algo.perception_checkpoint_path is None
     assert cfg.algo.train_perception is True
@@ -450,6 +452,7 @@ def test_inherited_td3_noise_must_remain_zero(field):
         ("sac_policy_frequency", 0, "positive"),
         ("sac_learning_starts", 0, "positive"),
         ("sac_tau", 0.0, "sac_tau"),
+        ("teacher_perception_warmup_steps", -1, "non-negative"),
         ("failure_phase_lookback_steps", 0, "positive"),
         ("failure_phase_samples_per_failure", 0, "positive"),
         ("failure_phase_num_bins", 0, "positive"),
@@ -472,6 +475,13 @@ def test_sac_and_bc_weights_cannot_both_be_zero():
     cfg.algo.lambda_bc = 0.0
     with pytest.raises(ValueError, match="cannot both be zero"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_teacher_perception_warmup_can_be_disabled():
+    cfg = _cfg()
+    cfg.algo.teacher_perception_warmup_steps = 0
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
 def test_inherited_aliases_cannot_disagree_with_sac_controls():
@@ -550,3 +560,33 @@ def test_entrypoint_reuses_shared_training_engine(monkeypatch):
     assert result == "shared-result"
     assert sources == [cfg]
     assert received == [cfg]
+
+
+@pytest.mark.parametrize(
+    ("distributed", "world_size"),
+    ((True, 1), (False, 2)),
+)
+def test_fastsac_entrypoint_rejects_distributed_before_source_or_training(
+    monkeypatch, distributed, world_size
+):
+    cfg = _cfg()
+    source_calls = []
+    training_calls = []
+    monkeypatch.setattr(sac_entry.aa, "is_distributed", lambda: distributed)
+    monkeypatch.setattr(sac_entry.aa, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(
+        sac_entry,
+        "prepare_fresh_fastsac_bc_dagger_source",
+        lambda actual: source_calls.append(actual),
+    )
+    monkeypatch.setattr(
+        sac_entry,
+        "run_training",
+        lambda actual: training_calls.append(actual),
+    )
+
+    with pytest.raises(RuntimeError, match="exactly one training process"):
+        sac_entry.main.__wrapped__(cfg)
+
+    assert source_calls == []
+    assert training_calls == []

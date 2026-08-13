@@ -29,7 +29,10 @@ def main(cfg: DictConfig):
     app_launcher = AppLauncher(OmegaConf.to_container(cfg.app))
     simulation_app = app_launcher.app
 
-    env, agent, vecnorm = make_env_policy(cfg)
+    # Evaluation restores model tensors only.  TD3/FastSAC online replay is
+    # deliberately not checkpointed, so this must not request a training
+    # resume or optimizer/RNG restoration.
+    env, agent, vecnorm = make_env_policy(cfg, inference_only=True)
     
     keys = [
         ("next", "stats"),

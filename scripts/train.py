@@ -58,6 +58,70 @@ FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
 
+_ENV_EMA_SCALAR_FIELDS = (
+    "reset_time",
+    "simulation_time",
+    "update_time",
+    "reward_time",
+    "command_time",
+    "termination_time",
+    "observation_time",
+    "ema_cnt",
+)
+
+
+def _base_training_env(env):
+    """Return the physical environment beneath any TorchRL wrappers."""
+    current = env
+    seen = set()
+    while hasattr(current, "base_env") and id(current) not in seen:
+        seen.add(id(current))
+        next_env = current.base_env
+        if next_env is current:
+            break
+        current = next_env
+    return current
+
+
+def _zero_accumulator_tree(tree) -> None:
+    """Zero tensor/scalar accumulator leaves without replacing containers."""
+    if isinstance(tree, dict):
+        for value in tree.values():
+            _zero_accumulator_tree(value)
+        return
+    if isinstance(tree, (tuple, list)):
+        for value in tree:
+            _zero_accumulator_tree(value)
+        return
+    if torch.is_tensor(tree):
+        tree.zero_()
+
+
+def _reset_after_teacher_prefill(env, episode_stats):
+    """Start main DAgger from clean episodes and clean environment EMAs.
+
+    Teacher prefill can end midway through every physical environment's
+    episode.  Merely dropping completed prefill episodes is insufficient: a
+    later main-policy termination would still expose cumulative episode stats
+    whose prefix was controlled by the Teacher.  Reset all environments at
+    the phase boundary, then erase the reward/performance running statistics
+    accumulated by prefill (including the reset operation itself).
+    """
+    if len(episode_stats):
+        episode_stats.pop()
+
+    carry = env.reset()
+    base_env = _base_training_env(env)
+    for field in ("_stats_ema", "_perf_ema_reward", "_perf_ema_update"):
+        accumulators = getattr(base_env, field, None)
+        if accumulators is not None:
+            _zero_accumulator_tree(accumulators)
+    for field in _ENV_EMA_SCALAR_FIELDS:
+        if hasattr(base_env, field):
+            setattr(base_env, field, 0.0)
+    return carry
+
+
 def _bc_dagger_checkpoint_index(
     policy,
     physical_iteration: int,
@@ -582,18 +646,23 @@ def run_training(cfg: DictConfig):
         training_start = time.perf_counter()
         info.update(policy.train_op(data_buf))
         progress.update(policy)
-        if (
+        prefill_completed_this_rollout = (
             prefill_active_before_rollout
             and hasattr(policy, "is_teacher_prefill_active")
             and not policy.is_teacher_prefill_active()
-            and len(episode_stats)
-        ):
-            # Do not let successful Teacher-prefill episodes contaminate the
-            # first main Student train/stats window.
-            episode_stats.pop()
+        )
+        if prefill_completed_this_rollout:
+            # Begin the first main rollout with fresh physical episodes. This
+            # also resets recurrent carry/is_init state, so a main-policy
+            # episode can never inherit a Teacher-controlled prefix.
+            carry = _reset_after_teacher_prefill(env, episode_stats)
         training_time = time.perf_counter() - training_start + interleaved_training_time
         info.update(env.extra)
-        info.update(env.stats_ema)
+        if not prefill_active_before_rollout:
+            # Environment reward/performance EMAs are intentionally absent
+            # during prefill.  After the boundary reset, their first values
+            # therefore contain main-policy steps only.
+            info.update(env.stats_ema)
 
         if hasattr(policy, "step_schedule"):
             schedule_progress = i / total_iters

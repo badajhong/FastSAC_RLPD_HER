@@ -76,6 +76,9 @@ algo:
   perception_replay_burn_in: 8
   perception_encode_microbatch_size: 128
   teacher_perception_batch_size: 128
+  # One-shot Teacher-only perception updates at the prefill/main boundary.
+  # Set 0 to disable. Online weights are hard-synchronized to EMA afterward.
+  teacher_perception_warmup_steps: 128
   perception_depth_codec: uint8_div_100_v1
   # Optional perception warm start.  A Student checkpoint must contain the
   # complete online + EMA depth/object/adaptation stack.  Alternatively this

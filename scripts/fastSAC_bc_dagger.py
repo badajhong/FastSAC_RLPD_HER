@@ -80,6 +80,20 @@ PPOVEL_TRAIN_PHASE_PARTIAL_PERCEPTION_MODULES = (
 )
 
 
+def _require_single_process_execution() -> None:
+    """Reject distributed execution before constructing Isaac or the policy."""
+    world_size = aa.get_world_size()
+    if isinstance(world_size, bool) or not isinstance(world_size, int):
+        raise RuntimeError("distributed world size must be an integer")
+    if bool(aa.is_distributed()) or world_size != 1:
+        raise RuntimeError(
+            "FastSAC-BC DAgger currently supports exactly one training process; "
+            "distributed/multi-GPU execution is rejected because its custom "
+            "Actor, Critic, temperature, and perception gradients are not "
+            "synchronized"
+        )
+
+
 def _positive_int(name: str, value, *, allow_zero: bool = False) -> int:
     lower = 0 if allow_zero else 1
     if isinstance(value, bool) or not isinstance(value, int) or value < lower:
@@ -599,6 +613,7 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
 
 def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     """Fail before simulator startup when the method contract is violated."""
+    _require_single_process_execution()
     apply_fastsac_dagger_iteration_controls(cfg)
     if cfg.algo.get("name") != EXPECTED_ALGO_NAME:
         raise ValueError(
@@ -628,6 +643,11 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     _positive_int(
         "algo.teacher_prefill_max_rollouts",
         cfg.algo.get("teacher_prefill_max_rollouts", None),
+    )
+    _positive_int(
+        "algo.teacher_perception_warmup_steps",
+        cfg.algo.get("teacher_perception_warmup_steps", None),
+        allow_zero=True,
     )
     _validate_teacher_prefill_reachability(cfg)
     _validate_failure_phase_teacher_sampling(cfg)
@@ -741,6 +761,9 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     version_base=None,
 )
 def main(cfg: DictConfig):
+    # Fail before source-checkpoint I/O and the shared runner's W&B/Isaac/
+    # policy construction.
+    _require_single_process_execution()
     apply_fastsac_dagger_iteration_controls(cfg)
     prepare_fastsac_bc_dagger_checkpoint(cfg)
     prepare_fresh_fastsac_bc_dagger_source(cfg)

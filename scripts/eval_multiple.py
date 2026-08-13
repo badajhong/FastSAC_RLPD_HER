@@ -15,7 +15,7 @@ except ImportError:
 import wandb
 import logging
 from tqdm import tqdm
-from helpers import make_env_policy, evaluate
+from helpers import _load_policy_checkpoint, make_env_policy, evaluate
 
 import os
 import datetime
@@ -37,7 +37,7 @@ def main(cfg: DictConfig):
     app_launcher = AppLauncher(OmegaConf.to_container(cfg.app))
     simulation_app = app_launcher.app
 
-    env, agent, vecnorm = make_env_policy(cfg)
+    env, agent, vecnorm = make_env_policy(cfg, inference_only=True)
     
     # --- 3. Evaluation Loop for Each Checkpoint ---
     all_results = {}
@@ -63,7 +63,11 @@ def main(cfg: DictConfig):
             print(termcolor.colored(f"Successfully loaded checkpoint {step} from wandb.", "green"))
 
             # Load the state dict into the policy
-            agent.load_state_dict(state_dict["policy"])
+            _load_policy_checkpoint(
+                agent,
+                state_dict["policy"],
+                inference_only=True,
+            )
             vecnorm.load_state_dict(state_dict["vecnorm"])
             new_observation_norms = vecnorm.to_observation_norm().transforms
 

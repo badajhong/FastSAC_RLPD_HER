@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,7 +117,10 @@ TD3_COLLECTOR_NOISE_KEY = "td3_collector_q_noise"
 TD3_BETA_KEY = "td3_beta_probability"
 TEACHER_PREFILL_SEMANTICS = (
     "forced_valid_teacher_successful_episode_commit_until_replay_capacity_"
-    "then_frozen_before_main_dagger_v4"
+    "then_teacher_perception_warmup_then_main_dagger_v5"
+)
+PERCEPTION_PREFILL_WARMUP_SEMANTICS = (
+    "teacher_raw_replay_supervised_online_updates_then_hard_ema_sync_v1"
 )
 
 # Authoritative perception replay fields.  These contain only sensor/model
@@ -912,6 +916,10 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     perception_replay_burn_in: int = 8
     perception_encode_microbatch_size: int = 128
     teacher_perception_batch_size: int = 128
+    # Teacher-replay-only supervised updates performed exactly once after the
+    # successful-only prefill ring reaches capacity and before Student control
+    # begins. Zero keeps the old no-warm-up behavior.
+    teacher_perception_warmup_steps: int = 128
     perception_depth_codec: str = PERCEPTION_DEPTH_CODEC
     # Optional perception warm start. A complete Student checkpoint overlays
     # all seven online/EMA children. A phase=train PPOVEL checkpoint may instead
@@ -1244,6 +1252,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             int(cfg.failure_phase_num_bins), dtype=torch.float64, device="cpu"
         )
         self._failure_phase_history: list[list[float]] | None = None
+        self._failure_phase_student_history: list[list[bool]] | None = None
+        self._failure_phase_takeover_history: list[list[bool]] | None = None
         self._teacher_phase_bin_rows: tuple[torch.Tensor, ...] = ()
         self._teacher_phase_nearest_nonempty = torch.empty(0, dtype=torch.long)
         self._teacher_phase_flat_rows = torch.empty(0, dtype=torch.long)
@@ -1289,6 +1299,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self.teacher_prefill_rollout_count = 0
         self.teacher_prefill_environment_steps = 0
         self._teacher_prefill_complete = False
+        self._teacher_perception_warmup_complete = False
+        self._teacher_perception_warmup_updates = 0
+        self._last_teacher_perception_warmup_metrics: dict[str, float] = {}
         self.critic_update_count = 0
         self.actor_update_count = 0
         self._perception_optimizer = self.opt_adapt
@@ -1307,6 +1320,21 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     @staticmethod
     def _validate_td3_config(cfg) -> None:
+        try:
+            configured_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        except ValueError as exc:
+            raise ValueError("WORLD_SIZE must be an integer") from exc
+        process_group_world_size = (
+            dist.get_world_size()
+            if dist.is_available() and dist.is_initialized()
+            else 1
+        )
+        if configured_world_size != 1 or process_group_world_size != 1:
+            raise RuntimeError(
+                "TD3/FastSAC BC-DAgger supports one process only; custom Actor, "
+                "Critic, temperature, and perception gradients are not "
+                "distributed-synchronized"
+            )
         _linear_teacher_probability(
             cfg.dagger_beta_start,
             cfg.dagger_beta_end,
@@ -1414,6 +1442,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         prefill_max_rollouts = cfg.teacher_prefill_max_rollouts
         if isinstance(prefill_max_rollouts, bool) or int(prefill_max_rollouts) < 1:
             raise ValueError("teacher_prefill_max_rollouts must be a positive integer")
+        warmup_steps = cfg.teacher_perception_warmup_steps
+        if (
+            isinstance(warmup_steps, bool)
+            or not isinstance(warmup_steps, int)
+            or warmup_steps < 0
+        ):
+            raise ValueError(
+                "teacher_perception_warmup_steps must be a non-negative integer"
+            )
         if int(cfg.q_teacher_buffer_capacity) < int(cfg.td3_learning_starts):
             raise ValueError("q_teacher_buffer_capacity must cover td3_learning_starts")
         if int(cfg.q_batch_size) % 2:
@@ -2078,7 +2115,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         Each eligible episode contributes evenly spaced phase anchors from its
         causal ``[done-lookback, done]`` history.  Pure timeouts, motion
-        completion, and Teacher-executed terminal actions do not contribute.
+        completion, and Teacher-only failures do not contribute. Direct Student
+        control on the final or preceding step is causal; an explicit SafeDAgger
+        takeover marker remains causal through the later Teacher hold window.
         A physical termination wins when reset causes coincide.
         """
         if len(rollout.batch_size) != 2:
@@ -2095,6 +2134,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         phase = _grid(self._reference_phase(rollout))
         student = _grid(rollout[DAGGER_IS_STUDENT_ACTION_KEY], boolean=True)
+        safe_takeover_value = rollout.get(DAGGER_SAFE_TAKEOVER_KEY, None)
+        safe_takeover = (
+            torch.zeros_like(student)
+            if safe_takeover_value is None
+            else _grid(safe_takeover_value, boolean=True)
+        )
         done = _grid(rollout[DONE_KEY], boolean=True)
         terminated = _grid(rollout[TERM_KEY], boolean=True)
         command_finished = _grid(
@@ -2116,6 +2161,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 terminated.float(),
                 command_finished.float(),
                 is_init.float(),
+                safe_takeover.float(),
             ),
             dim=-1,
         ).detach()
@@ -2127,10 +2173,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         terminated = packed[..., 3].bool()
         command_finished = packed[..., 4].bool()
         is_init = packed[..., 5].bool()
+        safe_takeover = packed[..., 6].bool()
 
         histories = self._failure_phase_history
         if histories is None or len(histories) != num_envs:
             histories = [[] for _ in range(num_envs)]
+        student_histories = getattr(self, "_failure_phase_student_history", None)
+        if student_histories is None or len(student_histories) != num_envs:
+            student_histories = [[] for _ in range(num_envs)]
+        takeover_histories = getattr(self, "_failure_phase_takeover_history", None)
+        if takeover_histories is None or len(takeover_histories) != num_envs:
+            takeover_histories = [[] for _ in range(num_envs)]
         lookback = int(self.cfg.failure_phase_lookback_steps)
         maximum_history = lookback + 1
         requested = int(self.cfg.failure_phase_samples_per_failure)
@@ -2139,17 +2192,35 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         for env_index in range(num_envs):
             history = histories[env_index]
+            student_history = student_histories[env_index]
+            takeover_history = takeover_histories[env_index]
             for step in range(num_steps):
                 if bool(is_init[env_index, step]):
                     history.clear()
+                    student_history.clear()
+                    takeover_history.clear()
                 history.append(float(phase[env_index, step]))
+                student_history.append(bool(student[env_index, step]))
+                takeover_history.append(bool(safe_takeover[env_index, step]))
                 if len(history) > maximum_history:
-                    del history[: len(history) - maximum_history]
+                    trim = len(history) - maximum_history
+                    del history[:trim]
+                    del student_history[:trim]
+                    del takeover_history[:trim]
+
+                # Direct Student control on the terminal or preceding step is
+                # the conservative causal seam. A SafeDAgger takeover marker
+                # remains attributable throughout its hysteresis/hold window,
+                # without relabeling unrelated Teacher failures merely because
+                # the Student acted much earlier in the episode.
+                causal_student_control = bool(student_history[-1]) or bool(
+                    len(student_history) >= 2 and student_history[-2]
+                ) or any(takeover_history)
 
                 physical_student_failure = bool(
                     done[env_index, step]
                     and terminated[env_index, step]
-                    and student[env_index, step]
+                    and causal_student_control
                     and not command_finished[env_index, step]
                 )
                 if physical_student_failure:
@@ -2171,9 +2242,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     self._failure_phase_episode_count += 1
                 if bool(done[env_index, step]):
                     history.clear()
+                    student_history.clear()
+                    takeover_history.clear()
             histories[env_index] = history
+            student_histories[env_index] = student_history
+            takeover_histories[env_index] = takeover_history
 
         self._failure_phase_history = histories
+        self._failure_phase_student_history = student_histories
+        self._failure_phase_takeover_history = takeover_histories
         self._failure_phase_anchor_count += anchors_added
         if anchors_added:
             getattr(self, "_failure_histogram_device_cache", {}).clear()
@@ -3176,6 +3253,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "perception_replay_burn_in",
             "perception_encode_microbatch_size",
             "teacher_perception_batch_size",
+            "teacher_perception_warmup_steps",
             "perception_depth_codec",
             "load_pretrained_perception",
             "perception_checkpoint_path",
@@ -3548,6 +3626,111 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         }
 
     @set_recurrent_mode(True)
+    def _run_teacher_perception_warmup(self) -> dict[str, float]:
+        """Warm perception from frozen Teacher inputs before Student control.
+
+        Dynamic prefill is intentionally optimizer-free while it is collecting
+        trajectories.  Once the successful-only Teacher ring is complete, this
+        one-shot phase trains only the online depth/object/adaptation stack from
+        replay.  A hard online-to-EMA copy is required at the boundary: using
+        the normal 0.04 rollout Polyak step would leave Student behavior almost
+        entirely on the constructor-fresh depth model for its first rollout.
+        Actor, Critic, alpha, replay contents, and main-rollout counters are not
+        touched here.
+        """
+        if bool(getattr(self, "_teacher_perception_warmup_complete", False)):
+            return copy.deepcopy(
+                getattr(self, "_last_teacher_perception_warmup_metrics", {})
+            )
+        prefill_flag = getattr(self, "_teacher_prefill_complete", None)
+        if prefill_flag is not None and not bool(prefill_flag):
+            raise RuntimeError(
+                "Teacher perception warm-up requires a completed Teacher prefill"
+            )
+
+        requested_steps = int(self.cfg.teacher_perception_warmup_steps)
+        if requested_steps < 0:
+            raise ValueError(
+                "teacher_perception_warmup_steps must be a non-negative integer"
+            )
+        trainable = bool(self.cfg.train_perception)
+        if requested_steps and trainable:
+            if (
+                prefill_flag is not None
+                and self.q_teacher_replay.size < self.q_teacher_replay.capacity
+            ):
+                raise RuntimeError(
+                    "Teacher perception warm-up requires a capacity-filled replay"
+                )
+            if self.opt_adapt is None:
+                raise RuntimeError(
+                    "Teacher perception warm-up requires the perception optimizer"
+                )
+
+        priv_losses: list[torch.Tensor] = []
+        object_losses: list[torch.Tensor] = []
+        grad_norms: list[torch.Tensor] = []
+        remaining = max(
+            requested_steps
+            - int(getattr(self, "_teacher_perception_warmup_updates", 0)),
+            0,
+        )
+        if trainable:
+            for _ in range(remaining):
+                self.opt_adapt.zero_grad(set_to_none=True)
+                teacher = self._teacher_perception_replay_loss()
+                priv_loss = teacher["priv_loss"]
+                object_loss = teacher["object_loss"]
+                (priv_loss + object_loss).backward()
+                parameters = list(self.adapt_module.parameters())
+                parameters += list(self.object_adapt.parameters())
+                parameters += list(self.temporal_depth_gru.parameters())
+                grad_norm = nn.utils.clip_grad_norm_(
+                    parameters, float(self.cfg.max_grad_norm)
+                )
+                self.opt_adapt.step()
+                self._teacher_perception_warmup_updates += 1
+                priv_losses.append(priv_loss.detach())
+                object_losses.append(object_loss.detach())
+                grad_norms.append(torch.as_tensor(grad_norm).detach())
+
+            if requested_steps:
+                self.adapt_ema.load_state_dict(
+                    self.adapt_module.state_dict(), strict=True
+                )
+                self.object_adapt_ema.load_state_dict(
+                    self.object_adapt.state_dict(), strict=True
+                )
+                self.temporal_depth_gru_ema.load_state_dict(
+                    self.temporal_depth_gru.state_dict(), strict=True
+                )
+                for module in (
+                    self.adapt_ema,
+                    self.object_adapt_ema,
+                    self.temporal_depth_gru_ema,
+                ):
+                    module.requires_grad_(False).eval()
+
+        def _mean(values: list[torch.Tensor]) -> float:
+            if not values:
+                return 0.0
+            return torch.stack([value.float() for value in values]).mean().item()
+
+        self._teacher_perception_warmup_complete = True
+        metrics = {
+            "prefill_perception_warmup_steps": float(
+                self._teacher_perception_warmup_updates
+            ),
+            "prefill_perception_warmup_complete": 1.0,
+            "prefill_perception_warmup_priv_loss": _mean(priv_losses),
+            "prefill_perception_warmup_object_loss": _mean(object_losses),
+            "prefill_perception_warmup_grad_norm": _mean(grad_norms),
+            "prefill_perception_warmup_skipped_frozen": float(not trainable),
+        }
+        self._last_teacher_perception_warmup_metrics = copy.deepcopy(metrics)
+        return metrics
+
+    @set_recurrent_mode(True)
     def train_adapt(self, tensordict: TensorDict):
         """Mix frozen-Teacher raw replay into the existing adaptation steps."""
         if not bool(self.cfg.train_perception):
@@ -3856,11 +4039,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             del valid, is_student, transitions
 
         if teacher_prefill_active:
-            # This phase deliberately owns no optimizer and no main replay.
-            # Keeping the raw recurrent history built above makes the first
-            # main-rollout windows temporally continuous with prefill.
+            # Collection owns no optimizer and no main replay. Only the final
+            # capacity-filling call runs the explicit Teacher perception
+            # warm-up below, before Student behavior can begin.
             self.teacher_prefill_rollout_count += 1
             self.teacher_prefill_environment_steps += int(self.cfg.train_every)
+            warmup_metrics = {
+                "prefill_perception_warmup_steps": float(
+                    getattr(self, "_teacher_perception_warmup_updates", 0)
+                ),
+                "prefill_perception_warmup_complete": float(
+                    getattr(self, "_teacher_perception_warmup_complete", False)
+                ),
+                "prefill_perception_warmup_priv_loss": 0.0,
+                "prefill_perception_warmup_object_loss": 0.0,
+                "prefill_perception_warmup_grad_norm": 0.0,
+                "prefill_perception_warmup_skipped_frozen": 0.0,
+            }
             if self._all_ranks_teacher_replay_full():
                 self._teacher_prefill_complete = True
                 teacher_unresolved_rows_discarded = (
@@ -3885,6 +4080,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 self.cfg, "failure_phase_num_bins"
             ):
                 self._build_teacher_phase_index()
+            if self._teacher_prefill_complete:
+                warmup_metrics = self._run_teacher_perception_warmup()
             prefill_progress = self.q_teacher_replay.size / max(
                 self.q_teacher_replay.capacity, 1
             )
@@ -3940,6 +4137,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     getattr(self, "_failure_phase_anchor_count", 0)
                 ),
             }
+            info.update(
+                {f"td3/{key}": value for key, value in warmup_metrics.items()}
+            )
             self._last_td3_diagnostics = {
                 key: float(value)
                 for key, value in info.items()
@@ -4205,6 +4405,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "teacher_prefill_environment_steps": int(
                 self.teacher_prefill_environment_steps
             ),
+            "teacher_perception_warmup_complete": bool(
+                getattr(self, "_teacher_perception_warmup_complete", False)
+            ),
+            "teacher_perception_warmup_updates": int(
+                getattr(self, "_teacher_perception_warmup_updates", 0)
+            ),
             "dagger_rng_state": self.dagger_rng.get_state(),
             "q_rng_state": self.q_rng.get_state(),
             "collector_exploration_rng_state": (
@@ -4252,6 +4458,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self.teacher_prefill_environment_steps = int(
             state["teacher_prefill_environment_steps"]
         )
+        self._teacher_perception_warmup_complete = bool(
+            state.get("teacher_perception_warmup_complete", False)
+        )
+        self._teacher_perception_warmup_updates = int(
+            state.get("teacher_perception_warmup_updates", 0)
+        )
         self.dagger_rng.set_state(state["dagger_rng_state"])
         self.q_rng.set_state(state["q_rng_state"])
         self.collector_exploration_rng.set_state(
@@ -4264,6 +4476,68 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
         self.actor_target.requires_grad_(False).eval()
         self.qnet_target.requires_grad_(False).eval()
+
+    def load_inference_state_dict(self, state_dict, strict=True):
+        """Restore a self-contained TD3 checkpoint for deterministic inference.
+
+        Online replay is intentionally absent from checkpoints, so the normal
+        loader continues to reject same-stage *training resume*. Evaluation is
+        different: it needs only the serialized module tree and must not load
+        optimizer, replay, RNG, or training-counter state.
+        """
+        if state_dict.get("training_algorithm") != TRAINING_ALGORITHM:
+            raise ValueError("not a distributional TD3 Teacher-BC checkpoint")
+        if int(state_dict.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
+            raise ValueError("distributional TD3 checkpoint version mismatch")
+        if state_dict.get("actor_backend") != ACTOR_BACKEND:
+            raise ValueError("distributional TD3 actor backend mismatch")
+        saved_action_contract = state_dict.get("action_contract")
+        if not isinstance(saved_action_contract, Mapping):
+            raise ValueError("TD3 inference checkpoint lacks its action contract")
+        for key in ("joint_names", "execution_support_fingerprint"):
+            if saved_action_contract.get(key) != self._fastsac_action_contract.get(key):
+                raise ValueError(
+                    f"TD3 inference checkpoint action contract mismatch at {key!r}"
+                )
+
+        if self.actor_target is None:
+            self.actor_target = copy.deepcopy(self.actor_adapt).requires_grad_(False)
+        failed = PPOVEL.load_state_dict(self, state_dict, strict)
+        critical = {
+            "actor_adapt",
+            "qnet",
+            "qnet_target",
+            "temporal_depth_gru_ema",
+            "object_adapt_ema",
+            "adapt_ema",
+        }
+        missing = critical.intersection(failed)
+        if missing:
+            raise RuntimeError(
+                "TD3 inference checkpoint failed to restore critical modules: "
+                f"{sorted(missing)}"
+            )
+        for name in ("actor_adapt", "actor_target", "qnet", "qnet_target"):
+            source = state_dict.get(name)
+            if not isinstance(source, Mapping):
+                raise ValueError(
+                    f"TD3 inference checkpoint lacks module mapping {name!r}"
+                )
+            getattr(self, name).load_state_dict(source, strict=True)
+
+        initialization = state_dict.get("perception_initialization")
+        if isinstance(initialization, Mapping):
+            self._perception_initialization = copy.deepcopy(dict(initialization))
+        self._teacher_prefill_complete = True
+        self._teacher_perception_warmup_complete = True
+        self._freeze_teacher()
+        self.actor_adapt.requires_grad_(False).eval()
+        self.actor_target.requires_grad_(False).eval()
+        self.qnet.requires_grad_(False).eval()
+        self.qnet_target.requires_grad_(False).eval()
+        for name in PRETRAINED_PERCEPTION_MODULES:
+            getattr(self, name).requires_grad_(False).eval()
+        return failed
 
     def state_dict(self):
         state = PPOVEL.state_dict(self)
@@ -4283,6 +4557,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     "fresh_only_online_raw_perception_rings_not_serialized_v2"
                 ),
                 "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
+                "perception_prefill_warmup_semantics": (
+                    PERCEPTION_PREFILL_WARMUP_SEMANTICS
+                ),
                 "perception_initialization": copy.deepcopy(
                     self._perception_initialization
                 ),
@@ -4309,7 +4586,27 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         elif state_dict.get("last_phase") != "train":
             raise ValueError("fresh TD3 Teacher-BC requires a PPO train checkpoint")
 
+        # ``load_pretrained_perception=false`` means exactly constructor-fresh
+        # perception. PPOVEL's compatibility loader would otherwise import the
+        # Teacher checkpoint's object/adaptation children opportunistically and
+        # make the setting indistinguishable from a partial warm start while
+        # reporting false provenance. Snapshot all seven children atomically
+        # before the PPO load, then restore them into the same Parameter objects
+        # so the already-created optimizer remains valid.
+        constructor_perception = None
+        if not bool(self.cfg.load_pretrained_perception) and all(
+            hasattr(self, name) for name in PRETRAINED_PERCEPTION_MODULES
+        ):
+            constructor_perception = {
+                name: copy.deepcopy(getattr(self, name).state_dict())
+                for name in PRETRAINED_PERCEPTION_MODULES
+            }
         failed = PPOVEL.load_state_dict(self, state_dict, strict)
+        if constructor_perception is not None:
+            for name in PRETRAINED_PERCEPTION_MODULES:
+                getattr(self, name).load_state_dict(
+                    constructor_perception[name], strict=True
+                )
         if not same_stage:
             allowed_fresh = {
                 "depth_cnn",
@@ -4337,6 +4634,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self.teacher_prefill_rollout_count = 0
             self.teacher_prefill_environment_steps = 0
             self._teacher_prefill_complete = False
+            self._teacher_perception_warmup_complete = False
+            self._teacher_perception_warmup_updates = 0
+            self._last_teacher_perception_warmup_metrics = {}
             self._teacher_prefill_pending = None
             self._teacher_prefill_successful_episodes = 0
             self._teacher_prefill_failed_episodes = 0

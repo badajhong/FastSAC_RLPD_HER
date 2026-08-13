@@ -140,6 +140,7 @@ DAGGER_BACKEND_CONFIG_FIELDS = (
     "perception_replay_burn_in",
     "perception_encode_microbatch_size",
     "teacher_perception_batch_size",
+    "teacher_perception_warmup_steps",
     "perception_depth_codec",
     "load_pretrained_perception",
     "perception_checkpoint_path",
@@ -183,6 +184,19 @@ INERT_PPO_COMPATIBILITY_FIELDS = {
     "init_noise_scale",
     "load_noise_scale",
 }
+
+
+def _require_single_process_execution() -> None:
+    """Reject distributed execution before constructing Isaac or the policy."""
+    world_size = aa.get_world_size()
+    if isinstance(world_size, bool) or not isinstance(world_size, int):
+        raise RuntimeError("distributed world size must be an integer")
+    if bool(aa.is_distributed()) or world_size != 1:
+        raise RuntimeError(
+            "TD3-BC DAgger currently supports exactly one training process; "
+            "distributed/multi-GPU execution is rejected because its custom "
+            "Actor, Critic, and perception gradients are not synchronized"
+        )
 
 
 def _positive_int(name: str, value, *, allow_zero: bool = False) -> int:
@@ -573,6 +587,7 @@ def prepare_fresh_td3_bc_dagger_source(cfg: DictConfig) -> dict | None:
 
 def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
     """Fail before simulator startup when the method contract is violated."""
+    _require_single_process_execution()
     apply_td3_dagger_iteration_controls(cfg)
     if cfg.algo.get("name") != EXPECTED_ALGO_NAME:
         raise ValueError(
@@ -655,6 +670,11 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
     _positive_int(
         "algo.teacher_perception_batch_size",
         cfg.algo.get("teacher_perception_batch_size", None),
+    )
+    _positive_int(
+        "algo.teacher_perception_warmup_steps",
+        cfg.algo.get("teacher_perception_warmup_steps", None),
+        allow_zero=True,
     )
     if cfg.get("td3_dagger_iterations", None) is None:
         raise ValueError(
@@ -848,6 +868,9 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
     version_base=None,
 )
 def main(cfg: DictConfig):
+    # This must precede checkpoint loading and, most importantly, the shared
+    # runner's W&B/Isaac/policy construction.
+    _require_single_process_execution()
     apply_td3_dagger_iteration_controls(cfg)
     prepare_td3_bc_dagger_checkpoint(cfg)
     prepare_fresh_td3_bc_dagger_source(cfg)
