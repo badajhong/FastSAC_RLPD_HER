@@ -35,8 +35,6 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "dagger_beta_decay_rollouts": 1800,
                 "dagger_beta_zero_iteration": None,
                 "dagger_seed": 0,
-                "dagger_teacher_action_threshold": 20.0,
-                "dagger_action_clip": 20.0,
                 "dagger_bc_lr": 3.0e-4,
                 "dagger_actor_huber_delta": 1.0,
                 "dagger_buffer_capacity": 131_072,
@@ -67,7 +65,7 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "q_v_max": 20.0,
                 "q_layer_norm": True,
                 "q_action_fusion": "late",
-                "q_action_coordinates": "absolute",
+                "q_action_coordinates": "raw_joint_command",
                 "q_normalize_actions": True,
                 "q_action_input_gain": 1.0,
                 "q_lr": 3.0e-5,
@@ -200,6 +198,11 @@ def test_fastsac_config_composes_with_stochastic_mean_bc_contract():
     assert cfg.algo.save_teacher_buffer is False
     assert cfg.algo.target_policy_noise_std == 0.0
     assert cfg.algo.collector_exploration_noise_std == 0.0
+    assert cfg.algo.q_action_coordinates == "raw_joint_command"
+    assert "dagger_teacher_action_threshold" not in cfg.algo
+    assert "dagger_action_clip" not in cfg.algo
+    assert cfg.algo.dagger_safe_takeover_rms == pytest.approx(0.12)
+    assert cfg.algo.dagger_safe_release_rms == pytest.approx(0.08)
 
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
     assert cfg.total_frames == 4000 * 256 * 32
@@ -457,6 +460,7 @@ def test_inherited_td3_noise_must_remain_zero(field):
         ("failure_phase_samples_per_failure", 0, "positive"),
         ("failure_phase_num_bins", 0, "positive"),
         ("q_num_atoms", 51, "501"),
+        ("q_action_coordinates", "absolute", "raw_joint_command"),
         ("q_batch_size", 3, "even"),
         ("q_updates_per_rollout", 0, "positive"),
         ("q_teacher_replay_ratio", 0.4, "50/50"),
@@ -474,6 +478,18 @@ def test_sac_and_bc_weights_cannot_both_be_zero():
     cfg.algo.eta_sac = 0.0
     cfg.algo.lambda_bc = 0.0
     with pytest.raises(ValueError, match="cannot both be zero"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "removed_field", ("dagger_teacher_action_threshold", "dagger_action_clip")
+)
+def test_removed_bounded_action_controls_are_rejected(removed_field):
+    cfg = _cfg()
+    with open_dict(cfg.algo):
+        cfg.algo[removed_field] = 20.0
+
+    with pytest.raises(ValueError, match="removed|unbounded raw"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 

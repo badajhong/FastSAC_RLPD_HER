@@ -1,11 +1,16 @@
 """Dedicated distributional-TD3 + Teacher-BC DAgger entrypoint.
 
-The method is C51 distributional TD3 with the exact existing Teacher-BC
-auxiliary objective.  Collection, environment stepping, checkpoint writing,
+The method is C51 distributional TD3 with joint-normalized raw-action
+Teacher BC. Collection, environment stepping, checkpoint writing,
 and evaluation remain owned by :mod:`scripts.train`; this module provides the
-new method's Hydra surface and fail-fast fresh-source validation.  Version 2
-replays raw perception inputs and intentionally does not resume an old TD3
-replay lineage.
+new method's Hydra surface and fail-fast fresh-source validation.  Version 3
+keeps raw perception replay and introduces a fresh direct-raw-action lineage;
+it intentionally does not resume an older TD3 lineage.
+
+The Student Actor uses the original PPOVEL unbounded raw joint-command
+coordinates.  Teacher BC and Critic inputs are normalized with the same
+per-joint nominal center/scale, while environment execution remains raw: no
+tanh/atanh transform or final action clip is part of this backend.
 
 ``PPOConfig`` contributes a few legacy exploration-objective configuration
 keys which are retained only because the Actor/checkpoint topology is locked.
@@ -25,18 +30,20 @@ from omegaconf import DictConfig, open_dict
 
 import active_adaptation as aa
 from active_adaptation.learning.ppo.td3_bc_dagger import (
+    ACTION_CONTRACT_SEMANTICS,
+    ACTOR_BACKEND,
     ACTOR_LEARNING_SEMANTICS,
+    CHECKPOINT_VERSION,
     CRITIC_SEMANTICS,
+    TRAINING_ALGORITHM,
 )
 
 try:
-    from . import bc_dagger as _bc_dagger
     from .train import run_training
 except ImportError:
-    import bc_dagger as _bc_dagger  # type: ignore
     from train import run_training
 
-EXPECTED_ACTION_CONTRACT_SEMANTICS = _bc_dagger.EXPECTED_ACTION_CONTRACT_SEMANTICS
+EXPECTED_ACTION_CONTRACT_SEMANTICS = ACTION_CONTRACT_SEMANTICS
 
 
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -48,9 +55,9 @@ EXPECTED_ALGO_TARGET = (
 )
 EXPECTED_ACTOR_LEARNING_SEMANTICS = ACTOR_LEARNING_SEMANTICS
 EXPECTED_CRITIC_SEMANTICS = CRITIC_SEMANTICS
-EXPECTED_TRAINING_ALGORITHM = "distributional_td3_teacher_bc_v1"
-EXPECTED_CHECKPOINT_VERSION = 2
-EXPECTED_ACTOR_BACKEND = "vaic_ppo_latent_tanh_bc_dagger_v4"
+EXPECTED_TRAINING_ALGORITHM = TRAINING_ALGORITHM
+EXPECTED_CHECKPOINT_VERSION = CHECKPOINT_VERSION
+EXPECTED_ACTOR_BACKEND = ACTOR_BACKEND
 EXPECTED_ACTOR_IN_KEYS = (
     "command",
     "policy",
@@ -123,8 +130,6 @@ DAGGER_BACKEND_CONFIG_FIELDS = (
     "dagger_beta_end",
     "dagger_beta_decay_rollouts",
     "dagger_seed",
-    "dagger_teacher_action_threshold",
-    "dagger_action_clip",
     "dagger_bc_lr",
     "dagger_actor_huber_delta",
     "dagger_buffer_capacity",
@@ -414,9 +419,23 @@ def _expected_dagger_backend_config(algo: Mapping) -> dict:
     return {
         **{name: algo.get(name) for name in DAGGER_BACKEND_CONFIG_FIELDS},
         "method": EXPECTED_TRAINING_ALGORITHM,
-        "actor_output": "pre_tanh_latent_to_locked_execution_support",
-        "bc_loss": "exact_inverse_tanh_mean_smooth_l1",
+        "actor_output": "direct_unbounded_raw_joint_command",
+        "bc_loss": "joint_normalized_raw_mean_teacher_smooth_l1",
     }
+
+
+def _reject_obsolete_bounded_action_controls(cfg: DictConfig) -> None:
+    """Reject stale knobs that would imply a bounded/tanh action backend."""
+    obsolete = sorted(
+        name
+        for name in ("dagger_action_clip", "dagger_teacher_action_threshold")
+        if name in cfg.algo
+    )
+    if obsolete:
+        raise ValueError(
+            "the direct unbounded raw-action backend removed bounded-action "
+            f"controls: {obsolete}"
+        )
 
 
 def _forbidden_algo_fields(algo: Mapping) -> list[str]:
@@ -536,13 +555,14 @@ def td3_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
 
 
 def prepare_td3_bc_dagger_checkpoint(cfg: DictConfig) -> dict | None:
-    """Reject same-stage TD3 continuation for the fresh-only v2 replay."""
+    """Reject same-stage continuation across the fresh-only v3 contract."""
     requested = cfg.get("td3_bc_dagger_checkpoint", None)
     if requested is None:
         return None
     raise ValueError(
         "same-stage TD3 resume is intentionally unsupported by the fresh-only "
-        "raw-perception replay v2 contract; leave td3_bc_dagger_checkpoint=null "
+        "direct-raw-action/raw-perception v3 contract; leave "
+        "td3_bc_dagger_checkpoint=null "
         "and start from a train-phase PPO checkpoint_path"
     )
 
@@ -626,6 +646,7 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError(
             "distributional TD3 Teacher-BC requires raw replay observations"
         )
+    _reject_obsolete_bounded_action_controls(cfg)
     _validate_perception_training_controls(cfg)
 
     forbidden = _forbidden_algo_fields(cfg.algo)
@@ -726,18 +747,10 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
     for name in (
         "dagger_bc_lr",
         "dagger_actor_huber_delta",
-        "dagger_teacher_action_threshold",
-        "dagger_action_clip",
         "q_lr",
         "q_action_input_gain",
     ):
         _finite_positive(f"algo.{name}", cfg.algo.get(name, None))
-    if float(cfg.algo.dagger_teacher_action_threshold) > float(
-        cfg.algo.dagger_action_clip
-    ):
-        raise ValueError(
-            "algo.dagger_teacher_action_threshold cannot exceed dagger_action_clip"
-        )
     _finite_nonnegative("algo.q_tau", cfg.algo.get("q_tau", None))
     if not 0.0 < float(cfg.algo.q_tau) <= 1.0:
         raise ValueError("algo.q_tau must be in (0, 1]")
@@ -754,8 +767,8 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError("distributional TD3 requires late Q-action fusion")
     if cfg.algo.get("q_layer_norm") is not True:
         raise ValueError("distributional TD3 requires LayerNorm Q Critics")
-    if cfg.algo.get("q_action_coordinates") != "absolute":
-        raise ValueError("distributional TD3 requires absolute Q actions")
+    if cfg.algo.get("q_action_coordinates") != "raw_joint_command":
+        raise ValueError("distributional TD3 requires raw_joint_command Q actions")
     if cfg.algo.get("q_normalize_actions") is not True:
         raise ValueError("distributional TD3 requires normalized Q actions")
     if not math.isclose(float(cfg.algo.get("q_action_input_gain", math.nan)), 1.0):
@@ -783,11 +796,9 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
     release = float(cfg.algo.get("dagger_safe_release_rms", math.nan))
     takeover = float(cfg.algo.get("dagger_safe_takeover_rms", math.nan))
     if not (
-        math.isfinite(release)
-        and math.isfinite(takeover)
-        and 0.0 <= release < takeover <= 2.0
+        math.isfinite(release) and math.isfinite(takeover) and 0.0 <= release < takeover
     ):
-        raise ValueError("SafeDAgger requires 0 <= release_rms < takeover_rms <= 2")
+        raise ValueError("SafeDAgger requires 0 <= release_rms < takeover_rms")
     safe_zero_iteration = cfg.algo.get("dagger_safe_zero_iteration", None)
     if safe_zero_iteration is not None and control_mode == "beta":
         raise ValueError(
@@ -796,7 +807,8 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
 
     if cfg.get("td3_bc_dagger_checkpoint", None) is not None:
         raise ValueError(
-            "same-stage TD3 resume is unsupported by raw-perception replay v2; "
+            "same-stage TD3 resume is unsupported by the direct-raw-action "
+            "raw-perception v3 contract; "
             "use only a fresh train-phase PPO checkpoint_path"
         )
     obsolete_resume_values = {

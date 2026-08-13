@@ -981,20 +981,24 @@ def test_td3_config_only_overrides_the_authorized_environment_count():
     )
 
     baseline = _load_yaml(Path("cfg/bc_dagger.yaml"))["algo"]
+    assert "dagger_action_clip" not in algo
+    assert "dagger_teacher_action_threshold" not in algo
     immutable_if_redeclared = {
-        "dagger_action_clip": 20.0,
         "dagger_beta_start": baseline["dagger_beta_start"],
         "dagger_beta_end": baseline["dagger_beta_end"],
         "dagger_beta_zero_iteration": baseline["dagger_beta_zero_iteration"],
         "dagger_beta_decay_rollouts": baseline["dagger_beta_decay_rollouts"],
-        "dagger_safe_takeover_rms": baseline["dagger_safe_takeover_rms"],
-        "dagger_safe_release_rms": baseline["dagger_safe_release_rms"],
+        # Direct-raw SafeDAgger measures joint-wise normalized action error;
+        # these thresholds therefore intentionally differ from the legacy
+        # scalar +/-20 envelope coordinates.
+        "dagger_safe_takeover_rms": 0.12,
+        "dagger_safe_release_rms": 0.08,
         "dagger_safe_min_teacher_steps": baseline["dagger_safe_min_teacher_steps"],
         "q_num_atoms": 501,
         "q_v_min": -20.0,
         "q_v_max": 20.0,
         "q_action_fusion": "late",
-        "q_action_coordinates": "absolute",
+        "q_action_coordinates": "raw_joint_command",
         "sac_q_normalize_actions": True,
         "sac_q_action_input_gain": 1.0,
         "q_normalize_actions": True,

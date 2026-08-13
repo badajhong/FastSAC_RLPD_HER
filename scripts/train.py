@@ -107,18 +107,23 @@ def _reset_after_teacher_prefill(env, episode_stats):
     the phase boundary, then erase the reward/performance running statistics
     accumulated by prefill (including the reset operation itself).
     """
-    if len(episode_stats):
-        episode_stats.pop()
+    # Isaac's simulator state is created and advanced under inference mode in
+    # the rollout loop.  Reset mutates those tensors in-place, and therefore
+    # must run under the same mode.  Keep the subsequent accumulator clearing
+    # in this context as those trees may also contain inference tensors.
+    with torch.inference_mode():
+        if len(episode_stats):
+            episode_stats.pop()
 
-    carry = env.reset()
-    base_env = _base_training_env(env)
-    for field in ("_stats_ema", "_perf_ema_reward", "_perf_ema_update"):
-        accumulators = getattr(base_env, field, None)
-        if accumulators is not None:
-            _zero_accumulator_tree(accumulators)
-    for field in _ENV_EMA_SCALAR_FIELDS:
-        if hasattr(base_env, field):
-            setattr(base_env, field, 0.0)
+        carry = env.reset()
+        base_env = _base_training_env(env)
+        for field in ("_stats_ema", "_perf_ema_reward", "_perf_ema_update"):
+            accumulators = getattr(base_env, field, None)
+            if accumulators is not None:
+                _zero_accumulator_tree(accumulators)
+        for field in _ENV_EMA_SCALAR_FIELDS:
+            if hasattr(base_env, field):
+                setattr(base_env, field, 0.0)
     return carry
 
 

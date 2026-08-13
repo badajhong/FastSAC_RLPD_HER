@@ -6,7 +6,7 @@ nohup env \
   algo.load_pretrained_perception=true \
   algo.perception_checkpoint_path=outputs/15-13-46-G1Skateboard-ppo_vel/wandb/run-20260805_151350-7tsje71w/files/checkpoint_final.pt \
   algo.train_perception=true \
-  fastsac_dagger_iterations=3000 \
+  td3_dagger_iterations=3000 \
   algo.teacher_prefill_max_rollouts=300 \
   algo.q_teacher_buffer_capacity=131072 \
   algo.teacher_actor_replay_fraction=0.5 \
@@ -41,7 +41,7 @@ nohup env \
   algo.dagger_control_mode=beta \
   algo.dagger_beta_start=0 \
   algo.dagger_beta_end=0 \
-  algo.eta_sac=0.0001 \
+  algo.eta_sac=1e-5 \
   algo.lambda_bc=1.0 \
   algo.sac_initial_action_std=0.05 \
   algo.q_updates_per_rollout=16 \

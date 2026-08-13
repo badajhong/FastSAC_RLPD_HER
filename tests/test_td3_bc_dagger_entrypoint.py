@@ -52,8 +52,6 @@ def _cfg(
                 "dagger_beta_decay_rollouts": 1800,
                 "dagger_beta_zero_iteration": beta_zero_iteration,
                 "dagger_seed": 0,
-                "dagger_teacher_action_threshold": 20.0,
-                "dagger_action_clip": 20.0,
                 "dagger_bc_lr": 3.0e-4,
                 "dagger_actor_huber_delta": 1.0,
                 "dagger_buffer_capacity": 131_072,
@@ -92,7 +90,7 @@ def _cfg(
                 "q_v_max": 20.0,
                 "q_layer_norm": True,
                 "q_action_fusion": "late",
-                "q_action_coordinates": "absolute",
+                "q_action_coordinates": "raw_joint_command",
                 "q_normalize_actions": True,
                 "q_action_input_gain": 1.0,
                 "q_lr": 3.0e-5,
@@ -190,7 +188,11 @@ def test_td3_config_composes_without_simulator_startup():
     assert cfg.algo.q_num_atoms == 501
     assert cfg.algo.q_v_min == pytest.approx(-20.0)
     assert cfg.algo.q_v_max == pytest.approx(20.0)
-    assert cfg.algo.q_action_coordinates == "absolute"
+    assert cfg.algo.q_action_coordinates == "raw_joint_command"
+    assert "dagger_teacher_action_threshold" not in cfg.algo
+    assert "dagger_action_clip" not in cfg.algo
+    assert cfg.algo.dagger_safe_takeover_rms == pytest.approx(0.12)
+    assert cfg.algo.dagger_safe_release_rms == pytest.approx(0.08)
     assert cfg.algo.q_normalize_actions is True
     assert cfg.algo.q_action_input_gain == pytest.approx(1.0)
     assert cfg.algo.eta_td3 == pytest.approx(1.0)
@@ -623,7 +625,7 @@ def test_config_rejects_forbidden_stochastic_policy_fields(field):
         ("q_v_max", 10.0, "q_v_max"),
         ("q_action_fusion", "early", "late"),
         ("q_layer_norm", False, "LayerNorm"),
-        ("q_action_coordinates", "unit", "absolute"),
+        ("q_action_coordinates", "absolute", "raw_joint_command"),
         ("q_normalize_actions", False, "normalized"),
         ("q_action_input_gain", 2.0, "input_gain"),
         ("q_batch_size", 3, "even"),
@@ -670,10 +672,14 @@ def test_residual_distillation_fails_before_training():
         td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
-def test_teacher_validity_threshold_cannot_exceed_execution_clip():
+@pytest.mark.parametrize(
+    "removed_field", ("dagger_teacher_action_threshold", "dagger_action_clip")
+)
+def test_removed_bounded_action_controls_are_rejected(removed_field):
     cfg = _cfg()
-    cfg.algo.dagger_teacher_action_threshold = 20.1
-    with pytest.raises(ValueError, match="cannot exceed"):
+    with open_dict(cfg.algo):
+        cfg.algo[removed_field] = 20.0
+    with pytest.raises(ValueError, match="removed|unbounded raw"):
         td3_entry.validate_td3_bc_dagger_config(cfg)
 
 
@@ -747,7 +753,9 @@ def test_same_stage_td3_resume_is_rejected_for_legacy_and_current_versions(
     )
     cfg = _cfg(checkpoint="/fresh/ppo.pt", resume=str(checkpoint))
 
-    with pytest.raises(ValueError, match="fresh-only raw-perception replay v2"):
+    with pytest.raises(
+        ValueError, match="fresh-only direct-raw-action/raw-perception v3"
+    ):
         td3_entry.prepare_td3_bc_dagger_checkpoint(cfg)
     with pytest.raises(ValueError, match="same-stage TD3 resume is unsupported"):
         td3_entry.validate_td3_bc_dagger_config(cfg)
@@ -858,6 +866,7 @@ def test_prefill_boundary_resets_episodes_and_all_environment_emas():
 
         def reset(self):
             self.reset_calls += 1
+            assert torch.is_inference_mode_enabled()
             # A real reset updates reset/observation timing.  The helper must
             # clear even work performed by this boundary reset.
             self._stats_ema["reward"]["term"][0].add_(100.0)

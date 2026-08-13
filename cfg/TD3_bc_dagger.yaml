@@ -1,7 +1,7 @@
 # Dedicated Phase-1 defaults for scripts/TD3_bc_dagger.py. The shared trainer
 # owns rollout, environment, normalization, checkpoint writing, and evaluation.
-# The algorithm is C51 distributional TD3 plus the exact existing Teacher-BC
-# auxiliary objective; controller/source selection remains unchanged.
+# The algorithm is C51 distributional TD3 plus joint-normalized raw-action
+# Teacher BC; controller/source selection remains unchanged.
 defaults:
   - train
   - override /algo: td3_bc_dagger_finetune
@@ -19,7 +19,7 @@ total_frames: 19_660_800
 td3_dagger_iterations: null
 save_interval: 100
 
-# Version 2 starts only from the train-phase PPO checkpoint_path inherited from
+# Version 3 starts only from the train-phase PPO checkpoint_path inherited from
 # train.yaml.  A non-null value here is retained solely for a clear fail-fast
 # error; same-stage TD3 replay resume is intentionally unsupported.
 td3_bc_dagger_checkpoint: null
@@ -28,8 +28,10 @@ algo:
   # Existing state-wise safety controller. Beta remains available for the
   # exact beta/hybrid categorical-source ablations.
   dagger_control_mode: safe
-  dagger_safe_takeover_rms: 0.006
-  dagger_safe_release_rms: 0.004
+  # RMS discrepancy is measured per joint after nominal center/scale
+  # normalization, not in the removed scalar /20 action coordinates.
+  dagger_safe_takeover_rms: 0.12
+  dagger_safe_release_rms: 0.08
   dagger_safe_min_teacher_steps: 8
   dagger_safe_zero_iteration: null
   dagger_beta_start: 1.0
@@ -37,10 +39,11 @@ algo:
   dagger_beta_zero_iteration: null
   dagger_beta_decay_rollouts: 1800
   dagger_seed: 0
-  dagger_teacher_action_threshold: 20.0
-  dagger_action_clip: 20.0
+  # Teacher labels are accepted by a finite-value check only.  Both Teacher
+  # and Student actions remain unbounded raw PPOVEL joint commands: there is
+  # no tanh/atanh transform, magnitude threshold, or final action clip.
 
-  # Exact existing valid-Teacher latent-coordinate SmoothL1 objective.
+  # Joint-wise normalized raw-action SmoothL1 objective.
   dagger_bc_lr: 3.0e-4
   dagger_actor_huber_delta: 1.0
   dagger_buffer_capacity: 131_072
@@ -107,6 +110,7 @@ algo:
   q_v_max: 20.0
   q_layer_norm: true
   q_action_fusion: late
+  q_action_coordinates: raw_joint_command
   q_normalize_actions: true
   q_action_input_gain: 1.0
   q_lr: 3.0e-5

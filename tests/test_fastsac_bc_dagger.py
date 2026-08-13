@@ -9,10 +9,7 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from active_adaptation.learning.ppo.common import ACTION_KEY
-from active_adaptation.learning.ppo.fastsac_vel import (
-    FastSACTanhNormal,
-    _BCDaggerSACAdapter,
-)
+from active_adaptation.learning.ppo.fastsac_vel import _BCDaggerSACAdapter
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_ACTION_DISCREPANCY_RMS_KEY,
     DAGGER_IS_STUDENT_ACTION_KEY,
@@ -21,6 +18,7 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_TEACHER_ACTION_KEY,
     DAGGER_TEACHER_ACTION_VALID_KEY,
 )
+from active_adaptation.learning.ppo.ppo_vel import PPOVEL
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     PRETRAINED_PERCEPTION_MODULES,
     TD3_COLLECTOR_NOISE_KEY,
@@ -34,11 +32,14 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     _project_c51_probabilities,
 )
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+    ACTOR_BACKEND,
+    CHECKPOINT_VERSION,
     TRAINING_ALGORITHM,
     DistributionalFastSACTeacherBC,
     DistributionalFastSACTeacherBCConfig,
     _DeterministicFastSACStudentEvalPolicy,
     _DistributionalFastSACDaggerRolloutPolicy,
+    _RawActionNormal,
 )
 
 
@@ -125,13 +126,8 @@ class _CountingSGD(torch.optim.SGD):
 
 
 def _install_unit_action_contract(policy) -> None:
-    policy._fastsac_action_low = torch.tensor([-1.0])
-    policy._fastsac_action_high = torch.tensor([1.0])
-    policy._fastsac_actor_action_center = torch.tensor([0.0])
-    policy._fastsac_actor_action_scale = torch.tensor([1.0])
     policy._fastsac_q_action_center = torch.tensor([0.0])
     policy._fastsac_q_action_scale = torch.tensor([1.0])
-    policy._fastsac_action_log_scale_sum = 0.0
     policy._fastsac_entropy_reference_log_scale_sum = 0.0
 
 
@@ -178,27 +174,19 @@ def test_config_allows_explicit_pure_sac_ablation_without_inherited_td3_eta():
     DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
-def test_global_log_std_builds_direct_execution_distribution_on_plus_minus_20():
+def test_raw_action_normal_is_unbounded_reparameterized_and_has_exact_log_prob():
     adapter = _BCDaggerSACAdapter(
         action_dim=2,
         initial_log_std=torch.log(torch.tensor([0.01, 0.02])),
         device="cpu",
     )
-    latent_mean = torch.tensor([[0.0, 0.5], [-0.5, 1.0]])
-    scale = adapter.log_std.exp().expand_as(latent_mean)
-    dist = FastSACTanhNormal(
-        latent_mean,
-        scale,
-        low=torch.full((2,), -20.0),
-        high=torch.full((2,), 20.0),
-        event_dims=1,
-    )
+    raw_mean = torch.tensor([[0.0, 25.0], [-31.0, 1.0]], requires_grad=True)
+    scale = adapter.log_std.exp().expand_as(raw_mean)
+    dist = _RawActionNormal(raw_mean, scale)
 
     assert tuple(adapter.parameters()) == (adapter.log_std,)
     assert adapter.log_std.shape == (2,)
-    assert torch.equal(dist.low, torch.full((2,), -20.0))
-    assert torch.equal(dist.high, torch.full((2,), 20.0))
-    assert torch.allclose(dist.mean, latent_mean.tanh() * 20.0)
+    assert torch.equal(dist.mean, raw_mean)
     first, first_log_prob = dist.rsample_with_log_prob(
         generator=torch.Generator().manual_seed(71)
     )
@@ -208,34 +196,53 @@ def test_global_log_std_builds_direct_execution_distribution_on_plus_minus_20():
     assert not torch.equal(first, second)
     assert torch.isfinite(first_log_prob).all()
     assert torch.isfinite(second_log_prob).all()
-    assert (first >= -20.0).all() and (first <= 20.0).all()
+    assert first[0, 1] > 20.0 and first[1, 0] < -20.0
+    assert torch.allclose(first_log_prob, dist.log_prob(first))
+    (first.sum() - first_log_prob.mean()).backward()
+    assert raw_mean.grad is not None and torch.isfinite(raw_mean.grad).all()
 
 
-def test_backend_distribution_seam_uses_global_std_and_direct_execution_support():
+def test_backend_distribution_seam_uses_global_std_and_raw_unbounded_mean():
     policy = _bare_policy(sac_log_std_min=-8.0, sac_log_std_max=-2.0)
-    policy._fastsac_action_low = torch.full((2,), -20.0)
-    policy._fastsac_action_high = torch.full((2,), 20.0)
     policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
         action_dim=2,
         initial_log_std=torch.tensor([-4.0, -3.0]),
         device="cpu",
     )
-    latent = torch.tensor([[0.0, 0.5], [-0.5, 1.0]])
+    raw_mean = torch.tensor([[0.0, 25.0], [-31.0, 1.0]])
 
-    dist = policy._sac_dist_from_latent(latent)
+    dist = policy._sac_dist_from_mean(raw_mean)
 
-    assert torch.equal(dist.loc, latent)
+    assert torch.equal(dist.loc, raw_mean)
     assert torch.allclose(
         dist.scale,
-        policy.bc_dagger_sac_adapter.log_std.exp().expand_as(latent),
+        policy.bc_dagger_sac_adapter.log_std.exp().expand_as(raw_mean),
     )
-    assert torch.equal(dist.low, torch.full((2,), -20.0))
-    assert torch.equal(dist.high, torch.full((2,), 20.0))
-    assert torch.allclose(dist.mean, latent.tanh() * 20.0)
+    assert torch.equal(dist.mean, raw_mean)
 
 
-def test_exact_bc_on_deterministic_latent_mean_has_no_log_std_gradient():
-    latent_mean = nn.Parameter(torch.tensor([[0.2], [-0.4], [0.8]]))
+def test_raw_normal_log_prob_converts_exactly_to_nonunit_q_coordinates():
+    raw_mean = torch.tensor([[1.0, -2.0], [0.5, 3.0]])
+    raw_scale = torch.tensor([[0.4, 0.8], [0.4, 0.8]])
+    raw_action = torch.tensor([[1.3, -1.1], [-0.2, 4.5]])
+    q_center = torch.tensor([3.0, -1.0])
+    q_scale = torch.tensor([2.0, 4.0])
+    raw_log_prob = _RawActionNormal(raw_mean, raw_scale).log_prob(raw_action)
+    normalized_log_prob = _RawActionNormal(
+        (raw_mean - q_center) / q_scale,
+        raw_scale / q_scale,
+    ).log_prob((raw_action - q_center) / q_scale)
+    policy = _bare_policy()
+    policy._fastsac_entropy_reference_log_scale_sum = float(q_scale.log().sum())
+
+    assert torch.allclose(
+        policy._normalized_action_log_prob(raw_log_prob), normalized_log_prob
+    )
+    assert torch.allclose(normalized_log_prob, raw_log_prob + q_scale.log().sum())
+
+
+def test_exact_bc_on_deterministic_raw_mean_has_no_log_std_gradient():
+    raw_mean = nn.Parameter(torch.tensor([[0.2], [-0.4], [0.8]]))
     adapter = _BCDaggerSACAdapter(
         action_dim=1,
         initial_log_std=torch.tensor(-4.0),
@@ -245,16 +252,10 @@ def test_exact_bc_on_deterministic_latent_mean_has_no_log_std_gradient():
     valid = torch.tensor([True, True, False])
 
     # Creating the executable stochastic policy must not make its variance part
-    # of the supervised objective. BC owns only the noise-free latent location.
-    FastSACTanhNormal(
-        latent_mean,
-        adapter.log_std.exp().expand_as(latent_mean),
-        low=-20.0,
-        high=20.0,
-        event_dims=1,
-    )
+    # of the supervised objective. BC owns only the raw noise-free mean.
+    _RawActionNormal(raw_mean, adapter.log_std.exp().expand_as(raw_mean))
     loss = _exact_teacher_bc_loss(
-        latent_mean,
+        raw_mean,
         teacher,
         valid,
         torch.tensor([0.0]),
@@ -263,11 +264,11 @@ def test_exact_bc_on_deterministic_latent_mean_has_no_log_std_gradient():
     )
     loss.backward()
 
-    assert latent_mean.grad is not None
-    assert latent_mean.grad.abs().sum().item() > 0.0
+    assert raw_mean.grad is not None
+    assert raw_mean.grad.abs().sum().item() > 0.0
     assert adapter.log_std.grad is None
     assert torch.equal(
-        latent_mean.grad[~valid], torch.zeros_like(latent_mean.grad[~valid])
+        raw_mean.grad[~valid], torch.zeros_like(raw_mean.grad[~valid])
     )
 
 
@@ -345,29 +346,10 @@ def _install_tiny_stochastic_actor(policy, *, actor_weight=0.25, log_std=-1.0):
         device="cpu",
     )
 
-    def actor_latent(owner, observations):
+    def actor_mean(owner, observations):
         return owner.actor_adapt(observations)
 
-    def actor_dist(owner, observations):
-        loc = owner._actor_latent_from_flat(observations)
-        scale = (
-            owner.bc_dagger_sac_adapter.log_std.clamp(
-                float(owner.cfg.sac_log_std_min),
-                float(owner.cfg.sac_log_std_max),
-            )
-            .exp()
-            .expand_as(loc)
-        )
-        return FastSACTanhNormal(
-            loc,
-            scale,
-            low=owner._fastsac_action_low,
-            high=owner._fastsac_action_high,
-            event_dims=1,
-        )
-
-    policy._actor_latent_from_flat = MethodType(actor_latent, policy)
-    policy._actor_dist_from_flat = MethodType(actor_dist, policy)
+    policy._actor_mean_from_flat = MethodType(actor_mean, policy)
     policy._fastsac_actor_parameters = tuple(policy.actor_adapt.parameters()) + tuple(
         policy.bc_dagger_sac_adapter.parameters()
     )
@@ -405,12 +387,9 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
     expected_q = copy.deepcopy(policy.qnet)
     expected_rng = torch.Generator().set_state(policy.sac_action_rng.get_state())
     loc = expected_actor(batch["observations"])
-    expected_dist = FastSACTanhNormal(
+    expected_dist = _RawActionNormal(
         loc,
         expected_adapter.log_std.exp().expand_as(loc),
-        low=-1.0,
-        high=1.0,
-        event_dims=1,
     )
     sampled_action, log_prob = expected_dist.rsample_with_log_prob(
         generator=expected_rng
@@ -426,8 +405,8 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
         loc,
         batch[DAGGER_REPLAY_TEACHER_ACTIONS],
         batch[DAGGER_TEACHER_ACTION_VALID_KEY],
-        policy._fastsac_actor_action_center,
-        policy._fastsac_actor_action_scale,
+        policy._fastsac_q_action_center,
+        policy._fastsac_q_action_scale,
         policy.cfg.dagger_actor_huber_delta,
     )
     expected_total = (
@@ -502,13 +481,11 @@ def test_bc_only_actor_step_does_not_update_global_log_std():
 def _rollout_owner(*, prefill: bool, beta: float = 0.5):
     action_dim = 2
     batch_size = 64
-    latent = torch.zeros(batch_size, action_dim)
-    teacher = torch.zeros_like(latent)
+    raw_mean = torch.zeros(batch_size, action_dim)
+    teacher = torch.zeros_like(raw_mean)
     cfg = SimpleNamespace(
         teacher_prefill_max_rollouts=1,
         dagger_control_mode="beta",
-        dagger_teacher_action_threshold=20.0,
-        dagger_action_clip=20.0,
         dagger_safe_takeover_rms=0.006,
         dagger_safe_release_rms=0.004,
         dagger_safe_min_teacher_steps=8,
@@ -524,43 +501,29 @@ def _rollout_owner(*, prefill: bool, beta: float = 0.5):
     owner.dagger_rng = torch.Generator().manual_seed(17)
     owner.sac_rollout_rng = torch.Generator().manual_seed(18)
     owner.sac_action_rng = torch.Generator().manual_seed(19)
-    owner._student_latent = lambda td: latent.clone()
+    owner._student_mean_action = lambda td: raw_mean.clone()
     owner._teacher_action = lambda td: teacher.clone()
-    owner._project_execution_action = lambda action: action.clamp(-20.0, 20.0)
-    owner._student_action_from_latent = lambda value: value.tanh() * 20.0
     owner._teacher_prefill_active = lambda: prefill
     owner._effective_control_mode = lambda: "beta"
     owner._teacher_mixture_probability = lambda: beta
     owner._safe_teacher_control_enabled = lambda: False
-    owner._fastsac_action_low = torch.full((action_dim,), -20.0)
-    owner._fastsac_action_high = torch.full((action_dim,), 20.0)
     owner._fastsac_q_action_center = torch.zeros(action_dim)
     owner._fastsac_q_action_scale = torch.ones(action_dim)
 
     def stochastic_dist(value):
-        return FastSACTanhNormal(
-            value,
-            torch.full_like(value, 0.15),
-            low=owner._fastsac_action_low,
-            high=owner._fastsac_action_high,
-            event_dims=1,
-        )
+        return _RawActionNormal(value, torch.full_like(value, 0.15))
 
-    # Keep the fixture tolerant to a private naming change while the public
-    # contract remains one direct stochastic distribution from Student latent.
-    owner._student_sac_dist_from_latent = stochastic_dist
-    owner._sac_dist_from_latent = stochastic_dist
-    owner._student_distribution_from_latent = stochastic_dist
+    owner._sac_dist_from_mean = stochastic_dist
     owner._q_action_input = lambda action: action
-    return owner, latent, teacher
+    return owner, raw_mean, teacher
 
 
 def test_main_rollout_keeps_teacher_rows_exact_and_samples_only_student_behavior():
-    owner, latent, teacher = _rollout_owner(prefill=False, beta=0.5)
+    owner, raw_mean, teacher = _rollout_owner(prefill=False, beta=0.5)
     policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
     td = TensorDict(
-        {"is_init": torch.zeros(latent.shape[0], dtype=torch.bool)},
-        batch_size=[latent.shape[0]],
+        {"is_init": torch.zeros(raw_mean.shape[0], dtype=torch.bool)},
+        batch_size=[raw_mean.shape[0]],
     )
     rollout_rng_before = owner.sac_rollout_rng.get_state().clone()
     learning_rng_before = owner.sac_action_rng.get_state().clone()
@@ -572,7 +535,7 @@ def test_main_rollout_keeps_teacher_rows_exact_and_samples_only_student_behavior
     assert torch.equal(result[DAGGER_TEACHER_ACTION_KEY], teacher)
     assert result[DAGGER_TEACHER_ACTION_VALID_KEY].all()
     assert torch.equal(result[ACTION_KEY][~student], teacher[~student])
-    assert torch.equal(result[TD3_NOISE_FREE_STUDENT_ACTION_KEY], latent.tanh() * 20.0)
+    assert torch.equal(result[TD3_NOISE_FREE_STUDENT_ACTION_KEY], raw_mean)
     assert not torch.equal(
         result[ACTION_KEY][student],
         result[TD3_NOISE_FREE_STUDENT_ACTION_KEY][student],
@@ -581,18 +544,18 @@ def test_main_rollout_keeps_teacher_rows_exact_and_samples_only_student_behavior
     # exploration draw. Here those means are identical, so discrepancy is zero.
     assert torch.equal(
         result[DAGGER_ACTION_DISCREPANCY_RMS_KEY],
-        torch.zeros(latent.shape[0]),
+        torch.zeros(raw_mean.shape[0]),
     )
     assert not torch.equal(owner.sac_rollout_rng.get_state(), rollout_rng_before)
     assert torch.equal(owner.sac_action_rng.get_state(), learning_rng_before)
 
 
 def test_teacher_only_prefill_is_bitwise_exact_and_does_not_draw_sac_noise():
-    owner, latent, teacher = _rollout_owner(prefill=True, beta=0.0)
+    owner, raw_mean, teacher = _rollout_owner(prefill=True, beta=0.0)
     policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
     td = TensorDict(
-        {"is_init": torch.zeros(latent.shape[0], dtype=torch.bool)},
-        batch_size=[latent.shape[0]],
+        {"is_init": torch.zeros(raw_mean.shape[0], dtype=torch.bool)},
+        batch_size=[raw_mean.shape[0]],
     )
     rollout_rng_before = owner.sac_rollout_rng.get_state().clone()
 
@@ -606,21 +569,23 @@ def test_teacher_only_prefill_is_bitwise_exact_and_does_not_draw_sac_noise():
 
 
 def test_deterministic_eval_uses_mean_without_advancing_any_sac_rng():
-    owner, latent, _ = _rollout_owner(prefill=False, beta=0.0)
+    owner, raw_mean, _ = _rollout_owner(prefill=False, beta=0.0)
+    raw_mean = torch.tensor([[25.0, -31.0]]).expand_as(raw_mean).clone()
     owner.cfg.use_object_adapt = False
     owner.depth_feature_dim = 1
     owner.adapt_ema = nn.Identity()
     owner.actor_adapt = nn.Identity()
+    owner._student_mean_action = lambda td: raw_mean.clone()
     eval_policy = _DeterministicFastSACStudentEvalPolicy(owner)
     rollout_rng_before = owner.sac_rollout_rng.get_state().clone()
     learning_rng_before = owner.sac_action_rng.get_state().clone()
-    td = TensorDict({}, batch_size=[latent.shape[0]])
+    td = TensorDict({}, batch_size=[raw_mean.shape[0]])
 
     first = eval_policy(td.clone())[ACTION_KEY]
     second = eval_policy(td.clone())[ACTION_KEY]
 
     assert torch.equal(first, second)
-    assert torch.equal(first, latent.tanh() * 20.0)
+    assert torch.equal(first, raw_mean)
     assert torch.equal(owner.sac_rollout_rng.get_state(), rollout_rng_before)
     assert torch.equal(owner.sac_action_rng.get_state(), learning_rng_before)
 
@@ -810,7 +775,7 @@ def _checkpoint_policy(seed: int):
     policy._last_fastsac_diagnostics = {}
     policy._fastsac_action_contract = {
         "joint_names": ["unit_joint"],
-        "execution_support_fingerprint": "sha256:unit-test",
+        "fingerprint": "sha256:unit-test",
     }
     return policy
 
@@ -1019,3 +984,71 @@ def test_fastsac_inference_loader_restores_models_without_training_state():
 
     with pytest.raises(ValueError, match="same-stage resume"):
         restored.load_state_dict(state)
+
+
+@pytest.mark.parametrize(
+    ("version", "backend", "message"),
+    (
+        (1, ACTOR_BACKEND, "version mismatch"),
+        (
+            CHECKPOINT_VERSION,
+            "ppo_bc_dagger_mean_plus_global_log_std_fastsac_v1",
+            "backend mismatch",
+        ),
+    ),
+)
+def test_fastsac_inference_rejects_legacy_tanh_checkpoint_contract_before_loading(
+    monkeypatch, version, backend, message
+):
+    policy = _bare_policy()
+    policy._fastsac_action_contract = {
+        "joint_names": ["unit_joint"],
+        "fingerprint": "sha256:raw-unit-test",
+    }
+    state = {
+        "training_algorithm": TRAINING_ALGORITHM,
+        "checkpoint_version": version,
+        "actor_backend": backend,
+        "action_contract": copy.deepcopy(policy._fastsac_action_contract),
+    }
+    monkeypatch.setattr(
+        PPOVEL,
+        "load_state_dict",
+        lambda *args, **kwargs: pytest.fail(
+            "incompatible checkpoint must be rejected before module loading"
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        policy.load_inference_state_dict(state)
+
+
+@pytest.mark.parametrize("saved_fingerprint", (None, "sha256:different"))
+def test_fastsac_inference_requires_exact_raw_action_contract_fingerprint(
+    monkeypatch, saved_fingerprint
+):
+    policy = _bare_policy()
+    policy._fastsac_action_contract = {
+        "joint_names": ["unit_joint"],
+        "fingerprint": "sha256:raw-unit-test",
+    }
+    saved_contract = {"joint_names": ["unit_joint"]}
+    if saved_fingerprint is not None:
+        saved_contract["fingerprint"] = saved_fingerprint
+    state = {
+        "training_algorithm": TRAINING_ALGORITHM,
+        "checkpoint_version": CHECKPOINT_VERSION,
+        "actor_backend": ACTOR_BACKEND,
+        "action_contract": saved_contract,
+    }
+    monkeypatch.setattr(
+        PPOVEL,
+        "load_state_dict",
+        lambda *args, **kwargs: pytest.fail(
+            "invalid contract must be rejected before module loading"
+        ),
+    )
+
+    message = "lacks a contract fingerprint" if saved_fingerprint is None else "mismatch"
+    with pytest.raises(ValueError, match=message):
+        policy.load_inference_state_dict(state)

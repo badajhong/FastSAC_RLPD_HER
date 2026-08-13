@@ -6,10 +6,12 @@ method-specific Hydra surface and rejects incompatible configuration before
 the simulator starts.
 
 The stochastic policy is intentional: Student collection, the soft Bellman
-target, and the SAC Actor objective sample reparameterized squashed-Gaussian
+target, and the SAC Actor objective sample reparameterized raw-Gaussian
 actions.  Exact Teacher BC is evaluated only on the same policy's noise-free
-mean.  Exploration therefore comes from SAC itself; inherited TD3 noise knobs
-are locked to zero.
+raw mean.  Teacher BC and Critic inputs use the same per-joint nominal
+normalization, while environment execution has no tanh/atanh transform or
+final action clip.  Exploration therefore comes from SAC itself; inherited
+TD3 noise knobs are locked to zero.
 """
 
 from __future__ import annotations
@@ -23,12 +25,16 @@ import torch
 from omegaconf import DictConfig, open_dict
 
 import active_adaptation as aa
+from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+    ACTION_CONTRACT_SEMANTICS,
+    ACTOR_BACKEND,
+    CHECKPOINT_VERSION,
+    TRAINING_ALGORITHM,
+)
 
 try:
-    from . import bc_dagger as _bc_dagger
     from .train import run_training
 except ImportError:
-    import bc_dagger as _bc_dagger  # type: ignore
     from train import run_training
 
 
@@ -39,9 +45,10 @@ EXPECTED_ALGO_NAME = "fastsac_bc_dagger"
 EXPECTED_ALGO_TARGET = (
     "active_adaptation.learning.ppo.fastsac_bc_dagger.DistributionalFastSACTeacherBC"
 )
-EXPECTED_TRAINING_ALGORITHM = "distributional_fastsac_teacher_bc_v1"
-EXPECTED_CHECKPOINT_VERSION = 1
-EXPECTED_ACTION_CONTRACT_SEMANTICS = _bc_dagger.EXPECTED_ACTION_CONTRACT_SEMANTICS
+EXPECTED_TRAINING_ALGORITHM = TRAINING_ALGORITHM
+EXPECTED_CHECKPOINT_VERSION = CHECKPOINT_VERSION
+EXPECTED_ACTOR_BACKEND = ACTOR_BACKEND
+EXPECTED_ACTION_CONTRACT_SEMANTICS = ACTION_CONTRACT_SEMANTICS
 EXPECTED_ACTOR_IN_KEYS = (
     "command",
     "policy",
@@ -123,6 +130,20 @@ def _finite_fraction(name: str, value) -> float:
     if value > 1.0:
         raise ValueError(f"{name} must lie in [0, 1]")
     return value
+
+
+def _reject_obsolete_bounded_action_controls(cfg: DictConfig) -> None:
+    """Reject stale knobs that would imply a bounded/tanh action backend."""
+    obsolete = sorted(
+        name
+        for name in ("dagger_action_clip", "dagger_teacher_action_threshold")
+        if name in cfg.algo
+    )
+    if obsolete:
+        raise ValueError(
+            "the direct unbounded raw-action backend removed bounded-action "
+            f"controls: {obsolete}"
+        )
 
 
 def _validate_perception_training_controls(cfg: DictConfig) -> str | None:
@@ -399,13 +420,13 @@ def fastsac_dagger_rollout_schedule(cfg: DictConfig) -> dict[str, int]:
 
 
 def prepare_fastsac_bc_dagger_checkpoint(cfg: DictConfig) -> None:
-    """Reject same-stage continuation; replay state is deliberately ephemeral."""
+    """Reject same-stage continuation across the fresh-only v2 contract."""
     requested = cfg.get("fastsac_bc_dagger_checkpoint", None)
     if requested is None:
         return None
     raise ValueError(
         "same-stage FastSAC resume is intentionally unsupported by the "
-        "fresh-only raw-perception replay contract; leave "
+        "fresh-only direct-raw-action/raw-perception v2 contract; leave "
         "fastsac_bc_dagger_checkpoint=null and use a train-phase PPO "
         "checkpoint_path"
     )
@@ -534,8 +555,6 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
     for name in (
         "dagger_bc_lr",
         "dagger_actor_huber_delta",
-        "dagger_teacher_action_threshold",
-        "dagger_action_clip",
         "q_lr",
         "q_action_input_gain",
         "sac_actor_lr",
@@ -560,9 +579,6 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         raise ValueError("algo.sac_use_autotune must be boolean")
     if not 0.0 < float(cfg.algo.sac_target_entropy_ratio) <= 1.0:
         raise ValueError("algo.sac_target_entropy_ratio must lie in (0, 1]")
-    if float(cfg.algo.sac_initial_action_std) > float(cfg.algo.dagger_action_clip):
-        raise ValueError("sac_initial_action_std cannot exceed dagger_action_clip")
-
     for name in (
         "sac_policy_frequency",
         "sac_learning_starts",
@@ -628,6 +644,7 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
             f"got algo._target_={cfg.algo.get('_target_')!r}"
         )
     _validate_locked_topology(cfg)
+    _reject_obsolete_bounded_action_controls(cfg)
     _validate_perception_training_controls(cfg)
 
     for name in (
@@ -660,13 +677,6 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError(
             "algo.q_teacher_buffer_capacity must cover algo.sac_learning_starts"
         )
-    if float(cfg.algo.dagger_teacher_action_threshold) > float(
-        cfg.algo.dagger_action_clip
-    ):
-        raise ValueError(
-            "algo.dagger_teacher_action_threshold cannot exceed dagger_action_clip"
-        )
-
     if int(cfg.algo.get("q_num_atoms", -1)) != 501:
         raise ValueError("distributional FastSAC requires exactly 501 C51 atoms")
     if not math.isclose(float(cfg.algo.get("q_v_min", math.nan)), -20.0):
@@ -677,8 +687,8 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError("distributional FastSAC requires late Q-action fusion")
     if cfg.algo.get("q_layer_norm") is not True:
         raise ValueError("distributional FastSAC requires LayerNorm Q Critics")
-    if cfg.algo.get("q_action_coordinates") != "absolute":
-        raise ValueError("distributional FastSAC requires absolute Q actions")
+    if cfg.algo.get("q_action_coordinates") != "raw_joint_command":
+        raise ValueError("distributional FastSAC requires raw_joint_command Q actions")
     if cfg.algo.get("q_normalize_actions") is not True:
         raise ValueError("distributional FastSAC requires normalized Q actions")
     if not math.isclose(float(cfg.algo.get("q_action_input_gain", math.nan)), 1.0):
@@ -706,11 +716,9 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     release = float(cfg.algo.get("dagger_safe_release_rms", math.nan))
     takeover = float(cfg.algo.get("dagger_safe_takeover_rms", math.nan))
     if not (
-        math.isfinite(release)
-        and math.isfinite(takeover)
-        and 0.0 <= release < takeover <= 2.0
+        math.isfinite(release) and math.isfinite(takeover) and 0.0 <= release < takeover
     ):
-        raise ValueError("SafeDAgger requires 0 <= release_rms < takeover_rms <= 2")
+        raise ValueError("SafeDAgger requires 0 <= release_rms < takeover_rms")
     safe_zero_iteration = cfg.algo.get("dagger_safe_zero_iteration", None)
     if safe_zero_iteration is not None and control_mode == "beta":
         raise ValueError(
