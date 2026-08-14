@@ -100,6 +100,11 @@ def _finite_scalar(name: str, value, *, positive: bool = False) -> float:
 
 def _validate_tvkd_algorithm_config(cfg) -> None:
     """Validate controls shared by direct construction and the Hydra CLI."""
+    if getattr(cfg, "sac_alpha_update_cadence", None) != "critic":
+        raise ValueError(
+            "TVKD v1 requires sac_alpha_update_cadence='critic' for "
+            "resume-compatible temperature updates"
+        )
     for name in ("use_tvkd_value_shaping", "use_adaptive_student_bc"):
         if not isinstance(getattr(cfg, name), bool):
             raise ValueError(f"{name} must be boolean")
@@ -155,6 +160,8 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
 
     _target_: str = EXPECTED_ALGO_TARGET
     name: str = EXPECTED_ALGO_NAME
+    # Preserve the v1 TVKD optimizer timescale for exact same-stage resume.
+    sac_alpha_update_cadence: str = "critic"
 
     use_tvkd_value_shaping: bool = True
     tvkd_lambda: float = 0.25

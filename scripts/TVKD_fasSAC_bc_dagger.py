@@ -475,6 +475,10 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
         resolve=True,
         enum_to_str=True,
     )
+    # Checkpoints written before this explicit provenance field used the TVKD
+    # v1 every-Critic cadence.  Normalize that known legacy omission without
+    # relaxing any other same-stage algorithm comparison.
+    source_algo_contract.setdefault("sac_alpha_update_cadence", "critic")
     runtime_algo_contract = OmegaConf.to_container(
         cfg.algo, resolve=True, enum_to_str=True
     )
@@ -541,7 +545,6 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
             f"TVKD entrypoint requires algo._target_={EXPECTED_ALGO_TARGET!r}"
         )
     _validate_tvkd_algorithm_config(cfg.algo)
-
     # Keep one source of truth for topology, replay ratios, UTD, target cadence,
     # perception/randomization controls, and fresh PPO checkpoint rules.
     baseline_cfg = OmegaConf.create(
@@ -550,6 +553,9 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     with open_dict(baseline_cfg.algo):
         baseline_cfg.algo.name = BASE_EXPECTED_ALGO_NAME
         baseline_cfg.algo._target_ = BASE_EXPECTED_ALGO_TARGET
+        # Baseline validation locks its new production entrypoint to Actor
+        # cadence. TVKD itself is locked above to its legacy Critic cadence.
+        baseline_cfg.algo.sac_alpha_update_cadence = "actor"
     # The baseline intentionally rejects continuation because it has no model
     # for TVKD's scheduler-aware, fresh-ring resume contract.  Every topology
     # and source-ratio lock still applies to the translated validation config.
@@ -601,6 +607,7 @@ def main(cfg: DictConfig):
         f"{start_rollout + schedule['main_rollouts']}), "
         f"frames/rollout={schedule['frames_per_rollout']}; "
         f"tvkd_lambda={float(cfg.algo.tvkd_lambda):g}, "
+        f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence}, "
         "sources=Student 50% / uniform Teacher 35% / failure Teacher 15%"
     )
     return run_training(cfg)

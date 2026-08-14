@@ -102,6 +102,10 @@ ACTOR_LEARNING_SEMANTICS = (
 )
 ENTROPY_SEMANTICS = (
     "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
+    "auto_temperature_delayed_actor_cadence_v3"
+)
+_CRITIC_CADENCE_ENTROPY_SEMANTICS = (
+    "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
     "auto_temperature_v2"
 )
 
@@ -143,6 +147,7 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     sac_alpha_init: float = 1e-5
     sac_alpha_lr: float = 2e-5
     sac_use_autotune: bool = True
+    sac_alpha_update_cadence: str = "actor"
     sac_target_entropy_ratio: float = 1.0
     sac_policy_frequency: int = 8
     sac_learning_starts: int = 8192
@@ -443,6 +448,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 raise ValueError(f"FastSAC requires inherited TD3 field {name}=0")
         if not isinstance(cfg.sac_use_autotune, bool):
             raise ValueError("sac_use_autotune must be a boolean")
+        if str(cfg.sac_alpha_update_cadence) not in ("actor", "critic"):
+            raise ValueError(
+                "sac_alpha_update_cadence must be 'actor' or 'critic'"
+            )
         if not (
             math.isfinite(float(cfg.sac_log_std_min))
             and math.isfinite(float(cfg.sac_log_std_max))
@@ -778,7 +787,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         }
 
     def _critic_update(self, batch: dict[str, torch.Tensor]):
-        """One twin-C51 soft Bellman update plus one temperature update."""
+        """One twin-C51 update and a configured-cadence temperature update."""
         projected_target, target_metrics, target_log_prob = (
             self._distributional_fastsac_target(batch)
         )
@@ -813,7 +822,36 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "FastSAC alpha bootstrap mask and target log-probability "
                 "population are misaligned"
             )
-        alpha_metrics = self._alpha_update(alpha_log_prob[alpha_bootstrap])
+        # Baseline temperature and Actor see the same policy-update timescale.
+        # Cadence is evaluated after incrementing ``critic_update_count``, so
+        # an Actor-cadence update adjusts alpha immediately before the matching
+        # Actor update in the inherited replay loop.  TVKD v1 explicitly keeps
+        # its legacy every-Critic cadence for resume compatibility.
+        alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
+        alpha_update_due = alpha_update_cadence == "critic" or (
+            self.critic_update_count % int(self.cfg.sac_policy_frequency) == 0
+        )
+        alpha_update_count_before = int(getattr(self, "alpha_update_count", 0))
+        if alpha_update_due:
+            alpha_metrics = self._alpha_update(alpha_log_prob[alpha_bootstrap])
+        else:
+            # Reuse the empty-population path to publish zero per-step loss and
+            # gradient without touching the optimizer.
+            alpha_metrics = self._alpha_update(alpha_log_prob[:0])
+        alpha_update_performed = (
+            int(getattr(self, "alpha_update_count", 0))
+            > alpha_update_count_before
+        )
+        alpha_metrics.update(
+            {
+                "alpha_update_due_fraction": alpha_log_prob.new_tensor(
+                    float(alpha_update_due)
+                ),
+                "alpha_update_performed_fraction": alpha_log_prob.new_tensor(
+                    float(alpha_update_performed)
+                ),
+            }
+        )
         _polyak_update_(self.qnet_target, self.qnet, float(self.cfg.sac_tau))
         self.qnet_target.requires_grad_(False).eval()
         with torch.no_grad():
@@ -980,9 +1018,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "entropy_tax_mean",
             "entropy_tax_abs_mean",
             "entropy_tax_reward_abs_ratio",
-            "alpha_loss",
-            "alpha_grad_norm",
-            "alpha",
+            "alpha_update_due_fraction",
+            "alpha_update_performed_fraction",
         )
         actor_keys = (
             "actor_expected_q1_mean",
@@ -998,8 +1035,30 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         critic = self._mean_metric_dict(
             self._fastsac_rollout_critic_metrics, critic_keys
         )
-        if not self._fastsac_rollout_critic_metrics:
-            critic["alpha"] = self.log_alpha.detach().exp().item()
+        # Skipped Critic steps intentionally carry zero temperature metrics.
+        # Report loss/gradient over optimizer steps only, so a delayed cadence
+        # does not dilute them in the rollout aggregate.
+        if self._fastsac_rollout_critic_metrics:
+            performed = torch.stack(
+                [
+                    metrics["alpha_update_performed_fraction"].detach().float()
+                    for metrics in self._fastsac_rollout_critic_metrics
+                ]
+            )
+            performed_count = performed.sum().clamp_min(1.0)
+            for key in ("alpha_loss", "alpha_grad_norm"):
+                values = torch.stack(
+                    [
+                        metrics[key].detach().float()
+                        for metrics in self._fastsac_rollout_critic_metrics
+                    ]
+                )
+                critic[key] = ((values * performed).sum() / performed_count).item()
+        else:
+            critic.update({"alpha_loss": 0.0, "alpha_grad_norm": 0.0})
+        # Publish the temperature actually available to the next rollout,
+        # rather than the within-rollout mean of stale and updated values.
+        critic["alpha"] = self.log_alpha.detach().exp().item()
         actor = self._mean_metric_dict(self._fastsac_rollout_actor_metrics, actor_keys)
         info.update({f"fastsac/{key}": value for key, value in critic.items()})
         info.update({f"fastsac/{key}": value for key, value in actor.items()})
@@ -1014,17 +1073,32 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
 
     def _q_backend_metadata(self):
         metadata = DistributionalTD3TeacherBC._q_backend_metadata(self)
+        alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
         metadata.update(
             {
                 "target_semantics": CRITIC_SEMANTICS,
                 "actor_q_reduction": "minimum_online_twin_expectations",
                 "actor_target": False,
                 "stochastic_actor": True,
-                "entropy_semantics": ENTROPY_SEMANTICS,
+                "entropy_semantics": (
+                    ENTROPY_SEMANTICS
+                    if alpha_update_cadence == "actor"
+                    else _CRITIC_CADENCE_ENTROPY_SEMANTICS
+                ),
                 "entropy_reference_log_scale_sum": (
                     self._fastsac_entropy_reference_log_scale_sum
                 ),
                 "target_entropy": float(self.target_entropy),
+                "temperature_update_cadence": (
+                    "delayed_actor_update"
+                    if alpha_update_cadence == "actor"
+                    else "every_critic_update"
+                ),
+                "temperature_update_frequency_critic_steps": (
+                    int(self.cfg.sac_policy_frequency)
+                    if alpha_update_cadence == "actor"
+                    else 1
+                ),
             }
         )
         return metadata
@@ -1052,6 +1126,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "sac_alpha_init",
                     "sac_alpha_lr",
                     "sac_use_autotune",
+                    "sac_alpha_update_cadence",
                     "sac_target_entropy_ratio",
                     "sac_policy_frequency",
                     "sac_learning_starts",
@@ -1072,13 +1147,18 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         return common
 
     def _fastsac_checkpoint_state(self):
+        alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
         return {
             "training_algorithm": TRAINING_ALGORITHM,
             "checkpoint_version": CHECKPOINT_VERSION,
             "actor_backend": ACTOR_BACKEND,
             "critic_learning_semantics": CRITIC_SEMANTICS,
             "actor_learning_semantics": ACTOR_LEARNING_SEMANTICS,
-            "entropy_semantics": ENTROPY_SEMANTICS,
+            "entropy_semantics": (
+                ENTROPY_SEMANTICS
+                if alpha_update_cadence == "actor"
+                else _CRITIC_CADENCE_ENTROPY_SEMANTICS
+            ),
             "actor_adapt": self.actor_adapt.state_dict(),
             "bc_dagger_sac_adapter": self.bc_dagger_sac_adapter.state_dict(),
             "qnet": self.qnet.state_dict(),

@@ -777,6 +777,9 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
             ],
         )
     saved_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    # Legacy TVKD v1 configs predate the explicit cadence provenance field but
+    # already used one alpha update per Critic step.
+    del saved_cfg.algo.sac_alpha_update_cadence
     checkpoint_path = tmp_path / "checkpoint_12.pt"
     rng_state = torch.Generator().manual_seed(11).get_state()
     module_names = (
@@ -1040,6 +1043,7 @@ def test_tvkd_hydra_config_inherits_locked_source_mix_and_new_defaults():
         )
 
     assert cfg.algo.name == "tvkd_fastsac_bc_dagger"
+    assert cfg.algo.sac_alpha_update_cadence == "critic"
     assert cfg.algo.use_tvkd_value_shaping is True
     assert cfg.algo.tvkd_lambda == pytest.approx(0.25)
     assert cfg.algo.use_adaptive_student_bc is True
@@ -1049,3 +1053,7 @@ def test_tvkd_hydra_config_inherits_locked_source_mix_and_new_defaults():
     assert cfg.algo.failure_phase_teacher_fraction == pytest.approx(0.3)
     assert cfg.algo.q_teacher_replay_ratio == pytest.approx(0.5)
     assert cfg.algo.q_updates_per_rollout == 32
+
+    cfg.algo.sac_alpha_update_cadence = "actor"
+    with pytest.raises(ValueError, match="TVKD v1 requires.*critic"):
+        validate_tvkd_fastsac_bc_dagger_config(cfg)

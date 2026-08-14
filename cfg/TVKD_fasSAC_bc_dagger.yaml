@@ -14,3 +14,7 @@ defaults:
 # again, avoiding multi-gigabyte replay tensors in every periodic checkpoint.
 fastsac_bc_dagger_checkpoint: null
 _tvkd_model_only_resume: false
+
+algo:
+  # TVKD v1 checkpoints were trained with one temperature update per Critic.
+  sac_alpha_update_cadence: critic

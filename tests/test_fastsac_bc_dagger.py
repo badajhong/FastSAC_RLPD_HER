@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from types import MethodType, SimpleNamespace
 
@@ -43,6 +44,13 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     DistributionalFastSACTeacherBCConfig,
     _DeterministicFastSACStudentEvalPolicy,
     _DistributionalFastSACDaggerRolloutPolicy,
+)
+from active_adaptation.learning.ppo.fastsac_gradient_probe import (
+    GRADIENT_PROBE_SCHEMA,
+    diagnose_fastsac_actor_gradients,
+)
+from active_adaptation.learning.ppo.td3_bc_dagger import (
+    FAILURE_PHASE_TEACHER_SOURCE_KEY,
 )
 
 
@@ -174,6 +182,7 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.collector_exploration_noise_clip == 0.0
     assert cfg.eta_td3 == 0.0
     assert cfg.policy_delay == cfg.sac_policy_frequency == 8
+    assert cfg.sac_alpha_update_cadence == "actor"
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
 
@@ -188,6 +197,15 @@ def test_config_rejects_entropy_target_above_maximum_gaussian_entropy():
     cfg = DistributionalFastSACTeacherBCConfig(sac_log_std_max=-3.0)
 
     with pytest.raises(ValueError, match="entropy target is unreachable"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+def test_config_rejects_unknown_temperature_update_cadence():
+    cfg = DistributionalFastSACTeacherBCConfig(
+        sac_alpha_update_cadence="rollout"
+    )
+
+    with pytest.raises(ValueError, match="sac_alpha_update_cadence.*critic"):
         DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
@@ -586,6 +604,109 @@ def test_bc_only_actor_step_does_not_update_global_log_std():
     assert torch.equal(policy.bc_dagger_sac_adapter.log_std, log_std_before)
 
 
+def test_gradient_probe_separates_components_and_is_strictly_read_only():
+    policy = _bare_policy(
+        eta_sac=0.2,
+        lambda_bc=1.3,
+        dagger_actor_huber_delta=0.4,
+        sac_log_std_min=-5.0,
+        sac_log_std_max=1.0,
+        q_action_input_gain=1.0,
+    )
+    _install_unit_action_contract(policy)
+    _install_tiny_stochastic_actor(policy, actor_weight=0.25, log_std=-1.0)
+    policy.qnet = _ActionSensitiveTwinC51()
+    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.4)))
+    policy.actor_optimizer = torch.optim.AdamW(
+        (
+            {"params": tuple(policy.actor_adapt.parameters())},
+            {"params": tuple(policy.bc_dagger_sac_adapter.parameters())},
+        ),
+        lr=0.01,
+    )
+    policy.sac_action_rng = torch.Generator().manual_seed(71)
+    batch = {
+        "observations": torch.tensor([[1.0], [2.0], [-1.0], [0.5]]),
+        "critic_observations": torch.ones(4, 1),
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.tensor(
+            [[0.5], [-0.2], [0.1], [0.3]]
+        ),
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.tensor(
+            [True, True, False, True]
+        ),
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor(
+            [False, False, True, True]
+        ),
+        FAILURE_PHASE_TEACHER_SOURCE_KEY: torch.tensor(
+            [False, False, False, True]
+        ),
+    }
+
+    actor_parameters = tuple(policy.actor_adapt.parameters()) + tuple(
+        policy.bc_dagger_sac_adapter.parameters()
+    )
+    for index, parameter in enumerate(actor_parameters):
+        parameter.grad = torch.full_like(parameter, float(index + 1))
+        parameter.requires_grad_(False)
+    policy.qnet.requires_grad_(False)
+    policy.log_alpha.requires_grad_(False)
+    model_before = copy.deepcopy(nn.Module.state_dict(policy))
+    optimizer_before = copy.deepcopy(policy.actor_optimizer.state_dict())
+    rng_before = policy.sac_action_rng.get_state().clone()
+    gradients_before = tuple(parameter.grad.clone() for parameter in actor_parameters)
+    requires_grad_before = tuple(
+        parameter.requires_grad for parameter in actor_parameters
+    )
+
+    result = diagnose_fastsac_actor_gradients(
+        policy,
+        batch,
+        sample_seed=313,
+        source_gradients=True,
+    )
+
+    assert result["schema"] == GRADIENT_PROBE_SCHEMA
+    assert result["batch_rows"] == 4
+    assert result["strata"]["student"]["rows"] == 2
+    assert result["strata"]["teacher"]["rows"] == 2
+    assert result["strata"]["failure_teacher"]["rows"] == 1
+    assert result["strata"]["all"]["dqda_policy_sample_norm_mean"] > 0.0
+    assert (
+        result["strata"]["all"][
+            "cos_dqda_mean_with_teacher_minus_mean"
+        ]
+        is not None
+    )
+    assert (
+        result["strata"]["all"][
+            "teacher_direction_fd_sign_agreement_fraction"
+        ]
+        == pytest.approx(1.0)
+    )
+    assert (
+        result["strata"]["all"][
+            "teacher_direction_fd_relative_error_mean"
+        ]
+        < 0.02
+    )
+    all_groups = result["gradients"]["all"]["groups"]
+    assert all_groups["actor_mean"]["unweighted_norms"]["bc"] > 0.0
+    assert all_groups["global_log_std"]["unweighted_norms"]["bc"] == 0.0
+    assert all_groups["global_log_std"]["unweighted_norms"]["q"] > 0.0
+    assert all_groups["global_log_std"]["unweighted_norms"]["entropy"] > 0.0
+    assert all_groups["global_log_std"]["cosines"]["bc_q"] is None
+    json.dumps(result, allow_nan=False)
+
+    _assert_nested_equal(nn.Module.state_dict(policy), model_before)
+    _assert_nested_equal(policy.actor_optimizer.state_dict(), optimizer_before)
+    assert torch.equal(policy.sac_action_rng.get_state(), rng_before)
+    assert tuple(parameter.requires_grad for parameter in actor_parameters) == (
+        requires_grad_before
+    )
+    for parameter, gradient in zip(actor_parameters, gradients_before):
+        assert torch.equal(parameter.grad, gradient)
+
+
 def _rollout_owner(*, prefill: bool, beta: float = 0.5):
     action_dim = 2
     batch_size = 64
@@ -820,9 +941,11 @@ def test_temperature_log_alpha_gradient_is_not_attenuated_by_small_alpha():
 
 
 def test_critic_temperature_population_excludes_true_terminals_but_keeps_timeouts():
-    """Alpha learns only from next states for which the target can bootstrap."""
+    """Actor-cadence alpha uses only next states which can bootstrap."""
     policy = _bare_policy(
         sac_use_autotune=True,
+        sac_alpha_update_cadence="actor",
+        sac_policy_frequency=2,
         sac_max_grad_norm=1.0e6,
         sac_tau=0.0,
         q_action_input_gain=1.0,
@@ -854,17 +977,48 @@ def test_critic_temperature_population_excludes_true_terminals_but_keeps_timeout
         "truncations": torch.tensor([False, False, True]),
     }
 
-    policy._critic_update(batch)
+    skipped = policy._critic_update(batch)
+
+    assert torch.equal(policy.log_alpha, before)
+    assert policy.alpha_optimizer.step_calls == 0
+    assert policy.alpha_update_count == 0
+    assert skipped["alpha_update_due_fraction"].item() == 0.0
+    assert skipped["alpha_update_performed_fraction"].item() == 0.0
+    assert skipped["alpha_loss"].item() == 0.0
+    assert skipped["alpha_grad_norm"].item() == 0.0
+
+    performed = policy._critic_update(batch)
 
     assert policy.log_alpha.item() > before.item()
+    assert policy.alpha_optimizer.step_calls == 1
     assert policy.alpha_update_count == 1
+    assert performed["alpha_update_due_fraction"].item() == 1.0
+    assert performed["alpha_update_performed_fraction"].item() == 1.0
+
+    alpha_seen_by_actor = []
+    policy._actor_update = MethodType(
+        lambda owner, actor_batch: alpha_seen_by_actor.append(
+            owner.log_alpha.detach().clone()
+        )
+        or {"batch": actor_batch},
+        policy,
+    )
+    policy._maybe_delayed_actor_and_targets({"sentinel": True})
+    assert len(alpha_seen_by_actor) == 1
+    assert torch.equal(alpha_seen_by_actor[0], policy.log_alpha.detach())
 
     after_valid_population = policy.log_alpha.detach().clone()
     batch["dones"] = torch.ones(3, dtype=torch.bool)
     batch["truncations"] = torch.zeros(3, dtype=torch.bool)
+    # Critic update 3 is off cadence; Critic update 4 is due but has no valid
+    # temperature population.  Neither may invoke the optimizer.
     policy._critic_update(batch)
+    terminal_due = policy._critic_update(batch)
     assert torch.equal(policy.log_alpha, after_valid_population)
+    assert policy.alpha_optimizer.step_calls == 1
     assert policy.alpha_update_count == 1
+    assert terminal_due["alpha_update_due_fraction"].item() == 1.0
+    assert terminal_due["alpha_update_performed_fraction"].item() == 0.0
 
 
 def test_fixed_temperature_skips_optimizer_but_remains_in_soft_target():
@@ -886,6 +1040,7 @@ def test_fixed_temperature_skips_optimizer_but_remains_in_soft_target():
 def _checkpoint_policy(seed: int):
     policy = _bare_policy(
         sac_use_autotune=True,
+        sac_alpha_update_cadence="actor",
         sac_log_std_min=-10.0,
         sac_log_std_max=-2.0,
         q_batch_size=512,

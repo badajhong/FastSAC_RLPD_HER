@@ -95,6 +95,7 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "sac_alpha_init": 1.0e-5,
                 "sac_alpha_lr": 2.0e-5,
                 "sac_use_autotune": True,
+                "sac_alpha_update_cadence": "actor",
                 "sac_target_entropy_ratio": 1.0,
                 "sac_policy_frequency": 8,
                 "sac_learning_starts": 8192,
@@ -197,6 +198,7 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     assert cfg.algo.sac_initial_action_std == pytest.approx(0.1)
     assert cfg.algo.action_support_clip == pytest.approx(20.0)
     assert cfg.algo.sac_use_autotune is True
+    assert cfg.algo.sac_alpha_update_cadence == "actor"
     assert cfg.algo.q_batch_size == 512
     assert cfg.algo.q_updates_per_rollout == 32
     assert cfg.algo.q_update_to_data_ratio == pytest.approx(1.0)
@@ -483,6 +485,7 @@ def test_inherited_td3_noise_must_remain_zero(field):
         ("sac_initial_action_std", 0.0, "positive"),
         ("sac_log_std_min", -1.0, "below"),
         ("sac_alpha_init", 0.0, "positive"),
+        ("sac_alpha_update_cadence", "critic", "must be 'actor'"),
         ("sac_target_entropy_ratio", 1.1, r"\(0, 1\]"),
         ("sac_policy_frequency", 0, "positive"),
         ("sac_learning_starts", 0, "positive"),
@@ -596,7 +599,7 @@ def test_same_stage_resume_is_rejected():
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
-def test_entrypoint_reuses_shared_training_engine(monkeypatch):
+def test_entrypoint_reuses_shared_training_engine(monkeypatch, capsys):
     assert sac_entry.run_training is shared_run_training
     cfg = _cfg()
     received = []
@@ -617,6 +620,8 @@ def test_entrypoint_reuses_shared_training_engine(monkeypatch):
     assert result == "shared-result"
     assert sources == [cfg]
     assert received == [cfg]
+    output = capsys.readouterr().out
+    assert "alpha_update_cadence=actor (every 8 Critic updates)" in output
 
 
 @pytest.mark.parametrize(

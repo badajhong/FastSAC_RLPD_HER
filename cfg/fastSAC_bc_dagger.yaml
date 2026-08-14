@@ -144,6 +144,8 @@ algo:
   sac_alpha_init: 1.0e-5
   sac_alpha_lr: 2.0e-5
   sac_use_autotune: true
+  # Lock autotune to the delayed Actor cadence, not every Critic update.
+  sac_alpha_update_cadence: actor
   sac_target_entropy_ratio: 1.0
   sac_policy_frequency: 8
   sac_learning_starts: 8192

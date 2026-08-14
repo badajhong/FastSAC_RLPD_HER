@@ -1,0 +1,35 @@
+# Read-only fresh-state diagnostic for a completed FastSAC-BC-DAgger model.
+defaults:
+  - eval
+  - override /task: G1/vaic/skateboard_stu
+  - override /algo: fastsac_bc_dagger_finetune
+  - _self_
+
+checkpoint_path: null
+vecnorm: eval
+headless: true
+eval_render: false
+app:
+  enable_cameras: true
+
+# Raw recurrent perception windows are reconstructed exactly as in training.
+task:
+  num_envs: 128
+
+gradient_probe:
+  # "balanced" collects one pure-Student and one forced-Teacher rollout and
+  # forms an exact 50/50 batch. "student" is useful for learner-state-only
+  # diagnosis; "teacher" diagnoses only fresh Teacher-controlled states.
+  source_mode: balanced
+  rollouts_per_source: 1
+  batch_size: 1024
+  collection_seed: 0
+  sample_seed: 313
+  source_gradients: true
+  output_path: fastsac_gradient_probe.json
+
+hydra:
+  run:
+    dir: ./outputs_probe/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

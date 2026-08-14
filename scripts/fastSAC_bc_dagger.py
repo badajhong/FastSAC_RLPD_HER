@@ -597,6 +597,11 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         raise ValueError("sac_log_std_min must be finite and below sac_log_std_max")
     if cfg.algo.get("sac_use_autotune", None) not in (True, False):
         raise ValueError("algo.sac_use_autotune must be boolean")
+    if cfg.algo.get("sac_alpha_update_cadence", None) != "actor":
+        raise ValueError(
+            "algo.sac_alpha_update_cadence must be 'actor' so temperature "
+            "updates match the delayed Actor cadence"
+        )
     if not 0.0 < float(cfg.algo.sac_target_entropy_ratio) <= 1.0:
         raise ValueError("algo.sac_target_entropy_ratio must lie in (0, 1]")
     max_unsquashed_entropy_per_dim = (
@@ -830,7 +835,9 @@ def main(cfg: DictConfig):
         f"tau={float(cfg.algo.sac_tau):g}, "
         f"eta_sac={float(cfg.algo.eta_sac):g}, "
         f"lambda_bc={float(cfg.algo.lambda_bc):g}, "
-        f"alpha_init={float(cfg.algo.sac_alpha_init):g}"
+        f"alpha_init={float(cfg.algo.sac_alpha_init):g}, "
+        f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence} "
+        f"(every {int(cfg.algo.sac_policy_frequency)} Critic updates)"
     )
     return run_training(cfg)
 
