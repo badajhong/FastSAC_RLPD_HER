@@ -76,10 +76,11 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "q_max_grad_norm": 1.0,
                 "q_batch_size": 512,
                 "q_updates_per_rollout": 32,
+                "q_update_to_data_ratio": 1.0,
                 "q_teacher_replay_ratio": 0.5,
                 "q_teacher_buffer_capacity": 131_072,
                 "eta_td3": 0.0,
-                "policy_delay": 2,
+                "policy_delay": 8,
                 "target_policy_noise_std": 0.0,
                 "target_policy_noise_clip": 0.0,
                 "collector_exploration_noise_std": 0.0,
@@ -95,7 +96,7 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "sac_alpha_lr": 2.0e-5,
                 "sac_use_autotune": True,
                 "sac_target_entropy_ratio": 1.0,
-                "sac_policy_frequency": 2,
+                "sac_policy_frequency": 8,
                 "sac_learning_starts": 8192,
                 "sac_tau": 0.005,
                 "sac_max_grad_norm": 1.0,
@@ -184,6 +185,7 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
         1.0 - cfg.algo.failure_phase_teacher_fraction
     ) == pytest.approx(0.35)
     assert cfg.algo.teacher_perception_batch_size == 128
+    assert cfg.algo.perception_encode_microbatch_size == 512
     assert cfg.algo.teacher_perception_warmup_steps == 128
     assert cfg.algo.load_pretrained_perception is False
     assert cfg.algo.perception_checkpoint_path is None
@@ -197,6 +199,9 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     assert cfg.algo.sac_use_autotune is True
     assert cfg.algo.q_batch_size == 512
     assert cfg.algo.q_updates_per_rollout == 32
+    assert cfg.algo.q_update_to_data_ratio == pytest.approx(1.0)
+    assert cfg.algo.policy_delay == 8
+    assert cfg.algo.sac_policy_frequency == 8
     assert cfg.algo.save_teacher_buffer is False
     assert cfg.algo.target_policy_noise_std == 0.0
     assert cfg.algo.collector_exploration_noise_std == 0.0
@@ -388,6 +393,30 @@ def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "teacher_actor_replay_fraction",
+        "teacher_perception_replay_fraction",
+        "q_teacher_replay_ratio",
+    ),
+)
+def test_shared_training_sources_require_exact_half_teacher_half_student(field):
+    cfg = _cfg()
+    cfg.algo[field] = 0.4
+
+    with pytest.raises(ValueError, match="exact 50/50"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_exact_half_teacher_actor_mix_requires_even_batch_size():
+    cfg = _cfg()
+    cfg.algo.dagger_batch_size = 4095
+
+    with pytest.raises(ValueError, match=r"dagger_batch_size.*even.*50/50"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
 def test_dynamic_teacher_prefill_requires_positive_safety_ceiling():
     cfg = _cfg()
     cfg.algo.teacher_prefill_max_rollouts = 0
@@ -466,6 +495,7 @@ def test_inherited_td3_noise_must_remain_zero(field):
         ("q_action_coordinates", "absolute", "raw_joint_command"),
         ("q_batch_size", 3, "even"),
         ("q_updates_per_rollout", 0, "positive"),
+        ("q_update_to_data_ratio", 0.5, "row-level Q UTD=1"),
         ("q_teacher_replay_ratio", 0.4, "50/50"),
     ),
 )
@@ -481,6 +511,14 @@ def test_sac_and_bc_weights_cannot_both_be_zero():
     cfg.algo.eta_sac = 0.0
     cfg.algo.lambda_bc = 0.0
     with pytest.raises(ValueError, match="cannot both be zero"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_unreachable_entropy_target_fails_before_training():
+    cfg = _cfg()
+    cfg.algo.sac_log_std_max = -3.0
+
+    with pytest.raises(ValueError, match="entropy target is unreachable"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 

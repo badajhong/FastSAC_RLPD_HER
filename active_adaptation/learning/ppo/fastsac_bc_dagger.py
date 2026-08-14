@@ -83,8 +83,12 @@ from .td3_bc_dagger import (
 
 
 TRAINING_ALGORITHM = "distributional_fastsac_teacher_bc_v1"
-CHECKPOINT_VERSION = 3
-ACTOR_BACKEND = "ppo_vel_normalized_std_tanh_bounded_fastsac_bc_v1"
+CHECKPOINT_VERSION = 4
+ACTOR_BACKEND = "ppo_vel_smooth_bounded_normalized_std_tanh_fastsac_bc_v2"
+_LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION = 3
+_LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND = (
+    "ppo_vel_normalized_std_tanh_bounded_fastsac_bc_v1"
+)
 ACTION_CONTRACT_SEMANTICS = (
     "finite_raw_joint_action_support_with_jointwise_normalized_q_bc_v1"
 )
@@ -97,7 +101,8 @@ ACTOR_LEARNING_SEMANTICS = (
     "joint_normalized_raw_teacher_mean_bc_v1"
 )
 ENTROPY_SEMANTICS = (
-    "bounded_tanh_normal_nominal_joint_coordinate_log_probability_auto_temperature_v1"
+    "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
+    "auto_temperature_v2"
 )
 
 
@@ -122,8 +127,12 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     target_policy_noise_clip: float = 0.0
     collector_exploration_noise_std: float = 0.0
     collector_exploration_noise_clip: float = 0.0
-    policy_delay: int = 2
+    policy_delay: int = 8
     td3_learning_starts: int = 8192
+
+    # Process larger replay chunks on the target 5090 so the increased Q UTD
+    # does not multiply small depth-encoder launches.
+    perception_encode_microbatch_size: int = 512
 
     eta_sac: float = 1e-4
     lambda_bc: float = 1.0
@@ -135,12 +144,13 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     sac_alpha_lr: float = 2e-5
     sac_use_autotune: bool = True
     sac_target_entropy_ratio: float = 1.0
-    sac_policy_frequency: int = 2
+    sac_policy_frequency: int = 8
     sac_learning_starts: int = 8192
     sac_tau: float = 0.005
     sac_max_grad_norm: float = 1.0
 
     q_updates_per_rollout: int = 32
+    q_update_to_data_ratio: float | None = 1.0
 
 
 ConfigStore.instance().store(
@@ -332,17 +342,26 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 (self.action_dim,), float(cfg.sac_initial_action_std)
             )
         )
-        if (initial_log_std < float(cfg.sac_log_std_min)).any() or (
-            initial_log_std > float(cfg.sac_log_std_max)
+        if (initial_log_std <= float(cfg.sac_log_std_min)).any() or (
+            initial_log_std >= float(cfg.sac_log_std_max)
         ).any():
             raise ValueError(
-                "sac_initial_action_std maps outside normalized log-std bounds"
+                "sac_initial_action_std must map strictly inside normalized "
+                "log-std bounds"
             )
+        initial_raw_log_std = self._inverse_smooth_log_std(
+            initial_log_std,
+            float(cfg.sac_log_std_min),
+            float(cfg.sac_log_std_max),
+        )
         self.register_buffer(
             "_fastsac_initial_log_std", initial_log_std.detach().clone()
         )
+        self.register_buffer(
+            "_fastsac_initial_raw_log_std", initial_raw_log_std.detach().clone()
+        )
         self.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
-            self.action_dim, initial_log_std, self.device
+            self.action_dim, initial_raw_log_std, self.device
         )
         self._freeze_legacy_actor_std()
 
@@ -353,8 +372,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         if not actor_mean_parameters:
             raise RuntimeError("FastSAC Actor has no trainable mean parameters")
-        # Weight decay on a negative log-std would systematically enlarge
-        # exploration toward std=1.  Keep that single parameter unregularized.
+        # The adapter stores the unconstrained pre-tanh log-std coordinate.
+        # Keep that single parameter unregularized so weight decay cannot pull
+        # the effective standard deviation toward the interval midpoint.
         self.actor_optimizer = torch.optim.AdamW(
             (
                 {
@@ -446,6 +466,16 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 raise ValueError(f"{name} must be finite and non-negative")
         if not 0.0 < float(cfg.sac_target_entropy_ratio) <= 1.0:
             raise ValueError("sac_target_entropy_ratio must lie in (0,1]")
+        max_unsquashed_entropy_per_dim = (
+            0.5 * math.log(2.0 * math.pi * math.e)
+            + float(cfg.sac_log_std_max)
+        )
+        target_entropy_per_dim = -float(cfg.sac_target_entropy_ratio)
+        if max_unsquashed_entropy_per_dim <= target_entropy_per_dim:
+            raise ValueError(
+                "FastSAC entropy target is unreachable: sac_log_std_max must be "
+                "greater than -sac_target_entropy_ratio - 0.5*log(2*pi*e)"
+            )
         if float(cfg.eta_sac) == 0.0 and float(cfg.lambda_bc) == 0.0:
             raise ValueError("eta_sac and lambda_bc cannot both be zero")
         for name in ("sac_policy_frequency", "sac_learning_starts"):
@@ -466,6 +496,36 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             right = float(getattr(cfg, sac_name))
             if not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(f"{legacy} must equal {sac_name} in this backend")
+        for name in (
+            "teacher_actor_replay_fraction",
+            "teacher_perception_replay_fraction",
+            "q_teacher_replay_ratio",
+        ):
+            if not math.isclose(
+                float(getattr(cfg, name)), 0.5, rel_tol=0.0, abs_tol=1e-12
+            ):
+                raise ValueError(
+                    "FastSAC requires exact 50/50 frozen-Teacher/online-Student "
+                    f"training sources; {name} must equal 0.5"
+                )
+        if int(cfg.dagger_batch_size) % 2:
+            raise ValueError(
+                "dagger_batch_size must be even for exact 50/50 Actor replay"
+            )
+        q_update_to_data_ratio = getattr(cfg, "q_update_to_data_ratio", None)
+        if (
+            q_update_to_data_ratio is None
+            or isinstance(q_update_to_data_ratio, bool)
+            or not math.isclose(
+                float(q_update_to_data_ratio),
+                1.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "FastSAC requires q_update_to_data_ratio=1 for row-level Q UTD=1"
+            )
 
     def _freeze_legacy_actor_std(self) -> None:
         cores = [
@@ -482,13 +542,97 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         core.actor_std.requires_grad_(False)
         core.actor_std.grad = None
 
+    @staticmethod
+    def _inverse_smooth_log_std(
+        log_std: torch.Tensor, log_std_min: float, log_std_max: float
+    ) -> torch.Tensor:
+        """Inverse-map an effective log std to its unconstrained coordinate."""
+        if not math.isfinite(float(log_std_min)) or not math.isfinite(
+            float(log_std_max)
+        ):
+            raise ValueError("FastSAC log-std bounds must be finite")
+        if not float(log_std_min) < float(log_std_max):
+            raise ValueError("FastSAC log-std bounds must be ordered")
+        if not torch.isfinite(log_std).all() or (
+            (log_std <= float(log_std_min))
+            | (log_std >= float(log_std_max))
+        ).any():
+            raise ValueError(
+                "FastSAC effective log std must be finite and strictly inside "
+                "its bounds"
+            )
+        normalized = (
+            2.0
+            * (log_std - float(log_std_min))
+            / (float(log_std_max) - float(log_std_min))
+            - 1.0
+        )
+        return torch.atanh(normalized)
+
+    def _bounded_log_std(
+        self, raw_log_std: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Smoothly map the adapter parameter into configured log-std bounds."""
+        if raw_log_std is None:
+            raw_log_std = self.bc_dagger_sac_adapter.log_std
+        log_std_min = float(self.cfg.sac_log_std_min)
+        log_std_max = float(self.cfg.sac_log_std_max)
+        return log_std_min + 0.5 * (log_std_max - log_std_min) * (
+            torch.tanh(raw_log_std) + 1.0
+        )
+
+    def _legacy_effective_log_std_to_raw(
+        self,
+        legacy_log_std: torch.Tensor,
+        legacy_log_std_min: float,
+        legacy_log_std_max: float,
+    ) -> torch.Tensor:
+        """Convert a v3 hard-clamped effective log std for v4 inference.
+
+        V3 allowed the learned tensor to leave its configured interval and
+        hard-clamped it only while building a distribution. Map that effective
+        value just inside the open v4 interval so inference retains the v3
+        policy scale to floating-point precision without an infinite atanh.
+        """
+        if not torch.is_tensor(legacy_log_std) or not torch.is_floating_point(
+            legacy_log_std
+        ):
+            raise ValueError("FastSAC v3 checkpoint has invalid adapter log_std")
+        if not torch.isfinite(legacy_log_std).all():
+            raise ValueError("FastSAC v3 checkpoint has non-finite adapter log_std")
+        try:
+            legacy_log_std_min = float(legacy_log_std_min)
+            legacy_log_std_max = float(legacy_log_std_max)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "FastSAC v3 checkpoint has invalid log-std bounds"
+            ) from error
+        if not (
+            math.isfinite(legacy_log_std_min)
+            and math.isfinite(legacy_log_std_max)
+            and legacy_log_std_min < legacy_log_std_max
+        ):
+            raise ValueError("FastSAC v3 checkpoint has invalid log-std bounds")
+        # Reproduce the v3 distribution before changing coordinate systems.
+        effective = legacy_log_std.clamp(
+            legacy_log_std_min, legacy_log_std_max
+        )
+        log_std_min = float(self.cfg.sac_log_std_min)
+        log_std_max = float(self.cfg.sac_log_std_max)
+        normalized = (
+            2.0
+            * (effective - log_std_min)
+            / (log_std_max - log_std_min)
+            - 1.0
+        )
+        inward = 4.0 * torch.finfo(normalized.dtype).eps
+        return torch.atanh(normalized.clamp(-1.0 + inward, 1.0 - inward))
+
     def _sac_dist_from_mean(self, mean: torch.Tensor) -> FastSACTanhNormal:
         """Build a bounded policy with std in nominal Q-action coordinates."""
         if not torch.isfinite(mean).all():
             raise RuntimeError("FastSAC Actor proposal contains non-finite raw actions")
-        log_std = self.bc_dagger_sac_adapter.log_std.clamp(
-            float(self.cfg.sac_log_std_min), float(self.cfg.sac_log_std_max)
-        )
+        log_std = self._bounded_log_std()
         actor_center = self._fastsac_actor_action_center.to(mean)
         actor_scale = self._fastsac_actor_action_scale.to(mean)
         q_scale = self._fastsac_q_action_scale.to(mean)
@@ -613,8 +757,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             }
         if self.alpha_optimizer is None:
             raise RuntimeError("FastSAC alpha autotune has no optimizer")
+        # Optimize the standard log-temperature surrogate. Its gradient is the
+        # entropy error itself rather than alpha times that error, so a cautious
+        # alpha initialization (1e-5 in the default config) can still recover.
         alpha_loss = -(
-            self.log_alpha.exp() * (log_prob.detach() + float(self.target_entropy))
+            self.log_alpha * (log_prob.detach() + float(self.target_entropy))
         ).mean()
         self.alpha_optimizer.zero_grad(set_to_none=True)
         alpha_loss.backward()
@@ -778,7 +925,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_entropy": -normalized_log_prob.detach().mean(),
             "actor_sample_action_abs_mean": sampled_action.detach().abs().mean(),
             "actor_mean_action_abs_mean": dist.mean.detach().abs().mean(),
-            "actor_log_std_mean": self.bc_dagger_sac_adapter.log_std.detach().mean(),
+            "actor_log_std_mean": self._bounded_log_std().detach().mean(),
+            "actor_raw_log_std_mean": (
+                self.bc_dagger_sac_adapter.log_std.detach().mean()
+            ),
             "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
             "actor_failure_phase_teacher_fraction": batch.get(
                 FAILURE_PHASE_TEACHER_SOURCE_KEY,
@@ -843,6 +993,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_sample_action_abs_mean",
             "actor_mean_action_abs_mean",
             "actor_log_std_mean",
+            "actor_raw_log_std_mean",
         )
         critic = self._mean_metric_dict(
             self._fastsac_rollout_critic_metrics, critic_keys
@@ -912,7 +1063,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         common.update(
             {
                 "method": TRAINING_ALGORITHM,
-                "actor_output": "normalized_std_tanh_bounded_raw_action_normal",
+                "actor_output": (
+                    "smooth_tanh_bounded_normalized_std_raw_action_normal"
+                ),
                 "bc_loss": "joint_normalized_raw_mean_teacher_smooth_l1",
             }
         )
@@ -946,6 +1099,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_update_count": int(self.actor_update_count),
             "critic_update_count": int(self.critic_update_count),
             "alpha_update_count": int(self.alpha_update_count),
+            "q_update_row_credit": float(
+                getattr(self, "q_update_row_credit", 0.0)
+            ),
             "dagger_rollout_count": int(self.dagger_rollout_count),
             "dagger_environment_steps": int(self.dagger_environment_steps),
             "teacher_prefill_rollout_count": int(self.teacher_prefill_rollout_count),
@@ -1011,6 +1167,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "teacher_prefill_environment_steps",
         ):
             setattr(self, name, int(state[name]))
+        self.q_update_row_credit = float(state.get("q_update_row_credit", 0.0))
+        q_batch_size = int(getattr(self.cfg, "q_batch_size", 512))
+        if not 0.0 <= self.q_update_row_credit < q_batch_size:
+            raise ValueError("FastSAC checkpoint Q UTD row credit is invalid")
         self._teacher_perception_warmup_complete = bool(
             state.get("teacher_perception_warmup_complete", False)
         )
@@ -1031,9 +1191,17 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         """Restore FastSAC model tensors without attempting replay resume."""
         if state_dict.get("training_algorithm") != TRAINING_ALGORITHM:
             raise ValueError("not a distributional FastSAC Teacher-BC checkpoint")
-        if int(state_dict.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
+        checkpoint_version = int(state_dict.get("checkpoint_version", -1))
+        legacy_v3 = checkpoint_version == _LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION
+        if checkpoint_version not in (
+            _LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION,
+            CHECKPOINT_VERSION,
+        ):
             raise ValueError("distributional FastSAC checkpoint version mismatch")
-        if state_dict.get("actor_backend") != ACTOR_BACKEND:
+        expected_actor_backend = (
+            _LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND if legacy_v3 else ACTOR_BACKEND
+        )
+        if state_dict.get("actor_backend") != expected_actor_backend:
             raise ValueError("distributional FastSAC actor backend mismatch")
         saved_action_contract = state_dict.get("action_contract")
         if not isinstance(saved_action_contract, Mapping):
@@ -1048,7 +1216,27 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     f"FastSAC inference checkpoint action contract mismatch at {key!r}"
                 )
 
-        failed = PPOVEL.load_state_dict(self, state_dict, strict)
+        load_state = state_dict
+        if legacy_v3:
+            source_adapter = state_dict.get("bc_dagger_sac_adapter")
+            if not isinstance(source_adapter, Mapping):
+                raise ValueError("FastSAC v3 inference checkpoint lacks its adapter")
+            source_config = state_dict.get("dagger_backend_config")
+            if not isinstance(source_config, Mapping):
+                raise ValueError(
+                    "FastSAC v3 inference checkpoint lacks its backend config"
+                )
+            legacy_log_std = source_adapter.get("log_std")
+            converted_adapter = dict(source_adapter)
+            converted_adapter["log_std"] = self._legacy_effective_log_std_to_raw(
+                legacy_log_std,
+                source_config.get("sac_log_std_min"),
+                source_config.get("sac_log_std_max"),
+            )
+            load_state = dict(state_dict)
+            load_state["bc_dagger_sac_adapter"] = converted_adapter
+
+        failed = PPOVEL.load_state_dict(self, load_state, strict)
         critical = {
             "actor_adapt",
             "bc_dagger_sac_adapter",
@@ -1070,13 +1258,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "qnet",
             "qnet_target",
         ):
-            source = state_dict.get(name)
+            source = load_state.get(name)
             if not isinstance(source, Mapping):
                 raise ValueError(
                     f"FastSAC inference checkpoint lacks module mapping {name!r}"
                 )
             getattr(self, name).load_state_dict(source, strict=True)
-        log_alpha = state_dict.get("log_alpha")
+        log_alpha = load_state.get("log_alpha")
         if not torch.is_tensor(log_alpha) or log_alpha.numel() != 1:
             raise ValueError("FastSAC inference checkpoint lacks scalar log_alpha")
         self.log_alpha.data.copy_(log_alpha.to(self.log_alpha))
@@ -1157,11 +1345,14 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         failed = DistributionalTD3TeacherBC.load_state_dict(self, padded_source, strict)
         self.actor_target = None
         self._freeze_legacy_actor_std()
-        self.bc_dagger_sac_adapter.log_std.data.copy_(self._fastsac_initial_log_std)
+        self.bc_dagger_sac_adapter.log_std.data.copy_(
+            self._fastsac_initial_raw_log_std
+        )
         self.log_alpha.data.fill_(math.log(float(self.cfg.sac_alpha_init)))
         self.actor_update_count = 0
         self.critic_update_count = 0
         self.alpha_update_count = 0
+        self.q_update_row_credit = 0.0
         self.dagger_rollout_count = 0
         self.dagger_environment_steps = 0
         self.teacher_prefill_rollout_count = 0

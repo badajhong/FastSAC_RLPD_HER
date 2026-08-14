@@ -17,6 +17,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 
 import torch
@@ -1094,6 +1095,11 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     q_max_grad_norm: float = 1.0
     q_batch_size: int = 512
     q_updates_per_rollout: int = 128
+    # Optional row-level scheduler.  When configured, each newly accepted
+    # Student replay row earns this many total Q sample-row credits.  Dividing
+    # by q_batch_size makes the applied update count invariant to num_envs and
+    # rollout chunking; q_updates_per_rollout remains the legacy fallback.
+    q_update_to_data_ratio: float | None = None
     q_teacher_replay_ratio: float = 0.5
     q_teacher_buffer_capacity: int = 131_072
 
@@ -1457,6 +1463,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._last_teacher_perception_warmup_metrics: dict[str, float] = {}
         self.critic_update_count = 0
         self.actor_update_count = 0
+        self.q_update_row_credit = 0.0
         self._perception_optimizer = self.opt_adapt
         self._perception_initialization = {
             "semantics": PERCEPTION_WARMSTART_SEMANTICS,
@@ -1592,6 +1599,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             value = getattr(cfg, name)
             if isinstance(value, bool) or int(value) < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        q_update_to_data_ratio = getattr(cfg, "q_update_to_data_ratio", None)
+        if q_update_to_data_ratio is not None and (
+            isinstance(q_update_to_data_ratio, bool)
+            or not math.isfinite(float(q_update_to_data_ratio))
+            or float(q_update_to_data_ratio) <= 0.0
+        ):
+            raise ValueError(
+                "q_update_to_data_ratio must be null or finite and positive"
+            )
         prefill_max_rollouts = cfg.teacher_prefill_max_rollouts
         if isinstance(prefill_max_rollouts, bool) or int(prefill_max_rollouts) < 1:
             raise ValueError("teacher_prefill_max_rollouts must be a positive integer")
@@ -3442,6 +3458,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_max_grad_norm",
             "q_batch_size",
             "q_updates_per_rollout",
+            "q_update_to_data_ratio",
             "q_teacher_replay_ratio",
             "q_teacher_buffer_capacity",
             "perception_replay_burn_in",
@@ -4148,6 +4165,48 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             for key in keys
         }
 
+    def _q_updates_due(self, accepted_student_rows: int) -> int:
+        """Return Q updates from total sampled-row/new-Student-row credit.
+
+        ``q_update_to_data_ratio=None`` preserves the historical fixed update
+        burst.  A configured ratio makes optimizer work invariant to the
+        number of environments and to how an equivalent set of replay rows is
+        chunked across calls.  Credit is intentionally earned only after both
+        replay sources satisfy the learning-start gate, avoiding a catch-up
+        burst for rows collected while Q learning was unavailable.
+        """
+        if (
+            isinstance(accepted_student_rows, bool)
+            or not isinstance(accepted_student_rows, Integral)
+            or int(accepted_student_rows) < 0
+        ):
+            raise ValueError("accepted_student_rows must be a non-negative integer")
+
+        ratio = getattr(self.cfg, "q_update_to_data_ratio", None)
+        if ratio is None:
+            return int(self.cfg.q_updates_per_rollout)
+        if (
+            isinstance(ratio, bool)
+            or not math.isfinite(float(ratio))
+            or float(ratio) <= 0.0
+        ):
+            raise ValueError("q_update_to_data_ratio must be finite and positive")
+
+        batch_size = int(self.cfg.q_batch_size)
+        self.q_update_row_credit = float(
+            getattr(self, "q_update_row_credit", 0.0)
+        ) + int(accepted_student_rows) * float(ratio)
+        updates = int(self.q_update_row_credit // batch_size)
+        self.q_update_row_credit -= updates * batch_size
+        if self.q_update_row_credit < 0.0:
+            if self.q_update_row_credit > -1e-9:
+                self.q_update_row_credit = 0.0
+            else:
+                raise RuntimeError("Q UTD row credit became negative")
+        if not 0.0 <= self.q_update_row_credit < batch_size:
+            raise RuntimeError("Q UTD row credit escaped its batch range")
+        return updates
+
     def train_op(self, tensordict):
         """Collect locked transitions and run Phase-1 TD3/BC updates only."""
         teacher_prefill_active = self._teacher_prefill_active()
@@ -4316,6 +4375,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "td3/replay_ready": 0.0,
                 "td3/actor_update_count": self.actor_update_count,
                 "td3/critic_update_count": self.critic_update_count,
+                "td3/q_update_to_data_ratio_config": (
+                    -1.0
+                    if getattr(self.cfg, "q_update_to_data_ratio", None) is None
+                    else float(self.cfg.q_update_to_data_ratio)
+                ),
+                "td3/q_update_row_credit": float(
+                    getattr(self, "q_update_row_credit", 0.0)
+                ),
+                "td3/q_teacher_replay_fraction_config": float(
+                    getattr(self.cfg, "q_teacher_replay_ratio", 0.5)
+                ),
                 "td3/actor_updates_this_rollout": 0,
                 "td3/critic_updates_this_rollout": 0,
                 "td3/actor_teacher_replay_fraction": 0.0,
@@ -4348,7 +4418,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             and student_q_rows >= learning_starts
         )
         if replay_ready:
-            q_updates = int(self.cfg.q_updates_per_rollout)
+            q_updates = self._q_updates_due(appended)
             sample_plans = None
             if (
                 isinstance(self.dagger_replay, _TD3DeviceReplay)
@@ -4522,6 +4592,26 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "td3/collector_exploration_noise_norm": collector_noise_norm,
             "td3/actor_update_count": self.actor_update_count,
             "td3/critic_update_count": self.critic_update_count,
+            "td3/q_update_to_data_ratio_config": (
+                -1.0
+                if getattr(self.cfg, "q_update_to_data_ratio", None) is None
+                else float(self.cfg.q_update_to_data_ratio)
+            ),
+            "td3/q_update_row_credit": float(
+                getattr(self, "q_update_row_credit", 0.0)
+            ),
+            "td3/q_teacher_replay_fraction_config": float(
+                getattr(self.cfg, "q_teacher_replay_ratio", 0.5)
+            ),
+            "td3/q_sampled_rows_this_rollout": (
+                len(critic_metrics) * int(self.cfg.q_batch_size)
+            ),
+            "td3/q_sampled_teacher_rows_this_rollout": (
+                len(critic_metrics) * (int(self.cfg.q_batch_size) // 2)
+            ),
+            "td3/q_sampled_student_rows_this_rollout": (
+                len(critic_metrics) * (int(self.cfg.q_batch_size) // 2)
+            ),
             "td3/actor_updates_this_rollout": len(actor_metrics),
             "td3/critic_updates_this_rollout": len(critic_metrics),
             "td3/replay_ready": float(replay_ready),
@@ -4591,6 +4681,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             },
             "actor_update_count": int(self.actor_update_count),
             "critic_update_count": int(self.critic_update_count),
+            "q_update_row_credit": float(
+                getattr(self, "q_update_row_credit", 0.0)
+            ),
             "dagger_rollout_count": int(self.dagger_rollout_count),
             "dagger_environment_steps": int(self.dagger_environment_steps),
             "teacher_prefill_rollout_count": int(self.teacher_prefill_rollout_count),
@@ -4644,6 +4737,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self.opt_adapt.load_state_dict(adapt_optimizer_state)
         self.actor_update_count = int(state["actor_update_count"])
         self.critic_update_count = int(state["critic_update_count"])
+        self.q_update_row_credit = float(state.get("q_update_row_credit", 0.0))
+        q_batch_size = int(getattr(self.cfg, "q_batch_size", 512))
+        if not 0.0 <= self.q_update_row_credit < q_batch_size:
+            raise ValueError("TD3 checkpoint Q UTD row credit is invalid")
         self.dagger_rollout_count = int(state["dagger_rollout_count"])
         self.dagger_environment_steps = int(state["dagger_environment_steps"])
         self.teacher_prefill_rollout_count = int(state["teacher_prefill_rollout_count"])
@@ -4822,6 +4919,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self.actor_target.eval()
             self.actor_update_count = 0
             self.critic_update_count = 0
+            self.q_update_row_credit = 0.0
             self.dagger_rollout_count = 0
             self.dagger_environment_steps = 0
             self.teacher_prefill_rollout_count = 0

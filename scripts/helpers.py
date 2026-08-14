@@ -456,6 +456,7 @@ def _load_policy_checkpoint(
     replayless_inference_algorithms = {
         "distributional_td3_teacher_bc_v1",
         "distributional_fastsac_teacher_bc_v1",
+        "distributional_tvkd_fastsac_teacher_bc_v1",
     }
     if inference_only and algorithm in replayless_inference_algorithms:
         loader = getattr(policy, "load_inference_state_dict", None)
@@ -506,6 +507,12 @@ def _fill_replayless_inference_algo_defaults(
         )
 
         default_config = DistributionalFastSACTeacherBCConfig()
+    elif algorithm == "distributional_tvkd_fastsac_teacher_bc_v1":
+        from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
+            TVKDDistributionalFastSACTeacherBCConfig,
+        )
+
+        default_config = TVKDDistributionalFastSACTeacherBCConfig()
     else:
         return empty
 
@@ -524,6 +531,18 @@ def _fill_replayless_inference_algo_defaults(
     filled_checkpoint = []
     filled_defaults = []
     with open_dict(cfg.algo):
+        if algorithm == "distributional_tvkd_fastsac_teacher_bc_v1":
+            # ValueNorm changes the module type, so it must be selected from
+            # the checkpoint before policy construction even when an eval
+            # config already carries the structured default ``False``.
+            saved_value_norm = backend.get("value_norm")
+            if not isinstance(saved_value_norm, bool):
+                raise ValueError(
+                    "TVKD inference checkpoint lacks boolean value_norm metadata"
+                )
+            if cfg.algo.get("value_norm") != saved_value_norm:
+                cfg.algo.value_norm = saved_value_norm
+                filled_checkpoint.append("value_norm")
         for name in current_fields:
             if name not in cfg.algo and name in backend:
                 cfg.algo[name] = copy.deepcopy(backend[name])

@@ -690,7 +690,10 @@ def run_training(cfg: DictConfig):
             main_rollout_budget,
             model_only_resume=bool(cfg.get("_bc_dagger_model_only_resume", False)),
         )
-        if should_save(checkpoint_index):
+        skip_tvkd_refill_checkpoint = prefill_active_before_rollout and bool(
+            cfg.get("_tvkd_model_only_resume", False)
+        )
+        if not skip_tvkd_refill_checkpoint and should_save(checkpoint_index):
             save(policy, f"checkpoint_{checkpoint_index}")
 
         if aa.is_main_process():

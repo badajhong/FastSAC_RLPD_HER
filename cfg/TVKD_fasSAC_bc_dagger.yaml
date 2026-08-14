@@ -1,0 +1,16 @@
+# TVKD extends the current fresh-only FastSAC + BC-DAgger configuration.
+# The structured algo node below adds frozen Teacher-value shaping and the
+# recent-Student adaptive BC scheduler while inheriting every existing rollout,
+# replay, perception, randomization, C51, UTD, and target-update default.
+defaults:
+  - fastSAC_bc_dagger
+  - override /algo: tvkd_fastsac_bc_dagger_finetune
+  - _self_
+
+# Optional TVKD checkpoint for model/optimizer/policy-RNG/scheduler continuation.
+# fastsac_dagger_iterations is the number of additional main rollouts. The
+# raw Student and Teacher learning rings are intentionally rebuilt: the frozen
+# Teacher ring is refilled before main collection and the Student ring warms up
+# again, avoiding multi-gigabyte replay tensors in every periodic checkpoint.
+fastsac_bc_dagger_checkpoint: null
+_tvkd_model_only_resume: false

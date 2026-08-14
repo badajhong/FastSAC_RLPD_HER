@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -172,13 +173,45 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.collector_exploration_noise_std == 0.0
     assert cfg.collector_exploration_noise_clip == 0.0
     assert cfg.eta_td3 == 0.0
-    assert cfg.policy_delay == cfg.sac_policy_frequency
+    assert cfg.policy_delay == cfg.sac_policy_frequency == 8
+    assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
+    assert cfg.perception_encode_microbatch_size == 512
 
 
 def test_config_allows_explicit_pure_sac_ablation_without_inherited_td3_eta():
     cfg = DistributionalFastSACTeacherBCConfig(lambda_bc=0.0, eta_sac=1.0)
 
     DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+def test_config_rejects_entropy_target_above_maximum_gaussian_entropy():
+    cfg = DistributionalFastSACTeacherBCConfig(sac_log_std_max=-3.0)
+
+    with pytest.raises(ValueError, match="entropy target is unreachable"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "teacher_actor_replay_fraction",
+        "teacher_perception_replay_fraction",
+        "q_teacher_replay_ratio",
+    ),
+)
+def test_backend_locks_every_training_source_to_half_teacher_half_student(field):
+    cfg = DistributionalFastSACTeacherBCConfig()
+    setattr(cfg, field, 0.4)
+
+    with pytest.raises(ValueError, match="exact 50/50"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+def test_backend_locks_row_level_q_utd_to_one():
+    cfg = DistributionalFastSACTeacherBCConfig(q_update_to_data_ratio=0.5)
+
+    with pytest.raises(ValueError, match="row-level Q UTD=1"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
 def test_tanh_normal_is_bounded_reparameterized_and_has_exact_log_prob():
@@ -214,9 +247,15 @@ def test_backend_distribution_maps_normalized_std_to_joint_scaled_bounded_policy
     policy = _bare_policy(
         sac_log_std_min=-8.0, sac_log_std_max=-1.0, action_support_clip=20.0
     )
+    expected_log_std = torch.log(torch.tensor([0.1, 0.2]))
+    initial_raw_log_std = policy._inverse_smooth_log_std(
+        expected_log_std,
+        policy.cfg.sac_log_std_min,
+        policy.cfg.sac_log_std_max,
+    )
     policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
         action_dim=2,
-        initial_log_std=torch.log(torch.tensor([0.1, 0.2])),
+        initial_log_std=initial_raw_log_std,
         device="cpu",
     )
     policy._fastsac_q_action_scale = torch.tensor([2.0, 4.0])
@@ -232,11 +271,38 @@ def test_backend_distribution_maps_normalized_std_to_joint_scaled_bounded_policy
     assert torch.allclose(
         dist.scale,
         (
-            policy.bc_dagger_sac_adapter.log_std.exp() * torch.tensor([2.0, 4.0]) / 20.0
+            expected_log_std.exp() * torch.tensor([2.0, 4.0]) / 20.0
         ).expand_as(raw_mean),
     )
     assert torch.allclose(dist.mean, 20.0 * torch.tanh(raw_mean / 20.0))
     assert torch.all(dist.mean >= -20.0) and torch.all(dist.mean <= 20.0)
+
+
+def test_smooth_log_std_stays_bounded_and_keeps_gradient_past_old_hard_cap():
+    policy = _bare_policy(
+        sac_log_std_min=-8.0, sac_log_std_max=-1.0, action_support_clip=20.0
+    )
+    # A value this far above the old direct-log-std cap produced exactly zero
+    # gradient through Tensor.clamp. It is now an unconstrained coordinate.
+    policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
+        action_dim=1,
+        initial_log_std=torch.tensor(3.0),
+        device="cpu",
+    )
+    policy._fastsac_q_action_scale = torch.tensor([1.0])
+    policy._fastsac_action_low = torch.tensor([-20.0])
+    policy._fastsac_action_high = torch.tensor([20.0])
+    policy._fastsac_actor_action_center = torch.tensor([0.0])
+    policy._fastsac_actor_action_scale = torch.tensor([20.0])
+
+    effective_log_std = policy._bounded_log_std()
+    dist = policy._sac_dist_from_mean(torch.zeros(2, 1))
+    dist.scale.sum().backward()
+
+    assert torch.all(effective_log_std > policy.cfg.sac_log_std_min)
+    assert torch.all(effective_log_std < policy.cfg.sac_log_std_max)
+    assert policy.bc_dagger_sac_adapter.log_std.grad is not None
+    assert policy.bc_dagger_sac_adapter.log_std.grad.abs().item() > 0.0
 
 
 def test_bounded_log_prob_converts_exactly_to_nonunit_q_coordinates():
@@ -371,9 +437,14 @@ def _install_tiny_stochastic_actor(policy, *, actor_weight=0.25, log_std=-1.0):
     policy.actor_adapt = nn.Linear(1, 1, bias=False)
     with torch.no_grad():
         policy.actor_adapt.weight.fill_(actor_weight)
+    raw_log_std = policy._inverse_smooth_log_std(
+        torch.tensor(log_std),
+        policy.cfg.sac_log_std_min,
+        policy.cfg.sac_log_std_max,
+    )
     policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
         action_dim=1,
-        initial_log_std=torch.tensor(log_std),
+        initial_log_std=raw_log_std,
         device="cpu",
     )
 
@@ -420,7 +491,9 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
     raw_mean = expected_actor(batch["observations"])
     expected_dist = FastSACTanhNormal(
         raw_mean / 20.0,
-        (expected_adapter.log_std.exp() / 20.0).expand_as(raw_mean),
+        (
+            policy._bounded_log_std(expected_adapter.log_std).exp() / 20.0
+        ).expand_as(raw_mean),
         low=torch.tensor([-20.0]),
         high=torch.tensor([20.0]),
         event_dims=1,
@@ -726,6 +799,26 @@ def test_temperature_update_has_the_standard_entropy_dual_sign(log_prob, directi
     assert metrics["alpha"].item() == pytest.approx(policy.log_alpha.exp().item())
 
 
+def test_temperature_log_alpha_gradient_is_not_attenuated_by_small_alpha():
+    gradients = []
+    deltas = []
+    for initial_alpha in (1.0, 1.0e-5):
+        policy = _bare_policy(sac_use_autotune=True)
+        policy.log_alpha = nn.Parameter(torch.tensor(math.log(initial_alpha)))
+        policy.alpha_optimizer = _CountingSGD([policy.log_alpha], lr=0.1)
+        policy.target_entropy = -1.0
+        policy.alpha_update_count = 0
+        before = policy.log_alpha.detach().clone()
+
+        metrics = policy._alpha_update(torch.full((4,), 2.0))
+
+        gradients.append(metrics["alpha_grad_norm"].item())
+        deltas.append((policy.log_alpha.detach() - before).item())
+
+    assert gradients == pytest.approx([1.0, 1.0])
+    assert deltas == pytest.approx([0.1, 0.1], abs=1.0e-6)
+
+
 def test_critic_temperature_population_excludes_true_terminals_but_keeps_timeouts():
     """Alpha learns only from next states for which the target can bootstrap."""
     policy = _bare_policy(
@@ -791,7 +884,12 @@ def test_fixed_temperature_skips_optimizer_but_remains_in_soft_target():
 
 
 def _checkpoint_policy(seed: int):
-    policy = _bare_policy(sac_use_autotune=True)
+    policy = _bare_policy(
+        sac_use_autotune=True,
+        sac_log_std_min=-10.0,
+        sac_log_std_max=-2.0,
+        q_batch_size=512,
+    )
     with torch.random.fork_rng():
         torch.manual_seed(seed)
         policy.actor_adapt = nn.Linear(2, 1)
@@ -841,6 +939,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     source.actor_update_count = 7
     source.critic_update_count = 11
     source.alpha_update_count = 13
+    source.q_update_row_credit = 123.0
     source.dagger_rollout_count = 17
     source.dagger_environment_steps = 19
     source.teacher_prefill_rollout_count = 3
@@ -894,6 +993,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     assert restored.actor_update_count == 7
     assert restored.critic_update_count == 11
     assert restored.alpha_update_count == 13
+    assert restored.q_update_row_credit == pytest.approx(123.0)
     assert restored.dagger_rollout_count == 17
     assert restored.dagger_environment_steps == 19
     assert restored.teacher_prefill_rollout_count == 3
@@ -923,7 +1023,8 @@ def _install_tiny_fastsac_inference_perception_stack(policy, seed: int) -> None:
             setattr(policy, name, nn.Linear(2, 2))
 
 
-def test_fastsac_inference_loader_restores_models_without_training_state():
+@pytest.mark.parametrize("legacy_v3", (False, True))
+def test_fastsac_inference_loader_restores_models_without_training_state(legacy_v3):
     source = _checkpoint_policy(1300)
     _install_tiny_fastsac_inference_perception_stack(source, 1301)
     _optimizer_step(
@@ -963,6 +1064,18 @@ def test_fastsac_inference_loader_restores_models_without_training_state():
             "perception_initialization": {"loaded": True, "mode": "test"},
         }
     )
+    if legacy_v3:
+        # V3 stored the effective log std directly and allowed the learned
+        # tensor to move beyond the hard-clamp ceiling.
+        state["checkpoint_version"] = 3
+        state["actor_backend"] = (
+            "ppo_vel_normalized_std_tanh_bounded_fastsac_bc_v1"
+        )
+        state["dagger_backend_config"] = {
+            "sac_log_std_min": -10.0,
+            "sac_log_std_max": -3.0,
+        }
+        state["bc_dagger_sac_adapter"] = {"log_std": torch.tensor([5.0])}
 
     restored = _checkpoint_policy(2300)
     _install_tiny_fastsac_inference_perception_stack(restored, 2301)
@@ -1006,10 +1119,16 @@ def test_fastsac_inference_loader_restores_models_without_training_state():
         "qnet_target",
         *PRETRAINED_PERCEPTION_MODULES,
     ):
-        _assert_nested_equal(
-            getattr(restored, name).state_dict(),
-            getattr(source, name).state_dict(),
-        )
+        if name == "bc_dagger_sac_adapter" and legacy_v3:
+            assert restored._bounded_log_std().item() == pytest.approx(
+                -3.0, abs=1.0e-5
+            )
+            assert torch.isfinite(restored.bc_dagger_sac_adapter.log_std).all()
+        else:
+            _assert_nested_equal(
+                getattr(restored, name).state_dict(),
+                getattr(source, name).state_dict(),
+            )
         assert not any(
             parameter.requires_grad
             for parameter in getattr(restored, name).parameters()

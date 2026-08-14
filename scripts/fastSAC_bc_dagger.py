@@ -300,6 +300,26 @@ def _validate_failure_phase_teacher_sampling(cfg: DictConfig) -> None:
             "algo.failure_phase_teacher_fraction > 0 requires a positive "
             "Teacher source fraction"
         )
+    for name, teacher_fraction in (
+        ("teacher_actor_replay_fraction", actor_teacher_fraction),
+        ("teacher_perception_replay_fraction", perception_teacher_fraction),
+        ("q_teacher_replay_ratio", critic_teacher_fraction),
+    ):
+        if not math.isclose(
+            teacher_fraction, 0.5, rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise ValueError(
+                "FastSAC requires exact 50/50 frozen-Teacher/online-Student "
+                f"training sources; algo.{name} must equal 0.5"
+            )
+    actor_batch_size = _positive_int(
+        "algo.dagger_batch_size", cfg.algo.get("dagger_batch_size", None)
+    )
+    if actor_batch_size % 2:
+        raise ValueError(
+            "algo.dagger_batch_size must be even for exact 50/50 "
+            "frozen-Teacher/online-Student Actor batches"
+        )
 
 
 def _validate_teacher_prefill_reachability(cfg: DictConfig) -> None:
@@ -556,6 +576,7 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         "dagger_actor_huber_delta",
         "q_lr",
         "q_action_input_gain",
+        "q_update_to_data_ratio",
         "sac_actor_lr",
         "sac_initial_action_std",
         "sac_alpha_init",
@@ -578,6 +599,15 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         raise ValueError("algo.sac_use_autotune must be boolean")
     if not 0.0 < float(cfg.algo.sac_target_entropy_ratio) <= 1.0:
         raise ValueError("algo.sac_target_entropy_ratio must lie in (0, 1]")
+    max_unsquashed_entropy_per_dim = (
+        0.5 * math.log(2.0 * math.pi * math.e) + log_std_max
+    )
+    target_entropy_per_dim = -float(cfg.algo.sac_target_entropy_ratio)
+    if max_unsquashed_entropy_per_dim <= target_entropy_per_dim:
+        raise ValueError(
+            "FastSAC entropy target is unreachable: algo.sac_log_std_max must "
+            "be greater than -algo.sac_target_entropy_ratio - 0.5*log(2*pi*e)"
+        )
     for name in (
         "sac_policy_frequency",
         "sac_learning_starts",
@@ -672,6 +702,15 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
 
     if int(cfg.algo.q_batch_size) % 2:
         raise ValueError("algo.q_batch_size must be even for exact 50/50 replay")
+    if not math.isclose(
+        float(cfg.algo.get("q_update_to_data_ratio", math.nan)),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "FastSAC requires q_update_to_data_ratio=1 for row-level Q UTD=1"
+        )
     if int(cfg.algo.q_teacher_buffer_capacity) < int(cfg.algo.sac_learning_starts):
         raise ValueError(
             "algo.q_teacher_buffer_capacity must cover algo.sac_learning_starts"

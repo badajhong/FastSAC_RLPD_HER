@@ -75,7 +75,10 @@ algo:
     - command
     - depth
   perception_replay_burn_in: 8
-  perception_encode_microbatch_size: 128
+  # Larger replay encoding chunks reduce kernel-launch overhead on the target
+  # RTX 5090 while preserving identical samples and gradients. Lower to 256 if
+  # a smaller GPU cannot accommodate the temporary activation memory.
+  perception_encode_microbatch_size: 512
   teacher_perception_batch_size: 128
   # One-shot Teacher-only perception updates at the prefill/main boundary.
   # Set 0 to disable. Online weights are hard-synchronized to EMA afterward.
@@ -108,14 +111,22 @@ algo:
   q_tau: 0.005
   q_max_grad_norm: 1.0
   q_batch_size: 512
+  # Spend one total Q sample row per newly accepted Student replay row.  The
+  # row-credit scheduler gives 32 Q updates for a 512-env x 32-step rollout,
+  # 16 for 256 envs, and preserves fractional credit for arbitrary chunking.
+  # q_updates_per_rollout remains serialized for compatibility with the shared
+  # TD3 base; this dedicated FastSAC entrypoint locks the row ratio to 1.0.
   q_updates_per_rollout: 32
+  q_update_to_data_ratio: 1.0
   q_teacher_replay_ratio: 0.5
   q_teacher_buffer_capacity: 131_072
 
   # FastSAC owns exploration through its learned squashed Gaussian.  These
   # inherited TD3 controls are locked inert to prevent a second noise source.
   eta_td3: 0.0
-  policy_delay: 2
+  # At the standard 512-env rollout this keeps four Actor updates while Q uses
+  # all 32 row-credit updates.  The Actor cadence scales with new data too.
+  policy_delay: 8
   target_policy_noise_std: 0.0
   target_policy_noise_clip: 0.0
   collector_exploration_noise_std: 0.0
@@ -134,7 +145,7 @@ algo:
   sac_alpha_lr: 2.0e-5
   sac_use_autotune: true
   sac_target_entropy_ratio: 1.0
-  sac_policy_frequency: 2
+  sac_policy_frequency: 8
   sac_learning_starts: 8192
   sac_tau: 0.005
   sac_max_grad_norm: 1.0

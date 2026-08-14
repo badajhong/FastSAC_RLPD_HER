@@ -563,6 +563,71 @@ def test_teacher_replay_fraction_is_a_unit_interval(field, invalid):
         DistributionalTD3TeacherBC._validate_td3_config(cfg)
 
 
+@pytest.mark.parametrize("invalid", (0.0, -1.0, float("nan"), True))
+def test_q_update_to_data_ratio_is_null_or_finite_positive(invalid):
+    cfg = DistributionalTD3TeacherBCConfig(q_update_to_data_ratio=invalid)
+
+    with pytest.raises(ValueError, match="q_update_to_data_ratio"):
+        DistributionalTD3TeacherBC._validate_td3_config(cfg)
+
+
+def test_q_row_credit_utd_is_environment_and_chunking_invariant():
+    def schedule(chunks):
+        policy = _bare_policy(
+            q_batch_size=512,
+            q_updates_per_rollout=7,
+            q_update_to_data_ratio=1.0,
+        )
+        policy.q_update_row_credit = 0.0
+        updates = sum(policy._q_updates_due(rows) for rows in chunks)
+        return updates, policy.q_update_row_credit
+
+    env256_updates, env256_credit = schedule([256 * 32])
+    env512_updates, env512_credit = schedule([512 * 32])
+    chunked_updates, chunked_credit = schedule([100, 4_000, 4_092])
+
+    assert env256_updates == 16
+    assert env512_updates == 32
+    assert chunked_updates == env256_updates
+    assert env256_updates * 512 == 256 * 32
+    assert env512_updates * 512 == 512 * 32
+    assert env256_credit == pytest.approx(0.0)
+    assert env512_credit == pytest.approx(0.0)
+    assert chunked_credit == pytest.approx(0.0)
+
+
+def test_q_row_credit_preserves_fractional_residue_and_legacy_fallback():
+    scheduled = _bare_policy(
+        q_batch_size=512,
+        q_updates_per_rollout=7,
+        q_update_to_data_ratio=1.0,
+    )
+    assert scheduled._q_updates_due(100) == 0
+    assert scheduled.q_update_row_credit == pytest.approx(100.0)
+    assert scheduled._q_updates_due(412) == 1
+    assert scheduled.q_update_row_credit == pytest.approx(0.0)
+
+    legacy = _bare_policy(
+        q_batch_size=512,
+        q_updates_per_rollout=7,
+        q_update_to_data_ratio=None,
+    )
+    assert legacy._q_updates_due(123) == 7
+    assert not hasattr(legacy, "q_update_row_credit")
+
+
+@pytest.mark.parametrize("invalid", (True, -1, 1.5, "512"))
+def test_q_row_credit_rejects_invalid_accepted_student_rows(invalid):
+    policy = _bare_policy(
+        q_batch_size=512,
+        q_updates_per_rollout=32,
+        q_update_to_data_ratio=1.0,
+    )
+
+    with pytest.raises(ValueError, match="accepted_student_rows"):
+        policy._q_updates_due(invalid)
+
+
 def test_actor_batch_optionally_mixes_exact_teacher_replay_labels_and_raw_inputs():
     policy = _bare_policy(
         dagger_batch_size=4,
