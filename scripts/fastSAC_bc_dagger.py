@@ -28,6 +28,7 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
     TRAINING_ALGORITHM,
+    _validate_fastsac_entropy_target_controls,
 )
 
 try:
@@ -581,37 +582,25 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         "sac_initial_action_std",
         "sac_alpha_init",
         "sac_alpha_lr",
-        "sac_target_entropy_ratio",
     ):
         _finite_positive(f"algo.{name}", cfg.algo.get(name, None))
     if float(cfg.algo.eta_sac) == 0.0 and float(cfg.algo.lambda_bc) == 0.0:
         raise ValueError("eta_sac and lambda_bc cannot both be zero")
 
-    log_std_min = float(cfg.algo.get("sac_log_std_min", math.nan))
-    log_std_max = float(cfg.algo.get("sac_log_std_max", math.nan))
-    if not (
-        math.isfinite(log_std_min)
-        and math.isfinite(log_std_max)
-        and log_std_min < log_std_max
-    ):
-        raise ValueError("sac_log_std_min must be finite and below sac_log_std_max")
+    log_std_min = cfg.algo.get("sac_log_std_min", None)
+    log_std_max = cfg.algo.get("sac_log_std_max", None)
+    _validate_fastsac_entropy_target_controls(
+        log_std_min,
+        log_std_max,
+        cfg.algo.get("sac_target_entropy_ratio", None),
+        field_prefix="algo",
+    )
     if cfg.algo.get("sac_use_autotune", None) not in (True, False):
         raise ValueError("algo.sac_use_autotune must be boolean")
     if cfg.algo.get("sac_alpha_update_cadence", None) != "actor":
         raise ValueError(
             "algo.sac_alpha_update_cadence must be 'actor' so temperature "
             "updates match the delayed Actor cadence"
-        )
-    if not 0.0 < float(cfg.algo.sac_target_entropy_ratio) <= 1.0:
-        raise ValueError("algo.sac_target_entropy_ratio must lie in (0, 1]")
-    max_unsquashed_entropy_per_dim = (
-        0.5 * math.log(2.0 * math.pi * math.e) + log_std_max
-    )
-    target_entropy_per_dim = -float(cfg.algo.sac_target_entropy_ratio)
-    if max_unsquashed_entropy_per_dim <= target_entropy_per_dim:
-        raise ValueError(
-            "FastSAC entropy target is unreachable: algo.sac_log_std_max must "
-            "be greater than -algo.sac_target_entropy_ratio - 0.5*log(2*pi*e)"
         )
     for name in (
         "sac_policy_frequency",

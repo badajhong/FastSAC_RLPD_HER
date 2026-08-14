@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import pytest
@@ -486,7 +487,7 @@ def test_inherited_td3_noise_must_remain_zero(field):
         ("sac_log_std_min", -1.0, "below"),
         ("sac_alpha_init", 0.0, "positive"),
         ("sac_alpha_update_cadence", "critic", "must be 'actor'"),
-        ("sac_target_entropy_ratio", 1.1, r"\(0, 1\]"),
+        ("sac_target_entropy_ratio", 0.0, "positive"),
         ("sac_policy_frequency", 0, "positive"),
         ("sac_learning_starts", 0, "positive"),
         ("sac_tau", 0.0, "sac_tau"),
@@ -522,6 +523,38 @@ def test_unreachable_entropy_target_fails_before_training():
     cfg.algo.sac_log_std_max = -3.0
 
     with pytest.raises(ValueError, match="entropy target is unreachable"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_entropy_target_below_log_std_min_fails_before_training():
+    cfg = _cfg()
+    cfg.algo.sac_target_entropy_ratio = 9.0
+
+    with pytest.raises(ValueError, match="entropy target is unreachable"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("ratio", "expected_target"), ((2.0, -46.0), (2.5, -57.5))
+)
+def test_lower_entropy_ratio_above_one_passes_preflight(ratio, expected_target):
+    cfg = _cfg()
+    cfg.algo.sac_target_entropy_ratio = ratio
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    action_dim = 23
+    assert -action_dim * float(cfg.algo.sac_target_entropy_ratio) == pytest.approx(
+        expected_target
+    )
+
+
+@pytest.mark.parametrize("ratio", (math.inf, math.nan))
+def test_nonfinite_entropy_ratio_fails_preflight(ratio):
+    cfg = _cfg()
+    cfg.algo.sac_target_entropy_ratio = ratio
+
+    with pytest.raises(ValueError, match="finite and positive"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 

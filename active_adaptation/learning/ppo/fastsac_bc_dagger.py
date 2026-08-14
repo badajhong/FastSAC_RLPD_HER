@@ -110,6 +110,70 @@ _CRITIC_CADENCE_ENTROPY_SEMANTICS = (
 )
 
 
+def _validate_fastsac_entropy_target_controls(
+    sac_log_std_min,
+    sac_log_std_max,
+    sac_target_entropy_ratio,
+    *,
+    field_prefix: str = "",
+) -> float:
+    """Validate the normalized target against a nominal log-std envelope.
+
+    The exact tanh-normal entropy also depends on the state-dependent mean and
+    tanh Jacobian.  This strict unsquashed-Gaussian bracket is therefore a
+    configuration sanity envelope, not an exact reachability guarantee.  It
+    prevents autotune from requiring a log-std boundary or relying on mean
+    saturation to reach its target.
+
+    Returns the normalized target entropy per action dimension.
+    """
+    prefix = f"{field_prefix}." if field_prefix else ""
+    values = (
+        ("sac_log_std_min", sac_log_std_min),
+        ("sac_log_std_max", sac_log_std_max),
+        ("sac_target_entropy_ratio", sac_target_entropy_ratio),
+    )
+    for name, value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{prefix}{name} must be a finite number")
+
+    log_std_min = float(sac_log_std_min)
+    log_std_max = float(sac_log_std_max)
+    if not (
+        math.isfinite(log_std_min)
+        and math.isfinite(log_std_max)
+        and log_std_min < log_std_max
+    ):
+        raise ValueError(
+            f"{prefix}sac_log_std_min must be finite and below "
+            f"{prefix}sac_log_std_max"
+        )
+
+    target_entropy_ratio = float(sac_target_entropy_ratio)
+    if not math.isfinite(target_entropy_ratio) or target_entropy_ratio <= 0.0:
+        raise ValueError(
+            f"{prefix}sac_target_entropy_ratio must be finite and positive"
+        )
+
+    gaussian_entropy_offset = 0.5 * math.log(2.0 * math.pi * math.e)
+    min_unsquashed_entropy_per_dim = gaussian_entropy_offset + log_std_min
+    max_unsquashed_entropy_per_dim = gaussian_entropy_offset + log_std_max
+    target_entropy_per_dim = -target_entropy_ratio
+    if not (
+        min_unsquashed_entropy_per_dim
+        < target_entropy_per_dim
+        < max_unsquashed_entropy_per_dim
+    ):
+        raise ValueError(
+            "FastSAC entropy target is unreachable within the nominal "
+            "unsquashed-Gaussian log-std envelope: require "
+            "0.5*log(2*pi*e) + sac_log_std_min "
+            "< -sac_target_entropy_ratio "
+            "< 0.5*log(2*pi*e) + sac_log_std_max"
+        )
+    return target_entropy_per_dim
+
+
 @dataclass
 class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     """Hydra surface for fresh-only FastSAC + Teacher BC."""
@@ -452,12 +516,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise ValueError(
                 "sac_alpha_update_cadence must be 'actor' or 'critic'"
             )
-        if not (
-            math.isfinite(float(cfg.sac_log_std_min))
-            and math.isfinite(float(cfg.sac_log_std_max))
-            and float(cfg.sac_log_std_min) < float(cfg.sac_log_std_max)
-        ):
-            raise ValueError("FastSAC log-std bounds must be finite and ordered")
+        _validate_fastsac_entropy_target_controls(
+            cfg.sac_log_std_min,
+            cfg.sac_log_std_max,
+            cfg.sac_target_entropy_ratio,
+        )
         for name in (
             "sac_actor_lr",
             "sac_initial_action_std",
@@ -469,22 +532,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
-        for name in ("eta_sac", "lambda_bc", "sac_target_entropy_ratio"):
+        for name in ("eta_sac", "lambda_bc"):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        if not 0.0 < float(cfg.sac_target_entropy_ratio) <= 1.0:
-            raise ValueError("sac_target_entropy_ratio must lie in (0,1]")
-        max_unsquashed_entropy_per_dim = (
-            0.5 * math.log(2.0 * math.pi * math.e)
-            + float(cfg.sac_log_std_max)
-        )
-        target_entropy_per_dim = -float(cfg.sac_target_entropy_ratio)
-        if max_unsquashed_entropy_per_dim <= target_entropy_per_dim:
-            raise ValueError(
-                "FastSAC entropy target is unreachable: sac_log_std_max must be "
-                "greater than -sac_target_entropy_ratio - 0.5*log(2*pi*e)"
-            )
         if float(cfg.eta_sac) == 0.0 and float(cfg.lambda_bc) == 0.0:
             raise ValueError("eta_sac and lambda_bc cannot both be zero")
         for name in ("sac_policy_frequency", "sac_learning_starts"):

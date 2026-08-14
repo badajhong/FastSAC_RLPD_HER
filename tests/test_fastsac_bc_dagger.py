@@ -14,6 +14,7 @@ from active_adaptation.learning.ppo.common import ACTION_KEY
 from active_adaptation.learning.ppo.fastsac_vel import (
     FastSACTanhNormal,
     _BCDaggerSACAdapter,
+    _fastsac_target_entropy,
 )
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_ACTION_DISCREPANCY_RMS_KEY,
@@ -183,6 +184,7 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.eta_td3 == 0.0
     assert cfg.policy_delay == cfg.sac_policy_frequency == 8
     assert cfg.sac_alpha_update_cadence == "actor"
+    assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
 
@@ -197,6 +199,44 @@ def test_config_rejects_entropy_target_above_maximum_gaussian_entropy():
     cfg = DistributionalFastSACTeacherBCConfig(sac_log_std_max=-3.0)
 
     with pytest.raises(ValueError, match="entropy target is unreachable"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+def test_config_rejects_entropy_target_below_minimum_gaussian_entropy():
+    cfg = DistributionalFastSACTeacherBCConfig(
+        sac_target_entropy_ratio=9.0
+    )
+
+    with pytest.raises(ValueError, match="entropy target is unreachable"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("ratio", "expected_target"), ((2.0, -46.0), (2.5, -57.5))
+)
+def test_config_allows_lower_entropy_targets_above_unit_ratio(
+    ratio, expected_target
+):
+    cfg = DistributionalFastSACTeacherBCConfig(
+        sac_target_entropy_ratio=ratio
+    )
+
+    DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+    action_low = torch.full((23,), -1.0)
+    action_high = torch.full((23,), 1.0)
+    assert _fastsac_target_entropy(action_low, action_high, ratio) == pytest.approx(
+        expected_target
+    )
+
+
+@pytest.mark.parametrize("ratio", (0.0, -1.0, math.inf, math.nan))
+def test_config_rejects_nonpositive_or_nonfinite_entropy_ratio(ratio):
+    cfg = DistributionalFastSACTeacherBCConfig(
+        sac_target_entropy_ratio=ratio
+    )
+
+    with pytest.raises(ValueError, match="finite and positive"):
         DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 

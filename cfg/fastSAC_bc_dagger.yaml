@@ -146,6 +146,8 @@ algo:
   sac_use_autotune: true
   # Lock autotune to the delayed Actor cadence, not every Critic update.
   sac_alpha_update_cadence: actor
+  # Normalized target = -action_dim * ratio. Values above one intentionally
+  # request lower entropy; the skateboard's 23 actions give -46 at ratio 2.
   sac_target_entropy_ratio: 1.0
   sac_policy_frequency: 8
   sac_learning_starts: 8192
