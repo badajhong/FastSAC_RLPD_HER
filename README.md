@@ -34,9 +34,10 @@ isaacsim # test isaacsim
 
 # install isaaclab
 cd ..
-git clone git@github.com:isaac-sim/IsaacLab.git
+git clone https://github.com/isaac-sim/IsaacLab.git
 cd IsaacLab
 git checkout v2.3.2
+python -m pip install "setuptools<81"
 python -m pip install --no-build-isolation "flatdict==4.0.1"
 ./isaaclab.sh -i none
 
