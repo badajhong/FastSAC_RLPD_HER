@@ -385,10 +385,13 @@ def test_pretrained_perception_requires_all_module_mappings(tmp_path):
     (
         "teacher_actor_replay_fraction",
         "teacher_perception_replay_fraction",
+        "q_teacher_replay_ratio",
         "failure_phase_teacher_fraction",
     ),
 )
-@pytest.mark.parametrize("value", (-0.1, 1.1, float("nan"), True))
+@pytest.mark.parametrize(
+    "value", (-0.1, 1.1, float("nan"), float("inf"), float("-inf"), True)
+)
 def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
     cfg = _cfg()
     cfg.algo[field] = value
@@ -404,20 +407,20 @@ def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
         "q_teacher_replay_ratio",
     ),
 )
-def test_shared_training_sources_require_exact_half_teacher_half_student(field):
+@pytest.mark.parametrize("fraction", (0.0, 0.1, 0.5, 1.0))
+def test_teacher_source_fractions_are_cli_configurable(field, fraction):
     cfg = _cfg()
-    cfg.algo[field] = 0.4
+    cfg.algo[field] = fraction
 
-    with pytest.raises(ValueError, match="exact 50/50"):
-        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
-def test_exact_half_teacher_actor_mix_requires_even_batch_size():
+def test_configurable_source_mixes_accept_odd_batch_sizes():
     cfg = _cfg()
     cfg.algo.dagger_batch_size = 4095
+    cfg.algo.q_batch_size = 511
 
-    with pytest.raises(ValueError, match=r"dagger_batch_size.*even.*50/50"):
-        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
 def test_dynamic_teacher_prefill_requires_positive_safety_ceiling():
@@ -442,14 +445,13 @@ def test_teacher_prefill_ceiling_must_theoretically_reach_ring_capacity():
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
-def test_failure_phase_focus_requires_an_enabled_teacher_source():
+def test_all_zero_teacher_sources_leave_failure_focus_dormant():
     cfg = _cfg()
     cfg.algo.teacher_actor_replay_fraction = 0.0
     cfg.algo.teacher_perception_replay_fraction = 0.0
     cfg.algo.q_teacher_replay_ratio = 0.0
 
-    with pytest.raises(ValueError, match="positive Teacher source fraction"):
-        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
 def test_failure_phase_samples_fit_in_inclusive_lookback_interval():
@@ -497,10 +499,8 @@ def test_inherited_td3_noise_must_remain_zero(field):
         ("failure_phase_num_bins", 0, "positive"),
         ("q_num_atoms", 51, "501"),
         ("q_action_coordinates", "absolute", "raw_joint_command"),
-        ("q_batch_size", 3, "even"),
         ("q_updates_per_rollout", 0, "positive"),
         ("q_update_to_data_ratio", 0.5, "row-level Q UTD=1"),
-        ("q_teacher_replay_ratio", 0.4, "50/50"),
     ),
 )
 def test_invalid_fastsac_controls_fail_before_training(field, value, message):

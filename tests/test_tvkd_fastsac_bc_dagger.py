@@ -1075,7 +1075,11 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
         TVKDDistributionalFastSACTeacherBC
     )
     nn.Module.__init__(policy)
-    policy.cfg = SimpleNamespace(lambda_bc=1.0)
+    policy.cfg = SimpleNamespace(
+        lambda_bc=1.0,
+        q_teacher_replay_ratio=0.1,
+        teacher_actor_replay_fraction=0.6,
+    )
     policy.teacher_value_bottleneck_detector = _detector()
     policy._reset_bottleneck_statistics()
     policy.cfg.failure_phase_student_fraction = 0.3
@@ -1122,7 +1126,8 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
         "bottleneck/student_focus_uniform_fallback_rows",
         "bottleneck/student_focus_pool_size",
         "bottleneck/student_focus_fraction_config",
-        "bottleneck/student_focus_global_fraction_cap",
+        "bottleneck/student_focus_q_global_fraction_cap",
+        "bottleneck/student_focus_actor_global_fraction_cap",
         "loss/critic",
         "loss/actor_total",
         "loss/actor_sac",
@@ -1133,6 +1138,12 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
     }
     assert required.issubset(info)
     assert all(torch.isfinite(torch.as_tensor(info[key])) for key in required)
+    assert info["bottleneck/student_focus_q_global_fraction_cap"] == pytest.approx(
+        0.27
+    )
+    assert info[
+        "bottleneck/student_focus_actor_global_fraction_cap"
+    ] == pytest.approx(0.12)
     assert not any(key.startswith("bc_scheduler/") for key in info)
 
 
@@ -1830,7 +1841,7 @@ def test_v1_resume_discards_scheduler_state_and_starts_fresh_detector(monkeypatc
     assert freezes == [True]
 
 
-def test_tvkd_hydra_config_inherits_locked_source_mix_and_new_defaults():
+def test_tvkd_hydra_config_inherits_source_mix_defaults_and_new_controls():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg = compose(
@@ -1869,9 +1880,11 @@ def test_tvkd_hydra_config_inherits_locked_source_mix_and_new_defaults():
         validate_tvkd_fastsac_bc_dagger_config(cfg)
 
 
-def test_tvkd_fresh_relative_perception_path_survives_hydra_run_chdir(
+@pytest.mark.parametrize("fraction", (0.0, 0.1, 0.5, 1.0))
+def test_tvkd_fresh_configurable_teacher_sources_survive_hydra_run_chdir(
     tmp_path,
     monkeypatch,
+    fraction,
 ):
     launch_dir = tmp_path / "launch"
     run_dir = tmp_path / "outputs" / "hydra-run"
@@ -1901,12 +1914,18 @@ def test_tvkd_fresh_relative_perception_path_survives_hydra_run_chdir(
                 "algo.load_pretrained_perception=true",
                 f"algo.perception_checkpoint_path={relative_checkpoint_path}",
                 "algo.train_perception=true",
+                f"algo.teacher_actor_replay_fraction={fraction}",
+                f"algo.teacher_perception_replay_fraction={fraction}",
+                f"algo.q_teacher_replay_ratio={fraction}",
                 "fastsac_dagger_iterations=14000",
             ],
         )
 
     monkeypatch.chdir(launch_dir)
     validate_tvkd_fastsac_bc_dagger_config(cfg)
+    assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(fraction)
+    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(fraction)
+    assert cfg.algo.q_teacher_replay_ratio == pytest.approx(fraction)
 
     canonical_checkpoint_path = checkpoint_path.resolve()
     assert Path(cfg.algo.perception_checkpoint_path) == canonical_checkpoint_path

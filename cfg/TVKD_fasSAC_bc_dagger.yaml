@@ -18,7 +18,7 @@ _tvkd_model_only_resume: false
 algo:
   # TVKD checkpoints use one temperature update per Critic.
   sac_alpha_update_cadence: critic
-  # Within the 50% Student Q/Actor allocation, request at most 30% from the
-  # failure/bottleneck-focused Student subset (15% of each full Q/Actor batch).
-  # Any focused-row shortage falls back to uniform Student replay.
+  # Within each configured Student Q/Actor allocation, request at most 30%
+  # from the failure/bottleneck-focused Student subset. Any focused-row
+  # shortage falls back to uniform Student replay.
   failure_phase_student_fraction: 0.3

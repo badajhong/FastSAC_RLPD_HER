@@ -253,20 +253,20 @@ def _validate_perception_training_controls(cfg: DictConfig) -> str | None:
 
 
 def _validate_failure_phase_teacher_sampling(cfg: DictConfig) -> None:
-    """Validate the shared live/uniform-Teacher/focused-Teacher source mix."""
-    actor_teacher_fraction = _finite_fraction(
+    """Validate independently configurable Teacher source fractions."""
+    _finite_fraction(
         "algo.teacher_actor_replay_fraction",
         cfg.algo.get("teacher_actor_replay_fraction", None),
     )
-    perception_teacher_fraction = _finite_fraction(
+    _finite_fraction(
         "algo.teacher_perception_replay_fraction",
         cfg.algo.get("teacher_perception_replay_fraction", None),
     )
-    critic_teacher_fraction = _finite_fraction(
+    _finite_fraction(
         "algo.q_teacher_replay_ratio",
         cfg.algo.get("q_teacher_replay_ratio", None),
     )
-    focus_fraction = _finite_fraction(
+    _finite_fraction(
         "algo.failure_phase_teacher_fraction",
         cfg.algo.get("failure_phase_teacher_fraction", None),
     )
@@ -286,40 +286,6 @@ def _validate_failure_phase_teacher_sampling(cfg: DictConfig) -> None:
         raise ValueError(
             "algo.failure_phase_samples_per_failure cannot exceed the inclusive "
             "algo.failure_phase_lookback_steps + 1 interval"
-        )
-
-    if (
-        focus_fraction > 0.0
-        and max(
-            actor_teacher_fraction,
-            perception_teacher_fraction,
-            critic_teacher_fraction,
-        )
-        == 0.0
-    ):
-        raise ValueError(
-            "algo.failure_phase_teacher_fraction > 0 requires a positive "
-            "Teacher source fraction"
-        )
-    for name, teacher_fraction in (
-        ("teacher_actor_replay_fraction", actor_teacher_fraction),
-        ("teacher_perception_replay_fraction", perception_teacher_fraction),
-        ("q_teacher_replay_ratio", critic_teacher_fraction),
-    ):
-        if not math.isclose(
-            teacher_fraction, 0.5, rel_tol=0.0, abs_tol=1e-12
-        ):
-            raise ValueError(
-                "FastSAC requires exact 50/50 frozen-Teacher/online-Student "
-                f"training sources; algo.{name} must equal 0.5"
-            )
-    actor_batch_size = _positive_int(
-        "algo.dagger_batch_size", cfg.algo.get("dagger_batch_size", None)
-    )
-    if actor_batch_size % 2:
-        raise ValueError(
-            "algo.dagger_batch_size must be even for exact 50/50 "
-            "frozen-Teacher/online-Student Actor batches"
         )
 
 
@@ -694,8 +660,6 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     _validate_replay_contract(cfg)
     _validate_sac_controls(cfg)
 
-    if int(cfg.algo.q_batch_size) % 2:
-        raise ValueError("algo.q_batch_size must be even for exact 50/50 replay")
     if not math.isclose(
         float(cfg.algo.get("q_update_to_data_ratio", math.nan)),
         1.0,
@@ -725,14 +689,6 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError("distributional FastSAC requires normalized Q actions")
     if not math.isclose(float(cfg.algo.get("q_action_input_gain", math.nan)), 1.0):
         raise ValueError("distributional FastSAC requires q_action_input_gain=1")
-    if not math.isclose(
-        float(cfg.algo.get("q_teacher_replay_ratio", math.nan)),
-        0.5,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
-        raise ValueError("FastSAC requires exact 50/50 Teacher/Student Q replay")
-
     control_mode = str(cfg.algo.get("dagger_control_mode", "beta"))
     if control_mode not in ("beta", "safe", "hybrid"):
         raise ValueError("algo.dagger_control_mode must be beta, safe, or hybrid")

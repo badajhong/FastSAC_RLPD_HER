@@ -552,9 +552,15 @@ def test_teacher_prefill_and_shared_teacher_mix_defaults_and_validation():
 
 @pytest.mark.parametrize(
     "field",
-    ("teacher_actor_replay_fraction", "teacher_perception_replay_fraction"),
+    (
+        "teacher_actor_replay_fraction",
+        "teacher_perception_replay_fraction",
+        "q_teacher_replay_ratio",
+    ),
 )
-@pytest.mark.parametrize("invalid", (-0.01, 1.01, float("nan"), True))
+@pytest.mark.parametrize(
+    "invalid", (-0.01, 1.01, float("nan"), float("inf"), float("-inf"), True)
+)
 def test_teacher_replay_fraction_is_a_unit_interval(field, invalid):
     cfg = DistributionalTD3TeacherBCConfig()
     setattr(cfg, field, invalid)
@@ -1625,8 +1631,11 @@ def test_perception_teacher_half_uses_seventy_thirty_uniform_focused_sampling():
     assert losses["rows"].item() == 10
 
 
-def test_teacher_perception_fraction_mixes_losses_in_existing_steps_and_updates_ema_once():
-    policy = _teacher_perception_policy(fraction=0.5)
+@pytest.mark.parametrize("fraction", (0.0, 0.1, 0.5, 1.0))
+def test_teacher_perception_fraction_mixes_losses_in_existing_steps_and_updates_ema_once(
+    fraction,
+):
+    policy = _teacher_perception_policy(fraction=fraction)
     old_ema = policy.temporal_depth_gru_ema.scale.detach().clone()
     online = TensorDict(
         {
@@ -1645,10 +1654,20 @@ def test_teacher_perception_fraction_mixes_losses_in_existing_steps_and_updates_
 
     info = policy.train_adapt(online)
 
-    assert info["adapt/teacher_replay_fraction"] == pytest.approx(0.5)
-    assert info["adapt/teacher_replay_rows"] == pytest.approx(2.0)
+    assert info["adapt/teacher_replay_fraction"] == pytest.approx(fraction)
+    assert info["adapt/teacher_replay_rows"] == pytest.approx(
+        0.0 if fraction == 0.0 else 2.0
+    )
     assert "adapt/online_priv_loss" in info
     assert "adapt/teacher_replay_priv_loss" in info
+    assert info["adapt/priv_loss"] == pytest.approx(
+        (1.0 - fraction) * info["adapt/online_priv_loss"]
+        + fraction * info["adapt/teacher_replay_priv_loss"]
+    )
+    assert info["adapt/object_loss"] == pytest.approx(
+        (1.0 - fraction) * info["adapt/online_object_loss"]
+        + fraction * info["adapt/teacher_replay_object_loss"]
+    )
     expected_ema = old_ema.lerp(policy.temporal_depth_gru.scale.detach(), 0.04)
     assert torch.allclose(policy.temporal_depth_gru_ema.scale, expected_ema)
 
@@ -2202,6 +2221,7 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
         td3_learning_starts=2,
         q_updates_per_rollout=1,
         q_batch_size=4,
+        q_teacher_replay_ratio=0.25,
         dagger_batch_size=4,
         policy_delay=1,
         dagger_beta_start=0.0,
@@ -2308,7 +2328,7 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
 
     # Main replay stores only Student-executed transitions. Those rows retain
     # exact Teacher BC labels and raw perception windows; Teacher-executed main
-    # rows would be dead under the shared 50/35/15 sampling contract.
+    # rows would be dead under the separated Teacher/Student sampling contract.
     student_indices = torch.tensor([0, 2])
     assert policy.dagger_replay.size == 2
     assert policy.dagger_replay.seen == 2
@@ -2341,17 +2361,19 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
     assert main_info["td3/student_replay_rows"] == 2
     assert main_info["td3/critic_updates_this_rollout"] == 1
     assert main_info["td3/actor_updates_this_rollout"] == 1
+    assert main_info["td3/q_sampled_teacher_rows_this_rollout"] == 1
+    assert main_info["td3/q_sampled_student_rows_this_rollout"] == 3
     assert len(critic_batches) == 1
     assert len(actor_batches) == 1
     assert len(perception_updates) == 1
 
-    # The critic receives an exact split: immutable prefill teacher actions and
-    # only student-executed main actions. The Actor batch comes entirely from
-    # main DAgger replay and therefore carries labels usable by exact BC.
+    # The critic receives the configured 25/75 mix of immutable prefill Teacher
+    # actions and Student-executed main actions. The Actor batch comes entirely
+    # from main replay and therefore carries labels usable by exact BC.
     critic_batch = critic_batches[0]
     teacher_source = critic_batch[DAGGER_Q_TEACHER_SOURCE_KEY]
-    assert teacher_source.sum().item() == 2
-    assert (~teacher_source).sum().item() == 2
+    assert teacher_source.sum().item() == 1
+    assert (~teacher_source).sum().item() == 3
     assert set(critic_batch["actions"][teacher_source, 0].tolist()) <= {101.0, 103.0}
     assert set(critic_batch["actions"][~teacher_source, 0].tolist()) <= {
         1_001.0,
@@ -2403,12 +2425,20 @@ def _sampling_policy(replay_type, seed: int, device):
     return policy
 
 
-def _curriculum_sampling_policy(seed: int = 853, device="cpu"):
+def _curriculum_sampling_policy(
+    seed: int = 853,
+    device="cpu",
+    *,
+    q_teacher_replay_ratio: float = 0.5,
+    teacher_actor_replay_fraction: float = 0.5,
+    q_batch_size: int = 20,
+    actor_batch_size: int = 20,
+):
     policy = _bare_policy(
-        q_batch_size=20,
-        q_teacher_replay_ratio=0.5,
-        dagger_batch_size=20,
-        teacher_actor_replay_fraction=0.5,
+        q_batch_size=q_batch_size,
+        q_teacher_replay_ratio=q_teacher_replay_ratio,
+        dagger_batch_size=actor_batch_size,
+        teacher_actor_replay_fraction=teacher_actor_replay_fraction,
         failure_phase_teacher_fraction=0.3,
         failure_phase_num_bins=16,
         policy_delay=1,
@@ -2466,6 +2496,138 @@ def test_q_and_actor_batches_use_exact_shared_sources_and_student_only_main_rows
         actor["critic_observations"][~actor_teacher, 0] - 1_000.0
     ).long()
     assert student_mask.index_select(0, actor_student_rows).all()
+
+
+@pytest.mark.parametrize(
+    ("q_fraction", "actor_fraction"),
+    ((0.0, 1.0), (0.1, 0.5), (0.5, 0.1), (1.0, 0.0)),
+)
+def test_configurable_q_and_actor_mixes_match_direct_and_prefetched_sampling(
+    q_fraction,
+    actor_fraction,
+):
+    direct, _ = _curriculum_sampling_policy(
+        877,
+        q_teacher_replay_ratio=q_fraction,
+        teacher_actor_replay_fraction=actor_fraction,
+    )
+    prefetched, _ = _curriculum_sampling_policy(
+        877,
+        q_teacher_replay_ratio=q_fraction,
+        teacher_actor_replay_fraction=actor_fraction,
+    )
+
+    expected_q = direct._sample_balanced_q_batch()
+    expected_actor = direct._sample_actor_batch()
+    plan = prefetched._prefetch_curriculum_sample_plans(1)[0]
+    actual_q = prefetched._sample_balanced_q_batch(plan)
+    actual_actor = prefetched._sample_actor_batch(
+        plan.actor_indices,
+        plan.actor_teacher_indices,
+        plan.actor_teacher_focused,
+        plan.actor_student_focused,
+    )
+
+    _assert_nested_equal(actual_q, expected_q)
+    _assert_nested_equal(actual_actor, expected_actor)
+    assert torch.equal(direct.q_rng.get_state(), prefetched.q_rng.get_state())
+
+    expected_q_teacher = _source_counts(20, q_fraction, 0.3)[1:]
+    expected_actor_teacher = _source_counts(20, actor_fraction, 0.3)[1:]
+    q_teacher_count = sum(expected_q_teacher)
+    actor_teacher_count = sum(expected_actor_teacher)
+    assert actual_q[DAGGER_Q_TEACHER_SOURCE_KEY].sum().item() == q_teacher_count
+    assert (
+        actual_actor[DAGGER_Q_TEACHER_SOURCE_KEY].sum().item()
+        == actor_teacher_count
+    )
+    assert plan.teacher_indices.numel() == q_teacher_count
+    assert plan.student_indices.numel() == 20 - q_teacher_count
+    planned_actor_teacher_count = (
+        0
+        if plan.actor_teacher_indices is None
+        else plan.actor_teacher_indices.numel()
+    )
+    planned_actor_student_count = (
+        0 if plan.actor_indices is None else plan.actor_indices.numel()
+    )
+    assert planned_actor_teacher_count == actor_teacher_count
+    assert planned_actor_student_count == 20 - actor_teacher_count
+
+
+@pytest.mark.parametrize("q_fraction", (0.0, 1.0))
+def test_q_and_actor_mix_endpoints_do_not_read_the_unused_replay_ring(q_fraction):
+    direct, _ = _curriculum_sampling_policy(
+        q_teacher_replay_ratio=q_fraction,
+        teacher_actor_replay_fraction=q_fraction,
+    )
+    prefetched, _ = _curriculum_sampling_policy(
+        q_teacher_replay_ratio=q_fraction,
+        teacher_actor_replay_fraction=q_fraction,
+    )
+    for policy in (direct, prefetched):
+        if q_fraction == 0.0:
+            policy.q_teacher_replay.clear()
+        else:
+            policy.dagger_replay.clear()
+
+    expected_q = direct._sample_balanced_q_batch()
+    expected_actor = direct._sample_actor_batch()
+    plan = prefetched._prefetch_curriculum_sample_plans(1)[0]
+    actual_q = prefetched._sample_balanced_q_batch(plan)
+    actual_actor = prefetched._sample_actor_batch(
+        plan.actor_indices,
+        plan.actor_teacher_indices,
+        plan.actor_teacher_focused,
+        plan.actor_student_focused,
+    )
+
+    _assert_nested_equal(actual_q, expected_q)
+    _assert_nested_equal(actual_actor, expected_actor)
+    assert torch.equal(direct.q_rng.get_state(), prefetched.q_rng.get_state())
+    expected_teacher_count = 0 if q_fraction == 0.0 else 20
+    assert (
+        actual_q[DAGGER_Q_TEACHER_SOURCE_KEY].sum().item()
+        == expected_teacher_count
+    )
+    assert (
+        actual_actor[DAGGER_Q_TEACHER_SOURCE_KEY].sum().item()
+        == expected_teacher_count
+    )
+
+
+def test_odd_q_and_actor_batches_round_configured_teacher_rows_to_nearest():
+    direct, _ = _curriculum_sampling_policy(
+        911,
+        q_teacher_replay_ratio=0.1,
+        teacher_actor_replay_fraction=0.1,
+        q_batch_size=7,
+        actor_batch_size=5,
+    )
+    prefetched, _ = _curriculum_sampling_policy(
+        911,
+        q_teacher_replay_ratio=0.1,
+        teacher_actor_replay_fraction=0.1,
+        q_batch_size=7,
+        actor_batch_size=5,
+    )
+
+    expected_q = direct._sample_balanced_q_batch()
+    expected_actor = direct._sample_actor_batch()
+    plan = prefetched._prefetch_curriculum_sample_plans(1)[0]
+    actual_q = prefetched._sample_balanced_q_batch(plan)
+    actual_actor = prefetched._sample_actor_batch(
+        plan.actor_indices,
+        plan.actor_teacher_indices,
+        plan.actor_teacher_focused,
+        plan.actor_student_focused,
+    )
+
+    _assert_nested_equal(actual_q, expected_q)
+    _assert_nested_equal(actual_actor, expected_actor)
+    assert actual_q[DAGGER_Q_TEACHER_SOURCE_KEY].sum().item() == 1
+    assert actual_actor[DAGGER_Q_TEACHER_SOURCE_KEY].sum().item() == 1
+    assert torch.equal(direct.q_rng.get_state(), prefetched.q_rng.get_state())
 
 
 @pytest.mark.parametrize(

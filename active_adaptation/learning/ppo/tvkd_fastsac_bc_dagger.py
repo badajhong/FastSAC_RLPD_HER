@@ -3,7 +3,7 @@
 This entrypoint is intentionally layered on top of the repository's current
 ``DistributionalFastSACTeacherBC`` implementation.  It therefore preserves
 the existing stochastic Student rollout, frozen successful-Teacher prefill,
-50/50 Student/Teacher sampling envelope,
+independently configured Student/Teacher Q, Actor, and perception mixtures,
 raw recurrent replay, timeout-final-observation handling, twin C51 critics,
 and target-update cadence.
 
@@ -194,8 +194,8 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     bottleneck_terminal_exclusion_steps: int = 5
     bottleneck_residual_scale_ema_decay: float = 0.99
     bottleneck_eps: float = 1e-6
-    # Within the fixed 50% Student half, reserve at most 30% for exact rows
-    # around failed-episode bottlenecks. Missing focused rows backfill uniform.
+    # Within each configured Student Q/Actor share, reserve at most 30% for
+    # exact rows around failed-episode bottlenecks. Missing rows backfill uniform.
     failure_phase_student_fraction: float = 0.3
 
 
@@ -1590,7 +1590,13 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             "student_focus_fraction_config": float(
                 self.cfg.failure_phase_student_fraction
             ),
-            "student_focus_global_fraction_cap": 0.5
+            "student_focus_q_global_fraction_cap": (
+                1.0 - float(self.cfg.q_teacher_replay_ratio)
+            )
+            * float(self.cfg.failure_phase_student_fraction),
+            "student_focus_actor_global_fraction_cap": (
+                1.0 - float(self.cfg.teacher_actor_replay_fraction)
+            )
             * float(self.cfg.failure_phase_student_fraction),
         }
 

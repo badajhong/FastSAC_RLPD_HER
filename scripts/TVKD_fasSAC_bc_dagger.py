@@ -759,16 +759,32 @@ def main(cfg: DictConfig):
             cfg._bc_dagger_main_rollout_budget = start_rollout + int(
                 cfg.fastsac_dagger_iterations
             )
+
+    def replay_mix_summary(label: str, teacher_fraction: float) -> str:
+        student_fraction = 1.0 - teacher_fraction
+        focused_student_max = student_fraction * float(
+            cfg.algo.failure_phase_student_fraction
+        )
+        uniform_student_min = student_fraction - focused_student_max
+        failure_teacher_fraction = teacher_fraction * float(
+            cfg.algo.failure_phase_teacher_fraction
+        )
+        uniform_teacher_fraction = teacher_fraction - failure_teacher_fraction
+        return (
+            f"{label}=Student {100.0 * student_fraction:g}% "
+            f"(uniform >={100.0 * uniform_student_min:g}%, "
+            f"failure/bottleneck <={100.0 * focused_student_max:g}%; "
+            "focused shortfall -> uniform) / Teacher "
+            f"{100.0 * teacher_fraction:g}% "
+            f"(uniform success {100.0 * uniform_teacher_fraction:g}%, "
+            f"failure-phase success {100.0 * failure_teacher_fraction:g}%)"
+        )
+
     actor_teacher_fraction = float(cfg.algo.teacher_actor_replay_fraction)
-    actor_student_fraction = 1.0 - actor_teacher_fraction
-    focused_student_max = actor_student_fraction * float(
-        cfg.algo.failure_phase_student_fraction
+    q_teacher_fraction = float(cfg.algo.q_teacher_replay_ratio)
+    perception_teacher_fraction = float(
+        cfg.algo.teacher_perception_replay_fraction
     )
-    uniform_student_min = actor_student_fraction - focused_student_max
-    failure_teacher_fraction = actor_teacher_fraction * float(
-        cfg.algo.failure_phase_teacher_fraction
-    )
-    uniform_teacher_fraction = actor_teacher_fraction - failure_teacher_fraction
     print(
         "TVKD Distributional FastSAC + fixed BC + value-bottleneck replay: "
         f"prefill=until {schedule['prefill_target_rows']} Teacher rows, "
@@ -779,13 +795,9 @@ def main(cfg: DictConfig):
         f"tvkd_lambda={float(cfg.algo.tvkd_lambda):g}, "
         f"bottleneck={bool(cfg.algo.use_teacher_value_bottleneck_replay)}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence}, "
-        f"Q/Actor replay=Student {100.0 * actor_student_fraction:g}% "
-        f"(uniform >={100.0 * uniform_student_min:g}%, "
-        f"failure/bottleneck <={100.0 * focused_student_max:g}%; "
-        "focused shortfall -> uniform) / Teacher "
-        f"{100.0 * actor_teacher_fraction:g}% "
-        f"(uniform success {100.0 * uniform_teacher_fraction:g}%, "
-        f"failure-phase success {100.0 * failure_teacher_fraction:g}%)"
+        f"{replay_mix_summary('Q replay', q_teacher_fraction)}; "
+        f"{replay_mix_summary('Actor replay', actor_teacher_fraction)}; "
+        f"Perception Teacher loss weight={100.0 * perception_teacher_fraction:g}%"
     )
     return run_training(cfg)
 

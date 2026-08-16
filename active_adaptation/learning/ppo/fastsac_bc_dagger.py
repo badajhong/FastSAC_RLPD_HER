@@ -557,22 +557,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             right = float(getattr(cfg, sac_name))
             if not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(f"{legacy} must equal {sac_name} in this backend")
-        for name in (
-            "teacher_actor_replay_fraction",
-            "teacher_perception_replay_fraction",
-            "q_teacher_replay_ratio",
-        ):
-            if not math.isclose(
-                float(getattr(cfg, name)), 0.5, rel_tol=0.0, abs_tol=1e-12
-            ):
-                raise ValueError(
-                    "FastSAC requires exact 50/50 frozen-Teacher/online-Student "
-                    f"training sources; {name} must equal 0.5"
-                )
-        if int(cfg.dagger_batch_size) % 2:
-            raise ValueError(
-                "dagger_batch_size must be even for exact 50/50 Actor replay"
-            )
         q_update_to_data_ratio = getattr(cfg, "q_update_to_data_ratio", None)
         if (
             q_update_to_data_ratio is None

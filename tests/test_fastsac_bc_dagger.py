@@ -257,12 +257,12 @@ def test_config_rejects_unknown_temperature_update_cadence():
         "q_teacher_replay_ratio",
     ),
 )
-def test_backend_locks_every_training_source_to_half_teacher_half_student(field):
+@pytest.mark.parametrize("fraction", (0.0, 0.1, 0.5, 1.0))
+def test_backend_accepts_configurable_teacher_source_fractions(field, fraction):
     cfg = DistributionalFastSACTeacherBCConfig()
-    setattr(cfg, field, 0.4)
+    setattr(cfg, field, fraction)
 
-    with pytest.raises(ValueError, match="exact 50/50"):
-        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+    DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
 def test_backend_locks_row_level_q_utd_to_one():
