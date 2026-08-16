@@ -63,6 +63,7 @@ from .ppo_vel import (
     PPOVEL,
 )
 from .td3_bc_dagger import (
+    FAILURE_PHASE_STUDENT_SOURCE_KEY,
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
     PERCEPTION_PREFILL_WARMUP_SEMANTICS,
     PERCEPTION_REPLAY_SEMANTICS,
@@ -876,8 +877,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # Baseline temperature and Actor see the same policy-update timescale.
         # Cadence is evaluated after incrementing ``critic_update_count``, so
         # an Actor-cadence update adjusts alpha immediately before the matching
-        # Actor update in the inherited replay loop.  TVKD v1 explicitly keeps
-        # its legacy every-Critic cadence for resume compatibility.
+        # Actor update in the inherited replay loop. TVKD checkpoints keep the
+        # historical every-Critic cadence for resume compatibility.
         alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
         alpha_update_due = alpha_update_cadence == "critic" or (
             self.critic_update_count % int(self.cfg.sac_policy_frequency) == 0
@@ -1021,6 +1022,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
             "actor_failure_phase_teacher_fraction": batch.get(
                 FAILURE_PHASE_TEACHER_SOURCE_KEY,
+                torch.zeros_like(batch[DAGGER_TEACHER_ACTION_VALID_KEY]),
+            )
+            .float()
+            .mean()
+            .detach(),
+            "actor_failure_phase_student_fraction": batch.get(
+                FAILURE_PHASE_STUDENT_SOURCE_KEY,
                 torch.zeros_like(batch[DAGGER_TEACHER_ACTION_VALID_KEY]),
             )
             .float()

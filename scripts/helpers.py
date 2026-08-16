@@ -457,6 +457,8 @@ def _load_policy_checkpoint(
         "distributional_td3_teacher_bc_v1",
         "distributional_fastsac_teacher_bc_v1",
         "distributional_tvkd_fastsac_teacher_bc_v1",
+        "distributional_tvkd_fastsac_teacher_bc_v2",
+        "distributional_tvkd_fastsac_teacher_bc_v3",
     }
     if inference_only and algorithm in replayless_inference_algorithms:
         loader = getattr(policy, "load_inference_state_dict", None)
@@ -507,7 +509,11 @@ def _fill_replayless_inference_algo_defaults(
         )
 
         default_config = DistributionalFastSACTeacherBCConfig()
-    elif algorithm == "distributional_tvkd_fastsac_teacher_bc_v1":
+    elif algorithm in {
+        "distributional_tvkd_fastsac_teacher_bc_v1",
+        "distributional_tvkd_fastsac_teacher_bc_v2",
+        "distributional_tvkd_fastsac_teacher_bc_v3",
+    }:
         from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
             TVKDDistributionalFastSACTeacherBCConfig,
         )
@@ -531,7 +537,11 @@ def _fill_replayless_inference_algo_defaults(
     filled_checkpoint = []
     filled_defaults = []
     with open_dict(cfg.algo):
-        if algorithm == "distributional_tvkd_fastsac_teacher_bc_v1":
+        if algorithm in {
+            "distributional_tvkd_fastsac_teacher_bc_v1",
+            "distributional_tvkd_fastsac_teacher_bc_v2",
+            "distributional_tvkd_fastsac_teacher_bc_v3",
+        }:
             # ValueNorm changes the module type, so it must be selected from
             # the checkpoint before policy construction even when an eval
             # config already carries the structured default ``False``.

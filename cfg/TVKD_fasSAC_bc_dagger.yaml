@@ -1,13 +1,13 @@
 # TVKD extends the current fresh-only FastSAC + BC-DAgger configuration.
 # The structured algo node below adds frozen Teacher-value shaping and the
-# recent-Student adaptive BC scheduler while inheriting every existing rollout,
+# Teacher-value bottleneck replay while inheriting every existing rollout,
 # replay, perception, randomization, C51, UTD, and target-update default.
 defaults:
   - fastSAC_bc_dagger
   - override /algo: tvkd_fastsac_bc_dagger_finetune
   - _self_
 
-# Optional TVKD checkpoint for model/optimizer/policy-RNG/scheduler continuation.
+# Optional TVKD checkpoint for model/optimizer/policy-RNG/bottleneck continuation.
 # fastsac_dagger_iterations is the number of additional main rollouts. The
 # raw Student and Teacher learning rings are intentionally rebuilt: the frozen
 # Teacher ring is refilled before main collection and the Student ring warms up
@@ -16,5 +16,9 @@ fastsac_bc_dagger_checkpoint: null
 _tvkd_model_only_resume: false
 
 algo:
-  # TVKD v1 checkpoints were trained with one temperature update per Critic.
+  # TVKD checkpoints use one temperature update per Critic.
   sac_alpha_update_cadence: critic
+  # Within the 50% Student Q/Actor allocation, request at most 30% from the
+  # failure/bottleneck-focused Student subset (15% of each full Q/Actor batch).
+  # Any focused-row shortage falls back to uniform Student replay.
+  failure_phase_student_fraction: 0.3

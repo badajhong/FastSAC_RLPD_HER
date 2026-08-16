@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
+import importlib
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from tensordict import TensorDict
@@ -24,28 +25,51 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
 )
 from active_adaptation.learning.ppo.ppo_vel import PPOVEL
 from active_adaptation.learning.ppo.td3_bc_dagger import (
+    FAILURE_PHASE_STUDENT_SOURCE_KEY,
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
+    PERCEPTION_DEPTH_U8_KEY,
+    PERCEPTION_IS_INIT_KEY,
+    PERCEPTION_POLICY_RAW_KEY,
+    PERCEPTION_VEL_COMMAND_RAW_KEY,
+    REFERENCE_PHASE_KEY,
+    STUDENT_REPLAY_EPISODE_ID_KEY,
+    STUDENT_REPLAY_EPISODE_STEP_KEY,
+    _TD3DeviceReplay,
+    _PREFILL_ENV_INDEX_KEY,
+    _PREFILL_STEP_INDEX_KEY,
     _project_c51_probabilities,
 )
 from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     ACTOR_BACKEND as TVKD_ACTOR_BACKEND,
     CHECKPOINT_VERSION as TVKD_CHECKPOINT_VERSION,
+    LEGACY_ADAPTIVE_BC_CONFIG_FIELDS,
+    LEGACY_CHECKPOINT_VERSION as TVKD_LEGACY_CHECKPOINT_VERSION,
+    LEGACY_TRAINING_ALGORITHM as TVKD_LEGACY_TRAINING_ALGORITHM,
+    PREVIOUS_CHECKPOINT_VERSION as TVKD_PREVIOUS_CHECKPOINT_VERSION,
+    PREVIOUS_TRAINING_ALGORITHM as TVKD_PREVIOUS_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
     FrozenTeacherValueWrapper,
-    TeacherValueBCScheduler,
+    TeacherValueBottleneckDetector,
     TRAINING_ALGORITHM as TVKD_TRAINING_ALGORITHM,
     TVKDDistributionalFastSACTeacherBC,
-    _source_ids_from_batch,
-    compute_source_separated_bc_losses,
+    TVKDDistributionalFastSACTeacherBCConfig,
     compute_teacher_value_terms,
 )
 from scripts.TVKD_fasSAC_bc_dagger import (
     _prepare_tvkd_checkpoint,
     validate_tvkd_fastsac_bc_dagger_config,
 )
+from scripts.fastSAC_bc_dagger import (
+    PPOVEL_TRAIN_PHASE_PARTIAL_PERCEPTION_MODULES,
+)
 from scripts.helpers import _fill_replayless_inference_algo_defaults
+
+tvkd_module = importlib.import_module(
+    "active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger"
+)
+tvkd_entry = importlib.import_module("scripts.TVKD_fasSAC_bc_dagger")
 
 
 class _KeyedTeacherValue(nn.Module):
@@ -99,75 +123,258 @@ class _TableTwin(nn.Module):
         return torch.stack((self.first[:count], self.second[:count]), dim=0)
 
 
-class _ActionSensitiveTwin(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.slope = nn.Parameter(torch.tensor([1.0, -2.0]))
-        self.register_buffer("support", torch.tensor([-1.0, 0.0, 1.0]))
-
-    def forward(self, observations, actions):
-        del observations
-        score = self.slope[:, None] * actions[:, 0][None, :]
-        zeros = torch.zeros_like(score)
-        return torch.stack((-score, zeros, score), dim=-1)
-
-
-def _scheduler(**overrides):
+def _detector(**overrides):
     kwargs = {
-        "lambda_min": 0.05,
-        "lambda_max": 1.0,
-        "margin": 0.0,
-        "temperature": 1.0,
-        "scale_ema_decay": 0.0,
-        "risk_ema_decay": 0.0,
-        "warmup_updates": 0,
-        "min_student_samples": 1,
+        "threshold": 0.7,
+        "smoothing_window": 1,
+        "min_consecutive": 3,
+        "terminal_exclusion_steps": 1,
+        "residual_scale_ema_decay": 0.0,
         "eps": 1e-6,
     }
     kwargs.update(overrides)
-    return TeacherValueBCScheduler(**kwargs)
+    return TeacherValueBottleneckDetector(**kwargs)
 
 
-def test_scheduler_orders_bad_neutral_and_good_student_transitions():
-    bad = _scheduler()
-    neutral = _scheduler()
-    good = _scheduler()
+def _empty_bottleneck_checkpoint_state(
+    detector_state: dict | None = None,
+) -> dict:
+    return {
+        "detector": detector_state
+        or {
+            "bottleneck_residual_scale_ema": 1.0,
+            "num_scale_updates": 0,
+        },
+        "failed_student_episode_count": 0,
+        "student_candidate_count": 0,
+        "detected_count": 0,
+        "fallback_count": 0,
+        "no_candidate_count": 0,
+        "selected_count": 0,
+        "teacher_sequences_inserted": 0,
+        "teacher_transitions_inserted": 0,
+        "phase_match_distance_count": 0,
+        "next_student_episode_id": 0,
+        "student_focus_rows_marked": 0,
+        "student_focus_rows_missing": 0,
+        "student_focus_sampled_rows": 0,
+        "student_focus_uniform_fallback_rows": 0,
+        "selected_step_sum": 0.0,
+        "selected_phase_sum": 0.0,
+        "score_sum": 0.0,
+        "score_max": 0.0,
+        "raw_td_residual_sum": 0.0,
+        "normalized_td_residual_sum": 0.0,
+        "phase_match_distance_sum": 0.0,
+        "last_metadata": {},
+    }
 
-    bad_lambda = bad.update(torch.full((32,), -10.0))
-    neutral_lambda = neutral.update(torch.zeros(32))
-    good_lambda = good.update(torch.full((32,), 10.0))
 
-    assert bad.risk_ema > neutral.risk_ema > good.risk_ema
-    assert bad_lambda > neutral_lambda > good_lambda
-    assert bad.num_updates == neutral.num_updates == good.num_updates == 1
+def _tvkd_replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
+    row = torch.arange(count, dtype=torch.float32) + float(offset)
+    time = torch.arange(2, dtype=torch.float32)
+    return {
+        "critic_observations": torch.stack((row, row + 0.5), dim=-1),
+        "actions": row[:, None] + 1.0,
+        "rewards": row + 2.0,
+        "dones": torch.zeros(count, dtype=torch.bool),
+        "truncations": torch.zeros(count, dtype=torch.bool),
+        "discounts": torch.full((count,), 0.95),
+        "next_critic_observations": torch.stack(
+            (row + 4.0, row + 4.5), dim=-1
+        ),
+        REFERENCE_PHASE_KEY: torch.linspace(0.0, 1.0, count),
+        PERCEPTION_DEPTH_U8_KEY: torch.zeros(
+            count, 2, 1, 1, 1, dtype=torch.uint8
+        ),
+        PERCEPTION_POLICY_RAW_KEY: row[:, None, None] + time[None, :, None],
+        PERCEPTION_VEL_COMMAND_RAW_KEY: (
+            row[:, None, None] + time[None, :, None] + 0.25
+        ),
+        PERCEPTION_IS_INIT_KEY: torch.zeros(count, 2, dtype=torch.bool),
+    }
 
 
-def test_scheduler_warmup_minimum_population_and_state_round_trip():
-    scheduler = _scheduler(
-        scale_ema_decay=0.9,
-        risk_ema_decay=0.8,
-        warmup_updates=2,
-        min_student_samples=4,
+def _student_split_sampling_policy(
+    *,
+    focused_rows: int,
+    seed: int = 941,
+) -> tuple[TVKDDistributionalFastSACTeacherBC, set[float], set[float]]:
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
     )
-    before = scheduler.state_dict()
-    assert scheduler.update(torch.tensor([-3.0, -2.0])) == pytest.approx(1.0)
-    assert scheduler.num_updates == 0
-    assert scheduler.residual_scale_ema == before["residual_scale_ema"]
-    assert scheduler.risk_ema == before["risk_ema"]
-
-    assert scheduler.update(torch.full((4,), -3.0)) == pytest.approx(1.0)
-    assert scheduler.update(torch.full((4,), 3.0)) == pytest.approx(1.0)
-    adaptive = scheduler.update(torch.full((4,), 3.0))
-    assert adaptive < 1.0
-
-    restored = _scheduler(
-        scale_ema_decay=0.9,
-        risk_ema_decay=0.8,
-        warmup_updates=2,
-        min_student_samples=4,
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        q_batch_size=20,
+        q_teacher_replay_ratio=0.5,
+        dagger_batch_size=20,
+        teacher_actor_replay_fraction=0.5,
+        failure_phase_teacher_fraction=0.3,
+        failure_phase_student_fraction=0.3,
+        failure_phase_num_bins=16,
+        policy_delay=1,
     )
-    restored.load_state_dict(scheduler.state_dict())
-    assert restored.state_dict() == scheduler.state_dict()
+    policy.device = torch.device("cpu")
+    policy.q_rng = torch.Generator().manual_seed(seed)
+    policy.critic_update_count = 0
+    policy.q_teacher_replay = _TD3DeviceReplay(64, "cpu")
+    policy.dagger_replay = _TD3DeviceReplay(64, "cpu")
+
+    teacher = _tvkd_replay_rows(30, 100)
+    teacher[REFERENCE_PHASE_KEY] = torch.linspace(0.0, 1.0, 30)
+    policy.q_teacher_replay.extend(teacher)
+
+    student_count = 40
+    if not 0 <= focused_rows <= student_count:
+        raise ValueError("focused_rows is invalid")
+    student = _tvkd_replay_rows(student_count, 1_000)
+    student[DAGGER_IS_STUDENT_ACTION_KEY] = torch.ones(
+        student_count, dtype=torch.bool
+    )
+    student[DAGGER_REPLAY_TEACHER_ACTIONS] = (
+        torch.arange(student_count, dtype=torch.float32)[:, None] + 2_000.0
+    )
+    student[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(
+        student_count, dtype=torch.bool
+    )
+    focused = torch.zeros(student_count, dtype=torch.bool)
+    focus_start = student_count - focused_rows
+    focused[focus_start:] = True
+    student[FAILURE_PHASE_STUDENT_SOURCE_KEY] = focused
+    student[STUDENT_REPLAY_EPISODE_ID_KEY] = torch.arange(
+        student_count, dtype=torch.long
+    )
+    student[STUDENT_REPLAY_EPISODE_STEP_KEY] = torch.arange(
+        student_count, dtype=torch.long
+    )
+    policy.dagger_replay.extend(student)
+
+    policy._prepare_dagger_learning_batch = MethodType(
+        lambda owner, batch: batch, policy
+    )
+    policy._failure_phase_histogram = torch.zeros(16, dtype=torch.float64)
+    policy._failure_phase_histogram[12] = 1.0
+    policy._failure_phase_anchor_count = 1
+    policy._failure_histogram_device_cache = {}
+    policy._teacher_phase_device_cache = {}
+    policy._teacher_phase_index_ready = False
+    policy._failure_phase_uniform_fallback_rows = 0
+    policy._failure_phase_focused_rows = 0
+    policy._build_teacher_phase_index()
+
+    uniform_values = {float(1_001 + index) for index in range(student_count)}
+    focused_values = {
+        float(1_001 + index) for index in range(focus_start, student_count)
+    }
+    return policy, uniform_values, focused_values
+
+
+def test_detector_selects_synthetic_bottleneck_onset_not_terminal_crash():
+    detector = _detector()
+    residual = torch.tensor([0.1, 0.0, -0.2, -1.4, -1.5, -1.3, -0.8, -5.0])
+    result = detector.detect(
+        residual,
+        torch.full((8,), SOURCE_STUDENT),
+        torch.arange(8, dtype=torch.float32) / 10.0,
+        torch.tensor([False] * 7 + [True]),
+        torch.zeros(8, dtype=torch.bool),
+    )
+
+    assert result is not None
+    assert result.index == 3
+    assert result.index != 7
+    assert result.threshold_detected is True
+    assert result.used_fallback is False
+    assert result.phase == pytest.approx(0.3)
+    assert result.score > 0.0
+    assert detector.last_diagnostics["student_candidate_count"] == 6.0
+
+
+def test_detector_has_no_teacher_only_candidate_or_scale_update():
+    detector = _detector()
+    before = detector.state_dict()
+    result = detector.detect(
+        torch.tensor([float("nan"), -100.0, 4.0]),
+        torch.tensor(
+            [SOURCE_UNIFORM_TEACHER, SOURCE_FAILURE_TEACHER, SOURCE_UNIFORM_TEACHER]
+        ),
+        torch.tensor([0.1, 0.2, 0.3]),
+        torch.tensor([False, False, True]),
+        torch.zeros(3, dtype=torch.bool),
+    )
+
+    assert result is None
+    assert detector.state_dict() == before
+    assert detector.last_diagnostics["student_transition_count"] == 0.0
+    assert detector.last_diagnostics["no_candidate"] is True
+
+
+def test_detector_teacher_gap_breaks_smoothing_and_consecutive_run():
+    detector = _detector(terminal_exclusion_steps=0)
+    result = detector.detect(
+        torch.tensor([-2.0, -2.0, -100.0, -2.0, -2.0, -2.0, -5.0]),
+        torch.tensor(
+            [
+                SOURCE_STUDENT,
+                SOURCE_STUDENT,
+                SOURCE_UNIFORM_TEACHER,
+                SOURCE_STUDENT,
+                SOURCE_STUDENT,
+                SOURCE_STUDENT,
+                SOURCE_STUDENT,
+            ]
+        ),
+        torch.arange(7, dtype=torch.float32) / 10.0,
+        torch.tensor([False] * 6 + [True]),
+        torch.zeros(7, dtype=torch.bool),
+    )
+
+    assert result is not None
+    # Rows 0-1 cannot combine with rows 3-5 across a Teacher-executed gap.
+    assert result.index == 3
+    assert result.threshold_detected is True
+
+
+def test_detector_argmin_fallback_keeps_timeout_candidate_and_round_trips_scale():
+    detector = _detector(
+        threshold=10.0,
+        min_consecutive=2,
+        terminal_exclusion_steps=5,
+        residual_scale_ema_decay=0.5,
+    )
+    result = detector.detect(
+        torch.tensor([0.1, -0.2, -2.0]),
+        torch.full((3,), SOURCE_STUDENT),
+        torch.tensor([0.1, 0.2, 0.3]),
+        torch.zeros(3, dtype=torch.bool),
+        torch.tensor([False, False, True]),
+    )
+
+    assert result is not None
+    assert result.index == 2
+    assert result.used_fallback is True
+    assert result.threshold_detected is False
+    assert detector.last_diagnostics["student_candidate_count"] == 3.0
+
+    restored = _detector(
+        threshold=10.0,
+        min_consecutive=2,
+        terminal_exclusion_steps=5,
+        residual_scale_ema_decay=0.5,
+    )
+    restored.load_state_dict(detector.state_dict())
+    assert restored.state_dict() == detector.state_dict()
+
+    only_terminal = detector.detect(
+        torch.tensor([-20.0]),
+        torch.tensor([SOURCE_STUDENT]),
+        torch.tensor([0.9]),
+        torch.tensor([True]),
+        torch.tensor([False]),
+    )
+    assert only_terminal is None
+    assert detector.last_diagnostics["no_candidate"] is True
+    assert detector.last_diagnostics["used_fallback"] is True
 
 
 def test_frozen_teacher_value_restores_keys_denormalizes_and_sums_groups():
@@ -245,70 +452,448 @@ def test_tvkd_lambda_zero_keeps_raw_reward_exactly():
     assert torch.equal(terms.shaped_reward, torch.tensor([1.5, -2.0]))
 
 
-def test_source_separated_bc_is_empty_safe_pretanh_and_does_not_touch_log_std():
-    latent = nn.Parameter(torch.tensor([[0.0], [0.2], [-0.3], [0.4]]))
-    log_std = nn.Parameter(torch.tensor(-2.0))
-    teacher_action = torch.tensor([[0.0], [0.5], [-0.5], [1.0]])
-    valid = torch.tensor([True, True, True, False])
-    source = torch.tensor(
-        [
-            SOURCE_STUDENT,
-            SOURCE_UNIFORM_TEACHER,
-            SOURCE_FAILURE_TEACHER,
-            SOURCE_STUDENT,
-        ]
+def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
     )
-    teacher_loss, student_loss = compute_source_separated_bc_losses(
-        latent,
-        teacher_action,
-        valid,
-        source,
-        action_center=torch.tensor([0.0]),
-        action_half_range=torch.tensor([1.0]),
-        huber_delta=1.0,
-    )
-    expected_student = F.smooth_l1_loss(latent[:1], torch.zeros(1, 1))
-    teacher_target = torch.atanh(torch.tensor([[0.5], [-0.5]]))
-    expected_teacher = F.smooth_l1_loss(latent[1:3], teacher_target)
-    assert torch.allclose(student_loss, expected_student)
-    assert torch.allclose(teacher_loss, expected_teacher)
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(gamma=0.9, q_batch_size=128)
+    policy.q_critic_keys = ("critic",)
+    policy._q_critic_widths = (1,)
+    policy._q_critic_dim = 1
+    policy._cat_replay_sources = lambda td, keys: td["critic"]
+    policy._vecnorm_snapshot = lambda: {"frozen": True}
+    normalization_calls = []
 
-    (teacher_loss + student_loss).backward()
-    assert latent.grad is not None
-    assert log_std.grad is None
+    def normalize(value, keys, widths, snapshot):
+        normalization_calls.append((value.clone(), keys, widths, snapshot))
+        return value
 
-    empty_teacher, all_student = compute_source_separated_bc_losses(
-        latent.detach().requires_grad_(),
-        teacher_action,
-        valid,
-        torch.full((4,), SOURCE_STUDENT),
-        torch.tensor([0.0]),
-        torch.tensor([1.0]),
-        1.0,
-    )
-    assert torch.isfinite(empty_teacher)
-    assert empty_teacher.item() == 0.0
-    assert torch.isfinite(all_student)
+    policy._normalize_replay_flat = normalize
+    teacher_value_calls = []
 
+    def teacher_value(observation):
+        teacher_value_calls.append(observation.clone())
+        return observation[:, 0]
 
-def test_sample_time_source_ids_preserve_uniform_fallback_semantics():
-    valid = torch.ones(5, dtype=torch.bool)
-    source = _source_ids_from_batch(
+    policy.get_frozen_teacher_value = teacher_value
+    policy._rollout_final_batch = {
+        # Both rows are collector carry states; env 1 has already reset after
+        # its timeout and must not use this value for bootstrapping.
+        "next_critic_observations": torch.tensor([[4.0], [999.0]])
+    }
+    policy._truncation_final_batches = [
         {
-            DAGGER_TEACHER_ACTION_VALID_KEY: valid,
-            DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([False, True, True, False, True]),
-            FAILURE_PHASE_TEACHER_SOURCE_KEY: torch.tensor(
-                [False, False, True, False, False]
+            "indices": torch.tensor([5]),
+            "next_critic_observations": torch.tensor([[40.0]]),
+        }
+    ]
+    rollout = TensorDict(
+        {
+            "critic": torch.tensor(
+                [
+                    [[1.0], [2.0], [3.0]],
+                    [[10.0], [20.0], [30.0]],
+                ]
             ),
+            "next": TensorDict(
+                {
+                    "reward": torch.tensor(
+                        [
+                            [[1.0], [2.0], [3.0]],
+                            [[4.0], [5.0], [6.0]],
+                        ]
+                    ),
+                    "done": torch.tensor(
+                        [
+                            [[False], [False], [True]],
+                            [[False], [False], [True]],
+                        ]
+                    ),
+                    "terminated": torch.tensor(
+                        [
+                            [[False], [False], [True]],
+                            [[False], [False], [False]],
+                        ]
+                    ),
+                    "stats": TensorDict(
+                        {
+                            "episode_time_limit": torch.tensor(
+                                [
+                                    [[False], [False], [False]],
+                                    [[False], [False], [True]],
+                                ]
+                            ),
+                            "command_finished": torch.zeros(
+                                2, 3, 1, dtype=torch.bool
+                            ),
+                        },
+                        batch_size=[2, 3],
+                    ),
+                },
+                batch_size=[2, 3],
+            ),
+        },
+        batch_size=[2, 3],
+    )
+    student = torch.tensor(
+        [[True, True, True], [False, True, True]], dtype=torch.bool
+    )
+
+    residual = policy._student_teacher_td_residual_grid(rollout, student)
+
+    assert torch.allclose(
+        residual,
+        torch.tensor([[1.8, 2.7, 0.0], [0.0, 12.0, 12.0]]),
+    )
+    assert len(normalization_calls) == 1
+    assert normalization_calls[0][1:] == (
+        ("critic",),
+        (1,),
+        {"frozen": True},
+    )
+    assert len(teacher_value_calls) == 1
+    # Adjacent Student transitions share state values. The physical-terminal
+    # reset and timeout reset carry are both excluded; timeout uses its captured
+    # true pre-reset final observation (40) instead.
+    assert teacher_value_calls[0].squeeze(-1).tolist() == [1, 2, 3, 20, 30, 40]
+
+
+def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        use_teacher_value_bottleneck_replay=True,
+        failure_phase_lookback_steps=4,
+        failure_phase_samples_per_failure=1,
+        failure_phase_num_bins=10,
+        bottleneck_eps=1e-6,
+    )
+    policy.teacher_value_bottleneck_detector = _detector()
+    policy._reset_bottleneck_statistics()
+    policy._reset_student_replay_episode_tracking()
+    policy._bottleneck_episode_histories = None
+    policy._failure_phase_histogram = torch.zeros(10, dtype=torch.float64)
+    policy._failure_phase_episode_count = 0
+    policy._failure_phase_anchor_count = 0
+    policy._failure_histogram_device_cache = {}
+    policy._rollout_final_batch = {}
+    residual = torch.tensor(
+        [[0.1, 0.0, -0.2, -1.4, -1.5, -1.3, -0.8, -5.0]]
+    )
+    policy._student_teacher_td_residual_grid = (
+        lambda rollout, student: residual.clone()
+    )
+    policy._reference_phase = lambda rollout: rollout["reference_phase"]
+    policy._record_teacher_phase_match_distances = lambda phases: None
+
+    shape = (1, 8, 1)
+    final_true = torch.zeros(shape, dtype=torch.bool)
+    final_true[:, -1] = True
+    rollout = TensorDict(
+        {
+            "reference_phase": (
+                torch.arange(8, dtype=torch.float32).reshape(1, 8, 1) / 10.0
+            ),
+            "is_student_action": torch.ones(shape, dtype=torch.bool),
+            "dagger_safe_takeover": torch.zeros(shape, dtype=torch.bool),
+            "is_init": torch.zeros(shape, dtype=torch.bool),
+            "next": TensorDict(
+                {
+                    "done": final_true.clone(),
+                    "terminated": final_true.clone(),
+                    "stats": TensorDict(
+                        {
+                            "episode_time_limit": torch.zeros(
+                                shape, dtype=torch.bool
+                            ),
+                            "command_finished": torch.zeros(
+                                shape, dtype=torch.bool
+                            ),
+                        },
+                        batch_size=[1, 8],
+                    ),
+                },
+                batch_size=[1, 8],
+            ),
+        },
+        batch_size=[1, 8],
+    )
+
+    assert policy._update_failure_phase_histogram(rollout) == 1
+    assert policy._last_bottleneck_metadata["bottleneck_step"] == 3
+    assert policy._last_bottleneck_metadata["bottleneck_phase"] == pytest.approx(0.3)
+    assert policy._last_bottleneck_metadata["fallback"] == "none"
+    assert policy._failure_phase_histogram[3].item() == 1.0
+    assert policy._bottleneck_detected_count == 1
+    assert policy._bottleneck_teacher_sequences_inserted == 1
+    assert len(policy._pending_student_focus_events) == 1
+    replay_episode_id, replay_steps = policy._pending_student_focus_events[0]
+    assert replay_episode_id == 0
+    assert torch.equal(replay_steps, torch.tensor([3]))
+    assert torch.equal(
+        policy._student_replay_episode_id_grid,
+        torch.zeros(1, 8, dtype=torch.long),
+    )
+    assert torch.equal(
+        policy._student_replay_episode_step_grid,
+        torch.arange(8, dtype=torch.long).reshape(1, 8),
+    )
+
+    # Preserve the inherited causal-failure seam: an unrelated Student action
+    # outside the terminal lookback, and an all-Teacher failure, register
+    # neither a bottleneck nor a legacy fallback.
+    early_student = rollout.clone()
+    early_student["is_student_action"].zero_()
+    early_student["is_student_action"][:, 0] = True
+    assert policy._update_failure_phase_histogram(early_student) == 0
+    teacher_only = rollout.clone()
+    teacher_only["is_student_action"].zero_()
+    assert policy._update_failure_phase_histogram(teacher_only) == 0
+    assert policy._bottleneck_failed_student_episode_count == 1
+    assert policy._bottleneck_teacher_sequences_inserted == 1
+
+
+def test_student_focus_events_mark_existing_ring_and_current_transition_chunk(
+    monkeypatch,
+):
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy._reset_bottleneck_statistics()
+    policy._reset_student_replay_episode_tracking()
+    policy.dagger_replay = _TD3DeviceReplay(16, "cpu")
+    policy.dagger_replay.extend(
+        {
+            "actions": torch.zeros(3, 1),
+            DAGGER_IS_STUDENT_ACTION_KEY: torch.ones(3, dtype=torch.bool),
+            STUDENT_REPLAY_EPISODE_ID_KEY: torch.tensor([4, 4, 7]),
+            STUDENT_REPLAY_EPISODE_STEP_KEY: torch.tensor([0, 2, 0]),
+            FAILURE_PHASE_STUDENT_SOURCE_KEY: torch.zeros(3, dtype=torch.bool),
         }
     )
-    assert source.tolist() == [
-        SOURCE_STUDENT,
-        SOURCE_UNIFORM_TEACHER,
-        SOURCE_FAILURE_TEACHER,
-        SOURCE_STUDENT,
-        SOURCE_UNIFORM_TEACHER,
+    policy._pending_student_focus_events = [
+        (4, torch.tensor([2])),
+        (9, torch.tensor([1])),
+        (11, torch.tensor([5])),
     ]
+    policy._student_replay_episode_id_grid = torch.tensor([[4, 9]])
+    policy._student_replay_episode_step_grid = torch.tensor([[1, 1]])
+    chunk = {
+        "actions": torch.ones(2, 1),
+        _PREFILL_ENV_INDEX_KEY: torch.tensor([0, 0]),
+        _PREFILL_STEP_INDEX_KEY: torch.tensor([0, 1]),
+    }
+    sentinel = object()
+
+    def baseline(self, td):
+        assert td is sentinel
+        yield chunk
+
+    monkeypatch.setattr(
+        DistributionalFastSACTeacherBC,
+        "_dagger_transition_chunks",
+        baseline,
+    )
+
+    (annotated,) = tuple(policy._dagger_transition_chunks(sentinel))
+
+    assert torch.equal(
+        policy.dagger_replay.data[FAILURE_PHASE_STUDENT_SOURCE_KEY][:3],
+        torch.tensor([False, True, False]),
+    )
+    assert torch.equal(
+        annotated[STUDENT_REPLAY_EPISODE_ID_KEY], torch.tensor([4, 9])
+    )
+    assert torch.equal(
+        annotated[STUDENT_REPLAY_EPISODE_STEP_KEY], torch.tensor([1, 1])
+    )
+    assert torch.equal(
+        annotated[FAILURE_PHASE_STUDENT_SOURCE_KEY],
+        torch.tensor([False, True]),
+    )
+    # Two requested rows were present across the old ring/current chunk; the
+    # third event was already evicted or otherwise unavailable.
+    assert policy._student_focus_rows_marked == 2
+    assert policy._student_focus_rows_missing == 1
+    assert policy._pending_student_focus_events == []
+    assert policy._student_replay_episode_id_grid is None
+    assert policy._student_replay_episode_step_grid is None
+
+
+def test_tvkd_actor_is_exact_fixed_baseline_implementation_without_scheduler():
+    assert (
+        TVKDDistributionalFastSACTeacherBC._actor_update
+        is DistributionalFastSACTeacherBC._actor_update
+    )
+    # Replay insertion is the one intentional rollout seam: it annotates
+    # exact failed-bottleneck Student rows without changing the Actor loss.
+    assert (
+        TVKDDistributionalFastSACTeacherBC._dagger_transition_chunks
+        is not DistributionalFastSACTeacherBC._dagger_transition_chunks
+    )
+    assert not hasattr(tvkd_module, "TeacherValueBCScheduler")
+    for removed_name in (
+        "_adaptive_bc_changes_actor_loss",
+        "_empty_scheduler_metrics",
+        "_update_scheduler_from_recent_student",
+    ):
+        assert removed_name not in TVKDDistributionalFastSACTeacherBC.__dict__
+
+    cfg = TVKDDistributionalFastSACTeacherBCConfig(lambda_bc=0.73)
+    detector = _detector(residual_scale_ema_decay=0.5)
+    initial_bc = cfg.lambda_bc
+    for residual in (
+        torch.full((8,), -10.0),
+        torch.zeros(8),
+        torch.full((8,), 10.0),
+    ):
+        detector.update_residual_scale(residual)
+        assert cfg.lambda_bc == pytest.approx(initial_bc)
+
+
+def test_tvkd_default_q_and_actor_mix_is_four_way_35_15_35_15():
+    cfg = TVKDDistributionalFastSACTeacherBCConfig()
+    total_student = 1.0 - float(cfg.q_teacher_replay_ratio)
+    focused_student = total_student * float(cfg.failure_phase_student_fraction)
+    uniform_student = total_student - focused_student
+    focused_teacher = float(cfg.q_teacher_replay_ratio) * float(
+        cfg.failure_phase_teacher_fraction
+    )
+    uniform_teacher = float(cfg.q_teacher_replay_ratio) - focused_teacher
+
+    assert uniform_student == pytest.approx(0.35)
+    assert focused_student == pytest.approx(0.15)
+    assert uniform_teacher == pytest.approx(0.35)
+    assert focused_teacher == pytest.approx(0.15)
+    for method in ("_sample_balanced_q_batch", "_sample_actor_batch"):
+        assert getattr(TVKDDistributionalFastSACTeacherBC, method) is getattr(
+            DistributionalFastSACTeacherBC, method
+        )
+
+
+def test_q_and_actor_batches_split_student_half_and_preserve_source_masks():
+    policy, uniform_values, focused_values = _student_split_sampling_policy(
+        focused_rows=6
+    )
+
+    critic = policy._sample_balanced_q_batch()
+    actor = policy._sample_actor_batch()
+
+    for batch in (critic, actor):
+        teacher = batch[DAGGER_Q_TEACHER_SOURCE_KEY]
+        focused_teacher = batch[FAILURE_PHASE_TEACHER_SOURCE_KEY]
+        focused_student = batch[FAILURE_PHASE_STUDENT_SOURCE_KEY]
+        uniform_student = ~teacher & ~focused_student
+        assert teacher.sum().item() == 10
+        assert (teacher & ~focused_teacher).sum().item() == 7
+        assert focused_teacher.sum().item() == 3
+        assert uniform_student.sum().item() == 7
+        assert focused_student.sum().item() == 3
+        assert not (focused_teacher & ~teacher).any()
+        assert not (focused_student & teacher).any()
+        assert "successful_student_source" not in batch
+
+    critic_actions = critic["actions"][:, 0]
+    critic_focused = critic_actions[critic[FAILURE_PHASE_STUDENT_SOURCE_KEY]]
+    critic_uniform = critic_actions[
+        ~critic[DAGGER_Q_TEACHER_SOURCE_KEY]
+        & ~critic[FAILURE_PHASE_STUDENT_SOURCE_KEY]
+    ]
+    assert set(critic_focused.tolist()) <= focused_values
+    assert set(critic_uniform.tolist()) <= uniform_values
+    assert critic_focused.unique().numel() == 3
+
+    actor_rows = actor["critic_observations"][:, 0]
+    actor_focused = actor_rows[actor[FAILURE_PHASE_STUDENT_SOURCE_KEY]] + 1.0
+    actor_uniform = actor_rows[
+        ~actor[DAGGER_Q_TEACHER_SOURCE_KEY]
+        & ~actor[FAILURE_PHASE_STUDENT_SOURCE_KEY]
+    ] + 1.0
+    assert set(actor_focused.tolist()) <= focused_values
+    assert set(actor_uniform.tolist()) <= uniform_values
+    assert actor_focused.unique().numel() == 3
+
+
+def test_prefetched_plan_preserves_student_focus_masks_and_rng_batches():
+    direct, _, _ = _student_split_sampling_policy(focused_rows=6, seed=977)
+    prefetched, _, _ = _student_split_sampling_policy(focused_rows=6, seed=977)
+
+    expected_q = direct._sample_balanced_q_batch()
+    expected_actor = direct._sample_actor_batch()
+    (plan,) = prefetched._prefetch_curriculum_sample_plans(1)
+    actual_q = prefetched._sample_balanced_q_batch(plan)
+    actual_actor = prefetched._sample_actor_batch(
+        plan.actor_indices,
+        plan.actor_teacher_indices,
+        plan.actor_teacher_focused,
+        plan.actor_student_focused,
+    )
+
+    assert torch.equal(direct.q_rng.get_state(), prefetched.q_rng.get_state())
+    assert plan.student_focused is not None
+    assert plan.student_focused.sum().item() == 3
+    assert plan.actor_student_focused is not None
+    assert plan.actor_student_focused.sum().item() == 3
+    assert plan.student_indices.device.type == "cpu"
+    assert plan.actor_indices is not None
+    assert plan.actor_indices.device.type == "cpu"
+    for expected, actual in (
+        (expected_q, actual_q),
+        (expected_actor, actual_actor),
+    ):
+        assert expected.keys() == actual.keys()
+        for key in expected:
+            assert torch.equal(expected[key], actual[key]), key
+
+
+@pytest.mark.parametrize(("available", "actual"), ((0, 0), (2, 2)))
+def test_student_focus_quota_is_a_cap_and_shortfall_backfills_uniform(
+    available, actual
+):
+    policy, uniform_values, focused_values = _student_split_sampling_policy(
+        focused_rows=available
+    )
+
+    for batch, row_values in (
+        (policy._sample_balanced_q_batch(), lambda value: value["actions"][:, 0]),
+        (
+            policy._sample_actor_batch(),
+            lambda value: value["critic_observations"][:, 0] + 1.0,
+        ),
+    ):
+        focused = batch[FAILURE_PHASE_STUDENT_SOURCE_KEY]
+        teacher = batch[DAGGER_Q_TEACHER_SOURCE_KEY]
+        uniform = ~teacher & ~focused
+        assert focused.sum().item() == actual
+        assert uniform.sum().item() == 10 - actual
+        assert (~teacher).sum().item() == 10
+        assert set(row_values(batch)[focused].tolist()) <= focused_values
+        assert set(row_values(batch)[uniform].tolist()) <= uniform_values
+        assert row_values(batch)[focused].unique().numel() == actual
+
+
+def test_empty_student_focus_pool_backfills_uniform_and_never_blocks():
+    policy, uniform_values, _ = _student_split_sampling_policy(focused_rows=0)
+
+    critic = policy._sample_balanced_q_batch()
+    actor = policy._sample_actor_batch()
+
+    for batch in (critic, actor):
+        teacher = batch[DAGGER_Q_TEACHER_SOURCE_KEY]
+        assert (~teacher).sum().item() == 10
+        assert not batch[FAILURE_PHASE_STUDENT_SOURCE_KEY].any()
+        if "actions" in batch:
+            values = batch["actions"][:, 0]
+        else:
+            values = batch["critic_observations"][:, 0] + 1.0
+        assert set(values[~teacher].tolist()) <= uniform_values
+        assert "successful_student_source" not in batch
+    # The Q and Actor calls each backfilled the requested three focused rows.
+    assert policy._failure_phase_student_uniform_fallback_rows == 6
 
 
 def test_disabled_tvkd_target_delegates_to_exact_baseline_path(monkeypatch):
@@ -320,14 +905,19 @@ def test_disabled_tvkd_target_delegates_to_exact_baseline_path(monkeypatch):
         use_tvkd_value_shaping=False,
         tvkd_lambda=0.25,
     )
+    baseline_target = torch.tensor([[1.0]])
+    baseline_metric = torch.tensor(2.0)
+    baseline_log_prob = torch.tensor([3.0])
     sentinel = (
-        torch.tensor([[1.0]]),
-        {"baseline": torch.tensor(2.0)},
-        torch.tensor([3.0]),
+        baseline_target,
+        {"baseline": baseline_metric},
+        baseline_log_prob,
     )
+    batch = {"unchanged": True, "rewards": torch.tensor([1.0, -3.0])}
 
     def baseline(self, batch):
-        assert batch == {"unchanged": True}
+        assert batch["unchanged"] is True
+        assert torch.equal(batch["rewards"], torch.tensor([1.0, -3.0]))
         return sentinel
 
     monkeypatch.setattr(
@@ -335,112 +925,41 @@ def test_disabled_tvkd_target_delegates_to_exact_baseline_path(monkeypatch):
         "_distributional_fastsac_target",
         baseline,
     )
-    result = policy._distributional_fastsac_target({"unchanged": True})
-    assert result is sentinel
+    target, metrics, log_prob = policy._distributional_fastsac_target(batch)
+
+    assert target is baseline_target
+    assert log_prob is baseline_log_prob
+    assert metrics["baseline"] is baseline_metric
+    assert metrics["tvkd_potential_delta_mean"].item() == 0.0
+    assert metrics["tvkd_potential_delta_std"].item() == 0.0
+    assert metrics["tvkd_potential_delta_min"].item() == 0.0
+    assert metrics["tvkd_potential_delta_max"].item() == 0.0
+    assert metrics["tvkd_raw_reward_mean"].item() == pytest.approx(-1.0)
+    assert metrics["tvkd_shaped_reward_mean"].item() == pytest.approx(-1.0)
+    assert metrics["tvkd_shaped_reward_std"].item() == pytest.approx(2.0)
 
 
-@pytest.mark.parametrize(
-    ("use_adaptive", "minimum", "maximum"),
-    [(False, 0.05, 1.0), (True, 0.7, 0.7)],
-)
-def test_equivalent_actor_modes_delegate_before_new_source_processing(
-    monkeypatch, use_adaptive, minimum, maximum
+def test_disabled_bottleneck_replay_delegates_to_legacy_failure_phase_path(
+    monkeypatch,
 ):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
     nn.Module.__init__(policy)
-    policy.cfg = SimpleNamespace(
-        use_adaptive_student_bc=use_adaptive,
-        lambda_bc=0.7,
-        student_bc_lambda_min=minimum,
-        student_bc_lambda_max=maximum,
-    )
-    sentinel = {"baseline_actor_loss": torch.tensor(4.0)}
+    policy.cfg = SimpleNamespace(use_teacher_value_bottleneck_replay=False)
+    sentinel = object()
 
-    def baseline(self, batch):
-        assert batch == {"no_tvkd_source_fields": True}
+    def baseline(self, rollout):
+        assert rollout is sentinel
         return sentinel
 
     monkeypatch.setattr(
         DistributionalFastSACTeacherBC,
-        "_actor_update",
+        "_update_failure_phase_histogram",
         baseline,
     )
-    result = policy._actor_update({"no_tvkd_source_fields": True})
+    result = policy._update_failure_phase_histogram(sentinel)
     assert result is sentinel
-
-
-def test_adaptive_bc_actor_step_updates_mean_but_not_production_log_std():
-    policy = TVKDDistributionalFastSACTeacherBC.__new__(
-        TVKDDistributionalFastSACTeacherBC
-    )
-    nn.Module.__init__(policy)
-    policy.cfg = SimpleNamespace(
-        use_adaptive_student_bc=True,
-        student_bc_lambda_min=0.05,
-        student_bc_lambda_max=1.0,
-        lambda_bc=1.0,
-        eta_sac=0.0,
-        dagger_actor_huber_delta=1.0,
-        sac_log_std_min=-5.0,
-        sac_log_std_max=1.0,
-        sac_max_grad_norm=1.0e6,
-        q_action_input_gain=1.0,
-        action_support_clip=20.0,
-    )
-    policy.actor_adapt = nn.Linear(1, 1, bias=False)
-    policy.actor_adapt.weight.data.fill_(0.25)
-    policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
-        action_dim=1,
-        initial_log_std=torch.tensor(-1.0),
-        device="cpu",
-    )
-
-    def actor_mean(owner, observations):
-        return owner.actor_adapt(observations)
-
-    policy._actor_mean_from_flat = MethodType(actor_mean, policy)
-    policy.qnet = _ActionSensitiveTwin()
-    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.4)))
-    policy._fastsac_action_low = torch.tensor([-20.0])
-    policy._fastsac_action_high = torch.tensor([20.0])
-    policy._fastsac_actor_action_center = torch.tensor([0.0])
-    policy._fastsac_actor_action_scale = torch.tensor([20.0])
-    policy._fastsac_q_action_center = torch.tensor([0.0])
-    policy._fastsac_q_action_scale = torch.tensor([1.0])
-    policy._fastsac_entropy_reference_log_scale_sum = 0.0
-    policy.actor_optimizer = torch.optim.SGD(
-        tuple(policy.actor_adapt.parameters())
-        + tuple(policy.bc_dagger_sac_adapter.parameters()),
-        lr=0.05,
-    )
-    policy.critic_optimizer = torch.optim.SGD(policy.qnet.parameters(), lr=0.05)
-    policy.sac_action_rng = torch.Generator().manual_seed(313)
-    policy.actor_update_count = 0
-    policy.sac_actor_update_count = 0
-    policy.student_bc_scheduler = SimpleNamespace(current_lambda_bc_student=0.8)
-    log_std_before = policy.bc_dagger_sac_adapter.log_std.detach().clone()
-    actor_before = policy.actor_adapt.weight.detach().clone()
-    batch = {
-        "observations": torch.tensor([[1.0], [2.0]]),
-        "critic_observations": torch.ones(2, 1),
-        DAGGER_REPLAY_TEACHER_ACTIONS: torch.tensor([[5.0], [-4.0]]),
-        DAGGER_TEACHER_ACTION_VALID_KEY: torch.ones(2, dtype=torch.bool),
-        DAGGER_Q_TEACHER_SOURCE_KEY: torch.zeros(2, dtype=torch.bool),
-        FAILURE_PHASE_TEACHER_SOURCE_KEY: torch.zeros(2, dtype=torch.bool),
-    }
-
-    metrics = policy._actor_update(batch)
-
-    assert metrics["bc_teacher_loss"].item() == 0.0
-    assert metrics["bc_student_loss"].item() > 0.0
-    assert not torch.equal(policy.actor_adapt.weight, actor_before)
-    assert torch.equal(policy.bc_dagger_sac_adapter.log_std, log_std_before)
-    assert torch.equal(
-        policy.bc_dagger_sac_adapter.log_std.grad,
-        torch.zeros_like(policy.bc_dagger_sac_adapter.log_std),
-    )
 
 
 def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
@@ -496,107 +1015,53 @@ def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
     assert projected.grad_fn is None
 
 
-@pytest.mark.parametrize("prefill", [False, True])
-def test_recent_scheduler_hook_selects_only_main_rollout_student_rows(
-    monkeypatch, prefill
-):
-    policy = TVKDDistributionalFastSACTeacherBC.__new__(
-        TVKDDistributionalFastSACTeacherBC
-    )
-    nn.Module.__init__(policy)
-    policy._teacher_prefill_active = lambda: prefill
-    received = []
-    policy._update_scheduler_from_recent_student = lambda chunks: received.append(
-        chunks
-    )
-    transitions = {
-        DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor([True, False, True]),
-        "critic_observations": torch.tensor([[1.0], [2.0], [3.0]]),
-        "next_critic_observations": torch.tensor([[11.0], [12.0], [13.0]]),
-        "rewards": torch.tensor([21.0, 22.0, 23.0]),
-        "dones": torch.tensor([False, False, True]),
-        "truncations": torch.tensor([False, False, True]),
-    }
-
-    def baseline_chunks(self, td):
-        del self, td
-        yield transitions
-
-    monkeypatch.setattr(
-        DistributionalFastSACTeacherBC,
-        "_dagger_transition_chunks",
-        baseline_chunks,
-    )
-    yielded = list(policy._dagger_transition_chunks(TensorDict({}, batch_size=[])))
-    assert len(yielded) == 1
-    assert yielded[0] is transitions
-    assert len(received) == 1
-    if prefill:
-        assert received[0] == []
-    else:
-        assert len(received[0]) == 1
-        recent = received[0][0]
-        assert recent["rewards"].tolist() == [21.0, 23.0]
-        assert recent["critic_observations"].squeeze(-1).tolist() == [1.0, 3.0]
-
-
-def test_recent_student_scheduler_normalizes_once_and_uses_terminal_mask():
+def test_short_terminal_only_episode_falls_back_to_legacy_failure_phase():
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
     nn.Module.__init__(policy)
     policy.cfg = SimpleNamespace(
-        use_adaptive_student_bc=True,
-        gamma=0.9,
-        student_bc_scheduler_eps=1e-6,
-        student_bc_margin=0.0,
+        failure_phase_lookback_steps=5,
+        failure_phase_samples_per_failure=3,
+        failure_phase_num_bins=10,
+        bottleneck_eps=1e-6,
     )
-    policy.q_critic_keys = ("critic",)
-    policy._q_critic_widths = (1,)
-    policy._vecnorm_snapshot = lambda: {"frozen": True}
-    normalization_calls = []
+    policy.teacher_value_bottleneck_detector = _detector()
+    policy._reset_bottleneck_statistics()
+    policy._failure_phase_histogram = torch.zeros(10, dtype=torch.float64)
+    policy._failure_phase_episode_count = 0
+    policy._failure_phase_anchor_count = 0
+    policy._failure_histogram_device_cache = {}
+    history = {
+        "phase": [0.8],
+        "teacher_td_residual": [-20.0],
+        "source_id": [SOURCE_STUDENT],
+        "true_terminal": [True],
+        "timeout": [False],
+    }
 
-    def normalize(value, keys, widths, snapshot):
-        normalization_calls.append((value.clone(), keys, widths, snapshot))
-        return value + 10.0
-
-    policy._normalize_replay_flat = normalize
-    policy.get_frozen_teacher_value = lambda observation: observation[:, 0]
-    residuals = []
-    policy.student_bc_scheduler = SimpleNamespace(
-        update=lambda residual: residuals.append(residual.clone()) or 0.4,
-        residual_scale_ema=2.0,
-        last_risk_batch_mean=0.3,
-        risk_ema=0.25,
-    )
-    chunks = [
-        {
-            "critic_observations": torch.tensor([[1.0], [2.0], [3.0]]),
-            "next_critic_observations": torch.tensor([[4.0], [5.0], [6.0]]),
-            "rewards": torch.zeros(3),
-            "dones": torch.tensor([False, True, True]),
-            "truncations": torch.tensor([False, False, True]),
-        }
-    ]
-
-    policy._update_scheduler_from_recent_student(chunks)
-    assert len(normalization_calls) == 2
-    assert all(
-        call[1:] == (("critic",), (1,), {"frozen": True})
-        for call in normalization_calls
-    )
-    # normalized V=[11,12,13], V_next=[14,15,16]; bootstrap=[1,0,1]
-    assert torch.allclose(residuals[0], torch.tensor([1.6, -12.0, 1.4]))
-    assert policy._last_bc_scheduler_metrics["recent_student_sample_count"] == 3.0
-    assert policy._last_bc_scheduler_metrics["student_bc_lambda"] == 0.4
+    assert policy._process_failed_student_episode(history) == 1
+    assert policy._bottleneck_fallback_count == 1
+    assert policy._bottleneck_no_candidate_count == 1
+    assert policy._last_bottleneck_metadata["fallback"] == "legacy_failure_phase"
+    assert policy._last_bottleneck_metadata["bottleneck_step"] == 0
+    assert policy._failure_phase_histogram[8].item() == 1.0
 
 
-def test_tvkd_inference_forces_checkpoint_value_norm_before_construction():
+@pytest.mark.parametrize(
+    "algorithm",
+    (
+        TVKD_LEGACY_TRAINING_ALGORITHM,
+        TVKD_PREVIOUS_TRAINING_ALGORITHM,
+        TVKD_TRAINING_ALGORITHM,
+    ),
+)
+def test_tvkd_inference_forces_checkpoint_value_norm_before_construction(algorithm):
     cfg = OmegaConf.create({"algo": {"value_norm": False}})
     result = _fill_replayless_inference_algo_defaults(
         cfg,
         {
-            "training_algorithm": "distributional_tvkd_fastsac_teacher_bc_v1",
+            "training_algorithm": algorithm,
             "dagger_backend_config": {"value_norm": True},
         },
         inference_only=True,
@@ -610,8 +1075,12 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
         TVKDDistributionalFastSACTeacherBC
     )
     nn.Module.__init__(policy)
-    policy.cfg = SimpleNamespace(lambda_bc=1.0, use_adaptive_student_bc=True)
-    policy._last_bc_scheduler_metrics = policy._empty_scheduler_metrics()
+    policy.cfg = SimpleNamespace(lambda_bc=1.0)
+    policy.teacher_value_bottleneck_detector = _detector()
+    policy._reset_bottleneck_statistics()
+    policy.cfg.failure_phase_student_fraction = 0.3
+    policy.dagger_replay = _TD3DeviceReplay(1, "cpu")
+    policy._teacher_phase_index_ready = False
     policy._fastsac_rollout_critic_metrics = []
     policy._fastsac_rollout_actor_metrics = []
     monkeypatch.setattr(
@@ -631,23 +1100,43 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
         "tvkd/potential_delta_mean",
         "tvkd/raw_reward_mean",
         "tvkd/shaped_reward_mean",
-        "bc_scheduler/teacher_td_residual_mean",
-        "bc_scheduler/residual_scale_ema",
-        "bc_scheduler/risk_ema",
-        "bc_scheduler/student_bc_lambda",
+        "bottleneck/failed_student_episode_count",
+        "bottleneck/student_candidate_count",
+        "bottleneck/detected_count",
+        "bottleneck/fallback_count",
+        "bottleneck/no_candidate_count",
+        "bottleneck/selected_step_mean",
+        "bottleneck/selected_phase_mean",
+        "bottleneck/score_mean",
+        "bottleneck/score_max",
+        "bottleneck/raw_td_residual_mean",
+        "bottleneck/normalized_td_residual_mean",
+        "bottleneck/residual_scale_ema",
+        "bottleneck/teacher_sequences_inserted",
+        "bottleneck/teacher_transitions_inserted",
+        "bottleneck/phase_match_distance_mean",
+        "bottleneck/failure_teacher_buffer_size",
+        "bottleneck/student_focus_rows_marked",
+        "bottleneck/student_focus_rows_missing",
+        "bottleneck/student_focus_sampled_rows",
+        "bottleneck/student_focus_uniform_fallback_rows",
+        "bottleneck/student_focus_pool_size",
+        "bottleneck/student_focus_fraction_config",
+        "bottleneck/student_focus_global_fraction_cap",
         "loss/critic",
         "loss/actor_total",
         "loss/actor_sac",
-        "loss/bc_teacher",
-        "loss/bc_student",
+        "loss/bc",
+        "loss/fixed_bc_coefficient",
         "loss/alpha",
         "source/student_transition_count",
     }
     assert required.issubset(info)
     assert all(torch.isfinite(torch.as_tensor(info[key])) for key in required)
+    assert not any(key.startswith("bc_scheduler/") for key in info)
 
 
-def test_tvkd_checkpoint_seam_saves_teacher_chain_and_restores_scheduler(
+def test_tvkd_v3_checkpoint_saves_student_focus_and_detector_state(
     monkeypatch,
 ):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
@@ -662,6 +1151,8 @@ def test_tvkd_checkpoint_seam_saves_teacher_chain_and_restores_scheduler(
     policy.cfg = SimpleNamespace(
         failure_phase_num_bins=4,
         train_dr_estimator=True,
+        lambda_bc=0.73,
+        failure_phase_student_fraction=0.3,
     )
     policy.dr_estimator = nn.Linear(1, 1)
     policy.opt_dr_estimator = torch.optim.Adam(
@@ -683,12 +1174,22 @@ def test_tvkd_checkpoint_seam_saves_teacher_chain_and_restores_scheduler(
     policy._failure_phase_uniform_fallback_rows = 4
     policy._failure_phase_focused_rows = 5
     policy._failure_histogram_device_cache = {}
-    policy.student_bc_scheduler = _scheduler(
-        scale_ema_decay=0.8,
-        risk_ema_decay=0.7,
+    policy.teacher_value_bottleneck_detector = _detector(
+        residual_scale_ema_decay=0.8
     )
-    policy.student_bc_scheduler.update(torch.full((8,), -2.0))
-    expected_scheduler = policy.student_bc_scheduler.state_dict()
+    policy.teacher_value_bottleneck_detector.update_residual_scale(
+        torch.full((8,), -2.0)
+    )
+    expected_detector = policy.teacher_value_bottleneck_detector.state_dict()
+    policy._reset_bottleneck_statistics()
+    policy._bottleneck_detected_count = 2
+    policy._bottleneck_selected_count = 2
+    policy._bottleneck_score_sum = 3.0
+    policy._bottleneck_score_max = 2.0
+    policy._student_focus_rows_marked = 6
+    policy._student_focus_rows_missing = 1
+    policy._failure_phase_student_focused_rows = 9
+    policy._failure_phase_student_uniform_fallback_rows = 2
     policy._last_tvkd_diagnostics = {"tvkd/shaped_reward_mean": 1.25}
     freeze_calls = []
     policy.teacher_value_wrapper = SimpleNamespace(
@@ -701,6 +1202,10 @@ def test_tvkd_checkpoint_seam_saves_teacher_chain_and_restores_scheduler(
         lambda self: {
             "baseline_state": torch.tensor(1.0),
             "optimizer_resume_state": {},
+            "dagger_backend_config": {
+                "lambda_bc": 0.73,
+                "failure_phase_student_fraction": 0.3,
+            },
         },
     )
     translated = []
@@ -715,7 +1220,23 @@ def test_tvkd_checkpoint_seam_saves_teacher_chain_and_restores_scheduler(
     )
 
     state = policy._fastsac_checkpoint_state()
-    assert state["teacher_value_bc_scheduler"] == expected_scheduler
+    assert state["training_algorithm"] == TVKD_TRAINING_ALGORITHM
+    assert state["checkpoint_version"] == TVKD_CHECKPOINT_VERSION
+    assert state["dagger_backend_config"]["lambda_bc"] == pytest.approx(0.73)
+    assert state["dagger_backend_config"][
+        "failure_phase_student_fraction"
+    ] == pytest.approx(0.3)
+    assert (
+        state["teacher_value_bottleneck_replay_state"]["detector"]
+        == expected_detector
+    )
+    focus_state = state["teacher_value_bottleneck_replay_state"]
+    assert focus_state["student_focus_rows_marked"] == 6
+    assert focus_state["student_focus_rows_missing"] == 1
+    assert focus_state["student_focus_sampled_rows"] == 9
+    assert focus_state["student_focus_uniform_fallback_rows"] == 2
+    assert "teacher_value_bc_scheduler" not in state
+    assert "student_bc_scheduler" not in state
     assert set(state["frozen_teacher_state"]) == {
         "actor",
         "encoder_priv",
@@ -733,13 +1254,25 @@ def test_tvkd_checkpoint_seam_saves_teacher_chain_and_restores_scheduler(
     assert state["sac_actor_update_count"] == 19
     assert state["sac_alpha_update_count"] == 23
 
-    policy.student_bc_scheduler.update(torch.full((8,), 4.0))
+    policy.teacher_value_bottleneck_detector.update_residual_scale(
+        torch.full((8,), 20.0)
+    )
+    policy._bottleneck_detected_count = 99
+    policy._student_focus_rows_marked = 99
+    policy._failure_phase_student_focused_rows = 99
     policy.opt_dr_estimator = torch.optim.Adam(
         policy.dr_estimator.parameters(), lr=0.25
     )
-    assert policy.student_bc_scheduler.state_dict() != expected_scheduler
+    assert policy.teacher_value_bottleneck_detector.state_dict() != expected_detector
     policy._load_fastsac_checkpoint_state(state, load_modules=False)
-    assert policy.student_bc_scheduler.state_dict() == expected_scheduler
+    assert policy.teacher_value_bottleneck_detector.state_dict() == expected_detector
+    assert policy._bottleneck_detected_count == 2
+    assert policy._student_focus_rows_marked == 6
+    assert policy._student_focus_rows_missing == 1
+    assert policy._failure_phase_student_focused_rows == 9
+    assert policy._failure_phase_student_uniform_fallback_rows == 2
+    assert policy.cfg.lambda_bc == pytest.approx(0.73)
+    assert not hasattr(policy, "student_bc_scheduler")
     assert policy.num_updates == 17
     assert policy.sac_actor_update_count == 19
     assert policy.sac_alpha_update_count == 23
@@ -763,6 +1296,7 @@ def test_tvkd_checkpoint_seam_saves_teacher_chain_and_restores_scheduler(
 
 def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     tmp_path,
+    monkeypatch,
 ):
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
@@ -777,10 +1311,22 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
             ],
         )
     saved_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-    # Legacy TVKD v1 configs predate the explicit cadence provenance field but
-    # already used one alpha update per Critic step.
-    del saved_cfg.algo.sac_alpha_update_cadence
-    checkpoint_path = tmp_path / "checkpoint_12.pt"
+    launch_dir = tmp_path / "launch"
+    checkpoint_path = launch_dir / "checkpoints" / "checkpoint_12.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    relative_checkpoint_path = Path("checkpoints") / checkpoint_path.name
+
+    def from_hydra_launch_dir(path):
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = launch_dir / candidate
+        return str(candidate)
+
+    monkeypatch.setattr(
+        tvkd_entry.hydra.utils,
+        "to_absolute_path",
+        from_hydra_launch_dir,
+    )
     rng_state = torch.Generator().manual_seed(11).get_state()
     module_names = (
         "actor",
@@ -793,6 +1339,8 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
         "qnet_target",
         "adapt_module",
         "adapt_ema",
+        "object_transform",
+        "object_pred_transform",
         "object_adapt",
         "object_adapt_ema",
         "depth_cnn",
@@ -805,12 +1353,14 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
             "training_algorithm": TVKD_TRAINING_ALGORITHM,
             "checkpoint_version": TVKD_CHECKPOINT_VERSION,
             "actor_backend": TVKD_ACTOR_BACKEND,
-            "teacher_value_bc_scheduler": {
-                "residual_scale_ema": 1.0,
-                "risk_ema": 0.5,
-                "num_updates": 12,
-                "current_lambda_bc_student": 0.5,
-            },
+            "teacher_value_bottleneck_replay_state": (
+                _empty_bottleneck_checkpoint_state(
+                    {
+                        "bottleneck_residual_scale_ema": 1.25,
+                        "num_scale_updates": 12,
+                    }
+                )
+            ),
             "frozen_teacher_state": {
                 name: {} for name in ("actor", "encoder_priv", "critic", "value_norm")
             },
@@ -835,7 +1385,13 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
                 "fingerprint": "action-fingerprint",
             },
             "perception_initialization": {},
-            "dagger_backend_config": {"value_norm": False},
+            "dagger_backend_config": {
+                "value_norm": False,
+                "lambda_bc": float(cfg.algo.lambda_bc),
+                "failure_phase_student_fraction": float(
+                    cfg.algo.failure_phase_student_fraction
+                ),
+            },
             "q_backend_config": {},
             "vecnorm_fingerprint": "vecnorm",
             "log_alpha": torch.tensor(-2.0),
@@ -867,13 +1423,16 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
         },
         checkpoint_path,
     )
-    cfg.fastsac_bc_dagger_checkpoint = str(checkpoint_path)
+    cfg.fastsac_bc_dagger_checkpoint = str(relative_checkpoint_path)
 
+    assert "teacher_value_bc_scheduler" not in policy_state
     result = _prepare_tvkd_checkpoint(cfg)
     validate_tvkd_fastsac_bc_dagger_config(cfg)
 
-    assert result == {"path": str(checkpoint_path), "rollout_count": 600}
-    assert cfg.checkpoint_path == str(checkpoint_path)
+    canonical_checkpoint_path = str(checkpoint_path.resolve())
+    assert result == {"path": canonical_checkpoint_path, "rollout_count": 600}
+    assert cfg.fastsac_bc_dagger_checkpoint == canonical_checkpoint_path
+    assert cfg.checkpoint_path == canonical_checkpoint_path
     assert cfg._tvkd_model_only_resume is True
     assert cfg._bc_dagger_fresh_source is True
     assert cfg.algo.value_norm is False
@@ -883,6 +1442,146 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     drifted.algo.train_every = int(drifted.algo.train_every) + 1
     with pytest.raises(ValueError, match="algorithm config"):
         _prepare_tvkd_checkpoint(drifted)
+
+    malformed_v3_path = tmp_path / "checkpoint_tvkd_v3_missing_student_fraction.pt"
+    malformed_v3_policy = copy.deepcopy(policy_state)
+    malformed_v3_policy["dagger_backend_config"].pop(
+        "failure_phase_student_fraction"
+    )
+    torch.save(
+        {
+            "policy": malformed_v3_policy,
+            "vecnorm": {},
+            "cfg": saved_cfg,
+        },
+        malformed_v3_path,
+    )
+    malformed_v3_runtime = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    malformed_v3_runtime.fastsac_bc_dagger_checkpoint = str(malformed_v3_path)
+
+    with pytest.raises(
+        ValueError, match="focused Student replay fraction mismatch"
+    ):
+        _prepare_tvkd_checkpoint(malformed_v3_runtime)
+
+    previous_path = tmp_path / "checkpoint_tvkd_v2.pt"
+    previous_cfg = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    del previous_cfg.algo.failure_phase_student_fraction
+    previous_policy = copy.deepcopy(policy_state)
+    previous_policy["training_algorithm"] = TVKD_PREVIOUS_TRAINING_ALGORITHM
+    previous_policy["checkpoint_version"] = TVKD_PREVIOUS_CHECKPOINT_VERSION
+    previous_policy["dagger_backend_config"].pop(
+        "failure_phase_student_fraction"
+    )
+    previous_focus = previous_policy["teacher_value_bottleneck_replay_state"]
+    for name in (
+        "student_focus_rows_marked",
+        "student_focus_rows_missing",
+        "student_focus_sampled_rows",
+        "student_focus_uniform_fallback_rows",
+    ):
+        previous_focus.pop(name)
+    torch.save(
+        {"policy": previous_policy, "vecnorm": {}, "cfg": previous_cfg},
+        previous_path,
+    )
+    previous_runtime = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    previous_runtime.fastsac_bc_dagger_checkpoint = str(previous_path)
+
+    with pytest.warns(UserWarning, match="v2 checkpoints predate focused Student"):
+        previous_result = _prepare_tvkd_checkpoint(previous_runtime)
+
+    assert previous_result == {
+        "path": str(previous_path),
+        "rollout_count": 600,
+    }
+    assert previous_runtime.algo.failure_phase_student_fraction == pytest.approx(0.0)
+
+
+def test_direct_v2_resume_forces_uniform_student_replay_and_zeros_new_counters(
+    monkeypatch,
+):
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        train_dr_estimator=False,
+        failure_phase_num_bins=2,
+        lambda_bc=0.61,
+        failure_phase_student_fraction=0.3,
+    )
+    policy.actor = nn.Linear(1, 1)
+    policy.encoder_priv = nn.Linear(1, 1)
+    policy.critic = nn.Linear(1, 2)
+    policy.value_norm = _AffineValueNorm()
+    policy.teacher_value_bottleneck_detector = _detector()
+    policy._reset_bottleneck_statistics()
+    policy._failure_phase_histogram = torch.zeros(2, dtype=torch.float64)
+    policy._failure_phase_episode_count = 0
+    policy._failure_phase_anchor_count = 0
+    policy._failure_phase_uniform_fallback_rows = 0
+    policy._failure_phase_focused_rows = 0
+    policy._failure_histogram_device_cache = {}
+    freezes = []
+    policy.teacher_value_wrapper = SimpleNamespace(
+        freeze=lambda: freezes.append(True)
+    )
+
+    bottleneck_state = _empty_bottleneck_checkpoint_state()
+    for name in (
+        "student_focus_rows_marked",
+        "student_focus_rows_missing",
+        "student_focus_sampled_rows",
+        "student_focus_uniform_fallback_rows",
+    ):
+        bottleneck_state.pop(name)
+    state = {
+        "training_algorithm": TVKD_PREVIOUS_TRAINING_ALGORITHM,
+        "checkpoint_version": TVKD_PREVIOUS_CHECKPOINT_VERSION,
+        "dagger_backend_config": {"lambda_bc": 0.61},
+        "teacher_value_bottleneck_replay_state": bottleneck_state,
+        "frozen_teacher_state": {
+            name: getattr(policy, name).state_dict()
+            for name in ("actor", "encoder_priv", "critic", "value_norm")
+        },
+        "failure_phase_curriculum_state": {
+            "histogram": torch.zeros(2, dtype=torch.float64),
+            "episode_count": 0,
+            "anchor_count": 0,
+            "uniform_fallback_rows": 0,
+            "focused_rows": 0,
+        },
+        "optimizer_resume_state": {"dr_estimator_optimizer": None},
+        "num_updates": 7,
+        "sac_actor_update_count": 8,
+        "sac_alpha_update_count": 9,
+    }
+    translated = []
+    monkeypatch.setattr(
+        DistributionalFastSACTeacherBC,
+        "_load_fastsac_checkpoint_state",
+        lambda self, state, *, load_modules=True: translated.append(
+            (state, load_modules)
+        ),
+    )
+
+    with pytest.warns(UserWarning, match="Migrating a TVKD v2"):
+        policy._load_fastsac_checkpoint_state(state, load_modules=False)
+
+    assert policy.cfg.failure_phase_student_fraction == pytest.approx(0.0)
+    assert policy._student_focus_rows_marked == 0
+    assert policy._student_focus_rows_missing == 0
+    assert policy._failure_phase_student_focused_rows == 0
+    assert policy._failure_phase_student_uniform_fallback_rows == 0
+    assert translated and translated[0][1] is False
+    assert freezes == [True]
 
 
 def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypatch):
@@ -968,6 +1667,8 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
         train_perception=False,
         train_dr_estimator=False,
         failure_phase_num_bins=2,
+        lambda_bc=0.61,
+        failure_phase_student_fraction=0.3,
     )
     policy.actor = nn.Linear(1, 1)
     policy.encoder_priv = nn.Linear(1, 1)
@@ -980,13 +1681,20 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
     policy._perception_initialization = {}
     policy._replay_vecnorm_fingerprint = "same-vecnorm"
     policy._failure_histogram_device_cache = {}
-    policy.student_bc_scheduler = _scheduler()
+    policy.teacher_value_bottleneck_detector = _detector()
+    policy._reset_bottleneck_statistics()
     freezes = []
     policy.teacher_value_wrapper = SimpleNamespace(freeze=lambda: freezes.append(1))
     state = {
         "training_algorithm": TVKD_TRAINING_ALGORITHM,
         "checkpoint_version": TVKD_CHECKPOINT_VERSION,
-        "teacher_value_bc_scheduler": policy.student_bc_scheduler.state_dict(),
+        "dagger_backend_config": {
+            "lambda_bc": 0.61,
+            "failure_phase_student_fraction": 0.3,
+        },
+        "teacher_value_bottleneck_replay_state": (
+            policy._bottleneck_replay_checkpoint_state()
+        ),
         "frozen_teacher_state": {
             name: getattr(policy, name).state_dict()
             for name in ("actor", "encoder_priv", "critic", "value_norm")
@@ -1027,7 +1735,99 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
     assert policy.opt_adapt is None
     assert policy._perception_optimizer is original_optimizer
     assert policy._perception_initialization["trainable"] is False
+    assert not hasattr(policy, "student_bc_scheduler")
     assert freezes == [1]
+
+
+def test_v1_resume_discards_scheduler_state_and_starts_fresh_detector(monkeypatch):
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        train_dr_estimator=False,
+        failure_phase_num_bins=2,
+        lambda_bc=0.44,
+    )
+    policy.actor = nn.Linear(1, 1)
+    policy.encoder_priv = nn.Linear(1, 1)
+    policy.critic = nn.Linear(1, 2)
+    policy.value_norm = _AffineValueNorm()
+    policy.teacher_value_bottleneck_detector = _detector()
+    policy.teacher_value_bottleneck_detector.update_residual_scale(
+        torch.full((4,), -8.0)
+    )
+    assert policy.teacher_value_bottleneck_detector.state_dict() != {
+        "bottleneck_residual_scale_ema": 1.0,
+        "num_scale_updates": 0,
+    }
+    policy._reset_bottleneck_statistics()
+    policy._failure_phase_histogram = torch.tensor([2.0, 1.0], dtype=torch.float64)
+    policy._failure_phase_episode_count = 2
+    policy._failure_phase_anchor_count = 3
+    policy._failure_phase_uniform_fallback_rows = 4
+    policy._failure_phase_focused_rows = 5
+    policy._failure_histogram_device_cache = {}
+    freezes = []
+    policy.teacher_value_wrapper = SimpleNamespace(
+        freeze=lambda: freezes.append(True)
+    )
+    state = {
+        "training_algorithm": TVKD_LEGACY_TRAINING_ALGORITHM,
+        "checkpoint_version": TVKD_LEGACY_CHECKPOINT_VERSION,
+        "dagger_backend_config": {"lambda_bc": 0.44},
+        "teacher_value_bc_scheduler": {
+            "residual_scale_ema": 99.0,
+            "risk_ema": 1.0,
+            "num_updates": 500,
+            "current_lambda_bc_student": 0.05,
+        },
+        "frozen_teacher_state": {
+            name: getattr(policy, name).state_dict()
+            for name in ("actor", "encoder_priv", "critic", "value_norm")
+        },
+        "failure_phase_curriculum_state": {
+            "histogram": torch.tensor([2.0, 1.0], dtype=torch.float64),
+            "episode_count": 2,
+            "anchor_count": 3,
+            "uniform_fallback_rows": 4,
+            "focused_rows": 5,
+        },
+        "optimizer_resume_state": {"dr_estimator_optimizer": None},
+        "num_updates": 7,
+        "sac_actor_update_count": 8,
+        "sac_alpha_update_count": 9,
+        "last_tvkd_diagnostics": {
+            "tvkd/raw_reward_mean": 1.0,
+            "bc_scheduler/risk_ema": 0.9,
+        },
+    }
+    translated = []
+    monkeypatch.setattr(
+        DistributionalFastSACTeacherBC,
+        "_load_fastsac_checkpoint_state",
+        lambda self, state, *, load_modules=True: translated.append(
+            (state, load_modules)
+        ),
+    )
+
+    with pytest.warns(UserWarning, match="Migrating a TVKD v1"):
+        policy._load_fastsac_checkpoint_state(state, load_modules=False)
+
+    assert translated and translated[0][1] is False
+    assert policy.teacher_value_bottleneck_detector.state_dict() == {
+        "bottleneck_residual_scale_ema": 1.0,
+        "num_scale_updates": 0,
+    }
+    assert torch.equal(
+        policy._failure_phase_histogram,
+        torch.zeros(2, dtype=torch.float64),
+    )
+    assert policy._failure_phase_anchor_count == 0
+    assert policy.cfg.lambda_bc == pytest.approx(0.44)
+    assert policy._last_tvkd_diagnostics == {"tvkd/raw_reward_mean": 1.0}
+    assert not hasattr(policy, "student_bc_scheduler")
+    assert freezes == [True]
 
 
 def test_tvkd_hydra_config_inherits_locked_source_mix_and_new_defaults():
@@ -1046,14 +1846,75 @@ def test_tvkd_hydra_config_inherits_locked_source_mix_and_new_defaults():
     assert cfg.algo.sac_alpha_update_cadence == "critic"
     assert cfg.algo.use_tvkd_value_shaping is True
     assert cfg.algo.tvkd_lambda == pytest.approx(0.25)
-    assert cfg.algo.use_adaptive_student_bc is True
-    assert cfg.algo.student_bc_lambda_min == pytest.approx(0.05)
-    assert cfg.algo.student_bc_lambda_max == pytest.approx(cfg.algo.lambda_bc)
+    assert cfg.algo.use_teacher_value_bottleneck_replay is True
+    assert cfg.algo.bottleneck_threshold == pytest.approx(1.0)
+    assert cfg.algo.bottleneck_smoothing_window == 5
+    assert cfg.algo.bottleneck_min_consecutive == 3
+    assert cfg.algo.bottleneck_terminal_exclusion_steps == 5
+    assert cfg.algo.bottleneck_residual_scale_ema_decay == pytest.approx(0.99)
+    assert cfg.algo.bottleneck_eps == pytest.approx(1e-6)
+    assert set(LEGACY_ADAPTIVE_BC_CONFIG_FIELDS).isdisjoint(cfg.algo.keys())
     assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.5)
     assert cfg.algo.failure_phase_teacher_fraction == pytest.approx(0.3)
+    assert cfg.algo.failure_phase_student_fraction == pytest.approx(0.3)
     assert cfg.algo.q_teacher_replay_ratio == pytest.approx(0.5)
     assert cfg.algo.q_updates_per_rollout == 32
 
-    cfg.algo.sac_alpha_update_cadence = "actor"
-    with pytest.raises(ValueError, match="TVKD v1 requires.*critic"):
+    cfg.algo.failure_phase_student_fraction = 1.01
+    with pytest.raises(ValueError, match="failure_phase_student_fraction"):
         validate_tvkd_fastsac_bc_dagger_config(cfg)
+    cfg.algo.failure_phase_student_fraction = 0.3
+    cfg.algo.sac_alpha_update_cadence = "actor"
+    with pytest.raises(ValueError, match="TVKD requires.*critic"):
+        validate_tvkd_fastsac_bc_dagger_config(cfg)
+
+
+def test_tvkd_fresh_relative_perception_path_survives_hydra_run_chdir(
+    tmp_path,
+    monkeypatch,
+):
+    launch_dir = tmp_path / "launch"
+    run_dir = tmp_path / "outputs" / "hydra-run"
+    checkpoint_path = launch_dir / "checkpoints" / "ppo_train.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    run_dir.mkdir(parents=True)
+    torch.save(
+        {
+            "policy": {
+                "last_phase": "train",
+                **{
+                    name: {}
+                    for name in PPOVEL_TRAIN_PHASE_PARTIAL_PERCEPTION_MODULES
+                },
+            }
+        },
+        checkpoint_path,
+    )
+    relative_checkpoint_path = Path("checkpoints") / checkpoint_path.name
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                f"checkpoint_path={relative_checkpoint_path}",
+                "algo.load_pretrained_perception=true",
+                f"algo.perception_checkpoint_path={relative_checkpoint_path}",
+                "algo.train_perception=true",
+                "fastsac_dagger_iterations=14000",
+            ],
+        )
+
+    monkeypatch.chdir(launch_dir)
+    validate_tvkd_fastsac_bc_dagger_config(cfg)
+
+    canonical_checkpoint_path = checkpoint_path.resolve()
+    assert Path(cfg.algo.perception_checkpoint_path) == canonical_checkpoint_path
+
+    # Policy construction happens after Hydra moves into its per-run output
+    # directory. The propagated path must remain independent of that cwd.
+    monkeypatch.chdir(run_dir)
+    assert (
+        Path(cfg.algo.perception_checkpoint_path).resolve(strict=True)
+        == canonical_checkpoint_path
+    )

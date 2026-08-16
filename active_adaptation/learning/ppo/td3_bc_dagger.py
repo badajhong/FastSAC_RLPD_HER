@@ -131,6 +131,9 @@ PERCEPTION_VEL_COMMAND_RAW_KEY = "perception_vel_command_raw"
 PERCEPTION_IS_INIT_KEY = "perception_is_init"
 REFERENCE_PHASE_KEY = "reference_phase"
 FAILURE_PHASE_TEACHER_SOURCE_KEY = "failure_phase_teacher_source"
+FAILURE_PHASE_STUDENT_SOURCE_KEY = "failure_phase_student_source"
+STUDENT_REPLAY_EPISODE_ID_KEY = "student_replay_episode_id"
+STUDENT_REPLAY_EPISODE_STEP_KEY = "student_replay_episode_step"
 _PREFILL_ENV_INDEX_KEY = "_teacher_prefill_env_index"
 _PREFILL_STEP_INDEX_KEY = "_teacher_prefill_step_index"
 _PREFILL_TERMINATED_KEY = "_teacher_prefill_terminated"
@@ -842,6 +845,8 @@ class _TD3ReplaySamplePlan:
     actor_teacher_indices: torch.Tensor | None
     teacher_focused: torch.Tensor | None = None
     actor_teacher_focused: torch.Tensor | None = None
+    student_focused: torch.Tensor | None = None
+    actor_student_focused: torch.Tensor | None = None
 
 
 @torch.no_grad()
@@ -2657,6 +2662,108 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             focused = focused.to(replay_device)
         return indices, focused
 
+    def _student_replay_source_rows(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return all-Student and exact failed-bottleneck populations."""
+        replay = self.dagger_replay
+        all_student = replay._valid_indices(DAGGER_IS_STUDENT_ACTION_KEY)
+        if all_student.numel() < 1:
+            raise RuntimeError("Cannot sample before a Student row exists")
+        if FAILURE_PHASE_STUDENT_SOURCE_KEY not in replay.data:
+            empty = torch.empty(0, dtype=torch.long, device=replay.device)
+            return all_student, empty
+        focused = replay._valid_indices(FAILURE_PHASE_STUDENT_SOURCE_KEY)
+        return all_student, focused
+
+    @torch.no_grad()
+    def _draw_student_indices(
+        self,
+        count: int,
+        generator: torch.Generator,
+        *,
+        focused_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draw a capped focused-Student stratum plus uniform backfill.
+
+        Focused rows are sampled without replacement within a batch.  If the
+        exact failed-bottleneck population has fewer rows than the configured
+        quota, its shortfall is reassigned to the uniform Student population.
+        Uniform replay retains the established with-replacement behavior.
+        """
+        count = int(count)
+        focused_count = int(focused_count)
+        if count < 1 or not 0 <= focused_count <= count:
+            raise ValueError("Student sample counts are invalid")
+        uniform_rows, focused_rows = self._student_replay_source_rows()
+        generator_device = torch.device(generator.device)
+        actual_focused = min(focused_count, int(focused_rows.numel()))
+        uniform_count = count - actual_focused
+
+        uniform_positions = torch.randint(
+            0,
+            uniform_rows.numel(),
+            (uniform_count,),
+            device=generator_device,
+            generator=generator,
+        )
+        if uniform_positions.device != uniform_rows.device:
+            uniform_positions = uniform_positions.to(uniform_rows.device)
+        uniform_indices = uniform_rows.index_select(0, uniform_positions)
+        if uniform_indices.device != generator_device:
+            uniform_indices = uniform_indices.to(generator_device)
+
+        if actual_focused:
+            focus_order = torch.randperm(
+                focused_rows.numel(),
+                device=generator_device,
+                generator=generator,
+            )[:actual_focused]
+            if focus_order.device != focused_rows.device:
+                focus_order = focus_order.to(focused_rows.device)
+            focused_indices = focused_rows.index_select(0, focus_order)
+            if focused_indices.device != generator_device:
+                focused_indices = focused_indices.to(generator_device)
+            indices = torch.cat((uniform_indices, focused_indices), dim=0)
+        else:
+            indices = uniform_indices
+
+        focused = torch.cat(
+            (
+                torch.zeros(
+                    uniform_count, dtype=torch.bool, device=generator_device
+                ),
+                torch.ones(
+                    actual_focused, dtype=torch.bool, device=generator_device
+                ),
+            )
+        )
+        shortfall = focused_count - actual_focused
+        self._failure_phase_student_focused_rows = int(
+            getattr(self, "_failure_phase_student_focused_rows", 0)
+        ) + actual_focused
+        self._failure_phase_student_uniform_fallback_rows = int(
+            getattr(self, "_failure_phase_student_uniform_fallback_rows", 0)
+        ) + shortfall
+        return indices, focused
+
+    @torch.no_grad()
+    def _sample_student_indices(
+        self,
+        count: int,
+        generator: torch.Generator,
+        *,
+        focused_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        indices, focused = self._draw_student_indices(
+            count, generator, focused_count=focused_count
+        )
+        replay_device = self.dagger_replay.device
+        if indices.device != replay_device:
+            indices = indices.to(replay_device)
+            focused = focused.to(replay_device)
+        return indices, focused
+
     @torch.no_grad()
     def _prefetch_curriculum_sample_plans(
         self, update_count: int
@@ -2674,9 +2781,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         batch_size = int(self.cfg.q_batch_size)
         teacher_count = batch_size // 2
         student_count = batch_size - teacher_count
-        student_rows = self.dagger_replay._valid_indices(DAGGER_IS_STUDENT_ACTION_KEY)
-        if student_rows.numel() < 1:
-            raise RuntimeError("Cannot prefetch before a Student row exists")
         actor_batch_size = int(self.cfg.dagger_batch_size)
         actor_main_count, _, actor_focused_count = _source_counts(
             actor_batch_size,
@@ -2689,6 +2793,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             1.0,
             float(self.cfg.failure_phase_teacher_fraction),
         )[2]
+        student_failure_fraction = float(
+            getattr(self.cfg, "failure_phase_student_fraction", 0.0)
+        )
+        q_student_focused_count = _source_counts(
+            student_count, 1.0, student_failure_fraction
+        )[2]
+        actor_student_focused_count = (
+            0
+            if actor_main_count == 0
+            else _source_counts(
+                actor_main_count, 1.0, student_failure_fraction
+            )[2]
+        )
         generator_device = torch.device(self.q_rng.device)
         if update_count == 0:
             return ()
@@ -2702,16 +2819,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             )
             teacher_draw = len(index_draws)
             index_draws.append(teacher_indices)
-            student_draw = len(index_draws)
-            index_draws.append(
-                torch.randint(
-                    0,
-                    student_rows.numel(),
-                    (student_count,),
-                    device=generator_device,
-                    generator=self.q_rng,
-                )
+            (
+                student_indices,
+                student_focused,
+            ) = self._draw_student_indices(
+                student_count,
+                self.q_rng,
+                focused_count=q_student_focused_count,
             )
+            student_draw = len(index_draws)
+            index_draws.append(student_indices)
             permutation = torch.randperm(
                 batch_size, device=generator_device, generator=self.q_rng
             )
@@ -2719,6 +2836,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             actor_draw = None
             actor_teacher_draw = None
             actor_teacher_focused = None
+            actor_student_focused = None
             if (int(self.critic_update_count) + update_index + 1) % int(
                 self.cfg.policy_delay
             ) == 0:
@@ -2733,16 +2851,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     actor_teacher_draw = len(index_draws)
                     index_draws.append(actor_teacher_indices)
                 if actor_main_count:
-                    actor_draw = len(index_draws)
-                    index_draws.append(
-                        torch.randint(
-                            0,
-                            student_rows.numel(),
-                            (actor_main_count,),
-                            device=generator_device,
-                            generator=self.q_rng,
-                        )
+                    (
+                        actor_student_indices,
+                        actor_student_focused,
+                    ) = self._draw_student_indices(
+                        actor_main_count,
+                        self.q_rng,
+                        focused_count=actor_student_focused_count,
                     )
+                    actor_draw = len(index_draws)
+                    index_draws.append(actor_student_indices)
             records.append(
                 (
                     teacher_draw,
@@ -2752,6 +2870,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     actor_draw,
                     actor_teacher_draw,
                     actor_teacher_focused,
+                    student_focused,
+                    actor_student_focused,
                 )
             )
 
@@ -2769,12 +2889,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             actor_draw,
             actor_teacher_draw,
             actor_teacher_focused,
+            student_focused,
+            actor_student_focused,
         ) in records:
-            student_indices = student_rows.index_select(0, cpu_draws[student_draw])
+            student_indices = cpu_draws[student_draw]
             actor_indices = (
                 None
                 if actor_draw is None
-                else student_rows.index_select(0, cpu_draws[actor_draw])
+                else cpu_draws[actor_draw]
             )
             actor_teacher_indices = (
                 None if actor_teacher_draw is None else cpu_draws[actor_teacher_draw]
@@ -2788,6 +2910,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     actor_teacher_indices=actor_teacher_indices,
                     teacher_focused=teacher_focused,
                     actor_teacher_focused=actor_teacher_focused,
+                    student_focused=student_focused,
+                    actor_student_focused=actor_student_focused,
                 )
             )
         return tuple(plans)
@@ -3338,6 +3462,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             .float()
             .mean()
             .detach(),
+            "actor_failure_phase_student_fraction": batch.get(
+                FAILURE_PHASE_STUDENT_SOURCE_KEY,
+                torch.zeros_like(batch[DAGGER_TEACHER_ACTION_VALID_KEY]),
+            )
+            .float()
+            .mean()
+            .detach(),
         }
 
     def _maybe_delayed_actor_and_targets(self, actor_batch: dict[str, torch.Tensor]):
@@ -3486,6 +3617,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         teacher_count = batch_size // 2
         student_count = batch_size - teacher_count
         q_fields = tuple(self.q_teacher_replay.data)
+        student_failure_fraction = float(
+            getattr(self.cfg, "failure_phase_student_fraction", 0.0)
+        )
+        student_curriculum_enabled = hasattr(
+            self.cfg, "failure_phase_student_fraction"
+        )
+        focused_student_count = _source_counts(
+            student_count, 1.0, student_failure_fraction
+        )[2]
         if sample_plan is None:
             failure_fraction = float(
                 getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)
@@ -3502,14 +3642,22 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 self.device,
                 fields=q_fields,
             )
-            student = self.dagger_replay.sample(
+            (
+                student_indices,
+                focused_student,
+            ) = self._sample_student_indices(
                 student_count,
-                self.device,
                 self.q_rng,
-                valid_key=DAGGER_IS_STUDENT_ACTION_KEY,
+                focused_count=focused_student_count,
+            )
+            student = _sample_replay_by_indices(
+                self.dagger_replay,
+                student_indices,
+                self.device,
                 fields=q_fields,
             )
             focused_teacher = focused_teacher.to(self.device)
+            focused_student = focused_student.to(self.device)
             permutation = torch.randperm(
                 batch_size, device=self.device, generator=self.q_rng
             )
@@ -3535,6 +3683,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 if sample_plan.teacher_focused is None
                 else sample_plan.teacher_focused.to(self.device)
             )
+            focused_student = (
+                torch.zeros(student_count, dtype=torch.bool, device=self.device)
+                if sample_plan.student_focused is None
+                else sample_plan.student_focused.to(self.device)
+            )
             permutation = sample_plan.permutation
             if permutation.shape != (batch_size,):
                 raise ValueError("Q replay sample plan has the wrong permutation shape")
@@ -3552,6 +3705,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     torch.zeros(student_count, dtype=torch.bool, device=self.device),
                 )
             )
+        if student_curriculum_enabled:
+            mixed[FAILURE_PHASE_STUDENT_SOURCE_KEY] = torch.cat(
+                (
+                    torch.zeros(
+                        teacher_count, dtype=torch.bool, device=self.device
+                    ),
+                    focused_student,
+                )
+            )
         return {key: value[permutation] for key, value in mixed.items()}
 
     def _sample_actor_batch(
@@ -3559,6 +3721,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         indices: torch.Tensor | None = None,
         teacher_indices: torch.Tensor | None = None,
         teacher_focused: torch.Tensor | None = None,
+        student_focused: torch.Tensor | None = None,
     ):
         """Sample one mixed Actor batch without changing the zero-share path."""
         main_fields = (
@@ -3579,6 +3742,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             failure_fraction if curriculum_enabled else 0.0,
         )
         teacher_count = uniform_teacher_count + focused_teacher_count
+        student_failure_fraction = float(
+            getattr(self.cfg, "failure_phase_student_fraction", 0.0)
+        )
+        student_curriculum_enabled = hasattr(
+            self.cfg, "failure_phase_student_fraction"
+        )
+        focused_student_count = (
+            0
+            if main_count == 0
+            else _source_counts(main_count, 1.0, student_failure_fraction)[2]
+        )
 
         # Keep the old operation and RNG sequence byte-for-byte at the
         # backward-compatible default.
@@ -3588,20 +3762,47 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if teacher_focused is not None:
                 raise ValueError("Actor replay plan unexpectedly marks focused rows")
             if indices is None:
-                batch = self.dagger_replay.sample(
-                    batch_size,
-                    self.device,
-                    self.q_rng,
-                    valid_key=(
-                        DAGGER_IS_STUDENT_ACTION_KEY if curriculum_enabled else None
-                    ),
-                    fields=main_fields,
-                )
+                if student_curriculum_enabled:
+                    (
+                        indices,
+                        focused_student,
+                    ) = self._sample_student_indices(
+                        batch_size,
+                        self.q_rng,
+                        focused_count=focused_student_count,
+                    )
+                    batch = _sample_replay_by_indices(
+                        self.dagger_replay,
+                        indices,
+                        self.device,
+                        fields=main_fields,
+                    )
+                    focused_student = focused_student.to(self.device)
+                else:
+                    batch = self.dagger_replay.sample(
+                        batch_size,
+                        self.device,
+                        self.q_rng,
+                        valid_key=(
+                            DAGGER_IS_STUDENT_ACTION_KEY
+                            if curriculum_enabled
+                            else None
+                        ),
+                        fields=main_fields,
+                    )
+                    focused_student = torch.zeros(
+                        batch_size, dtype=torch.bool, device=self.device
+                    )
             else:
                 if indices.numel() != batch_size:
                     raise ValueError("Actor replay sample plan has the wrong row count")
                 batch = self.dagger_replay.sample_by_indices(
                     indices, self.device, fields=main_fields
+                )
+                focused_student = (
+                    torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+                    if student_focused is None
+                    else student_focused.to(self.device)
                 )
             if curriculum_enabled:
                 batch[DAGGER_Q_TEACHER_SOURCE_KEY] = torch.zeros(
@@ -3610,6 +3811,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 batch[FAILURE_PHASE_TEACHER_SOURCE_KEY] = torch.zeros(
                     batch_size, dtype=torch.bool, device=self.device
                 )
+            if student_curriculum_enabled:
+                batch[FAILURE_PHASE_STUDENT_SOURCE_KEY] = focused_student
             return self._prepare_dagger_learning_batch(batch)
 
         teacher_fields = (
@@ -3663,22 +3866,49 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
 
         main = None
+        focused_student = torch.zeros(
+            main_count, dtype=torch.bool, device=self.device
+        )
         if main_count:
             if indices is None:
-                main = self.dagger_replay.sample(
-                    main_count,
-                    self.device,
-                    self.q_rng,
-                    valid_key=(
-                        DAGGER_IS_STUDENT_ACTION_KEY if curriculum_enabled else None
-                    ),
-                    fields=main_fields,
-                )
+                if student_curriculum_enabled:
+                    (
+                        indices,
+                        focused_student,
+                    ) = self._sample_student_indices(
+                        main_count,
+                        self.q_rng,
+                        focused_count=focused_student_count,
+                    )
+                    main = _sample_replay_by_indices(
+                        self.dagger_replay,
+                        indices,
+                        self.device,
+                        fields=main_fields,
+                    )
+                    focused_student = focused_student.to(self.device)
+                else:
+                    main = self.dagger_replay.sample(
+                        main_count,
+                        self.device,
+                        self.q_rng,
+                        valid_key=(
+                            DAGGER_IS_STUDENT_ACTION_KEY
+                            if curriculum_enabled
+                            else None
+                        ),
+                        fields=main_fields,
+                    )
             else:
                 if indices.numel() != main_count:
                     raise ValueError("Actor replay sample plan has the wrong row count")
                 main = self.dagger_replay.sample_by_indices(
                     indices, self.device, fields=main_fields
+                )
+                focused_student = (
+                    torch.zeros(main_count, dtype=torch.bool, device=self.device)
+                    if student_focused is None
+                    else student_focused.to(self.device)
                 )
         elif indices is not None and indices.numel() != 0:
             raise ValueError("Actor replay sample plan has the wrong row count")
@@ -3700,6 +3930,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 (
                     focused_teacher,
                     torch.zeros(main_count, dtype=torch.bool, device=self.device),
+                )
+            )
+        if student_curriculum_enabled:
+            batch[FAILURE_PHASE_STUDENT_SOURCE_KEY] = torch.cat(
+                (
+                    torch.zeros(
+                        teacher_count, dtype=torch.bool, device=self.device
+                    ),
+                    focused_student,
                 )
             )
         return self._prepare_dagger_learning_batch(batch)
@@ -4475,6 +4714,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                                 if sample_plan is None
                                 else sample_plan.actor_teacher_focused
                             ),
+                            (
+                                None
+                                if sample_plan is None
+                                else sample_plan.actor_student_focused
+                            ),
                         )
                     )
                     if delayed is None:
@@ -4518,6 +4762,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "actor_expected_q1_mean",
             "actor_teacher_replay_fraction",
             "actor_failure_phase_teacher_fraction",
+            "actor_failure_phase_student_fraction",
         )
         critic = self._mean_metric_dict(critic_metrics, critic_keys)
         actor = self._mean_metric_dict(actor_metrics, actor_keys)
@@ -4571,6 +4816,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "td3/actor_teacher_replay_fraction": actor["actor_teacher_replay_fraction"],
             "td3/actor_failure_phase_teacher_fraction": actor[
                 "actor_failure_phase_teacher_fraction"
+            ],
+            "td3/actor_failure_phase_student_fraction": actor[
+                "actor_failure_phase_student_fraction"
             ],
             "td3/target_expected_q1_mean": critic["target_expected_q1_mean"],
             "td3/target_expected_q2_mean": critic["target_expected_q2_mean"],

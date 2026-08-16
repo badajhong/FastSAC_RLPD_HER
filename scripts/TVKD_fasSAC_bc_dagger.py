@@ -1,4 +1,4 @@
-"""CLI for frozen-Teacher-value TVKD FastSAC + adaptive Student BC.
+"""CLI for frozen-Teacher-value TVKD FastSAC + bottleneck replay.
 
 The algorithm lives in the installed ``active_adaptation.learning.ppo``
 package so Hydra can import it both from this direct script and from tests.
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from collections.abc import Mapping
 
 import hydra
@@ -22,16 +23,20 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     EXPECTED_ACTOR_IN_KEYS,
     EXPECTED_ALGO_NAME,
     EXPECTED_ALGO_TARGET,
+    LEGACY_ADAPTIVE_BC_CONFIG_FIELDS,
+    LEGACY_CHECKPOINT_VERSION,
+    LEGACY_TRAINING_ALGORITHM,
+    PREVIOUS_CHECKPOINT_VERSION,
+    PREVIOUS_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
     TRAINING_ALGORITHM,
     FrozenTeacherValueWrapper,
-    TeacherValueBCScheduler,
+    TeacherValueBottleneckDetector,
     TVKDDistributionalFastSACTeacherBC,
     TVKDDistributionalFastSACTeacherBCConfig,
     _validate_tvkd_algorithm_config,
-    compute_source_separated_bc_losses,
     compute_teacher_value_terms,
 )
 from active_adaptation.utils.wandb import parse_checkpoint_path
@@ -192,7 +197,11 @@ def _validate_same_stage_task_contract(source_cfg: Mapping, cfg: DictConfig) -> 
 
 
 def _validate_tvkd_resume_policy_state(
-    policy_state: Mapping, source_algo: Mapping
+    policy_state: Mapping,
+    source_algo: Mapping,
+    *,
+    legacy: bool = False,
+    require_student_focus_counters: bool = False,
 ) -> None:
     """Fail before W&B/Isaac startup when continuation state is incomplete."""
 
@@ -207,6 +216,8 @@ def _validate_tvkd_resume_policy_state(
         "qnet_target",
         "adapt_module",
         "adapt_ema",
+        "object_transform",
+        "object_pred_transform",
     }
     if source_algo.get("use_object_adapt") is True:
         required_modules.update(("object_adapt", "object_adapt_ema"))
@@ -311,40 +322,73 @@ def _validate_tvkd_resume_policy_state(
     if policy_state.get("last_phase") != "finetune":
         raise ValueError("TVKD resume checkpoint is not a finetune-stage policy")
 
-    scheduler = policy_state.get("teacher_value_bc_scheduler")
-    for name in (
-        "residual_scale_ema",
-        "risk_ema",
-        "num_updates",
-        "current_lambda_bc_student",
-    ):
-        if name not in scheduler:
-            raise ValueError(f"TVKD resume scheduler lacks {name}")
-    if (
-        not isinstance(scheduler["num_updates"], int)
-        or isinstance(scheduler["num_updates"], bool)
-        or scheduler["num_updates"] < 0
-    ):
-        raise ValueError("TVKD resume scheduler update count is invalid")
-    for name in ("residual_scale_ema", "risk_ema", "current_lambda_bc_student"):
-        value = scheduler[name]
+    if not legacy:
+        bottleneck = policy_state.get("teacher_value_bottleneck_replay_state")
+        detector = bottleneck.get("detector") if isinstance(bottleneck, Mapping) else None
+        if not isinstance(detector, Mapping):
+            raise ValueError("TVKD resume checkpoint lacks bottleneck detector state")
+        scale = detector.get("bottleneck_residual_scale_ema")
         if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(float(scale))
+            or float(scale) <= 0.0
         ):
-            raise ValueError(f"TVKD resume scheduler {name} is invalid")
-    if (
-        float(scheduler["residual_scale_ema"]) <= 0.0
-        or not 0.0 <= float(scheduler["risk_ema"]) <= 1.0
-    ):
-        raise ValueError("TVKD resume scheduler scale/risk is invalid")
-    if (
-        not float(source_algo.get("student_bc_lambda_min"))
-        <= float(scheduler["current_lambda_bc_student"])
-        <= float(source_algo.get("student_bc_lambda_max"))
-    ):
-        raise ValueError("TVKD resume scheduler coefficient is out of bounds")
+            raise ValueError("TVKD resume bottleneck residual scale is invalid")
+        updates = detector.get("num_scale_updates", 0)
+        if (
+            isinstance(updates, bool)
+            or not isinstance(updates, int)
+            or updates < 0
+        ):
+            raise ValueError("TVKD resume bottleneck scale update count is invalid")
+        bottleneck_counter_names = [
+            "failed_student_episode_count",
+            "student_candidate_count",
+            "detected_count",
+            "fallback_count",
+            "no_candidate_count",
+            "selected_count",
+            "teacher_sequences_inserted",
+            "teacher_transitions_inserted",
+            "phase_match_distance_count",
+            "next_student_episode_id",
+        ]
+        if require_student_focus_counters:
+            bottleneck_counter_names.extend(
+                (
+                    "student_focus_rows_marked",
+                    "student_focus_rows_missing",
+                    "student_focus_sampled_rows",
+                    "student_focus_uniform_fallback_rows",
+                )
+            )
+        for name in bottleneck_counter_names:
+            value = bottleneck.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"TVKD resume bottleneck state {name} is invalid")
+        nonnegative_float_fields = {
+            "selected_step_sum",
+            "selected_phase_sum",
+            "score_sum",
+            "score_max",
+            "phase_match_distance_sum",
+        }
+        for name in (
+            *nonnegative_float_fields,
+            "raw_td_residual_sum",
+            "normalized_td_residual_sum",
+        ):
+            value = bottleneck.get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or (name in nonnegative_float_fields and float(value) < 0.0)
+            ):
+                raise ValueError(f"TVKD resume bottleneck state {name} is invalid")
+        if not isinstance(bottleneck.get("last_metadata", {}), Mapping):
+            raise ValueError("TVKD resume bottleneck metadata is invalid")
 
     failure = policy_state.get("failure_phase_curriculum_state")
     histogram = failure.get("histogram")
@@ -397,8 +441,25 @@ def _prepare_tvkd_fresh_source(cfg: DictConfig) -> dict | None:
     return prepared
 
 
+def _resolve_tvkd_checkpoint(path) -> str:
+    """Resolve a local or W&B TVKD checkpoint from Hydra's launch cwd."""
+    value = os.path.expanduser(os.fspath(path))
+    if value.startswith("run:"):
+        resolved = parse_checkpoint_path(value, download_replay=False)
+    else:
+        resolved = hydra.utils.to_absolute_path(value)
+    if resolved is None:
+        raise FileNotFoundError("Unable to resolve TVKD resume checkpoint")
+    resolved = os.path.realpath(os.path.expanduser(os.fspath(resolved)))
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(
+            f"TVKD resume checkpoint does not exist: {resolved}"
+        )
+    return resolved
+
+
 def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
-    """Validate a model-only TVKD continuation and preserve its scheduler."""
+    """Validate a model-only TVKD continuation and bottleneck state."""
     requested = cfg.get("fastsac_bc_dagger_checkpoint", None)
     if requested is None:
         return None
@@ -410,9 +471,7 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
             "TVKD model-state continuation rebuilds its online rings; remove "
             "explicit teacher replay paths"
         )
-    resolved = parse_checkpoint_path(os.fspath(requested), download_replay=False)
-    if resolved is None or not os.path.isfile(resolved):
-        raise FileNotFoundError(f"TVKD resume checkpoint does not exist: {resolved}")
+    resolved = _resolve_tvkd_checkpoint(requested)
     checkpoint = torch.load(resolved, map_location="cpu", weights_only=False)
     policy_state = checkpoint.get("policy")
     source_cfg = checkpoint.get("cfg")
@@ -422,20 +481,48 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
         raise ValueError("TVKD resume checkpoint has no VecNorm state")
     if not isinstance(source_cfg, Mapping):
         raise ValueError("TVKD resume checkpoint has no saved config")
-    if policy_state.get("training_algorithm") != TRAINING_ALGORITHM:
+    algorithm = policy_state.get("training_algorithm")
+    version = policy_state.get("checkpoint_version", -1)
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError("TVKD resume checkpoint version is invalid")
+    legacy = (
+        algorithm == LEGACY_TRAINING_ALGORITHM
+        and version == LEGACY_CHECKPOINT_VERSION
+    )
+    previous = (
+        algorithm == PREVIOUS_TRAINING_ALGORITHM
+        and version == PREVIOUS_CHECKPOINT_VERSION
+    )
+    current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
+    if not (legacy or previous or current):
         raise ValueError("fastsac_bc_dagger_checkpoint is not a TVKD checkpoint")
-    if int(policy_state.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
-        raise ValueError("TVKD resume checkpoint version mismatch")
+    if legacy:
+        warnings.warn(
+            "TVKD v1 adaptive BC state will be ignored; resume uses the fixed "
+            "baseline BC coefficient and a fresh bottleneck residual scale.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif previous:
+        warnings.warn(
+            "TVKD v2 checkpoints predate focused Student replay; continuation "
+            "preserves their replay behavior with "
+            "failure_phase_student_fraction=0.0.",
+            UserWarning,
+            stacklevel=2,
+        )
     if policy_state.get("actor_backend") != ACTOR_BACKEND:
         raise ValueError("TVKD resume checkpoint actor backend mismatch")
-    for name in (
-        "teacher_value_bc_scheduler",
+    required_mappings = [
         "frozen_teacher_state",
         "failure_phase_curriculum_state",
         "optimizer_resume_state",
         "action_contract",
         "perception_initialization",
-    ):
+    ]
+    if previous or current:
+        required_mappings.append("teacher_value_bottleneck_replay_state")
+    for name in required_mappings:
         if not isinstance(policy_state.get(name), Mapping):
             raise ValueError(f"TVKD resume checkpoint lacks {name!r}")
     vecnorm_fingerprint = policy_state.get("vecnorm_fingerprint")
@@ -444,12 +531,48 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
     backend = policy_state.get("dagger_backend_config")
     if not isinstance(backend, Mapping):
         raise ValueError("TVKD resume checkpoint lacks backend config")
+    saved_lambda_bc = backend.get("lambda_bc")
+    if (
+        isinstance(saved_lambda_bc, bool)
+        or not isinstance(saved_lambda_bc, (int, float))
+        or not math.isfinite(float(saved_lambda_bc))
+        or float(saved_lambda_bc) < 0.0
+        or not math.isclose(
+            float(saved_lambda_bc),
+            float(cfg.algo.lambda_bc),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError("TVKD resume fixed BC coefficient mismatch")
+    if current:
+        saved_student_fraction = backend.get("failure_phase_student_fraction")
+        if (
+            isinstance(saved_student_fraction, bool)
+            or not isinstance(saved_student_fraction, (int, float))
+            or not math.isfinite(float(saved_student_fraction))
+            or not 0.0 <= float(saved_student_fraction) <= 1.0
+            or not math.isclose(
+                float(saved_student_fraction),
+                float(cfg.algo.failure_phase_student_fraction),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "TVKD resume focused Student replay fraction mismatch"
+            )
     source_value_norm = _validate_teacher_return_contract(source_cfg, cfg)
     _validate_same_stage_task_contract(source_cfg, cfg)
     # ValueNorm changes the module type, so mirror the saved construction
     # choice before comparing the complete same-stage algorithm contract.
     with open_dict(cfg.algo):
         cfg.algo.value_norm = source_value_norm
+        if previous:
+            # v2 had no focused Student partition. Same-stage continuation is
+            # intentionally behavior-preserving even though fresh v3 runs use
+            # the new 0.3 default.
+            cfg.algo.failure_phase_student_fraction = 0.0
     source_algo = source_cfg.get("algo")
     if not isinstance(source_algo, Mapping):
         raise ValueError("TVKD resume checkpoint lacks saved algo config")
@@ -475,16 +598,39 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
         resolve=True,
         enum_to_str=True,
     )
-    # Checkpoints written before this explicit provenance field used the TVKD
-    # v1 every-Critic cadence.  Normalize that known legacy omission without
-    # relaxing any other same-stage algorithm comparison.
-    source_algo_contract.setdefault("sac_alpha_update_cadence", "critic")
+    # Legacy v1 checkpoints predate this explicit provenance field but already
+    # used one alpha update per Critic. v2+ checkpoints must contain it.
+    if legacy:
+        source_algo_contract.setdefault("sac_alpha_update_cadence", "critic")
     runtime_algo_contract = OmegaConf.to_container(
         cfg.algo, resolve=True, enum_to_str=True
     )
+    if legacy:
+        for name in LEGACY_ADAPTIVE_BC_CONFIG_FIELDS:
+            source_algo_contract.pop(name, None)
+        for name in (
+            "use_teacher_value_bottleneck_replay",
+            "bottleneck_threshold",
+            "bottleneck_smoothing_window",
+            "bottleneck_min_consecutive",
+            "bottleneck_terminal_exclusion_steps",
+            "bottleneck_residual_scale_ema_decay",
+            "bottleneck_eps",
+            "failure_phase_student_fraction",
+        ):
+            source_algo_contract[name] = runtime_algo_contract[name]
+    elif previous:
+        # Structured v2 configs did not contain this v3 replay control. Its
+        # behavior was equivalent to a zero focused share.
+        source_algo_contract.setdefault("failure_phase_student_fraction", 0.0)
     if source_algo_contract != runtime_algo_contract:
         raise ValueError("TVKD resume algorithm config does not match checkpoint")
-    _validate_tvkd_resume_policy_state(policy_state, source_algo)
+    _validate_tvkd_resume_policy_state(
+        policy_state,
+        source_algo,
+        legacy=legacy,
+        require_student_focus_counters=current,
+    )
     if backend.get("value_norm") is not source_value_norm:
         raise ValueError("TVKD resume checkpoint ValueNorm metadata is inconsistent")
     metadata_only = {
@@ -519,6 +665,7 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
         raise ValueError("TVKD resume rollout count must be non-negative")
 
     with open_dict(cfg):
+        cfg.fastsac_bc_dagger_checkpoint = resolved
         cfg.checkpoint_path = resolved
         cfg._tvkd_model_only_resume = True
         # Suppress generic H5 discovery: this continuation deliberately
@@ -557,7 +704,7 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         # cadence. TVKD itself is locked above to its legacy Critic cadence.
         baseline_cfg.algo.sac_alpha_update_cadence = "actor"
     # The baseline intentionally rejects continuation because it has no model
-    # for TVKD's scheduler-aware, fresh-ring resume contract.  Every topology
+    # for TVKD's bottleneck-aware, fresh-ring resume contract. Every topology
     # and source-ratio lock still applies to the translated validation config.
     with open_dict(baseline_cfg):
         baseline_cfg.fastsac_bc_dagger_checkpoint = None
@@ -569,7 +716,8 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
             baseline_cfg.fastsac_dagger_iterations = resume_rollouts + int(
                 cfg.fastsac_dagger_iterations
             )
-    if resume_rollouts and bool(baseline_cfg.algo.load_pretrained_perception):
+    model_only_resume = bool(cfg.get("_tvkd_model_only_resume", False))
+    if model_only_resume and bool(baseline_cfg.algo.load_pretrained_perception):
         # A TVKD checkpoint already owns every online/EMA perception child.
         # Do not require the historical warm-start file to remain available;
         # resume restores the saved children and optimizer state directly.
@@ -578,6 +726,18 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
             baseline_cfg.algo.perception_checkpoint_path = None
             baseline_cfg.algo.train_perception = True
     validate_fastsac_bc_dagger_config(baseline_cfg)
+    if (
+        not model_only_resume
+        and bool(baseline_cfg.algo.load_pretrained_perception)
+    ):
+        # Baseline validation resolves local paths against Hydra's original
+        # launch cwd.  Propagate that canonical path to the real TVKD config;
+        # otherwise policy construction would resolve the untouched relative
+        # string against Hydra's per-run output directory.
+        with open_dict(cfg.algo):
+            cfg.algo.perception_checkpoint_path = (
+                baseline_cfg.algo.perception_checkpoint_path
+            )
 
 
 @hydra.main(
@@ -599,16 +759,33 @@ def main(cfg: DictConfig):
             cfg._bc_dagger_main_rollout_budget = start_rollout + int(
                 cfg.fastsac_dagger_iterations
             )
+    actor_teacher_fraction = float(cfg.algo.teacher_actor_replay_fraction)
+    actor_student_fraction = 1.0 - actor_teacher_fraction
+    focused_student_max = actor_student_fraction * float(
+        cfg.algo.failure_phase_student_fraction
+    )
+    uniform_student_min = actor_student_fraction - focused_student_max
+    failure_teacher_fraction = actor_teacher_fraction * float(
+        cfg.algo.failure_phase_teacher_fraction
+    )
+    uniform_teacher_fraction = actor_teacher_fraction - failure_teacher_fraction
     print(
-        "TVKD Distributional FastSAC + adaptive Student-BC schedule: "
+        "TVKD Distributional FastSAC + fixed BC + value-bottleneck replay: "
         f"prefill=until {schedule['prefill_target_rows']} Teacher rows, "
         f"main_additional={schedule['main_rollouts']}, "
         f"main_range=[{start_rollout}, "
         f"{start_rollout + schedule['main_rollouts']}), "
         f"frames/rollout={schedule['frames_per_rollout']}; "
         f"tvkd_lambda={float(cfg.algo.tvkd_lambda):g}, "
+        f"bottleneck={bool(cfg.algo.use_teacher_value_bottleneck_replay)}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence}, "
-        "sources=Student 50% / uniform Teacher 35% / failure Teacher 15%"
+        f"Q/Actor replay=Student {100.0 * actor_student_fraction:g}% "
+        f"(uniform >={100.0 * uniform_student_min:g}%, "
+        f"failure/bottleneck <={100.0 * focused_student_max:g}%; "
+        "focused shortfall -> uniform) / Teacher "
+        f"{100.0 * actor_teacher_fraction:g}% "
+        f"(uniform success {100.0 * uniform_teacher_fraction:g}%, "
+        f"failure-phase success {100.0 * failure_teacher_fraction:g}%)"
     )
     return run_training(cfg)
 
@@ -626,12 +803,11 @@ __all__ = [
     "SOURCE_UNIFORM_TEACHER",
     "TRAINING_ALGORITHM",
     "FrozenTeacherValueWrapper",
-    "TeacherValueBCScheduler",
+    "TeacherValueBottleneckDetector",
     "TVKDDistributionalFastSACTeacherBC",
     "TVKDDistributionalFastSACTeacherBCConfig",
     "_prepare_tvkd_checkpoint",
     "_prepare_tvkd_fresh_source",
-    "compute_source_separated_bc_losses",
     "compute_teacher_value_terms",
     "main",
     "validate_tvkd_fastsac_bc_dagger_config",
