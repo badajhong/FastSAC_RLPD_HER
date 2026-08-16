@@ -7,6 +7,9 @@ import logging
 import os
 import time
 import datetime
+import hashlib
+import subprocess
+from contextlib import nullcontext
 
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf, DictConfig
@@ -20,6 +23,11 @@ except ImportError:
     from _isaaclab_bootstrap import AppLauncher
 
 import active_adaptation as aa
+from active_adaptation.utils.wallclock_profiler import (
+    WallClockProfileConfig,
+    WallClockProfiler,
+    instrument_training_policy,
+)
 
 # from active_adaptation.utils.torchrl import SyncDataCollector
 from torchrl.envs.utils import set_exploration_type, ExplorationType
@@ -68,6 +76,146 @@ _ENV_EMA_SCALAR_FIELDS = (
     "observation_time",
     "ema_cnt",
 )
+
+
+_PROFILE_ALGO_INVARIANTS = (
+    "name",
+    "train_every",
+    "q_batch_size",
+    "dagger_batch_size",
+    "perception_replay_batch_size",
+    "teacher_perception_batch_size",
+    "perception_encode_microbatch_size",
+    "perception_replay_burn_in",
+    "num_minibatches",
+    "q_updates_per_rollout",
+    "q_update_to_data_ratio",
+    "sac_policy_frequency",
+    "td3_learning_starts",
+    "sac_learning_starts",
+    "dagger_buffer_capacity",
+    "q_teacher_buffer_capacity",
+    "perception_replay_mode",
+    "use_tvkd_value_shaping",
+    "tvkd_lambda",
+    "tvkd_potential_clip",
+    "use_teacher_value_bottleneck_replay",
+    "bottleneck_fallback_mode",
+    "q_uniform_student_fraction",
+    "q_failure_student_fraction",
+    "q_uniform_teacher_fraction",
+    "q_failure_teacher_fraction",
+    "actor_uniform_student_fraction",
+    "actor_failure_student_fraction",
+    "actor_uniform_teacher_fraction",
+    "actor_failure_teacher_fraction",
+    "perception_uniform_student_fraction",
+    "perception_failure_student_fraction",
+    "perception_uniform_teacher_fraction",
+    "perception_failure_teacher_fraction",
+)
+
+
+def _profile_git_commit() -> str | None:
+    """Resolve the source commit before entering the measured GPU window."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", os.path.join(FILE_PATH, ".."), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _profile_git_status() -> list[str] | None:
+    """Expose dirty paths so a commit id is never mistaken for an exact tree."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                os.path.join(FILE_PATH, ".."),
+                "status",
+                "--short",
+                "--untracked-files=normal",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def _profile_static_metadata(cfg, env) -> dict:
+    algo = cfg.algo
+    invariants = {
+        name: OmegaConf.to_container(algo.get(name), resolve=True)
+        if OmegaConf.is_config(algo.get(name))
+        else algo.get(name)
+        for name in _PROFILE_ALGO_INVARIANTS
+        if algo.get(name, None) is not None
+    }
+    git_status = _profile_git_status()
+    return {
+        "git_commit": _profile_git_commit(),
+        "git_worktree_dirty": None if git_status is None else bool(git_status),
+        "git_status": git_status,
+        "seed": int(cfg.seed),
+        "num_envs": int(env.num_envs),
+        "world_size": int(aa.get_world_size()),
+        "device": str(env.device),
+        "total_frames": int(cfg.get("total_frames", -1)),
+        "main_rollout_budget": cfg.get("_bc_dagger_main_rollout_budget", None),
+        "algo_invariants": invariants,
+    }
+
+
+def _profile_replay_state(replay) -> dict | None:
+    if replay is None:
+        return None
+    schema = {}
+    for key, value in sorted(getattr(replay, "data", {}).items()):
+        schema[str(key)] = {
+            "dtype": str(value.dtype),
+            "shape_tail": list(value.shape[1:]),
+        }
+    return {
+        "size": int(getattr(replay, "size", 0)),
+        "seen": int(getattr(replay, "seen", 0)),
+        "capacity": int(getattr(replay, "capacity", 0)),
+        "device": str(getattr(replay, "device", "unknown")),
+        "schema": schema,
+    }
+
+
+def _profile_window_start_state(policy) -> dict:
+    """Capture cheap replay/RNG comparability state before timing begins."""
+    state = {
+        "dagger_replay": _profile_replay_state(
+            getattr(policy, "dagger_replay", None)
+        ),
+        "q_teacher_replay": _profile_replay_state(
+            getattr(policy, "q_teacher_replay", None)
+        ),
+        "dagger_rollout_count": int(getattr(policy, "dagger_rollout_count", 0)),
+        "teacher_prefill_rollout_count": int(
+            getattr(policy, "teacher_prefill_rollout_count", 0)
+        ),
+        "critic_update_count": int(getattr(policy, "critic_update_count", 0)),
+        "actor_update_count": int(getattr(policy, "actor_update_count", 0)),
+    }
+    q_rng = getattr(policy, "q_rng", None)
+    if isinstance(q_rng, torch.Generator):
+        rng_state = q_rng.get_state().detach().cpu().contiguous()
+        state["q_rng_state_sha256"] = hashlib.sha256(
+            rng_state.numpy().tobytes()
+        ).hexdigest()
+    return state
 
 
 def _base_training_env(env):
@@ -306,6 +454,13 @@ def make_wandb_settings(cfg: DictConfig):
 def run_training(cfg: DictConfig):
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
+    profile_node = cfg.get("wallclock_profile", None)
+    profile_mapping = (
+        OmegaConf.to_container(profile_node, resolve=True)
+        if OmegaConf.is_config(profile_node)
+        else profile_node
+    )
+    profile_config = WallClockProfileConfig.from_mapping(profile_mapping)
     if cfg.get("bc_dagger_checkpoint", None) is not None and not bool(
         cfg.get("_bc_dagger_model_only_resume", False)
     ):
@@ -378,6 +533,19 @@ def run_training(cfg: DictConfig):
     simulation_app = app_launcher.app
 
     env, policy, vecnorm = make_env_policy(cfg, configure_replay=True)
+
+    wallclock_profiler = WallClockProfiler(
+        profile_config,
+        device=env.device,
+        output_dir=run.dir,
+        metadata=_profile_static_metadata(cfg, env),
+    )
+    # Wrappers are installed at the first measured rollout and removed at the
+    # end of the short window. Disabled and post-window training pay no method
+    # wrapper overhead.
+    _profile_instrumentation = instrument_training_policy(
+        policy, wallclock_profiler
+    )
 
     # Checkpoint-source detection and replay/Q contract materialization happen
     # inside make_env_policy. Persist that resolved runtime configuration so
@@ -497,6 +665,7 @@ def run_training(cfg: DictConfig):
             artifact=artifact,
         )
         logging.info(f"Saved checkpoint to {str(ckpt_path)}")
+        return ckpt_path
 
     assert env.training
 
@@ -556,16 +725,62 @@ def run_training(cfg: DictConfig):
 
     env_frames = 0
     start_iter = env.current_iter
+    profile_start_state_captured = False
     for i in progress:
         prefill_active_before_rollout = bool(
             hasattr(policy, "is_teacher_prefill_active")
             and policy.is_teacher_prefill_active()
         )
+        profile_phase = (
+            "teacher_prefill"
+            if prefill_active_before_rollout
+            else "main_dagger"
+            if hasattr(policy, "dagger_rollout_count")
+            else "physical"
+        )
+        profile_phase_rollout = (
+            int(getattr(policy, "teacher_prefill_rollout_count", 0))
+            if profile_phase == "teacher_prefill"
+            else int(getattr(policy, "dagger_rollout_count", 0))
+            if profile_phase == "main_dagger"
+            else int(i)
+        )
+        profile_coordinate = (
+            int(i)
+            if profile_config.phase == "physical"
+            else profile_phase_rollout
+        )
+        profile_phase_matches = (
+            profile_config.phase == "physical"
+            or profile_config.phase == profile_phase
+        )
+        if (
+            profile_config.enabled
+            and not profile_start_state_captured
+            and profile_phase_matches
+            and profile_config.start_rollout
+            <= profile_coordinate
+            < profile_config.start_rollout + profile_config.num_rollouts
+        ):
+            wallclock_profiler.set_metadata(
+                "window_start_state", _profile_window_start_state(policy)
+            )
+            profile_start_state_captured = True
+        profile_active = wallclock_profiler.begin_rollout(
+            i, phase=profile_phase, phase_rollout=profile_phase_rollout
+        )
         if hasattr(policy, "begin_transition_collection"):
             policy.begin_transition_collection()
         rollout_start = time.perf_counter()
         interleaved_training_time = 0.0
-        with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
+        rollout_profile_context = (
+            wallclock_profiler.block("environment_rollout")
+            if profile_active
+            else nullcontext()
+        )
+        with rollout_profile_context, torch.inference_mode(), set_exploration_type(
+            ExplorationType.RANDOM
+        ):
             torch.compiler.cudagraph_mark_step_begin()  # for compiled policy
             env.set_progress(start_iter + i)
             for step in range(cfg.algo.train_every):
@@ -580,7 +795,11 @@ def run_training(cfg: DictConfig):
                     policy, "record_rollout_q_actuator_context"
                 ):
                     policy.record_rollout_q_actuator_context(actuator_context)
-                td, carry = env.step_and_maybe_reset(carry)
+                if profile_active:
+                    with wallclock_profiler.block("environment_step"):
+                        td, carry = env.step_and_maybe_reset(carry)
+                else:
+                    td, carry = env.step_and_maybe_reset(carry)
                 if interleaved_updates:
                     update_start = time.perf_counter()
                     # Replay tensors are ordinary device tensors, so gradients
@@ -642,12 +861,23 @@ def run_training(cfg: DictConfig):
             # success) a clean main-policy metric from its first window.
             episode_stats.add(data_buf)
         env_frames += data_buf.numel()
+        if profile_active:
+            wallclock_profiler.increment("environment_states", data_buf.numel())
+            wallclock_profiler.increment(
+                "environment_control_steps", int(cfg.algo.train_every)
+            )
 
         info = {}
-        if i % log_interval == 0 and len(episode_stats):
-            for k, v in sorted(episode_stats.pop().items(True, True)):
-                key = "train/" + ("/".join(k) if isinstance(k, tuple) else k)
-                info[key] = torch.mean(v.float()).item()
+        metrics_profile_context = (
+            wallclock_profiler.block("metrics_aggregation")
+            if profile_active
+            else nullcontext()
+        )
+        with metrics_profile_context:
+            if i % log_interval == 0 and len(episode_stats):
+                for k, v in sorted(episode_stats.pop().items(True, True)):
+                    key = "train/" + ("/".join(k) if isinstance(k, tuple) else k)
+                    info[key] = torch.mean(v.float()).item()
         training_start = time.perf_counter()
         info.update(policy.train_op(data_buf))
         progress.update(policy)
@@ -694,11 +924,23 @@ def run_training(cfg: DictConfig):
             cfg.get("_tvkd_model_only_resume", False)
         )
         if not skip_tvkd_refill_checkpoint and should_save(checkpoint_index):
-            save(policy, f"checkpoint_{checkpoint_index}")
+            if profile_active:
+                with wallclock_profiler.block("checkpoint_save"):
+                    save(policy, f"checkpoint_{checkpoint_index}")
+            else:
+                save(policy, f"checkpoint_{checkpoint_index}")
 
         if aa.is_main_process():
             # print(OmegaConf.to_yaml({k: v for k, v in info.items() if (isinstance(v, (float, int)) and not k.startswith("performance_reward"))}))
-            run.log(info)
+            if profile_active:
+                with wallclock_profiler.block("metrics_logging"):
+                    run.log(info)
+            else:
+                run.log(info)
+
+        wallclock_profiler.end_rollout(
+            i, phase_rollout=profile_phase_rollout
+        )
 
         if _bc_dagger_main_budget_complete(policy, main_rollout_budget):
             main_rollout_budget_complete = True
@@ -711,15 +953,37 @@ def run_training(cfg: DictConfig):
             f"completed={int(getattr(policy, 'dagger_rollout_count', -1))}"
         )
 
+    if profile_config.enabled and not wallclock_profiler.finished:
+        # Also emits an auditable partial result when a misconfigured phase or
+        # too-short run never reaches the complete requested window.
+        wallclock_profiler.finish()
+
     # 5. --- Finalization and Cleanup ---
     if aa.is_main_process():
-        save(policy, "checkpoint_final", artifact=True)
+        final_checkpoint_context = (
+            wallclock_profiler.external_cpu_block("checkpoint_save_final")
+            if profile_config.profile_final_checkpoint
+            else nullcontext()
+        )
+        with final_checkpoint_context:
+            final_checkpoint_path = save(
+                policy, "checkpoint_final", artifact=True
+            )
+        if profile_config.profile_final_checkpoint:
+            # I/O-only load probe after training. It does not mutate the live
+            # policy or measured learning window.
+            with wallclock_profiler.external_cpu_block("checkpoint_load_final"):
+                loaded_checkpoint_probe = torch.load(
+                    final_checkpoint_path, map_location="cpu", weights_only=False
+                )
+            del loaded_checkpoint_probe
 
-    policy_eval = policy.get_rollout_policy("eval")
-    info, trajs, stats, policy_trajs = evaluate(
-        env, policy_eval, render=cfg.eval_render, seed=cfg.seed
-    )
-    run.log(info)
+    if not (profile_config.enabled and profile_config.skip_final_evaluation):
+        policy_eval = policy.get_rollout_policy("eval")
+        info, trajs, stats, policy_trajs = evaluate(
+            env, policy_eval, render=cfg.eval_render, seed=cfg.seed
+        )
+        run.log(info)
 
     wandb.finish()
     os._exit(0)

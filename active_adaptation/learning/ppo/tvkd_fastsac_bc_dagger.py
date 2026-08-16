@@ -97,6 +97,13 @@ VERIFIED_HISTOGRAM_SEMANTICS = "verified_teacher_value_threshold_motion_phase_v1
 FRESH_RING_RESUME_SEMANTICS = "clear_online_rings_and_partial_row_credit_v1"
 UNBOUND_CONTRACT_FINGERPRINT = "unbound_direct_construction"
 
+# Replay cache: frozen PPO Teacher values precomputed once per transition and
+# stored alongside the replay row.  Q target updates read from these fields
+# instead of re-running the frozen Teacher critic on every batch.
+REPLAY_TEACHER_V_CURRENT_KEY = "replay_teacher_v_current"
+REPLAY_TEACHER_V_NEXT_KEY = "replay_teacher_v_next"
+TEACHER_VALUE_CACHE_SEMANTICS = "precomputed_frozen_ppo_float32_current_next_v1"
+
 LEGACY_ADAPTIVE_BC_CONFIG_FIELDS = (
     "use_adaptive_student_bc",
     "student_bc_lambda_min",
@@ -398,6 +405,10 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     teacher_value_boundary_semantics: str = TEACHER_VALUE_BOUNDARY_SEMANTICS
     teacher_value_reward_group_fingerprint: str = UNBOUND_CONTRACT_FINGERPRINT
     replay_task_fingerprint: str = UNBOUND_CONTRACT_FINGERPRINT
+    # Set > 0 to recompute live Teacher values for a random fraction of each
+    # Q batch and compare against the cached values.  Requires max abs error
+    # <= 1e-6.  Production value is 0.0 (disabled).
+    teacher_value_cache_validate_fraction: float = 0.0
     # Deprecated v3 migration input only. Canonical v4 samplers never consult it.
     failure_phase_student_fraction: float = 0.3
 
@@ -919,11 +930,218 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self._reset_student_replay_episode_tracking()
         self._reset_bottleneck_statistics()
         self._last_tvkd_diagnostics: dict[str, float] = {}
+        # Per-rollout Teacher-value grids populated by
+        # _student_teacher_td_residual_grid and consumed by
+        # _dagger_transition_chunks to fill the replay cache fields.
+        self._rollout_teacher_v_current_grid: torch.Tensor | None = None
+        self._rollout_teacher_v_next_grid: torch.Tensor | None = None
+
+    def _needs_teacher_value_cache(self) -> bool:
+        """True when at least one consumer of frozen Teacher values is active."""
+        cfg = getattr(self, "cfg", None)
+        if cfg is None:
+            return False
+        return bool(getattr(cfg, "use_tvkd_value_shaping", False)) or bool(
+            getattr(cfg, "use_teacher_value_bottleneck_replay", False)
+        )
+
+    def _q_replay_storage_fields(self) -> tuple[str, ...]:
+        """Extend the base schema with Teacher-value cache fields when needed."""
+        base = super()._q_replay_storage_fields()
+        if self._needs_teacher_value_cache():
+            return (*base, REPLAY_TEACHER_V_CURRENT_KEY, REPLAY_TEACHER_V_NEXT_KEY)
+        return base
+
+    def _q_replay_prefill_storage_fields(self) -> tuple[str, ...]:
+        """Exclude cache fields from the prefill transition schema.
+
+        Cache fields are added per-episode by
+        ``_post_process_teacher_prefill_episode`` after the episode is
+        assembled from per-rollout transition chunks, so they must not be
+        requested from the raw rollout transitions dict.
+        """
+        base = super()._q_replay_storage_fields()
+        return base  # intentionally omits cache fields
+
+    @torch.no_grad()
+    def _post_process_teacher_prefill_episode(
+        self, episode: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Compute and attach frozen Teacher values for a committed episode.
+
+        All rows in a successful Teacher episode are non-terminated ordinary
+        transitions except the last row which has ``command_finished=True``.
+        For intermediate rows the continuation uses ``teacher_v_next``
+        (following state); for the final row it uses ``teacher_v_current``
+        (self-bootstrap), so ``teacher_v_next`` of the last row is irrelevant
+        numerically but stored for schema uniformity.
+        """
+        if not self._needs_teacher_value_cache():
+            return episode
+        snapshot = self._vecnorm_snapshot()
+        obs_norm = self._normalize_replay_flat(
+            episode["critic_observations"].to(self.device),
+            self.q_critic_keys,
+            self._q_critic_widths,
+            snapshot,
+        )
+        next_obs_norm = self._normalize_replay_flat(
+            episode["next_critic_observations"].to(self.device),
+            self.q_critic_keys,
+            self._q_critic_widths,
+            snapshot,
+        )
+        teacher_v = self._batched_frozen_teacher_value(obs_norm).float()
+        teacher_v_next = self._batched_frozen_teacher_value(next_obs_norm).float()
+        episode = dict(episode)
+        episode[REPLAY_TEACHER_V_CURRENT_KEY] = teacher_v.reshape(-1)
+        episode[REPLAY_TEACHER_V_NEXT_KEY] = teacher_v_next.reshape(-1)
+        return episode
 
     def get_frozen_teacher_value(
         self, teacher_critic_obs: torch.Tensor
     ) -> torch.Tensor:
         return self.teacher_value_wrapper.get_frozen_teacher_value(teacher_critic_obs)
+
+    @torch.no_grad()
+    def _teacher_value_terms_from_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+        terminated: torch.Tensor,
+        command_finished: torch.Tensor,
+        time_limit: torch.Tensor,
+    ) -> "TeacherValueTerms":
+        """Compute TVKD value terms, using the replay cache when available.
+
+        In production mode (``teacher_value_cache_validate_fraction == 0``),
+        reads ``replay_teacher_v_current`` and ``replay_teacher_v_next`` from
+        the batch and raises a precise error if they are missing.  In debug
+        validation mode, recomputes live Teacher values for a random subset of
+        rows and asserts max abs error ≤ 1e-6.
+        """
+        validate_fraction = float(
+            getattr(self.cfg, "teacher_value_cache_validate_fraction", 0.0)
+        )
+        cache_present = (
+            REPLAY_TEACHER_V_CURRENT_KEY in batch
+            and REPLAY_TEACHER_V_NEXT_KEY in batch
+        )
+        if not cache_present:
+            if validate_fraction == 0.0:
+                raise KeyError(
+                    "TVKD value shaping requires precomputed Teacher-value cache "
+                    f"fields '{REPLAY_TEACHER_V_CURRENT_KEY}' and "
+                    f"'{REPLAY_TEACHER_V_NEXT_KEY}' in the replay batch. "
+                    "These are missing, indicating the replay ring was built "
+                    "without the cache schema. Rebuild with a fresh training run "
+                    "or set teacher_value_cache_validate_fraction > 0 to enable "
+                    "the debug live-inference fallback."
+                )
+            # Debug-only live fallback for incremental testing.
+            return compute_teacher_value_terms(
+                self.get_frozen_teacher_value,
+                batch["critic_observations"],
+                batch["next_critic_observations"],
+                batch["rewards"],
+                terminated=terminated,
+                command_finished=command_finished,
+                time_limit=time_limit,
+                replay_discount=batch["discounts"],
+                gamma=float(self.cfg.gamma),
+                semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
+                tvkd_lambda=float(self.cfg.tvkd_lambda),
+                potential_clip=self.cfg.tvkd_potential_clip,
+            )
+
+        teacher_v = batch[REPLAY_TEACHER_V_CURRENT_KEY].detach().float().reshape(-1)
+        teacher_v_next = batch[REPLAY_TEACHER_V_NEXT_KEY].detach().float().reshape(-1)
+
+        if validate_fraction > 0.0:
+            # Randomly sample a subset and compare live vs. cached values.
+            batch_size = teacher_v.shape[0]
+            num_validate = max(1, int(round(validate_fraction * batch_size)))
+            validate_indices = torch.randperm(
+                batch_size, device=teacher_v.device
+            )[:num_validate]
+            snapshot = self._vecnorm_snapshot()
+            obs_validate = self._normalize_replay_flat(
+                batch["critic_observations"].index_select(0, validate_indices),
+                self.q_critic_keys,
+                self._q_critic_widths,
+                snapshot,
+            )
+            next_obs_validate = self._normalize_replay_flat(
+                batch["next_critic_observations"].index_select(0, validate_indices),
+                self.q_critic_keys,
+                self._q_critic_widths,
+                snapshot,
+            )
+            live_v = self.get_frozen_teacher_value(obs_validate).float()
+            live_v_next = self.get_frozen_teacher_value(next_obs_validate).float()
+            cached_v = teacher_v.index_select(0, validate_indices)
+            cached_v_next = teacher_v_next.index_select(0, validate_indices)
+            max_err_v = (live_v - cached_v).abs().max().item()
+            max_err_v_next = (live_v_next - cached_v_next).abs().max().item()
+            tolerance = 1e-6
+            if max_err_v > tolerance or max_err_v_next > tolerance:
+                raise RuntimeError(
+                    f"Teacher-value cache validation failed: "
+                    f"max_err_v={max_err_v:.3e}, "
+                    f"max_err_v_next={max_err_v_next:.3e} "
+                    f"(tolerance={tolerance:.0e}). "
+                    "The cached values do not match live frozen-Teacher inference."
+                )
+
+        # Compute shaping from cached values without calling the frozen critic.
+        raw_reward = batch["rewards"].detach().float().reshape(-1)
+        if not torch.isfinite(raw_reward).all():
+            raise RuntimeError("TVKD raw reward contains NaN/Inf")
+
+        potential_clip = self.cfg.tvkd_potential_clip
+        fixed_v = teacher_v
+        fixed_v_next = teacher_v_next
+        if potential_clip is not None:
+            clip = _finite_scalar("potential_clip", potential_clip, positive=True)
+            fixed_v = fixed_v.clamp(-clip, clip)
+            fixed_v_next = fixed_v_next.clamp(-clip, clip)
+
+        fixed_continuation = compute_teacher_value_continuation(
+            teacher_v=fixed_v,
+            teacher_v_next=fixed_v_next,
+            terminated=terminated,
+            command_finished=command_finished,
+            time_limit=time_limit,
+            replay_discount=batch["discounts"],
+            gamma=float(self.cfg.gamma),
+            semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
+        )
+        raw_continuation = compute_teacher_value_continuation(
+            teacher_v=teacher_v,
+            teacher_v_next=teacher_v_next,
+            terminated=terminated,
+            command_finished=command_finished,
+            time_limit=time_limit,
+            replay_discount=batch["discounts"],
+            gamma=float(self.cfg.gamma),
+            semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
+        )
+        potential_delta = fixed_continuation - fixed_v
+        shaped_reward = raw_reward + float(self.cfg.tvkd_lambda) * potential_delta
+        teacher_td_residual = raw_reward + raw_continuation - teacher_v
+        for name, value in (
+            ("potential delta", potential_delta),
+            ("shaped reward", shaped_reward),
+            ("Teacher TD residual", teacher_td_residual),
+        ):
+            if not torch.isfinite(value).all():
+                raise RuntimeError(f"TVKD {name} contains NaN/Inf")
+        return TeacherValueTerms(
+            teacher_v=teacher_v.detach(),
+            teacher_v_next=teacher_v_next.detach(),
+            potential_delta=potential_delta.detach(),
+            shaped_reward=shaped_reward.detach(),
+            teacher_td_residual=teacher_td_residual.detach(),
+        )
 
     def _tvkd_enabled(self) -> bool:
         return (
@@ -991,20 +1209,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
         bootstrap = (batch["truncations"].bool() | ~done).float()
         effective_discount = float(self.cfg.gamma) * batch["discounts"]
-        terms = compute_teacher_value_terms(
-            self.get_frozen_teacher_value,
-            batch["critic_observations"],
-            batch["next_critic_observations"],
-            batch["rewards"],
-            terminated=terminated,
-            command_finished=command_finished,
-            time_limit=time_limit,
-            replay_discount=batch["discounts"],
-            gamma=float(self.cfg.gamma),
-            semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
-            tvkd_lambda=float(self.cfg.tvkd_lambda),
-            potential_clip=self.cfg.tvkd_potential_clip,
-        )
+        terms = self._teacher_value_terms_from_batch(batch, terminated, command_finished, time_limit)
         alpha = self.log_alpha.exp()
         entropy_tax = effective_discount * bootstrap * alpha * next_log_prob
         soft_reward = terms.shaped_reward.to(entropy_tax) - entropy_tax
@@ -1223,21 +1428,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
         replay_discount = rollout["next", "discount"].reshape(num_envs, num_steps)
         truncation = _vaic_truncation_mask(rollout).reshape(num_envs, num_steps)
-        q_bootstrap = (truncation | ~done).float()
+        q_bootstrap = truncation | ~done
         state_rows = []
         state_ids = []
-        current_state_ids = []
-        next_state_ids = []
-        reward_rows = []
-        q_bootstrap_rows = []
-        terminated_rows = []
-        command_finished_rows = []
-        time_limit_rows = []
-        replay_discount_rows = []
-        flat_positions = []
-        env_state_base = torch.arange(
-            num_envs, device=student.device, dtype=torch.long
-        ) * (num_steps + 1)
         # A timeout's real next observation is captured immediately before the
         # environment resets.  Give those states IDs outside the regular
         # rollout grid so they cannot alias the reset state at ``step + 1``.
@@ -1256,11 +1449,13 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 [batch["next_critic_observations"] for batch in truncation_batches],
                 dim=0,
             ).to(device=student.device)
-            if (
+            sorted_captured_indices = captured_indices.sort().values
+            invalid_captured_indices = (
                 (captured_indices < 0).any()
-                or (captured_indices >= num_envs * num_steps).any()
-                or captured_indices.unique().numel() != captured_indices.numel()
-            ):
+                | (captured_indices >= num_envs * num_steps).any()
+                | (sorted_captured_indices[1:] == sorted_captured_indices[:-1]).any()
+            )
+            if bool(invalid_captured_indices):
                 raise RuntimeError("Bottleneck timeout-final indices are invalid")
             captured_student = student.reshape(-1).index_select(0, captured_indices)
             captured_indices = captured_indices[captured_student]
@@ -1273,63 +1468,62 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             timeout_next_id_by_transition.index_copy_(0, captured_indices, virtual_ids)
             state_rows.append(captured_next_raw)
             state_ids.append(virtual_ids)
-        student_timeout = (student & truncation.bool()).reshape(-1)
-        if bool(student_timeout.any()) and bool(
-            (timeout_next_id_by_transition[student_timeout] < 0).any()
-        ):
+        missing_student_timeout = (
+            student.reshape(-1)
+            & truncation.reshape(-1)
+            & (timeout_next_id_by_transition < 0)
+        )
+        if bool(missing_student_timeout.any()):
             raise RuntimeError(
                 "Bottleneck replay lacks a captured timeout-final observation"
             )
-        previous_bootstrap_student = torch.zeros(
-            num_envs, dtype=torch.bool, device=student.device
-        )
-        current_raw = self._cat_replay_sources(rollout[:, 0], self.q_critic_keys)
-        for step in range(num_steps):
-            current_needed = student[:, step] | previous_bootstrap_student
-            needed_envs = current_needed.nonzero(as_tuple=False).squeeze(-1)
-            state_rows.append(current_raw[current_needed])
-            state_ids.append(env_state_base[needed_envs] + step)
-            next_raw = (
-                self._cat_replay_sources(rollout[:, step + 1], self.q_critic_keys)
-                if step + 1 < num_steps
-                else final_batch["next_critic_observations"].reshape(
-                    num_envs, self._q_critic_dim
-                )
-            )
-            mask = student[:, step]
-            reward_rows.append(reward[:, step][mask])
-            q_bootstrap_rows.append(q_bootstrap[:, step][mask])
-            terminated_rows.append(terminated[:, step][mask])
-            command_finished_rows.append(command_finished[:, step][mask])
-            time_limit_rows.append(time_limit[:, step][mask])
-            replay_discount_rows.append(replay_discount[:, step][mask])
-            env_indices = mask.nonzero(as_tuple=False).squeeze(-1)
-            current_state_ids.append(env_state_base[env_indices] + step)
-            flat_position = env_indices * num_steps + step
-            regular_next_ids = env_state_base[env_indices] + step + 1
-            timeout_next_ids = timeout_next_id_by_transition.index_select(
-                0, flat_position
-            )
-            next_state_ids.append(
-                torch.where(
-                    truncation[:, step][mask],
-                    timeout_next_ids,
-                    regular_next_ids,
-                )
-            )
-            flat_positions.append(flat_position)
-            previous_bootstrap_student = (
-                mask & q_bootstrap[:, step].bool() & ~truncation[:, step]
-            )
-            current_raw = next_raw
 
-        final_envs = previous_bootstrap_student.nonzero(as_tuple=False).squeeze(-1)
-        state_rows.append(current_raw[previous_bootstrap_student])
-        state_ids.append(env_state_base[final_envs] + num_steps)
+        # This fixed mask is algebraically identical to the former step loop:
+        # every Student row needs its current state, while only an ordinary
+        # bootstrapping row needs the regular state at ``step + 1``.  A pure
+        # timeout instead uses the virtual final state registered above.
+        regular_state_needed = torch.zeros(
+            (num_envs, num_steps + 1),
+            dtype=torch.bool,
+            device=student.device,
+        )
+        regular_state_needed[:, :num_steps] |= student
+        regular_state_needed[:, 1:] |= student & q_bootstrap & ~truncation
+
+        rollout_state_coordinates = regular_state_needed[:, :num_steps].nonzero(
+            as_tuple=False
+        )
+        rollout_state_envs = rollout_state_coordinates[:, 0]
+        rollout_state_steps = rollout_state_coordinates[:, 1]
+        # Index only the critic source leaves. Advanced-indexing the complete
+        # rollout would also gather every perception/history/statistics tensor.
+        replay_source_keys = (
+            *self.q_critic_keys,
+            *(self._raw_replay_key(key) for key in self.q_critic_keys),
+        )
+        rollout_sources = rollout.select(*replay_source_keys, strict=False)
+        state_rows.append(
+            self._cat_replay_sources(
+                rollout_sources[rollout_state_envs, rollout_state_steps],
+                self.q_critic_keys,
+            )
+        )
+        state_ids.append(rollout_state_envs * (num_steps + 1) + rollout_state_steps)
+
+        final_envs = (
+            regular_state_needed[:, num_steps].nonzero(as_tuple=False).squeeze(-1)
+        )
+        state_rows.append(
+            final_batch["next_critic_observations"]
+            .reshape(num_envs, self._q_critic_dim)
+            .index_select(0, final_envs)
+        )
+        state_ids.append(final_envs * (num_steps + 1) + num_steps)
+
         all_state_ids = torch.cat(state_ids, dim=0)
-        if all_state_ids.unique().numel() != all_state_ids.numel():
-            raise RuntimeError("Bottleneck Teacher state cache contains duplicates")
         sorted_state_ids, order = all_state_ids.sort()
+        if bool((sorted_state_ids[1:] <= sorted_state_ids[:-1]).any()):
+            raise RuntimeError("Bottleneck Teacher state cache contains duplicates")
         raw_states = torch.cat(state_rows, dim=0).index_select(0, order)
         snapshot = self._vecnorm_snapshot()
         states = self._normalize_replay_flat(
@@ -1339,40 +1533,72 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             snapshot,
         )
         state_values = self._batched_frozen_teacher_value(states).float()
-        current_ids = torch.cat(current_state_ids, dim=0)
-        next_ids = torch.cat(next_state_ids, dim=0)
+
+        # ``nonzero`` on the transposed mask retains the former loop's exact
+        # step-major, then environment-major transition order.
+        transition_coordinates = student.transpose(0, 1).nonzero(as_tuple=False)
+        transition_steps = transition_coordinates[:, 0]
+        transition_envs = transition_coordinates[:, 1]
+        flat_positions = transition_envs * num_steps + transition_steps
+        current_ids = transition_envs * (num_steps + 1) + transition_steps
+        regular_next_ids = current_ids + 1
+        timeout_next_ids = timeout_next_id_by_transition.index_select(0, flat_positions)
+        transition_truncation = truncation[transition_envs, transition_steps]
+        next_ids = torch.where(
+            transition_truncation,
+            timeout_next_ids,
+            regular_next_ids,
+        )
         current_positions = torch.searchsorted(sorted_state_ids, current_ids)
         teacher_v = state_values.index_select(0, current_positions)
-        transition_q_bootstrap = torch.cat(q_bootstrap_rows, dim=0).float()
-        teacher_v_next = torch.zeros_like(teacher_v)
-        q_bootstrap_rows_mask = transition_q_bootstrap.bool()
-        if bool(q_bootstrap_rows_mask.any()):
-            next_positions = torch.searchsorted(
-                sorted_state_ids, next_ids[q_bootstrap_rows_mask]
-            )
-            teacher_v_next[q_bootstrap_rows_mask] = state_values.index_select(
-                0, next_positions
-            )
+        transition_q_bootstrap = q_bootstrap[transition_envs, transition_steps]
+        # Current IDs are always present, so they are a safe lookup placeholder
+        # for physical/command boundaries whose next value must remain zero.
+        lookup_next_ids = torch.where(
+            transition_q_bootstrap,
+            next_ids,
+            current_ids,
+        )
+        next_positions = torch.searchsorted(sorted_state_ids, lookup_next_ids)
+        looked_up_next = state_values.index_select(0, next_positions)
+        teacher_v_next = torch.where(
+            transition_q_bootstrap,
+            looked_up_next,
+            torch.zeros_like(looked_up_next),
+        )
         teacher_continuation = compute_teacher_value_continuation(
             teacher_v=teacher_v,
             teacher_v_next=teacher_v_next,
-            terminated=torch.cat(terminated_rows, dim=0),
-            command_finished=torch.cat(command_finished_rows, dim=0),
-            time_limit=torch.cat(time_limit_rows, dim=0),
-            replay_discount=torch.cat(replay_discount_rows, dim=0),
+            terminated=terminated[transition_envs, transition_steps],
+            command_finished=command_finished[transition_envs, transition_steps],
+            time_limit=time_limit[transition_envs, transition_steps],
+            replay_discount=replay_discount[transition_envs, transition_steps],
             gamma=float(self.cfg.gamma),
             semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
         )
         transition_residual = (
-            torch.cat(reward_rows, dim=0).float() + teacher_continuation - teacher_v
+            reward[transition_envs, transition_steps].float()
+            + teacher_continuation
+            - teacher_v
         )
         if not torch.isfinite(transition_residual).all():
             raise RuntimeError("Bottleneck Teacher TD residual contains NaN/Inf")
         residual_grid.reshape(-1).index_copy_(
             0,
-            torch.cat(flat_positions, dim=0),
+            flat_positions,
             transition_residual.to(residual_grid),
         )
+        # Also populate per-transition value grids for the replay cache.
+        v_current_grid = torch.zeros(
+            (num_envs, num_steps), dtype=torch.float32, device=student.device
+        )
+        v_next_grid = torch.zeros(
+            (num_envs, num_steps), dtype=torch.float32, device=student.device
+        )
+        v_current_grid.reshape(-1).index_copy_(0, flat_positions, teacher_v.float())
+        v_next_grid.reshape(-1).index_copy_(0, flat_positions, teacher_v_next.float())
+        self._rollout_teacher_v_current_grid = v_current_grid
+        self._rollout_teacher_v_next_grid = v_next_grid
         return residual_grid
 
     def _student_bottleneck_anchor_indices(
@@ -1669,6 +1895,25 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             ):
                 self._reset_failure_curriculum_state()
             self._verified_failure_motion_phase_histogram = {}
+            # When value shaping is active without bottleneck detection, compute
+            # the value grids needed to populate the replay cache.
+            if (
+                self._needs_teacher_value_cache()
+                and len(rollout.batch_size) == 2
+                and isinstance(getattr(self, "_rollout_final_batch", None), Mapping)
+                and DAGGER_IS_STUDENT_ACTION_KEY in rollout.keys(True, True)
+            ):
+                ne, ns = (int(v) for v in rollout.batch_size)
+                student_mask = (
+                    rollout[DAGGER_IS_STUDENT_ACTION_KEY]
+                    .reshape(ne, ns, -1)
+                    .bool()
+                    .any(dim=-1)
+                )
+                self._student_teacher_td_residual_grid(rollout, student_mask)
+            else:
+                self._rollout_teacher_v_current_grid = None
+                self._rollout_teacher_v_next_grid = None
             return 0
         if len(rollout.batch_size) != 2:
             raise ValueError("bottleneck tracking requires an [env,time] rollout")
@@ -1680,6 +1925,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             self._student_replay_env_episode_steps = None
             self._student_replay_episode_id_grid = None
             self._student_replay_episode_step_grid = None
+            self._rollout_teacher_v_current_grid = None
+            self._rollout_teacher_v_next_grid = None
             events = getattr(self, "_pending_student_focus_events", None)
             if events is not None:
                 events.clear()
@@ -1943,6 +2190,36 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 transitions[STUDENT_REPLAY_EPISODE_ID_KEY] = episode_ids
                 transitions[STUDENT_REPLAY_EPISODE_STEP_KEY] = episode_steps
                 transitions[FAILURE_PHASE_STUDENT_SOURCE_KEY] = matched
+                # Attach Teacher-value cache fields for every transition so the
+                # replay ring is allocated with the complete schema on the first
+                # extend.  Non-Student rows are later filtered to the student
+                # replay before extend is called, so their zero values are never
+                # persisted.
+                if self._needs_teacher_value_cache():
+                    v_current_grid = self._rollout_teacher_v_current_grid
+                    v_next_grid = self._rollout_teacher_v_next_grid
+                    target_device = transitions["rewards"].device
+                    if (
+                        v_current_grid is not None
+                        and v_next_grid is not None
+                        and id_grid is not None
+                    ):
+                        env_idx_cpu = transitions[_PREFILL_ENV_INDEX_KEY].long().cpu()
+                        step_idx_cpu = transitions[_PREFILL_STEP_INDEX_KEY].long().cpu()
+                        v_current = v_current_grid[env_idx_cpu, step_idx_cpu].to(
+                            device=target_device, dtype=torch.float32
+                        )
+                        v_next = v_next_grid[env_idx_cpu, step_idx_cpu].to(
+                            device=target_device, dtype=torch.float32
+                        )
+                    else:
+                        zero = transitions["rewards"].new_zeros(
+                            transitions["rewards"].shape[0], dtype=torch.float32
+                        )
+                        v_current = zero
+                        v_next = zero
+                    transitions[REPLAY_TEACHER_V_CURRENT_KEY] = v_current
+                    transitions[REPLAY_TEACHER_V_NEXT_KEY] = v_next
                 yield transitions
         finally:
             found = torch.cat(found_keys).unique().numel() if found_keys else 0
@@ -1956,6 +2233,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             pending_events.clear()
             self._student_replay_episode_id_grid = None
             self._student_replay_episode_step_grid = None
+            self._rollout_teacher_v_current_grid = None
+            self._rollout_teacher_v_next_grid = None
 
     @staticmethod
     def _mean_optional_metric(
@@ -2189,6 +2468,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "method": TRAINING_ALGORITHM,
                 "teacher_value_semantics": CRITIC_LEARNING_SEMANTICS,
                 "bc_loss": "fixed_joint_valid_teacher_label_normalized_smooth_l1",
+                "teacher_value_cache_semantics": (
+                    TEACHER_VALUE_CACHE_SEMANTICS
+                    if self._needs_teacher_value_cache()
+                    else "disabled"
+                ),
             }
         )
         return common

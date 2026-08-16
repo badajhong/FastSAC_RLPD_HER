@@ -153,6 +153,16 @@ REPLAY_SOURCE_ORDER = (
     REPLAY_SOURCE_UNIFORM_TEACHER,
     REPLAY_SOURCE_FAILURE_TEACHER,
 ) = range(len(REPLAY_SOURCE_ORDER))
+_REPLAY_MIX_DEVICE_COUNTER_KEYS = (
+    "intrinsic_focused_rows",
+    "failure_provenance_rows",
+    "uniform_intrinsic_rows",
+    "uniform_rows",
+    "duplicate_rows",
+    "valid_rows",
+    *(f"actual_{source}_rows" for source in REPLAY_SOURCE_ORDER),
+    *(f"valid_{source}_rows" for source in REPLAY_SOURCE_ORDER),
+)
 STUDENT_REPLAY_EPISODE_ID_KEY = "student_replay_episode_id"
 STUDENT_REPLAY_EPISODE_STEP_KEY = "student_replay_episode_step"
 _PREFILL_ENV_INDEX_KEY = "_teacher_prefill_env_index"
@@ -1570,6 +1580,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._teacher_phase_device_cache: dict[
             str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
+        self._verified_teacher_focus_device_cache: dict[
+            str,
+            tuple[
+                tuple,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ] = {}
         self._failure_histogram_device_cache: dict[str, tuple[int, torch.Tensor]] = {}
         self._teacher_phase_index_ready = False
         self._failure_phase_episode_count = 0
@@ -2257,6 +2276,27 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             pending.extend([] for _ in range(num_envs - len(pending)))
 
     @torch.no_grad()
+    def _post_process_teacher_prefill_episode(
+        self, episode: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Optionally augment a committed Teacher episode before ring storage.
+
+        Subclasses that precompute per-transition quantities (e.g. frozen
+        Teacher-value cache fields) override this method to add those fields
+        to ``episode`` before ``q_teacher_replay.extend`` allocates storage.
+        The default is a no-op that returns ``episode`` unchanged.
+        """
+        return episode
+
+    def _q_replay_prefill_storage_fields(self) -> tuple[str, ...]:
+        """Fields sourced from rollout transitions during Teacher prefill.
+
+        Subclasses that add post-computed cache fields to ``_q_replay_storage_fields``
+        should exclude those fields here so ``_stage_teacher_prefill_rows`` does not
+        try to read them from the in-flight rollout transitions dict.
+        """
+        return self._q_replay_storage_fields()
+
     def _stage_teacher_prefill_rows(
         self,
         transitions: dict[str, torch.Tensor],
@@ -2272,7 +2312,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         rows may execute the deterministic Student as an environment fallback,
         but are never staged as Teacher replay data.
         """
-        replay_fields = self._q_replay_storage_fields()
+        replay_fields = self._q_replay_prefill_storage_fields()
         required = set(replay_fields).union(
             _PREFILL_INTERNAL_FIELDS,
             {
@@ -2445,6 +2485,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     key: torch.cat([chunk[key] for chunk in chunks], dim=0)
                     for key in replay_fields
                 }
+                episode = self._post_process_teacher_prefill_episode(episode)
                 rows = self.q_teacher_replay.extend(episode)
             else:
                 rows = 0
@@ -2782,7 +2823,22 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         mapping = getattr(self, "_verified_failure_motion_phase_histogram", None)
         if not isinstance(mapping, Mapping) or not mapping:
             empty_rows = torch.empty(0, dtype=torch.long)
-            return empty_rows, torch.empty(0, dtype=torch.float64)
+            empty_weights = torch.empty(0, dtype=torch.float64)
+            signature = ("empty", int(self.q_teacher_replay.size))
+            cached = getattr(self, "_verified_teacher_focus_pool_cache", None)
+            if (
+                isinstance(cached, tuple)
+                and len(cached) == 3
+                and cached[0] == signature
+            ):
+                return cached[1], cached[2]
+            self._verified_teacher_focus_pool_cache = (
+                signature,
+                empty_rows,
+                empty_weights,
+            )
+            getattr(self, "_verified_teacher_focus_device_cache", {}).clear()
+            return empty_rows, empty_weights
         if not bool(getattr(self, "_teacher_phase_index_ready", False)):
             self._build_teacher_phase_index()
 
@@ -2854,20 +2910,46 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         rows = (row_weights > 0).nonzero(as_tuple=False).squeeze(-1)
         weights = row_weights.index_select(0, rows)
         self._verified_teacher_focus_pool_cache = (signature, rows, weights)
+        getattr(self, "_verified_teacher_focus_device_cache", {}).clear()
         return rows, weights
+
+    def _verified_teacher_focus_tensors(
+        self, device
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Cache exact focused rows, weights, and dense membership per device."""
+        device = torch.device(device)
+        rows, weights = self._verified_teacher_focus_pool()
+        signature = self._verified_teacher_focus_pool_cache[0]
+        cache = getattr(self, "_verified_teacher_focus_device_cache", None)
+        if cache is None:
+            cache = {}
+            self._verified_teacher_focus_device_cache = cache
+        key = str(device)
+        entry = cache.get(key)
+        if entry is None or entry[0] != signature:
+            device_rows = rows.to(device)
+            device_weights = weights.to(device)
+            membership = torch.zeros(
+                int(self.q_teacher_replay.size), dtype=torch.bool, device=device
+            )
+            if device_rows.numel():
+                membership[device_rows] = True
+            entry = (signature, device_rows, device_weights, membership)
+            cache[key] = entry
+        return entry[1], entry[2], entry[3]
 
     def _teacher_intrinsic_focused_mask(self, indices: torch.Tensor) -> torch.Tensor:
         """Return dynamic membership in the current verified Teacher focus pool."""
         if indices.numel() == 0:
             return torch.zeros(indices.shape, dtype=torch.bool, device=indices.device)
         if self._has_canonical_replay_mix():
-            rows, _ = self._verified_teacher_focus_pool()
+            rows, _, membership = self._verified_teacher_focus_tensors(indices.device)
             if rows.numel() == 0:
                 return torch.zeros(
                     indices.shape, dtype=torch.bool, device=indices.device
                 )
-            result = torch.isin(indices.detach().long().cpu(), rows)
-            return result.to(indices.device)
+            flat_indices = indices.detach().reshape(-1).long().to(membership.device)
+            return membership.index_select(0, flat_indices).reshape(indices.shape)
 
         histogram = getattr(self, "_failure_phase_histogram", None)
         if (
@@ -2977,7 +3059,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         return batch
 
     def _reset_replay_mix_rollout_metrics(self) -> None:
-        self._replay_mix_rollout_metrics: dict[str, dict[str, float]] = {}
+        self._replay_mix_rollout_metrics: dict[
+            str, dict[str, float | torch.Tensor]
+        ] = {}
 
     def _record_replay_mix_batch(
         self,
@@ -2998,63 +3082,81 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             and is_teacher.numel() == rows
         ):
             raise ValueError("replay metric metadata is misaligned")
-        accumulator = self._replay_mix_rollout_metrics.setdefault(
-            purpose,
-            {
+        accumulator = self._replay_mix_rollout_metrics.get(purpose)
+        if accumulator is None:
+            accumulator = {
                 "batches": 0.0,
                 "rows": 0.0,
-                "intrinsic_focused_rows": 0.0,
-                "failure_provenance_rows": 0.0,
-                "uniform_intrinsic_rows": 0.0,
-                "uniform_rows": 0.0,
-                "duplicate_rows": 0.0,
-                "valid_rows": 0.0,
                 **{f"requested_{source}_rows": 0.0 for source in REPLAY_SOURCE_ORDER},
-                **{f"actual_{source}_rows": 0.0 for source in REPLAY_SOURCE_ORDER},
-                **{f"valid_{source}_rows": 0.0 for source in REPLAY_SOURCE_ORDER},
-            },
-        )
+                **{
+                    key: torch.zeros((), dtype=torch.int64, device=provenance.device)
+                    for key in _REPLAY_MIX_DEVICE_COUNTER_KEYS
+                },
+            }
+            self._replay_mix_rollout_metrics[purpose] = accumulator
         accumulator["batches"] += 1.0
         accumulator["rows"] += float(rows)
         failure = (provenance == REPLAY_SOURCE_FAILURE_STUDENT) | (
             provenance == REPLAY_SOURCE_FAILURE_TEACHER
         )
         uniform = ~failure
-        accumulator["intrinsic_focused_rows"] += float(intrinsic.sum().item())
-        accumulator["failure_provenance_rows"] += float(failure.sum().item())
-        accumulator["uniform_intrinsic_rows"] += float(
-            (uniform & intrinsic).sum().item()
-        )
-        accumulator["uniform_rows"] += float(uniform.sum().item())
         composite = physical + is_teacher.long() * int(self.dagger_replay.capacity)
-        accumulator["duplicate_rows"] += float(rows - int(composite.unique().numel()))
+        ordered_composite = composite.sort().values
+        duplicate_rows = (ordered_composite[1:] == ordered_composite[:-1]).sum()
         if valid_mask is None:
             valid = torch.ones(rows, dtype=torch.bool, device=provenance.device)
         else:
             valid = valid_mask.reshape(-1).bool().to(provenance.device)
             if valid.numel() != rows:
                 raise ValueError("perception valid mask is misaligned")
-        accumulator["valid_rows"] += float(valid.sum().item())
-        for source_id, source in enumerate(REPLAY_SOURCE_ORDER):
-            source_mask = provenance == source_id
+
+        source_masks = torch.stack(
+            [provenance == source_id for source_id in range(len(REPLAY_SOURCE_ORDER))]
+        )
+        batch_device_counts = (
+            intrinsic.sum(),
+            failure.sum(),
+            (uniform & intrinsic).sum(),
+            uniform.sum(),
+            duplicate_rows,
+            valid.sum(),
+            *source_masks.sum(dim=-1).unbind(),
+            *(source_masks & valid.unsqueeze(0)).sum(dim=-1).unbind(),
+        )
+        for key, value in zip(
+            _REPLAY_MIX_DEVICE_COUNTER_KEYS, batch_device_counts, strict=True
+        ):
+            target = accumulator[key]
+            if not torch.is_tensor(target) or target.device != provenance.device:
+                raise RuntimeError("replay metric accumulator device changed")
+            target.add_(value)
+        for source in REPLAY_SOURCE_ORDER:
             accumulator[f"requested_{source}_rows"] += float(
                 int(requested_counts[source])
-            )
-            accumulator[f"actual_{source}_rows"] += float(source_mask.sum().item())
-            accumulator[f"valid_{source}_rows"] += float(
-                (source_mask & valid).sum().item()
             )
 
     def _replay_mix_metrics(self, purpose: str) -> dict[str, float]:
         fractions = self._replay_mix_fractions(purpose)
         accumulator = self._replay_mix_rollout_metrics.get(purpose, {})
         rows = float(accumulator.get("rows", 0.0))
-        valid_rows = float(accumulator.get("valid_rows", 0.0))
+        device_counters: dict[str, float] = {}
+        if accumulator:
+            packed_counters = torch.stack(
+                [
+                    torch.as_tensor(accumulator[key]).detach().long()
+                    for key in _REPLAY_MIX_DEVICE_COUNTER_KEYS
+                ]
+            )
+            host_counters = packed_counters.to("cpu").tolist()
+            device_counters = dict(
+                zip(_REPLAY_MIX_DEVICE_COUNTER_KEYS, host_counters, strict=True)
+            )
+        valid_rows = float(device_counters.get("valid_rows", 0.0))
         result: dict[str, float] = {}
         for source in REPLAY_SOURCE_ORDER:
             requested = float(accumulator.get(f"requested_{source}_rows", 0.0))
-            actual = float(accumulator.get(f"actual_{source}_rows", 0.0))
-            valid = float(accumulator.get(f"valid_{source}_rows", 0.0))
+            actual = float(device_counters.get(f"actual_{source}_rows", 0.0))
+            valid = float(device_counters.get(f"valid_{source}_rows", 0.0))
             result[f"configured_{source}_fraction"] = float(fractions[source])
             result[f"requested_{source}_rows"] = requested
             result[f"requested_{source}_fraction"] = requested / max(rows, 1.0)
@@ -3073,17 +3175,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             0.0,
         )
         result["intrinsic_focused_row_fraction"] = float(
-            accumulator.get("intrinsic_focused_rows", 0.0)
+            device_counters.get("intrinsic_focused_rows", 0.0)
         ) / max(rows, 1.0)
         result["failure_stratum_provenance_fraction"] = float(
-            accumulator.get("failure_provenance_rows", 0.0)
+            device_counters.get("failure_provenance_rows", 0.0)
         ) / max(rows, 1.0)
         result["duplicate_row_fraction"] = float(
-            accumulator.get("duplicate_rows", 0.0)
+            device_counters.get("duplicate_rows", 0.0)
         ) / max(rows, 1.0)
         result["uniform_draw_intrinsic_focused_fraction"] = float(
-            accumulator.get("uniform_intrinsic_rows", 0.0)
-        ) / max(float(accumulator.get("uniform_rows", 0.0)), 1.0)
+            device_counters.get("uniform_intrinsic_rows", 0.0)
+        ) / max(float(device_counters.get("uniform_rows", 0.0)), 1.0)
         result["sampled_rows"] = rows
         result["valid_loss_rows"] = valid_rows
         return result
@@ -3144,6 +3246,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._teacher_replay_phase_bins = phase_bins
         self._teacher_replay_motion_ids = motion_ids
         getattr(self, "_teacher_phase_device_cache", {}).clear()
+        self._verified_teacher_focus_pool_cache = None
+        getattr(self, "_verified_teacher_focus_device_cache", {}).clear()
         self._teacher_phase_index_ready = True
 
     def _teacher_phase_tensors(self, device):
@@ -3212,7 +3316,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 _uniform(count),
                 torch.zeros(count, dtype=torch.bool, device=generator_device),
             )
-        focused_pool, focused_weights = self._verified_teacher_focus_pool()
+        focused_pool, focused_weights, _ = self._verified_teacher_focus_tensors(
+            generator_device
+        )
         actual_focused = min(focused_count, int(focused_pool.numel()))
         if actual_focused == 0:
             self._failure_phase_uniform_fallback_rows = (
@@ -3223,16 +3329,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 _uniform(count),
                 torch.zeros(count, dtype=torch.bool, device=generator_device),
             )
-        weights = focused_weights.to(generator_device)
         focused_positions = torch.multinomial(
-            weights,
+            focused_weights,
             actual_focused,
             replacement=False,
             generator=generator,
         )
-        focused_rows = focused_pool.to(generator_device).index_select(
-            0, focused_positions
-        )
+        focused_rows = focused_pool.index_select(0, focused_positions)
         uniform_count = count - actual_focused
         indices = torch.cat((_uniform(uniform_count), focused_rows), dim=0)
         focused = torch.cat(

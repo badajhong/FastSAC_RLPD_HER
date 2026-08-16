@@ -27,6 +27,26 @@ vecnorm: ${oc.select:algo.vecnorm,train}
 
 camera_follow: true
 
+# Disabled-by-default, short-window CUDA-event profiler. For dynamic DAgger,
+# `phase: main_dagger` makes start_rollout=0 mean the first Student/main rollout
+# after the deterministic Teacher prefill, independent of prefill duration.
+wallclock_profile:
+  enabled: false
+  label: ""
+  phase: physical # physical | teacher_prefill | main_dagger
+  start_rollout: 0
+  num_rollouts: 4
+  cuda_events: true
+  # Separate one-rollout audit only: counts host scalar extraction and CUDA
+  # synchronization events, but torch.profiler perturbs low-overhead timing.
+  torch_profiler_sync_audit: false
+  nvml_sample_interval_s: 0.2
+  output_filename: wallclock_profile.json
+  # Profile-only convenience: omit the long final evaluation after training.
+  skip_final_evaluation: false
+  # Separately time the already-required final save plus a CPU-only load probe.
+  profile_final_checkpoint: false
+
 wandb:
   name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
   job_type: train

@@ -54,6 +54,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     LEGACY_TRAINING_ALGORITHM as TVKD_LEGACY_TRAINING_ALGORITHM,
     PREVIOUS_CHECKPOINT_VERSION as TVKD_PREVIOUS_CHECKPOINT_VERSION,
     PREVIOUS_TRAINING_ALGORITHM as TVKD_PREVIOUS_TRAINING_ALGORITHM,
+    REPLAY_TEACHER_V_CURRENT_KEY,
+    REPLAY_TEACHER_V_NEXT_KEY,
     V3_CHECKPOINT_VERSION as TVKD_V3_CHECKPOINT_VERSION,
     V3_TRAINING_ALGORITHM as TVKD_V3_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
@@ -747,6 +749,318 @@ def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward
     assert teacher_value_calls[0].squeeze(-1).tolist() == [1, 2, 3, 20, 30, 40]
 
 
+def _old_loop_teacher_residual_reference(
+    rollout: TensorDict,
+    student: torch.Tensor,
+    *,
+    final_batch: dict[str, torch.Tensor],
+    truncation_batches: list[dict[str, torch.Tensor]],
+    gamma: float,
+    teacher_value,
+) -> dict[str, torch.Tensor]:
+    """Test-only copy of the pre-vectorization state-selection loop."""
+    num_envs, num_steps = (int(value) for value in rollout.batch_size)
+    student = student.reshape(num_envs, num_steps).bool()
+    residual_grid = torch.zeros((num_envs, num_steps), dtype=torch.float32)
+    if not bool(student.any()):
+        return {
+            "residual": residual_grid,
+            "raw_states": torch.empty(0, rollout["critic"].shape[-1]),
+            "sorted_state_ids": torch.empty(0, dtype=torch.long),
+            "virtual_ids": torch.empty(0, dtype=torch.long),
+            "captured_student_raw": torch.empty(0, rollout["critic"].shape[-1]),
+        }
+
+    reward = rollout["next", "reward"].sum(dim=-1)
+    done = rollout["next", "done"].reshape(num_envs, num_steps).bool()
+    terminated = rollout["next", "terminated"].reshape(num_envs, num_steps).bool()
+    command_finished = (
+        rollout["next", "stats", "command_finished"].reshape(num_envs, num_steps).bool()
+    )
+    time_limit = (
+        rollout["next", "stats", "episode_time_limit"]
+        .reshape(num_envs, num_steps)
+        .bool()
+    )
+    replay_discount = rollout["next", "discount"].reshape(num_envs, num_steps)
+    truncation = time_limit & ~command_finished & ~terminated
+    q_bootstrap = truncation | ~done
+
+    state_rows = []
+    state_ids = []
+    current_state_ids = []
+    next_state_ids = []
+    reward_rows = []
+    q_bootstrap_rows = []
+    terminated_rows = []
+    command_finished_rows = []
+    time_limit_rows = []
+    replay_discount_rows = []
+    flat_positions = []
+    env_state_base = torch.arange(num_envs) * (num_steps + 1)
+    timeout_next_id_by_transition = torch.full(
+        (num_envs * num_steps,), -1, dtype=torch.long
+    )
+    virtual_ids = torch.empty(0, dtype=torch.long)
+    captured_student_raw = torch.empty(0, rollout["critic"].shape[-1])
+    if truncation_batches:
+        captured_indices = torch.cat(
+            [batch["indices"] for batch in truncation_batches], dim=0
+        ).long()
+        captured_next_raw = torch.cat(
+            [batch["next_critic_observations"] for batch in truncation_batches],
+            dim=0,
+        )
+        captured_student = student.reshape(-1).index_select(0, captured_indices)
+        captured_indices = captured_indices[captured_student]
+        captured_student_raw = captured_next_raw[captured_student]
+        virtual_ids = num_envs * (num_steps + 1) + torch.arange(
+            captured_indices.numel(), dtype=torch.long
+        )
+        timeout_next_id_by_transition.index_copy_(0, captured_indices, virtual_ids)
+        state_rows.append(captured_student_raw)
+        state_ids.append(virtual_ids)
+
+    previous_bootstrap_student = torch.zeros(num_envs, dtype=torch.bool)
+    current_raw = rollout["critic"][:, 0]
+    for step in range(num_steps):
+        current_needed = student[:, step] | previous_bootstrap_student
+        needed_envs = current_needed.nonzero(as_tuple=False).squeeze(-1)
+        state_rows.append(current_raw[current_needed])
+        state_ids.append(env_state_base[needed_envs] + step)
+        next_raw = (
+            rollout["critic"][:, step + 1]
+            if step + 1 < num_steps
+            else final_batch["next_critic_observations"]
+        )
+        mask = student[:, step]
+        reward_rows.append(reward[:, step][mask])
+        q_bootstrap_rows.append(q_bootstrap[:, step][mask])
+        terminated_rows.append(terminated[:, step][mask])
+        command_finished_rows.append(command_finished[:, step][mask])
+        time_limit_rows.append(time_limit[:, step][mask])
+        replay_discount_rows.append(replay_discount[:, step][mask])
+        env_indices = mask.nonzero(as_tuple=False).squeeze(-1)
+        current_state_ids.append(env_state_base[env_indices] + step)
+        flat_position = env_indices * num_steps + step
+        regular_next_ids = env_state_base[env_indices] + step + 1
+        timeout_next_ids = timeout_next_id_by_transition.index_select(0, flat_position)
+        next_state_ids.append(
+            torch.where(
+                truncation[:, step][mask],
+                timeout_next_ids,
+                regular_next_ids,
+            )
+        )
+        flat_positions.append(flat_position)
+        previous_bootstrap_student = mask & q_bootstrap[:, step] & ~truncation[:, step]
+        current_raw = next_raw
+
+    final_envs = previous_bootstrap_student.nonzero(as_tuple=False).squeeze(-1)
+    state_rows.append(current_raw[previous_bootstrap_student])
+    state_ids.append(env_state_base[final_envs] + num_steps)
+    all_state_ids = torch.cat(state_ids)
+    sorted_state_ids, order = all_state_ids.sort()
+    raw_states = torch.cat(state_rows).index_select(0, order)
+    state_values = teacher_value(raw_states).float()
+    current_ids = torch.cat(current_state_ids)
+    next_ids = torch.cat(next_state_ids)
+    teacher_v = state_values.index_select(
+        0, torch.searchsorted(sorted_state_ids, current_ids)
+    )
+    transition_q_bootstrap = torch.cat(q_bootstrap_rows).bool()
+    teacher_v_next = torch.zeros_like(teacher_v)
+    if bool(transition_q_bootstrap.any()):
+        next_positions = torch.searchsorted(
+            sorted_state_ids, next_ids[transition_q_bootstrap]
+        )
+        teacher_v_next[transition_q_bootstrap] = state_values.index_select(
+            0, next_positions
+        )
+    continuation = compute_teacher_value_continuation(
+        teacher_v=teacher_v,
+        teacher_v_next=teacher_v_next,
+        terminated=torch.cat(terminated_rows),
+        command_finished=torch.cat(command_finished_rows),
+        time_limit=torch.cat(time_limit_rows),
+        replay_discount=torch.cat(replay_discount_rows),
+        gamma=gamma,
+    )
+    transition_residual = torch.cat(reward_rows).float() + continuation - teacher_v
+    residual_grid.reshape(-1).index_copy_(
+        0, torch.cat(flat_positions), transition_residual
+    )
+    return {
+        "residual": residual_grid,
+        "raw_states": raw_states,
+        "sorted_state_ids": sorted_state_ids,
+        "virtual_ids": virtual_ids,
+        "captured_student_raw": captured_student_raw,
+    }
+
+
+def test_vectorized_rollout_teacher_residual_is_exact_old_loop_equivalent():
+    generator = torch.Generator().manual_seed(9_381)
+    gamma = 0.875
+    total_evaluated_states = 0
+    last_case = None
+
+    def raw_state(identifier: torch.Tensor) -> torch.Tensor:
+        identifier = identifier.float()
+        return torch.stack(
+            (
+                identifier + 0.125,
+                identifier * 0.5 + 0.25,
+                identifier * -0.25 + 0.5,
+            ),
+            dim=-1,
+        )
+
+    teacher_weights = torch.tensor([0.5, -0.25, 0.125])
+
+    def teacher_value(observation: torch.Tensor) -> torch.Tensor:
+        return (observation * teacher_weights).sum(dim=-1)
+
+    for case_index in range(32):
+        num_envs = int(torch.randint(2, 6, (), generator=generator))
+        num_steps = int(torch.randint(2, 8, (), generator=generator))
+        row_count = num_envs * num_steps
+        cause = torch.randint(0, 8, (row_count,), generator=generator)
+        boundary_coverage = torch.arange(min(row_count, 8), dtype=torch.long)
+        cause[: boundary_coverage.numel()] = boundary_coverage
+        cause = cause.reshape(num_envs, num_steps)
+        terminated = cause.bitwise_and(1).bool()
+        command_finished = cause.bitwise_and(2).bool()
+        time_limit = cause.bitwise_and(4).bool()
+        done = terminated | command_finished | time_limit
+        truncation = time_limit & ~command_finished & ~terminated
+
+        student = torch.rand((num_envs, num_steps), generator=generator) < (
+            0.35 + 0.01 * case_index
+        )
+        # Make every boundary-bit combination an executed Student row whenever
+        # the sampled grid has room for the complete coverage prefix.
+        student.reshape(-1)[: min(row_count, 8)] = True
+        pure_timeout_rows = truncation.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        if pure_timeout_rows.numel():
+            student.reshape(-1)[pure_timeout_rows[0]] = True
+
+        regular_ids = torch.arange(num_envs).unsqueeze(1) * (
+            num_steps + 1
+        ) + torch.arange(num_steps).unsqueeze(0)
+        rollout_raw = raw_state(regular_ids)
+        final_ids = torch.arange(num_envs) * (num_steps + 1) + num_steps
+        final_batch = {"next_critic_observations": raw_state(final_ids)}
+        timeout_raw_by_flat = raw_state(
+            torch.arange(row_count) + 10_000 + case_index * row_count
+        )
+        truncation_batches = []
+        for step in range(num_steps):
+            timeout_envs = truncation[:, step].nonzero(as_tuple=False).squeeze(-1)
+            if timeout_envs.numel():
+                flat_indices = timeout_envs * num_steps + step
+                truncation_batches.append(
+                    {
+                        "indices": flat_indices,
+                        "next_critic_observations": timeout_raw_by_flat.index_select(
+                            0, flat_indices
+                        ),
+                    }
+                )
+
+        reward = (
+            torch.randint(
+                -16, 17, (num_envs, num_steps, 2), generator=generator
+            ).float()
+            / 8.0
+        )
+        discount = (
+            torch.randint(1, 5, (num_envs, num_steps, 1), generator=generator).float()
+            / 4.0
+        )
+        rollout = TensorDict(
+            {
+                "critic": rollout_raw,
+                "next": TensorDict(
+                    {
+                        "reward": reward,
+                        "done": done.unsqueeze(-1),
+                        "discount": discount,
+                        "terminated": terminated.unsqueeze(-1),
+                        "stats": TensorDict(
+                            {
+                                "episode_time_limit": time_limit.unsqueeze(-1),
+                                "command_finished": command_finished.unsqueeze(-1),
+                            },
+                            batch_size=[num_envs, num_steps],
+                        ),
+                    },
+                    batch_size=[num_envs, num_steps],
+                ),
+            },
+            batch_size=[num_envs, num_steps],
+        )
+        expected = _old_loop_teacher_residual_reference(
+            rollout,
+            student,
+            final_batch=final_batch,
+            truncation_batches=truncation_batches,
+            gamma=gamma,
+            teacher_value=teacher_value,
+        )
+
+        policy = TVKDDistributionalFastSACTeacherBC.__new__(
+            TVKDDistributionalFastSACTeacherBC
+        )
+        nn.Module.__init__(policy)
+        policy.cfg = SimpleNamespace(gamma=gamma, q_batch_size=100_000)
+        policy.q_critic_keys = ("critic",)
+        policy._q_critic_widths = (3,)
+        policy._q_critic_dim = 3
+        policy._cat_replay_sources = lambda td, keys: td["critic"]
+        policy._vecnorm_snapshot = lambda: None
+        policy._normalize_replay_flat = lambda value, keys, widths, snapshot: value
+        policy._rollout_final_batch = final_batch
+        policy._truncation_final_batches = truncation_batches
+        teacher_calls = []
+
+        def recorded_teacher_value(observation):
+            teacher_calls.append(observation.clone())
+            return teacher_value(observation)
+
+        policy.get_frozen_teacher_value = recorded_teacher_value
+        actual = policy._student_teacher_td_residual_grid(rollout, student)
+
+        assert torch.equal(actual, expected["residual"])
+        assert len(teacher_calls) == 1
+        assert torch.equal(teacher_calls[0], expected["raw_states"])
+        assert teacher_calls[0].shape[0] == expected["sorted_state_ids"].numel()
+        total_evaluated_states += int(teacher_calls[0].shape[0])
+        virtual_ids = expected["virtual_ids"]
+        if virtual_ids.numel():
+            assert torch.equal(
+                virtual_ids,
+                num_envs * (num_steps + 1) + torch.arange(virtual_ids.numel()),
+            )
+            assert torch.equal(
+                expected["sorted_state_ids"][-virtual_ids.numel() :],
+                virtual_ids,
+            )
+            assert torch.equal(
+                teacher_calls[0][-virtual_ids.numel() :],
+                expected["captured_student_raw"],
+            )
+        last_case = (policy, rollout, teacher_calls)
+
+    assert total_evaluated_states > 0
+    policy, rollout, teacher_calls = last_case
+    teacher_calls.clear()
+    zero_student = torch.zeros(tuple(rollout.batch_size), dtype=torch.bool)
+    zero_residual = policy._student_teacher_td_residual_grid(rollout, zero_student)
+    assert torch.equal(zero_residual, torch.zeros_like(zero_residual))
+    assert teacher_calls == []
+
+
 def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source(
     monkeypatch,
 ):
@@ -1395,6 +1709,8 @@ def test_c51_support_metrics_preserve_both_q_heads_and_aggregate_head_totals(
         REPLAY_TERMINATED_KEY: torch.zeros(2, dtype=torch.bool),
         REPLAY_COMMAND_FINISHED_KEY: torch.zeros(2, dtype=torch.bool),
         REPLAY_TIME_LIMIT_KEY: torch.zeros(2, dtype=torch.bool),
+        REPLAY_TEACHER_V_CURRENT_KEY: torch.zeros(2),
+        REPLAY_TEACHER_V_NEXT_KEY: torch.zeros(2),
     }
 
     _, metrics, _ = policy._distributional_fastsac_target(batch)
@@ -1471,6 +1787,9 @@ def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
         REPLAY_TERMINATED_KEY: torch.tensor([False, True, False]),
         REPLAY_COMMAND_FINISHED_KEY: torch.zeros(3, dtype=torch.bool),
         REPLAY_TIME_LIMIT_KEY: torch.tensor([False, False, True]),
+        # Cached Teacher values: get_frozen_teacher_value = lambda obs: obs[:, 0]
+        REPLAY_TEACHER_V_CURRENT_KEY: torch.tensor([2.0, 3.0, 6.0]),
+        REPLAY_TEACHER_V_NEXT_KEY: torch.tensor([4.0, 5.0, 8.0]),
     }
     raw_reward_before = batch["rewards"].clone()
 

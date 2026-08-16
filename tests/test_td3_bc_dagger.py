@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from active_adaptation.learning.ppo.common import ACTION_KEY, OBS_KEY, OBS_PRIV_KEY
 from active_adaptation.learning.ppo.fastsac_vel import (
@@ -49,6 +50,12 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     PERCEPTION_WARMSTART_MODE_FRESH,
     PRETRAINED_PERCEPTION_MODULES,
     REFERENCE_PHASE_KEY,
+    REPLAY_INTRINSIC_FOCUSED_KEY,
+    REPLAY_MOTION_ID_KEY,
+    REPLAY_SAMPLE_IS_TEACHER_KEY,
+    REPLAY_SAMPLE_PHYSICAL_INDEX_KEY,
+    REPLAY_SAMPLE_PROVENANCE_KEY,
+    REPLAY_SOURCE_ORDER,
     TD3_BETA_KEY,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
@@ -4069,3 +4076,199 @@ def test_td3_inference_requires_exact_bounded_action_contract_fingerprint(
     )
     with pytest.raises(ValueError, match=message):
         policy.load_inference_state_dict(state)
+
+
+def _canonical_focus_cache_policy() -> DistributionalTD3TeacherBC:
+    canonical_fractions = {
+        f"{purpose}_{source}_fraction": 0.25
+        for purpose in ("q", "actor", "perception")
+        for source in REPLAY_SOURCE_ORDER
+    }
+    policy = _bare_policy(
+        **canonical_fractions,
+        failure_phase_num_bins=4,
+        max_teacher_phase_match_distance=None,
+    )
+    policy.q_teacher_replay = _TD3DeviceReplay(16, "cpu")
+    policy.dagger_replay = SimpleNamespace(capacity=16)
+    policy.q_teacher_replay.extend(
+        {
+            REFERENCE_PHASE_KEY: torch.tensor(
+                [0.05, 0.30, 0.35, 0.55, 0.30, 0.55, 0.60, 0.90]
+            ),
+            REPLAY_MOTION_ID_KEY: torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]),
+        }
+    )
+    motion_zero = torch.tensor([0.0, 2.0, 1.0, 0.0], dtype=torch.float64)
+    motion_one = torch.tensor([0.0, 0.0, 3.0, 0.0], dtype=torch.float64)
+    policy._verified_failure_motion_phase_histogram = {
+        0: motion_zero,
+        1: motion_one,
+    }
+    policy._teacher_phase_index_ready = False
+    policy._teacher_phase_device_cache = {}
+    policy._verified_teacher_focus_device_cache = {}
+    return policy
+
+
+@pytest.mark.parametrize(
+    "generator_device",
+    ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",),
+)
+def test_verified_teacher_focus_device_cache_preserves_draws_and_rng_exactly(
+    generator_device,
+):
+    policy = _canonical_focus_cache_policy()
+    reference_rows, reference_weights = policy._verified_teacher_focus_pool()
+    actual_generator = torch.Generator(device=generator_device).manual_seed(1771)
+    reference_generator = torch.Generator(device=generator_device).manual_seed(1771)
+
+    def reference_draw(count: int, focused_count: int):
+        actual_focused = min(focused_count, int(reference_rows.numel()))
+        positions = torch.multinomial(
+            reference_weights.to(reference_generator.device),
+            actual_focused,
+            replacement=False,
+            generator=reference_generator,
+        )
+        focused_rows = reference_rows.to(reference_generator.device).index_select(
+            0, positions
+        )
+        uniform_count = count - actual_focused
+        uniform_rows = torch.randint(
+            0,
+            policy.q_teacher_replay.size,
+            (uniform_count,),
+            device=reference_generator.device,
+            generator=reference_generator,
+        )
+        return (
+            torch.cat((uniform_rows, focused_rows)),
+            torch.cat(
+                (
+                    torch.zeros(uniform_count, dtype=torch.bool),
+                    torch.ones(actual_focused, dtype=torch.bool),
+                )
+            ).to(generator_device),
+        )
+
+    for count, focused_count in ((5, 3), (4, 2)):
+        expected_indices, expected_focused = reference_draw(count, focused_count)
+        actual_indices, actual_focused = policy._draw_verified_motion_teacher_indices(
+            count, actual_generator, focused_count=focused_count
+        )
+        assert torch.equal(actual_indices, expected_indices)
+        assert torch.equal(actual_focused, expected_focused)
+
+    assert torch.equal(actual_generator.get_state(), reference_generator.get_state())
+
+
+@pytest.mark.parametrize(
+    "cache_device", ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",)
+)
+def test_verified_teacher_focus_membership_is_dense_exact_and_signature_invalidated(
+    monkeypatch, cache_device
+):
+    policy = _canonical_focus_cache_policy()
+    rows, weights, membership = policy._verified_teacher_focus_tensors(cache_device)
+    expected_membership = torch.zeros(
+        policy.q_teacher_replay.size, dtype=torch.bool, device=cache_device
+    )
+    expected_membership[rows] = True
+    assert torch.equal(membership, expected_membership)
+
+    cached_entry = policy._verified_teacher_focus_device_cache[cache_device]
+    cached_signature = cached_entry[0]
+    rows_again, weights_again, membership_again = (
+        policy._verified_teacher_focus_tensors(cache_device)
+    )
+    assert rows_again.data_ptr() == rows.data_ptr()
+    assert weights_again.data_ptr() == weights.data_ptr()
+    assert membership_again.data_ptr() == membership.data_ptr()
+
+    monkeypatch.setattr(
+        torch,
+        "isin",
+        lambda *args, **kwargs: pytest.fail("dense membership must replace torch.isin"),
+    )
+    indices = torch.tensor([0, 1, 1, 3, 6, 7], device=cache_device)
+    assert torch.equal(
+        policy._teacher_intrinsic_focused_mask(indices),
+        expected_membership.index_select(0, indices),
+    )
+
+    policy._verified_failure_motion_phase_histogram[0][0] = 1.0
+    changed_rows, changed_weights, changed_membership = (
+        policy._verified_teacher_focus_tensors(cache_device)
+    )
+    changed_entry = policy._verified_teacher_focus_device_cache[cache_device]
+    assert changed_entry[0] != cached_signature
+    assert changed_membership[0]
+    assert not membership[0]
+    assert changed_rows.data_ptr() != rows.data_ptr()
+    assert changed_weights.data_ptr() != weights.data_ptr()
+
+
+class _RejectHostScalarExtraction(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func == torch.ops.aten._local_scalar_dense.default:
+            raise AssertionError("replay metric recording extracted a host scalar")
+        return func(*args, **(kwargs or {}))
+
+
+def test_replay_mix_metrics_defer_host_scalars_and_preserve_exact_values():
+    policy = _bare_policy(
+        q_teacher_replay_ratio=0.5,
+        teacher_actor_replay_fraction=0.5,
+        teacher_perception_replay_fraction=0.5,
+        failure_phase_teacher_fraction=0.5,
+        failure_phase_student_fraction=0.5,
+    )
+    policy.dagger_replay = SimpleNamespace(capacity=100)
+    policy._reset_replay_mix_rollout_metrics()
+    batch = {
+        REPLAY_SAMPLE_PROVENANCE_KEY: torch.tensor([0, 1, 2, 3, 0, 0]),
+        REPLAY_INTRINSIC_FOCUSED_KEY: torch.tensor(
+            [True, True, False, True, True, False]
+        ),
+        REPLAY_SAMPLE_PHYSICAL_INDEX_KEY: torch.tensor([5, 6, 7, 8, 5, 9]),
+        REPLAY_SAMPLE_IS_TEACHER_KEY: torch.tensor(
+            [False, False, True, True, False, False]
+        ),
+    }
+    requested = dict(zip(REPLAY_SOURCE_ORDER, (1, 2, 1, 2), strict=True))
+    valid = torch.tensor([True, False, True, True, False, True])
+
+    with _RejectHostScalarExtraction():
+        policy._record_replay_mix_batch(
+            "perception", batch, requested, valid_mask=valid
+        )
+        policy._record_replay_mix_batch(
+            "perception", batch, requested, valid_mask=valid
+        )
+
+    accumulator = policy._replay_mix_rollout_metrics["perception"]
+    assert torch.is_tensor(accumulator["actual_uniform_student_rows"])
+    assert torch.is_tensor(accumulator["valid_failure_teacher_rows"])
+    metrics = policy._replay_mix_metrics("perception")
+
+    assert metrics["sampled_rows"] == 12.0
+    assert metrics["valid_loss_rows"] == 8.0
+    assert metrics["requested_uniform_student_rows"] == 2.0
+    assert metrics["requested_failure_student_rows"] == 4.0
+    assert metrics["requested_uniform_teacher_rows"] == 2.0
+    assert metrics["requested_failure_teacher_rows"] == 4.0
+    assert metrics["actual_uniform_student_rows"] == 6.0
+    assert metrics["actual_failure_student_rows"] == 2.0
+    assert metrics["actual_uniform_teacher_rows"] == 2.0
+    assert metrics["actual_failure_teacher_rows"] == 2.0
+    assert metrics["failure_student_backfill_rows"] == 2.0
+    assert metrics["failure_teacher_backfill_rows"] == 2.0
+    assert metrics["valid_loss_uniform_student_fraction"] == pytest.approx(0.5)
+    assert metrics["valid_loss_failure_student_fraction"] == 0.0
+    assert metrics["valid_loss_uniform_teacher_fraction"] == pytest.approx(0.25)
+    assert metrics["valid_loss_failure_teacher_fraction"] == pytest.approx(0.25)
+    assert metrics["intrinsic_focused_row_fraction"] == pytest.approx(2.0 / 3.0)
+    assert metrics["failure_stratum_provenance_fraction"] == pytest.approx(1.0 / 3.0)
+    assert metrics["duplicate_row_fraction"] == pytest.approx(1.0 / 6.0)
+    assert metrics["uniform_draw_intrinsic_focused_fraction"] == pytest.approx(0.5)
