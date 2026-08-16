@@ -67,6 +67,7 @@ from .td3_bc_dagger import (
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
     PERCEPTION_PREFILL_WARMUP_SEMANTICS,
     PERCEPTION_REPLAY_SEMANTICS,
+    REPLAY_MOTION_ID_KEY,
     TEACHER_PREFILL_SEMANTICS,
     TD3_BETA_KEY,
     TD3_COLLECTOR_NOISE_KEY,
@@ -146,8 +147,7 @@ def _validate_fastsac_entropy_target_controls(
         and log_std_min < log_std_max
     ):
         raise ValueError(
-            f"{prefix}sac_log_std_min must be finite and below "
-            f"{prefix}sac_log_std_max"
+            f"{prefix}sac_log_std_min must be finite and below {prefix}sac_log_std_max"
         )
 
     target_entropy_ratio = float(sac_target_entropy_ratio)
@@ -387,6 +387,18 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         td[TD3_EXPLORATORY_STUDENT_ACTION_KEY] = sampled_student_action
         td[TD3_COLLECTOR_NOISE_KEY] = sample_q_deviation
         td[TD3_BETA_KEY] = torch.full_like(discrepancy_rms, float(scheduled_beta))
+        motion_ids = getattr(
+            getattr(getattr(owner, "env", None), "command_manager", None),
+            "motion_ids",
+            None,
+        )
+        if torch.is_tensor(motion_ids):
+            motion_ids = motion_ids.detach().to(device=valid.device, dtype=torch.long)
+            if motion_ids.numel() != valid.numel():
+                raise RuntimeError(
+                    "command motion_ids do not match rollout environments"
+                )
+            td[REPLAY_MOTION_ID_KEY] = motion_ids.reshape(valid.shape)
         return td
 
 
@@ -514,9 +526,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         if not isinstance(cfg.sac_use_autotune, bool):
             raise ValueError("sac_use_autotune must be a boolean")
         if str(cfg.sac_alpha_update_cadence) not in ("actor", "critic"):
-            raise ValueError(
-                "sac_alpha_update_cadence must be 'actor' or 'critic'"
-            )
+            raise ValueError("sac_alpha_update_cadence must be 'actor' or 'critic'")
         _validate_fastsac_entropy_target_controls(
             cfg.sac_log_std_min,
             cfg.sac_log_std_max,
@@ -598,10 +608,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise ValueError("FastSAC log-std bounds must be finite")
         if not float(log_std_min) < float(log_std_max):
             raise ValueError("FastSAC log-std bounds must be ordered")
-        if not torch.isfinite(log_std).all() or (
-            (log_std <= float(log_std_min))
-            | (log_std >= float(log_std_max))
-        ).any():
+        if (
+            not torch.isfinite(log_std).all()
+            or ((log_std <= float(log_std_min)) | (log_std >= float(log_std_max))).any()
+        ):
             raise ValueError(
                 "FastSAC effective log std must be finite and strictly inside "
                 "its bounds"
@@ -614,9 +624,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         return torch.atanh(normalized)
 
-    def _bounded_log_std(
-        self, raw_log_std: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def _bounded_log_std(self, raw_log_std: torch.Tensor | None = None) -> torch.Tensor:
         """Smoothly map the adapter parameter into configured log-std bounds."""
         if raw_log_std is None:
             raw_log_std = self.bc_dagger_sac_adapter.log_std
@@ -659,17 +667,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         ):
             raise ValueError("FastSAC v3 checkpoint has invalid log-std bounds")
         # Reproduce the v3 distribution before changing coordinate systems.
-        effective = legacy_log_std.clamp(
-            legacy_log_std_min, legacy_log_std_max
-        )
+        effective = legacy_log_std.clamp(legacy_log_std_min, legacy_log_std_max)
         log_std_min = float(self.cfg.sac_log_std_min)
         log_std_max = float(self.cfg.sac_log_std_max)
-        normalized = (
-            2.0
-            * (effective - log_std_min)
-            / (log_std_max - log_std_min)
-            - 1.0
-        )
+        normalized = 2.0 * (effective - log_std_min) / (log_std_max - log_std_min) - 1.0
         inward = 4.0 * torch.finfo(normalized.dtype).eps
         return torch.atanh(normalized.clamp(-1.0 + inward, 1.0 - inward))
 
@@ -734,8 +735,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         target_probabilities = F.softmax(target_logits, dim=-1)
         projected_heads = []
-        left_fraction = soft_reward.new_zeros(())
-        right_fraction = soft_reward.new_zeros(())
+        support_clip_fractions = []
         for head_probability in target_probabilities:
             projected, left_fraction, right_fraction = _project_c51_probabilities(
                 head_probability,
@@ -745,6 +745,31 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 self.qnet_target.support,
             )
             projected_heads.append(projected)
+            support_clip_fractions.append((left_fraction, right_fraction))
+        if len(support_clip_fractions) != 2:
+            raise RuntimeError("FastSAC C51 target must contain exactly two Q heads")
+        (
+            (q1_left_support_clip_fraction, q1_right_support_clip_fraction),
+            (q2_left_support_clip_fraction, q2_right_support_clip_fraction),
+        ) = support_clip_fractions
+        q1_support_clip_fraction = (
+            q1_left_support_clip_fraction + q1_right_support_clip_fraction
+        )
+        q2_support_clip_fraction = (
+            q2_left_support_clip_fraction + q2_right_support_clip_fraction
+        )
+        support_clip_fraction_mean = 0.5 * (
+            q1_support_clip_fraction + q2_support_clip_fraction
+        )
+        support_clip_fraction_max = torch.maximum(
+            q1_support_clip_fraction, q2_support_clip_fraction
+        )
+        left_support_projection_clipping_fraction = 0.5 * (
+            q1_left_support_clip_fraction + q2_left_support_clip_fraction
+        )
+        right_support_projection_clipping_fraction = 0.5 * (
+            q1_right_support_clip_fraction + q2_right_support_clip_fraction
+        )
         projected_heads = torch.stack(projected_heads, dim=0)
         projected_expected_heads = (projected_heads * self.qnet_target.support).sum(
             dim=-1
@@ -775,8 +800,21 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "target_distribution_entropy": selected_entropy.mean(),
             "target_select_q1_fraction": (selected_head == 0).float().mean(),
             "target_select_q2_fraction": (selected_head == 1).float().mean(),
-            "left_support_projection_clipping_fraction": left_fraction,
-            "right_support_projection_clipping_fraction": right_fraction,
+            "q1_left_support_clip_fraction": q1_left_support_clip_fraction,
+            "q1_right_support_clip_fraction": q1_right_support_clip_fraction,
+            "q2_left_support_clip_fraction": q2_left_support_clip_fraction,
+            "q2_right_support_clip_fraction": q2_right_support_clip_fraction,
+            "support_clip_fraction_mean": support_clip_fraction_mean,
+            "support_clip_fraction_max": support_clip_fraction_max,
+            # Keep the historical directional aliases for existing dashboards
+            # and for the shared TD3 rollout aggregation surface. Unlike the
+            # old loop-overwrite behavior, each alias now averages both heads.
+            "left_support_projection_clipping_fraction": (
+                left_support_projection_clipping_fraction
+            ),
+            "right_support_projection_clipping_fraction": (
+                right_support_projection_clipping_fraction
+            ),
             "target_smoothing_noise_norm": soft_reward.new_zeros(()),
             "target_noise_free_action_abs_mean": next_dist.mean.abs().mean(),
             "target_sample_action_abs_mean": next_action.abs().mean(),
@@ -875,8 +913,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             # gradient without touching the optimizer.
             alpha_metrics = self._alpha_update(alpha_log_prob[:0])
         alpha_update_performed = (
-            int(getattr(self, "alpha_update_count", 0))
-            > alpha_update_count_before
+            int(getattr(self, "alpha_update_count", 0)) > alpha_update_count_before
         )
         alpha_metrics.update(
             {
@@ -1063,6 +1100,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "entropy_tax_reward_abs_ratio",
             "alpha_update_due_fraction",
             "alpha_update_performed_fraction",
+            "q1_left_support_clip_fraction",
+            "q1_right_support_clip_fraction",
+            "q2_left_support_clip_fraction",
+            "q2_right_support_clip_fraction",
+            "support_clip_fraction_mean",
+            "support_clip_fraction_max",
         )
         actor_keys = (
             "actor_expected_q1_mean",
@@ -1222,9 +1265,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_update_count": int(self.actor_update_count),
             "critic_update_count": int(self.critic_update_count),
             "alpha_update_count": int(self.alpha_update_count),
-            "q_update_row_credit": float(
-                getattr(self, "q_update_row_credit", 0.0)
-            ),
+            "q_update_row_credit": float(getattr(self, "q_update_row_credit", 0.0)),
             "dagger_rollout_count": int(self.dagger_rollout_count),
             "dagger_environment_steps": int(self.dagger_environment_steps),
             "teacher_prefill_rollout_count": int(self.teacher_prefill_rollout_count),
@@ -1468,9 +1509,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         failed = DistributionalTD3TeacherBC.load_state_dict(self, padded_source, strict)
         self.actor_target = None
         self._freeze_legacy_actor_std()
-        self.bc_dagger_sac_adapter.log_std.data.copy_(
-            self._fastsac_initial_raw_log_std
-        )
+        self.bc_dagger_sac_adapter.log_std.data.copy_(self._fastsac_initial_raw_log_std)
         self.log_alpha.data.fill_(math.log(float(self.cfg.sac_alpha_init)))
         self.actor_update_count = 0
         self.critic_update_count = 0

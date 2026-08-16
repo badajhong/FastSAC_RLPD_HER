@@ -32,12 +32,19 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     PERCEPTION_POLICY_RAW_KEY,
     PERCEPTION_VEL_COMMAND_RAW_KEY,
     REFERENCE_PHASE_KEY,
+    REPLAY_COMMAND_FINISHED_KEY,
+    REPLAY_MOTION_ID_KEY,
+    REPLAY_SAMPLE_PROVENANCE_KEY,
+    REPLAY_SOURCE_ORDER,
+    REPLAY_TERMINATED_KEY,
+    REPLAY_TIME_LIMIT_KEY,
     STUDENT_REPLAY_EPISODE_ID_KEY,
     STUDENT_REPLAY_EPISODE_STEP_KEY,
     _TD3DeviceReplay,
     _PREFILL_ENV_INDEX_KEY,
     _PREFILL_STEP_INDEX_KEY,
     _project_c51_probabilities,
+    allocate_source_counts,
 )
 from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     ACTOR_BACKEND as TVKD_ACTOR_BACKEND,
@@ -47,6 +54,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     LEGACY_TRAINING_ALGORITHM as TVKD_LEGACY_TRAINING_ALGORITHM,
     PREVIOUS_CHECKPOINT_VERSION as TVKD_PREVIOUS_CHECKPOINT_VERSION,
     PREVIOUS_TRAINING_ALGORITHM as TVKD_PREVIOUS_TRAINING_ALGORITHM,
+    V3_CHECKPOINT_VERSION as TVKD_V3_CHECKPOINT_VERSION,
+    V3_TRAINING_ALGORITHM as TVKD_V3_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
@@ -55,6 +64,7 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     TRAINING_ALGORITHM as TVKD_TRAINING_ALGORITHM,
     TVKDDistributionalFastSACTeacherBC,
     TVKDDistributionalFastSACTeacherBCConfig,
+    compute_teacher_value_continuation,
     compute_teacher_value_terms,
 )
 from scripts.TVKD_fasSAC_bc_dagger import (
@@ -64,10 +74,16 @@ from scripts.TVKD_fasSAC_bc_dagger import (
 from scripts.fastSAC_bc_dagger import (
     PPOVEL_TRAIN_PHASE_PARTIAL_PERCEPTION_MODULES,
 )
-from scripts.helpers import _fill_replayless_inference_algo_defaults
+from scripts.helpers import (
+    _fill_replayless_inference_algo_defaults,
+    _load_policy_checkpoint,
+)
 
 tvkd_module = importlib.import_module(
     "active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger"
+)
+fastsac_module = importlib.import_module(
+    "active_adaptation.learning.ppo.fastsac_bc_dagger"
 )
 tvkd_entry = importlib.import_module("scripts.TVKD_fasSAC_bc_dagger")
 
@@ -140,11 +156,16 @@ def _empty_bottleneck_checkpoint_state(
     detector_state: dict | None = None,
 ) -> dict:
     return {
+        "location_semantics": tvkd_module.BOTTLENECK_LOCATION_SEMANTICS,
         "detector": detector_state
         or {
             "bottleneck_residual_scale_ema": 1.0,
             "num_scale_updates": 0,
         },
+        "unsuccessful_episode_count": 0,
+        "episodes_with_student_candidates": 0,
+        "no_value_bottleneck_count": 0,
+        "value_argmin_ablation_count": 0,
         "failed_student_episode_count": 0,
         "student_candidate_count": 0,
         "detected_count": 0,
@@ -167,7 +188,136 @@ def _empty_bottleneck_checkpoint_state(
         "normalized_td_residual_sum": 0.0,
         "phase_match_distance_sum": 0.0,
         "last_metadata": {},
+        "last_value_argmin_metadata": {},
     }
+
+
+def _checkpoint_replay_mix(cfg) -> dict[str, dict[str, float]]:
+    return {
+        purpose: {
+            source: float(getattr(cfg, f"{purpose}_{source}_fraction"))
+            for source in REPLAY_SOURCE_ORDER
+        }
+        for purpose in ("q", "actor", "perception")
+    }
+
+
+def _verified_histogram_state(
+    num_bins: int,
+    *,
+    histogram: torch.Tensor | None = None,
+    motion_id: int = 0,
+) -> dict:
+    if histogram is None:
+        histogram = torch.zeros(num_bins, dtype=torch.float64)
+    histogram = histogram.detach().to(dtype=torch.float64, device="cpu").clone()
+    anchor_count = int(histogram.sum().item())
+    return {
+        "semantics": tvkd_module.VERIFIED_HISTOGRAM_SEMANTICS,
+        "histogram": histogram,
+        "episode_count": 0 if anchor_count == 0 else 1,
+        "anchor_count": anchor_count,
+        "uniform_fallback_rows": 0,
+        "focused_rows": 0,
+        "motion_histograms": (
+            {} if anchor_count == 0 else {motion_id: histogram.clone()}
+        ),
+    }
+
+
+def _strict_v4_backend_config(cfg) -> dict:
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = cfg
+    return copy.deepcopy(policy._checkpoint_config())
+
+
+def _strict_v4_policy_metadata(
+    cfg,
+    *,
+    vecnorm_fingerprint: str,
+    histogram_state: dict,
+) -> dict:
+    return {
+        "critic_learning_semantics": tvkd_module.CRITIC_LEARNING_SEMANTICS,
+        "actor_learning_semantics": tvkd_module.ACTOR_LEARNING_SEMANTICS,
+        "replay_mix_state": _checkpoint_replay_mix(cfg),
+        "perception_replay_mode": str(cfg.perception_replay_mode),
+        "bottleneck_location_semantics": (tvkd_module.BOTTLENECK_LOCATION_SEMANTICS),
+        "bottleneck_fallback_mode": str(cfg.bottleneck_fallback_mode),
+        "teacher_value_return_semantics": str(cfg.teacher_value_return_semantics),
+        "teacher_value_boundary_semantics": str(cfg.teacher_value_boundary_semantics),
+        "teacher_value_gamma": float(cfg.gamma),
+        "teacher_value_reward_group_fingerprint": str(
+            cfg.teacher_value_reward_group_fingerprint
+        ),
+        "teacher_value_vecnorm_fingerprint": vecnorm_fingerprint,
+        "replay_task_fingerprint": str(cfg.replay_task_fingerprint),
+        "verified_teacher_value_histogram_state": copy.deepcopy(histogram_state),
+        "failure_phase_curriculum_state": copy.deepcopy(histogram_state),
+        "fresh_ring_resume_semantics": tvkd_module.FRESH_RING_RESUME_SEMANTICS,
+        "q_backend_config": {
+            "target_semantics": tvkd_module.CRITIC_LEARNING_SEMANTICS,
+            "failure_phase_replay_semantics": (
+                tvkd_module.VERIFIED_HISTOGRAM_SEMANTICS
+            ),
+            "bottleneck_location_semantics": (
+                tvkd_module.BOTTLENECK_LOCATION_SEMANTICS
+            ),
+            "bottleneck_fallback_mode": str(cfg.bottleneck_fallback_mode),
+        },
+    }
+
+
+def _legacy_replay_backend(
+    lambda_bc: float,
+    *,
+    student_focus: float | None,
+    alpha_cadence: str = "critic",
+) -> dict:
+    backend = {
+        "value_norm": False,
+        "lambda_bc": float(lambda_bc),
+        "q_teacher_replay_ratio": 0.5,
+        "teacher_actor_replay_fraction": 0.5,
+        "teacher_perception_replay_fraction": 0.5,
+        "failure_phase_teacher_fraction": 0.3,
+        "sac_alpha_update_cadence": alpha_cadence,
+    }
+    if student_focus is not None:
+        backend["failure_phase_student_fraction"] = float(student_focus)
+    return backend
+
+
+def _legacy_saved_config(saved_cfg, *, include_student_focus: bool):
+    legacy_cfg = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
+    v4_only_fields = {
+        f"{purpose}_{source}_fraction"
+        for purpose in ("q", "actor", "perception")
+        for source in REPLAY_SOURCE_ORDER
+    }
+    v4_only_fields.update(
+        {
+            "perception_replay_mode",
+            "bottleneck_fallback_mode",
+            "bottleneck_include_unsuccessful_timeouts",
+            "max_teacher_phase_match_distance",
+            "perception_replay_batch_size",
+            "teacher_value_return_semantics",
+            "teacher_value_boundary_semantics",
+            "teacher_value_reward_group_fingerprint",
+            "replay_task_fingerprint",
+        }
+    )
+    for name in v4_only_fields:
+        if name in legacy_cfg.algo:
+            del legacy_cfg.algo[name]
+    if not include_student_focus:
+        del legacy_cfg.algo.failure_phase_student_fraction
+    legacy_cfg.algo.sac_alpha_update_cadence = "critic"
+    return legacy_cfg
 
 
 def _tvkd_replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
@@ -180,13 +330,9 @@ def _tvkd_replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
         "dones": torch.zeros(count, dtype=torch.bool),
         "truncations": torch.zeros(count, dtype=torch.bool),
         "discounts": torch.full((count,), 0.95),
-        "next_critic_observations": torch.stack(
-            (row + 4.0, row + 4.5), dim=-1
-        ),
+        "next_critic_observations": torch.stack((row + 4.0, row + 4.5), dim=-1),
         REFERENCE_PHASE_KEY: torch.linspace(0.0, 1.0, count),
-        PERCEPTION_DEPTH_U8_KEY: torch.zeros(
-            count, 2, 1, 1, 1, dtype=torch.uint8
-        ),
+        PERCEPTION_DEPTH_U8_KEY: torch.zeros(count, 2, 1, 1, 1, dtype=torch.uint8),
         PERCEPTION_POLICY_RAW_KEY: row[:, None, None] + time[None, :, None],
         PERCEPTION_VEL_COMMAND_RAW_KEY: (
             row[:, None, None] + time[None, :, None] + 0.25
@@ -228,9 +374,7 @@ def _student_split_sampling_policy(
     if not 0 <= focused_rows <= student_count:
         raise ValueError("focused_rows is invalid")
     student = _tvkd_replay_rows(student_count, 1_000)
-    student[DAGGER_IS_STUDENT_ACTION_KEY] = torch.ones(
-        student_count, dtype=torch.bool
-    )
+    student[DAGGER_IS_STUDENT_ACTION_KEY] = torch.ones(student_count, dtype=torch.bool)
     student[DAGGER_REPLAY_TEACHER_ACTIONS] = (
         torch.arange(student_count, dtype=torch.float32)[:, None] + 2_000.0
     )
@@ -348,6 +492,7 @@ def test_detector_argmin_fallback_keeps_timeout_candidate_and_round_trips_scale(
         torch.tensor([0.1, 0.2, 0.3]),
         torch.zeros(3, dtype=torch.bool),
         torch.tensor([False, False, True]),
+        fallback_mode="value_argmin",
     )
 
     assert result is not None
@@ -371,10 +516,11 @@ def test_detector_argmin_fallback_keeps_timeout_candidate_and_round_trips_scale(
         torch.tensor([0.9]),
         torch.tensor([True]),
         torch.tensor([False]),
+        fallback_mode="value_argmin",
     )
     assert only_terminal is None
     assert detector.last_diagnostics["no_candidate"] is True
-    assert detector.last_diagnostics["used_fallback"] is True
+    assert detector.last_diagnostics["used_fallback"] is False
 
 
 def test_frozen_teacher_value_restores_keys_denormalizes_and_sums_groups():
@@ -418,21 +564,27 @@ def test_teacher_value_terms_clip_potential_before_difference_and_keep_raw_td():
     current = torch.tensor([[20.0], [-4.0], [2.0]])
     next_observation = torch.tensor([[-20.0], [8.0], [9.0]])
     reward = torch.tensor([1.0, 2.0, 3.0])
-    bootstrap = torch.tensor([1.0, 0.0, 1.0])
     discount = torch.tensor([0.9, 0.9, 0.5])
     terms = compute_teacher_value_terms(
         value,
         current,
         next_observation,
         reward,
-        bootstrap,
-        discount,
+        terminated=torch.tensor([False, True, False]),
+        command_finished=torch.zeros(3, dtype=torch.bool),
+        time_limit=torch.zeros(3, dtype=torch.bool),
+        replay_discount=discount,
+        gamma=1.0,
         tvkd_lambda=0.25,
         potential_clip=5.0,
     )
 
     expected_potential = torch.tensor([0.9 * -5.0 - 5.0, 4.0, 0.5 * 5.0 - 2.0])
-    expected_td = reward + discount * bootstrap * next_observation[:, 0] - current[:, 0]
+    expected_td = (
+        reward
+        + discount * torch.tensor([1.0, 0.0, 1.0]) * next_observation[:, 0]
+        - current[:, 0]
+    )
     assert torch.allclose(terms.potential_delta, expected_potential)
     assert torch.allclose(terms.shaped_reward, reward + 0.25 * expected_potential)
     # TD residual uses raw reward and the *unclipped* frozen value.
@@ -445,11 +597,49 @@ def test_tvkd_lambda_zero_keeps_raw_reward_exactly():
         torch.tensor([[2.0], [3.0]]),
         torch.tensor([[8.0], [9.0]]),
         torch.tensor([1.5, -2.0]),
-        torch.tensor([1.0, 0.0]),
-        0.99,
+        terminated=torch.tensor([False, True]),
+        command_finished=torch.zeros(2, dtype=torch.bool),
+        time_limit=torch.zeros(2, dtype=torch.bool),
+        replay_discount=torch.ones(2),
+        gamma=0.99,
         tvkd_lambda=0.0,
     )
     assert torch.equal(terms.shaped_reward, torch.tensor([1.5, -2.0]))
+
+
+def test_teacher_value_boundary_contract_uses_self_bootstrap_and_variable_discount():
+    current = torch.tensor([13.0, 10.0, 8.0, 5.0])
+    following = torch.tensor([999.0, 20.0, 16.0, 10.0])
+    discount = torch.tensor([1.0, 0.75, 0.4, 0.5])
+    continuation = compute_teacher_value_continuation(
+        teacher_v=current,
+        teacher_v_next=following,
+        terminated=torch.tensor([False, False, True, False]),
+        # Physical termination wins even when a boundary cause coincides.
+        command_finished=torch.tensor([True, False, True, False]),
+        time_limit=torch.tensor([False, True, False, False]),
+        replay_discount=discount,
+        gamma=0.99,
+    )
+    assert torch.allclose(
+        continuation,
+        torch.tensor([0.99 * 13.0, 0.99 * 0.75 * 10.0, 0.0, 0.99 * 0.5 * 10.0]),
+    )
+
+    terms = compute_teacher_value_terms(
+        lambda observation: observation[:, 0],
+        torch.tensor([[13.0]]),
+        torch.tensor([[999.0]]),
+        torch.tensor([0.16]),
+        terminated=torch.tensor([False]),
+        command_finished=torch.tensor([True]),
+        time_limit=torch.tensor([False]),
+        replay_discount=torch.tensor([1.0]),
+        gamma=0.99,
+        tvkd_lambda=0.25,
+    )
+    assert terms.teacher_td_residual.item() == pytest.approx(0.03, abs=1e-6)
+    assert terms.shaped_reward.item() == pytest.approx(0.1275, abs=1e-6)
 
 
 def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward():
@@ -510,6 +700,7 @@ def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward
                             [[False], [False], [True]],
                         ]
                     ),
+                    "discount": torch.ones(2, 3, 1),
                     "terminated": torch.tensor(
                         [
                             [[False], [False], [True]],
@@ -524,9 +715,7 @@ def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward
                                     [[False], [False], [True]],
                                 ]
                             ),
-                            "command_finished": torch.zeros(
-                                2, 3, 1, dtype=torch.bool
-                            ),
+                            "command_finished": torch.zeros(2, 3, 1, dtype=torch.bool),
                         },
                         batch_size=[2, 3],
                     ),
@@ -536,15 +725,13 @@ def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward
         },
         batch_size=[2, 3],
     )
-    student = torch.tensor(
-        [[True, True, True], [False, True, True]], dtype=torch.bool
-    )
+    student = torch.tensor([[True, True, True], [False, True, True]], dtype=torch.bool)
 
     residual = policy._student_teacher_td_residual_grid(rollout, student)
 
     assert torch.allclose(
         residual,
-        torch.tensor([[1.8, 2.7, 0.0], [0.0, 12.0, 12.0]]),
+        torch.tensor([[1.8, 2.7, 0.0], [0.0, 12.0, 3.0]]),
     )
     assert len(normalization_calls) == 1
     assert normalization_calls[0][1:] == (
@@ -554,12 +741,15 @@ def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward
     )
     assert len(teacher_value_calls) == 1
     # Adjacent Student transitions share state values. The physical-terminal
-    # reset and timeout reset carry are both excluded; timeout uses its captured
-    # true pre-reset final observation (40) instead.
+    # reset and timeout reset carry are both excluded. The raw replay cache
+    # still contains the captured timeout-final state, while source PPO's
+    # boundary helper deliberately self-bootstraps from the current value.
     assert teacher_value_calls[0].squeeze(-1).tolist() == [1, 2, 3, 20, 30, 40]
 
 
-def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source():
+def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source(
+    monkeypatch,
+):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
@@ -580,14 +770,20 @@ def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source()
     policy._failure_phase_anchor_count = 0
     policy._failure_histogram_device_cache = {}
     policy._rollout_final_batch = {}
-    residual = torch.tensor(
-        [[0.1, 0.0, -0.2, -1.4, -1.5, -1.3, -0.8, -5.0]]
-    )
-    policy._student_teacher_td_residual_grid = (
-        lambda rollout, student: residual.clone()
-    )
+    residual = torch.tensor([[0.1, 0.0, -0.2, -1.4, -1.5, -1.3, -0.8, -5.0]])
+    policy._student_teacher_td_residual_grid = lambda rollout, student: residual.clone()
     policy._reference_phase = lambda rollout: rollout["reference_phase"]
-    policy._record_teacher_phase_match_distances = lambda phases: None
+    policy._record_teacher_phase_match_distances = lambda phases, motion_ids: None
+
+    def legacy_parent(owner, candidate_rollout):
+        del owner, candidate_rollout
+        raise AssertionError("TVKD v4 must never call the parent failure path")
+
+    monkeypatch.setattr(
+        DistributionalFastSACTeacherBC,
+        "_update_failure_phase_histogram",
+        legacy_parent,
+    )
 
     shape = (1, 8, 1)
     final_true = torch.zeros(shape, dtype=torch.bool)
@@ -597,6 +793,7 @@ def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source()
             "reference_phase": (
                 torch.arange(8, dtype=torch.float32).reshape(1, 8, 1) / 10.0
             ),
+            REPLAY_MOTION_ID_KEY: torch.zeros(shape, dtype=torch.long),
             "is_student_action": torch.ones(shape, dtype=torch.bool),
             "dagger_safe_takeover": torch.zeros(shape, dtype=torch.bool),
             "is_init": torch.zeros(shape, dtype=torch.bool),
@@ -606,12 +803,8 @@ def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source()
                     "terminated": final_true.clone(),
                     "stats": TensorDict(
                         {
-                            "episode_time_limit": torch.zeros(
-                                shape, dtype=torch.bool
-                            ),
-                            "command_finished": torch.zeros(
-                                shape, dtype=torch.bool
-                            ),
+                            "episode_time_limit": torch.zeros(shape, dtype=torch.bool),
+                            "command_finished": torch.zeros(shape, dtype=torch.bool),
                         },
                         batch_size=[1, 8],
                     ),
@@ -642,9 +835,9 @@ def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source()
         torch.arange(8, dtype=torch.long).reshape(1, 8),
     )
 
-    # Preserve the inherited causal-failure seam: an unrelated Student action
-    # outside the terminal lookback, and an all-Teacher failure, register
-    # neither a bottleneck nor a legacy fallback.
+    # A single non-negative early Student action and an all-Teacher failure
+    # contain no sustained negative Student-value interval. Neither creates a
+    # verified anchor or any terminal fallback.
     early_student = rollout.clone()
     early_student["is_student_action"].zero_()
     early_student["is_student_action"][:, 0] = True
@@ -652,8 +845,79 @@ def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source()
     teacher_only = rollout.clone()
     teacher_only["is_student_action"].zero_()
     assert policy._update_failure_phase_histogram(teacher_only) == 0
-    assert policy._bottleneck_failed_student_episode_count == 1
+    assert policy._bottleneck_failed_student_episode_count == 2
     assert policy._bottleneck_teacher_sequences_inserted == 1
+
+
+def test_delayed_failure_keeps_early_student_value_causality_without_terminal_gate():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        use_teacher_value_bottleneck_replay=True,
+        failure_phase_lookback_steps=4,
+        failure_phase_samples_per_failure=3,
+        failure_phase_num_bins=10,
+        bottleneck_fallback_mode="none",
+        bottleneck_include_unsuccessful_timeouts=True,
+        bottleneck_eps=1e-6,
+    )
+    policy.teacher_value_bottleneck_detector = _detector()
+    policy._reset_bottleneck_statistics()
+    policy._reset_student_replay_episode_tracking()
+    policy._bottleneck_episode_histories = None
+    policy._failure_phase_histogram = torch.zeros(10, dtype=torch.float64)
+    policy._failure_phase_episode_count = 0
+    policy._failure_phase_anchor_count = 0
+    policy._failure_phase_uniform_fallback_rows = 0
+    policy._failure_phase_focused_rows = 0
+    policy._failure_histogram_device_cache = {}
+    policy._rollout_final_batch = {}
+    policy._student_teacher_td_residual_grid = lambda rollout, student: torch.tensor(
+        [[-5.0, -5.0, -5.0] + [0.0] * 9]
+    )
+    policy._reference_phase = lambda rollout: rollout["reference_phase"]
+    policy._record_teacher_phase_match_distances = lambda phases, motion_ids: None
+
+    shape = (1, 12, 1)
+    done = torch.zeros(shape, dtype=torch.bool)
+    done[:, -1] = True
+    student = torch.zeros(shape, dtype=torch.bool)
+    student[:, :3] = True
+    rollout = TensorDict(
+        {
+            "reference_phase": torch.arange(12, dtype=torch.float32).reshape(shape)
+            / 12.0,
+            REPLAY_MOTION_ID_KEY: torch.zeros(shape, dtype=torch.long),
+            DAGGER_IS_STUDENT_ACTION_KEY: student,
+            "is_init": torch.zeros(shape, dtype=torch.bool),
+            "next": TensorDict(
+                {
+                    "done": done,
+                    "terminated": done.clone(),
+                    "stats": TensorDict(
+                        {
+                            "episode_time_limit": torch.zeros(shape, dtype=torch.bool),
+                            "command_finished": torch.zeros(shape, dtype=torch.bool),
+                        },
+                        batch_size=[1, 12],
+                    ),
+                },
+                batch_size=[1, 12],
+            ),
+        },
+        batch_size=[1, 12],
+    )
+
+    assert policy._update_failure_phase_histogram(rollout) == 1
+    assert policy._last_bottleneck_metadata["bottleneck_step"] == 0
+    assert policy._bottleneck_detected_count == 1
+    assert policy._failure_phase_histogram[0].item() == 1.0
+    assert len(policy._pending_student_focus_events) == 1
+    assert torch.equal(
+        policy._pending_student_focus_events[0][1], torch.tensor([0, 1, 2])
+    )
 
 
 def test_student_focus_events_mark_existing_ring_and_current_transition_chunk(
@@ -705,12 +969,8 @@ def test_student_focus_events_mark_existing_ring_and_current_transition_chunk(
         policy.dagger_replay.data[FAILURE_PHASE_STUDENT_SOURCE_KEY][:3],
         torch.tensor([False, True, False]),
     )
-    assert torch.equal(
-        annotated[STUDENT_REPLAY_EPISODE_ID_KEY], torch.tensor([4, 9])
-    )
-    assert torch.equal(
-        annotated[STUDENT_REPLAY_EPISODE_STEP_KEY], torch.tensor([1, 1])
-    )
+    assert torch.equal(annotated[STUDENT_REPLAY_EPISODE_ID_KEY], torch.tensor([4, 9]))
+    assert torch.equal(annotated[STUDENT_REPLAY_EPISODE_STEP_KEY], torch.tensor([1, 1]))
     assert torch.equal(
         annotated[FAILURE_PHASE_STUDENT_SOURCE_KEY],
         torch.tensor([False, True]),
@@ -753,6 +1013,134 @@ def test_tvkd_actor_is_exact_fixed_baseline_implementation_without_scheduler():
     ):
         detector.update_residual_scale(residual)
         assert cfg.lambda_bc == pytest.approx(initial_bc)
+
+
+def test_feature_off_tvkd_matches_baseline_alpha_and_policy_cadence_counters():
+    class _TrainableTwinC51(nn.Module):
+        def __init__(self):
+            super().__init__()
+            probabilities = torch.tensor(
+                [
+                    [[0.2, 0.3, 0.5]] * 4,
+                    [[0.5, 0.3, 0.2]] * 4,
+                ],
+                dtype=torch.float32,
+            )
+            self.logits = nn.Parameter(probabilities.log())
+            self.register_buffer("support", torch.tensor([-1.0, 0.0, 1.0]))
+
+        def forward(self, observations, actions):
+            del actions
+            return self.logits[:, : observations.shape[0]]
+
+    def build(policy_type):
+        policy = policy_type.__new__(policy_type)
+        nn.Module.__init__(policy)
+        policy.cfg = SimpleNamespace(
+            gamma=0.99,
+            sac_use_autotune=True,
+            sac_alpha_update_cadence="actor",
+            sac_policy_frequency=8,
+            sac_log_std_min=-5.0,
+            sac_log_std_max=1.0,
+            sac_max_grad_norm=1.0e6,
+            sac_tau=0.05,
+            q_action_input_gain=1.0,
+            action_support_clip=20.0,
+            eta_sac=0.7,
+            lambda_bc=1.3,
+            dagger_actor_huber_delta=0.4,
+            use_tvkd_value_shaping=False,
+            tvkd_lambda=0.25,
+            use_teacher_value_bottleneck_replay=False,
+            perception_replay_mode="legacy_online_student",
+        )
+        policy._fastsac_q_action_center = torch.zeros(1)
+        policy._fastsac_q_action_scale = torch.ones(1)
+        policy._fastsac_action_low = torch.full((1,), -20.0)
+        policy._fastsac_action_high = torch.full((1,), 20.0)
+        policy._fastsac_actor_action_center = torch.zeros(1)
+        policy._fastsac_actor_action_scale = torch.full((1,), 20.0)
+        policy._fastsac_entropy_reference_log_scale_sum = 0.0
+        policy.actor_adapt = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            policy.actor_adapt.weight.fill_(0.25)
+        raw_log_std = policy._inverse_smooth_log_std(
+            torch.tensor(-1.0),
+            policy.cfg.sac_log_std_min,
+            policy.cfg.sac_log_std_max,
+        )
+        policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
+            action_dim=1,
+            initial_log_std=raw_log_std,
+            device="cpu",
+        )
+        policy.qnet = _TrainableTwinC51()
+        policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+        policy.critic_optimizer = torch.optim.Adam(policy.qnet.parameters(), lr=1e-3)
+        policy.actor_optimizer = torch.optim.Adam(
+            (
+                *policy.actor_adapt.parameters(),
+                *policy.bc_dagger_sac_adapter.parameters(),
+            ),
+            lr=3e-4,
+        )
+        policy.log_alpha = nn.Parameter(torch.tensor(-2.0))
+        policy.alpha_optimizer = torch.optim.Adam((policy.log_alpha,), lr=4e-3)
+        policy.target_entropy = -1.0
+        policy.critic_update_count = 0
+        policy.actor_update_count = 0
+        policy.alpha_update_count = 0
+        policy.sac_actor_update_count = 0
+        policy.sac_alpha_update_count = 0
+        policy.sac_action_rng = torch.Generator().manual_seed(314159)
+        return policy
+
+    baseline = build(DistributionalFastSACTeacherBC)
+    tvkd = build(TVKDDistributionalFastSACTeacherBC)
+    assert not tvkd._tvkd_enabled()
+    batch = {
+        "observations": torch.tensor([[1.0], [2.0], [-1.0], [0.5]]),
+        "next_observations": torch.tensor([[0.2], [-0.7], [1.3], [0.9]]),
+        "critic_observations": torch.tensor([[0.1], [0.2], [0.3], [0.4]]),
+        "next_critic_observations": torch.tensor([[0.5], [0.6], [0.7], [0.8]]),
+        "actions": torch.tensor([[0.3], [-0.4], [0.1], [0.2]]),
+        "rewards": torch.tensor([0.2, -0.1, 0.3, 0.0]),
+        "dones": torch.tensor([False, False, True, True]),
+        "truncations": torch.tensor([False, False, False, True]),
+        "discounts": torch.tensor([1.0, 0.95, 1.0, 0.75]),
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.tensor([[0.5], [-0.2], [0.1], [0.0]]),
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.tensor([True, True, False, True]),
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([True, False, True, False]),
+    }
+    for _ in range(16):
+        for policy in (baseline, tvkd):
+            policy._critic_update(batch)
+            policy._maybe_delayed_actor_and_targets(batch)
+
+    expected_counters = (16, 2, 2, 2, 2)
+    for policy in (baseline, tvkd):
+        assert (
+            policy.critic_update_count,
+            policy.actor_update_count,
+            policy.alpha_update_count,
+            policy.sac_actor_update_count,
+            policy.sac_alpha_update_count,
+        ) == expected_counters
+    assert torch.equal(baseline.log_alpha, tvkd.log_alpha)
+    for baseline_module, tvkd_module_ in (
+        (baseline.actor_adapt, tvkd.actor_adapt),
+        (baseline.bc_dagger_sac_adapter, tvkd.bc_dagger_sac_adapter),
+        (baseline.qnet, tvkd.qnet),
+        (baseline.qnet_target, tvkd.qnet_target),
+    ):
+        for baseline_parameter, tvkd_parameter in zip(
+            baseline_module.parameters(), tvkd_module_.parameters()
+        ):
+            assert torch.equal(baseline_parameter, tvkd_parameter)
+    assert torch.equal(
+        baseline.sac_action_rng.get_state(), tvkd.sac_action_rng.get_state()
+    )
 
 
 def test_tvkd_default_q_and_actor_mix_is_four_way_35_15_35_15():
@@ -800,8 +1188,7 @@ def test_q_and_actor_batches_split_student_half_and_preserve_source_masks():
     critic_actions = critic["actions"][:, 0]
     critic_focused = critic_actions[critic[FAILURE_PHASE_STUDENT_SOURCE_KEY]]
     critic_uniform = critic_actions[
-        ~critic[DAGGER_Q_TEACHER_SOURCE_KEY]
-        & ~critic[FAILURE_PHASE_STUDENT_SOURCE_KEY]
+        ~critic[DAGGER_Q_TEACHER_SOURCE_KEY] & ~critic[FAILURE_PHASE_STUDENT_SOURCE_KEY]
     ]
     assert set(critic_focused.tolist()) <= focused_values
     assert set(critic_uniform.tolist()) <= uniform_values
@@ -809,10 +1196,13 @@ def test_q_and_actor_batches_split_student_half_and_preserve_source_masks():
 
     actor_rows = actor["critic_observations"][:, 0]
     actor_focused = actor_rows[actor[FAILURE_PHASE_STUDENT_SOURCE_KEY]] + 1.0
-    actor_uniform = actor_rows[
-        ~actor[DAGGER_Q_TEACHER_SOURCE_KEY]
-        & ~actor[FAILURE_PHASE_STUDENT_SOURCE_KEY]
-    ] + 1.0
+    actor_uniform = (
+        actor_rows[
+            ~actor[DAGGER_Q_TEACHER_SOURCE_KEY]
+            & ~actor[FAILURE_PHASE_STUDENT_SOURCE_KEY]
+        ]
+        + 1.0
+    )
     assert set(actor_focused.tolist()) <= focused_values
     assert set(actor_uniform.tolist()) <= uniform_values
     assert actor_focused.unique().numel() == 3
@@ -939,7 +1329,93 @@ def test_disabled_tvkd_target_delegates_to_exact_baseline_path(monkeypatch):
     assert metrics["tvkd_shaped_reward_std"].item() == pytest.approx(2.0)
 
 
-def test_disabled_bottleneck_replay_delegates_to_legacy_failure_phase_path(
+@pytest.mark.parametrize("variant", ("baseline", "tvkd"))
+def test_c51_support_metrics_preserve_both_q_heads_and_aggregate_head_totals(
+    monkeypatch,
+    variant,
+):
+    policy_type = (
+        DistributionalFastSACTeacherBC
+        if variant == "baseline"
+        else TVKDDistributionalFastSACTeacherBC
+    )
+    policy = policy_type.__new__(policy_type)
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        gamma=0.99,
+        use_tvkd_value_shaping=variant == "tvkd",
+        tvkd_lambda=0.25,
+        tvkd_potential_clip=None,
+    )
+    probabilities = torch.tensor(
+        [[0.2, 0.3, 0.5], [0.2, 0.3, 0.5]], dtype=torch.float32
+    )
+    policy.qnet_target = _TableTwin(probabilities, probabilities).requires_grad_(False)
+    policy.log_alpha = nn.Parameter(torch.tensor(-20.0))
+    policy._fastsac_entropy_reference_log_scale_sum = 0.0
+    policy.sac_action_rng = torch.Generator().manual_seed(17)
+    policy._actor_dist_from_flat = lambda observations: _FixedDist(
+        observations.shape[0]
+    )
+    policy._q_action_input = lambda actions: actions
+    if variant == "tvkd":
+        policy.get_frozen_teacher_value = lambda observations: torch.zeros(
+            observations.shape[0], dtype=torch.float32
+        )
+
+    per_head = iter(((0.1, 0.2), (0.3, 0.4)))
+
+    def distinct_projection(
+        head_probability,
+        rewards,
+        bootstrap,
+        effective_discount,
+        support,
+    ):
+        del rewards, bootstrap, effective_discount, support
+        left, right = next(per_head)
+        return (
+            head_probability,
+            head_probability.new_tensor(left),
+            head_probability.new_tensor(right),
+        )
+
+    target_module = fastsac_module if variant == "baseline" else tvkd_module
+    monkeypatch.setattr(
+        target_module, "_project_c51_probabilities", distinct_projection
+    )
+    batch = {
+        "next_observations": torch.zeros(2, 1),
+        "critic_observations": torch.zeros(2, 1),
+        "next_critic_observations": torch.zeros(2, 1),
+        "rewards": torch.zeros(2),
+        "dones": torch.zeros(2, dtype=torch.bool),
+        "truncations": torch.zeros(2, dtype=torch.bool),
+        "discounts": torch.ones(2),
+        REPLAY_TERMINATED_KEY: torch.zeros(2, dtype=torch.bool),
+        REPLAY_COMMAND_FINISHED_KEY: torch.zeros(2, dtype=torch.bool),
+        REPLAY_TIME_LIMIT_KEY: torch.zeros(2, dtype=torch.bool),
+    }
+
+    _, metrics, _ = policy._distributional_fastsac_target(batch)
+
+    expected = {
+        "q1_left_support_clip_fraction": 0.1,
+        "q1_right_support_clip_fraction": 0.2,
+        "q2_left_support_clip_fraction": 0.3,
+        "q2_right_support_clip_fraction": 0.4,
+        # Aggregate left+right within each head first: Q1=.3, Q2=.7.
+        "support_clip_fraction_mean": 0.5,
+        "support_clip_fraction_max": 0.7,
+        # Historical aliases now mean the cross-head directional averages.
+        "left_support_projection_clipping_fraction": 0.2,
+        "right_support_projection_clipping_fraction": 0.3,
+    }
+    for name, value in expected.items():
+        assert metrics[name].item() == pytest.approx(value)
+
+
+def test_disabled_bottleneck_replay_never_calls_legacy_failure_phase_path(
     monkeypatch,
 ):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
@@ -947,19 +1423,18 @@ def test_disabled_bottleneck_replay_delegates_to_legacy_failure_phase_path(
     )
     nn.Module.__init__(policy)
     policy.cfg = SimpleNamespace(use_teacher_value_bottleneck_replay=False)
-    sentinel = object()
 
     def baseline(self, rollout):
-        assert rollout is sentinel
-        return sentinel
+        del self, rollout
+        raise AssertionError("TVKD v4 must never call the parent failure path")
 
     monkeypatch.setattr(
         DistributionalFastSACTeacherBC,
         "_update_failure_phase_histogram",
         baseline,
     )
-    result = policy._update_failure_phase_histogram(sentinel)
-    assert result is sentinel
+    assert policy._update_failure_phase_histogram(object()) == 0
+    assert policy._verified_failure_motion_phase_histogram == {}
 
 
 def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
@@ -993,13 +1468,16 @@ def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
         "dones": torch.tensor([False, True, True]),
         "truncations": torch.tensor([False, False, True]),
         "discounts": torch.ones(3),
+        REPLAY_TERMINATED_KEY: torch.tensor([False, True, False]),
+        REPLAY_COMMAND_FINISHED_KEY: torch.zeros(3, dtype=torch.bool),
+        REPLAY_TIME_LIMIT_KEY: torch.tensor([False, False, True]),
     }
     raw_reward_before = batch["rewards"].clone()
 
     projected, metrics, _ = policy._distributional_fastsac_target(batch)
-    # Ordinary and timeout rows bootstrap; the true terminal does not.
-    # potential=[4-2, -3, 8-6], shaped reward=[1.5, .25, 1.5].
-    expected_shaped = torch.tensor([1.5, 0.25, 1.5])
+    # SAC Q bootstraps ordinary/timeout rows, while the frozen source PPO value
+    # self-bootstraps its timeout row. Potential=[4-2, -3, 6-6].
+    expected_shaped = torch.tensor([1.5, 0.25, 1.0])
     expected, _, _ = _project_c51_probabilities(
         second,
         expected_shaped,
@@ -1008,14 +1486,14 @@ def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
         policy.qnet_target.support,
     )
     assert torch.allclose(projected, expected)
-    assert metrics["tvkd_shaped_reward_mean"].item() == pytest.approx(13.0 / 12.0)
-    assert metrics["tvkd_potential_delta_mean"].item() == pytest.approx(1.0 / 3.0)
+    assert metrics["tvkd_shaped_reward_mean"].item() == pytest.approx(11.0 / 12.0)
+    assert metrics["tvkd_potential_delta_mean"].item() == pytest.approx(-1.0 / 3.0)
     assert torch.equal(batch["rewards"], raw_reward_before)
     assert projected.requires_grad is False
     assert projected.grad_fn is None
 
 
-def test_short_terminal_only_episode_falls_back_to_legacy_failure_phase():
+def test_short_terminal_only_episode_creates_no_failure_curriculum():
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
@@ -1025,6 +1503,7 @@ def test_short_terminal_only_episode_falls_back_to_legacy_failure_phase():
         failure_phase_samples_per_failure=3,
         failure_phase_num_bins=10,
         bottleneck_eps=1e-6,
+        bottleneck_fallback_mode="none",
     )
     policy.teacher_value_bottleneck_detector = _detector()
     policy._reset_bottleneck_statistics()
@@ -1036,16 +1515,52 @@ def test_short_terminal_only_episode_falls_back_to_legacy_failure_phase():
         "phase": [0.8],
         "teacher_td_residual": [-20.0],
         "source_id": [SOURCE_STUDENT],
+        "motion_id": [0],
         "true_terminal": [True],
         "timeout": [False],
     }
 
-    assert policy._process_failed_student_episode(history) == 1
-    assert policy._bottleneck_fallback_count == 1
+    assert policy._process_failed_student_episode(history) == 0
+    assert policy._bottleneck_fallback_count == 0
     assert policy._bottleneck_no_candidate_count == 1
-    assert policy._last_bottleneck_metadata["fallback"] == "legacy_failure_phase"
-    assert policy._last_bottleneck_metadata["bottleneck_step"] == 0
-    assert policy._failure_phase_histogram[8].item() == 1.0
+    assert policy._bottleneck_no_value_bottleneck_count == 1
+    assert policy._last_bottleneck_metadata == {}
+    assert policy._failure_phase_histogram.sum().item() == 0.0
+
+
+def test_unsuccessful_episode_without_threshold_crossing_creates_no_focus():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        failure_phase_lookback_steps=5,
+        failure_phase_samples_per_failure=3,
+        failure_phase_num_bins=10,
+        bottleneck_fallback_mode="none",
+    )
+    policy.teacher_value_bottleneck_detector = _detector(threshold=5.0)
+    policy._reset_bottleneck_statistics()
+    policy._reset_student_replay_episode_tracking()
+    policy._failure_phase_histogram = torch.zeros(10, dtype=torch.float64)
+    policy._failure_phase_episode_count = 0
+    policy._failure_phase_anchor_count = 0
+    policy._failure_histogram_device_cache = {}
+    history = {
+        "phase": [0.1, 0.2, 0.3, 0.4],
+        "teacher_td_residual": [-0.1, -0.2, -0.1, -10.0],
+        "source_id": [SOURCE_STUDENT] * 4,
+        "motion_id": [0] * 4,
+        "true_terminal": [False, False, False, True],
+        "timeout": [False] * 4,
+    }
+
+    assert policy._process_failed_student_episode(history, replay_episode_id=7) == 0
+    assert policy._bottleneck_no_value_bottleneck_count == 1
+    assert policy._bottleneck_detected_count == 0
+    assert policy._failure_phase_histogram.sum().item() == 0.0
+    assert policy._verified_failure_motion_phase_histogram == {}
+    assert policy._pending_student_focus_events == []
 
 
 @pytest.mark.parametrize(
@@ -1053,6 +1568,7 @@ def test_short_terminal_only_episode_falls_back_to_legacy_failure_phase():
     (
         TVKD_LEGACY_TRAINING_ALGORITHM,
         TVKD_PREVIOUS_TRAINING_ALGORITHM,
+        TVKD_V3_TRAINING_ALGORITHM,
         TVKD_TRAINING_ALGORITHM,
     ),
 )
@@ -1068,6 +1584,35 @@ def test_tvkd_inference_forces_checkpoint_value_norm_before_construction(algorit
     )
     assert cfg.algo.value_norm is True
     assert "value_norm" in result["checkpoint"]
+
+
+def test_tvkd_v4_version_identity_keeps_v3_as_an_explicit_migration_pair():
+    assert TVKD_TRAINING_ALGORITHM == "distributional_tvkd_fastsac_teacher_bc_v4"
+    assert TVKD_CHECKPOINT_VERSION == 4
+    assert TVKD_V3_TRAINING_ALGORITHM == ("distributional_tvkd_fastsac_teacher_bc_v3")
+    assert TVKD_V3_CHECKPOINT_VERSION == 3
+
+
+def test_tvkd_v4_inference_uses_the_replayless_model_only_loader():
+    calls = []
+
+    class _InferencePolicy:
+        def load_inference_state_dict(self, state, strict=True):
+            calls.append((state["training_algorithm"], strict))
+            return ["model-only"]
+
+        def load_state_dict(self, state):
+            del state
+            raise AssertionError("v4 inference must not enter the training loader")
+
+    result = _load_policy_checkpoint(
+        _InferencePolicy(),
+        {"training_algorithm": TVKD_TRAINING_ALGORITHM},
+        inference_only=True,
+    )
+
+    assert result == ["model-only"]
+    assert calls == [(TVKD_TRAINING_ALGORITHM, True)]
 
 
 def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch):
@@ -1114,11 +1659,14 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
         "bottleneck/score_mean",
         "bottleneck/score_max",
         "bottleneck/raw_td_residual_mean",
+        "bottleneck/raw_teacher_td_residual_mean",
         "bottleneck/normalized_td_residual_mean",
+        "bottleneck/normalized_teacher_td_residual_mean",
         "bottleneck/residual_scale_ema",
         "bottleneck/teacher_sequences_inserted",
         "bottleneck/teacher_transitions_inserted",
         "bottleneck/phase_match_distance_mean",
+        "bottleneck/teacher_phase_match_distance",
         "bottleneck/failure_teacher_buffer_size",
         "bottleneck/student_focus_rows_marked",
         "bottleneck/student_focus_rows_missing",
@@ -1138,16 +1686,14 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
     }
     assert required.issubset(info)
     assert all(torch.isfinite(torch.as_tensor(info[key])) for key in required)
-    assert info["bottleneck/student_focus_q_global_fraction_cap"] == pytest.approx(
-        0.27
+    assert info["bottleneck/student_focus_q_global_fraction_cap"] == pytest.approx(0.27)
+    assert info["bottleneck/student_focus_actor_global_fraction_cap"] == pytest.approx(
+        0.12
     )
-    assert info[
-        "bottleneck/student_focus_actor_global_fraction_cap"
-    ] == pytest.approx(0.12)
     assert not any(key.startswith("bc_scheduler/") for key in info)
 
 
-def test_tvkd_v3_checkpoint_saves_student_focus_and_detector_state(
+def test_tvkd_v4_checkpoint_saves_student_focus_and_detector_state(
     monkeypatch,
 ):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
@@ -1159,12 +1705,14 @@ def test_tvkd_v3_checkpoint_saves_student_focus_and_detector_state(
     policy.critic = nn.Linear(1, 2)
     policy.value_norm = _AffineValueNorm()
     policy.height_encoder = nn.Linear(1, 1)
-    policy.cfg = SimpleNamespace(
-        failure_phase_num_bins=4,
-        train_dr_estimator=True,
-        lambda_bc=0.73,
-        failure_phase_student_fraction=0.3,
-    )
+    policy.cfg = TVKDDistributionalFastSACTeacherBCConfig()
+    policy.cfg.teacher_value_reward_group_fingerprint = "a" * 64
+    policy.cfg.replay_task_fingerprint = "b" * 64
+    policy.cfg.failure_phase_num_bins = 4
+    policy.cfg.train_dr_estimator = True
+    policy.cfg.lambda_bc = 0.73
+    policy.cfg.failure_phase_student_fraction = 0.3
+    policy._replay_vecnorm_fingerprint = "checkpoint-vecnorm"
     policy.dr_estimator = nn.Linear(1, 1)
     policy.opt_dr_estimator = torch.optim.Adam(
         policy.dr_estimator.parameters(), lr=1e-3
@@ -1185,14 +1733,15 @@ def test_tvkd_v3_checkpoint_saves_student_focus_and_detector_state(
     policy._failure_phase_uniform_fallback_rows = 4
     policy._failure_phase_focused_rows = 5
     policy._failure_histogram_device_cache = {}
-    policy.teacher_value_bottleneck_detector = _detector(
-        residual_scale_ema_decay=0.8
-    )
+    policy.teacher_value_bottleneck_detector = _detector(residual_scale_ema_decay=0.8)
     policy.teacher_value_bottleneck_detector.update_residual_scale(
         torch.full((8,), -2.0)
     )
     expected_detector = policy.teacher_value_bottleneck_detector.state_dict()
     policy._reset_bottleneck_statistics()
+    policy._verified_failure_motion_phase_histogram = {
+        7: policy._failure_phase_histogram.clone()
+    }
     policy._bottleneck_detected_count = 2
     policy._bottleneck_selected_count = 2
     policy._bottleneck_score_sum = 3.0
@@ -1213,10 +1762,7 @@ def test_tvkd_v3_checkpoint_saves_student_focus_and_detector_state(
         lambda self: {
             "baseline_state": torch.tensor(1.0),
             "optimizer_resume_state": {},
-            "dagger_backend_config": {
-                "lambda_bc": 0.73,
-                "failure_phase_student_fraction": 0.3,
-            },
+            "dagger_backend_config": _strict_v4_backend_config(self.cfg),
         },
     )
     translated = []
@@ -1238,8 +1784,7 @@ def test_tvkd_v3_checkpoint_saves_student_focus_and_detector_state(
         "failure_phase_student_fraction"
     ] == pytest.approx(0.3)
     assert (
-        state["teacher_value_bottleneck_replay_state"]["detector"]
-        == expected_detector
+        state["teacher_value_bottleneck_replay_state"]["detector"] == expected_detector
     )
     focus_state = state["teacher_value_bottleneck_replay_state"]
     assert focus_state["student_focus_rows_marked"] == 6
@@ -1264,6 +1809,11 @@ def test_tvkd_v3_checkpoint_saves_student_focus_and_detector_state(
     assert state["num_updates"] == 17
     assert state["sac_actor_update_count"] == 19
     assert state["sac_alpha_update_count"] == 23
+
+    policy.cfg.replay_task_fingerprint = tvkd_module.UNBOUND_CONTRACT_FINGERPRINT
+    with pytest.raises(ValueError, match="bound lowercase SHA-256"):
+        policy._fastsac_checkpoint_state()
+    policy.cfg.replay_task_fingerprint = "b" * 64
 
     policy.teacher_value_bottleneck_detector.update_residual_scale(
         torch.full((8,), 20.0)
@@ -1305,6 +1855,59 @@ def test_tvkd_v3_checkpoint_saves_student_focus_and_detector_state(
     assert translated[0][1] is False
 
 
+def test_v4_checkpoint_rejects_binwise_motion_histogram_mismatch(monkeypatch):
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        failure_phase_num_bins=4,
+        value_norm=False,
+        bottleneck_fallback_mode="none",
+    )
+    policy._failure_histogram_device_cache = {}
+    mismatched = _verified_histogram_state(
+        4, histogram=torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    )
+    mismatched["motion_histograms"] = {
+        0: torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float64)
+    }
+
+    with pytest.raises(ValueError, match="motion/global"):
+        policy._load_failure_curriculum_checkpoint_state(mismatched)
+
+    policy._failure_phase_histogram = torch.zeros(4, dtype=torch.float64)
+    policy._verified_failure_motion_phase_histogram = {}
+    policy._failure_phase_episode_count = 0
+    policy._failure_phase_anchor_count = 7
+    policy._failure_phase_uniform_fallback_rows = 0
+    policy._failure_phase_focused_rows = 0
+    with pytest.raises(RuntimeError, match="anchor count"):
+        policy._failure_curriculum_checkpoint_state()
+
+    policy._failure_phase_anchor_count = 0
+    policy._verified_failure_motion_phase_histogram = {
+        True: torch.zeros(4, dtype=torch.float64)
+    }
+    with pytest.raises(RuntimeError, match="motion histogram"):
+        policy._failure_curriculum_checkpoint_state()
+
+    monkeypatch.setattr(
+        DistributionalFastSACTeacherBC,
+        "_q_backend_metadata",
+        lambda self: {"failure_phase_replay_semantics": "legacy_terminal_lookback"},
+    )
+    metadata = policy._q_backend_metadata()
+    assert (
+        metadata["failure_phase_replay_semantics"]
+        == tvkd_module.VERIFIED_HISTOGRAM_SEMANTICS
+    )
+    assert (
+        metadata["bottleneck_location_semantics"]
+        == tvkd_module.BOTTLENECK_LOCATION_SEMANTICS
+    )
+
+
 def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     tmp_path,
     monkeypatch,
@@ -1321,6 +1924,7 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
                 "algo.dagger_beta_decay_rollouts=500",
             ],
         )
+    tvkd_entry._install_teacher_contract_fingerprints(cfg)
     saved_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     launch_dir = tmp_path / "launch"
     checkpoint_path = launch_dir / "checkpoints" / "checkpoint_12.pt"
@@ -1358,6 +1962,7 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
         "temporal_depth_gru",
         "temporal_depth_gru_ema",
     )
+    histogram_state = _verified_histogram_state(int(cfg.algo.failure_phase_num_bins))
     policy_state = {name: {} for name in module_names}
     policy_state.update(
         {
@@ -1372,17 +1977,13 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
                     }
                 )
             ),
+            **_strict_v4_policy_metadata(
+                cfg.algo,
+                vecnorm_fingerprint="vecnorm",
+                histogram_state=histogram_state,
+            ),
             "frozen_teacher_state": {
                 name: {} for name in ("actor", "encoder_priv", "critic", "value_norm")
-            },
-            "failure_phase_curriculum_state": {
-                "histogram": torch.zeros(
-                    int(cfg.algo.failure_phase_num_bins), dtype=torch.float64
-                ),
-                "episode_count": 0,
-                "anchor_count": 0,
-                "uniform_fallback_rows": 0,
-                "focused_rows": 0,
             },
             "optimizer_resume_state": {
                 "actor_optimizer": {},
@@ -1396,19 +1997,13 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
                 "fingerprint": "action-fingerprint",
             },
             "perception_initialization": {},
-            "dagger_backend_config": {
-                "value_norm": False,
-                "lambda_bc": float(cfg.algo.lambda_bc),
-                "failure_phase_student_fraction": float(
-                    cfg.algo.failure_phase_student_fraction
-                ),
-            },
-            "q_backend_config": {},
+            "dagger_backend_config": _strict_v4_backend_config(cfg.algo),
             "vecnorm_fingerprint": "vecnorm",
             "log_alpha": torch.tensor(-2.0),
             "actor_update_count": 1,
             "critic_update_count": 2,
             "alpha_update_count": 3,
+            "q_update_row_credit": 383.0,
             "dagger_rollout_count": 600,
             "dagger_environment_steps": 600 * int(cfg.algo.train_every),
             "teacher_prefill_rollout_count": 4,
@@ -1448,6 +2043,50 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     assert cfg._bc_dagger_fresh_source is True
     assert cfg.algo.value_norm is False
 
+    mismatched_path = tmp_path / "checkpoint_tvkd_v4_binwise_mismatch.pt"
+    mismatched_policy = copy.deepcopy(policy_state)
+    mismatched_histogram = _verified_histogram_state(
+        int(cfg.algo.failure_phase_num_bins),
+        histogram=torch.nn.functional.pad(
+            torch.ones(1, dtype=torch.float64),
+            (0, int(cfg.algo.failure_phase_num_bins) - 1),
+        ),
+    )
+    mismatched_histogram["motion_histograms"] = {
+        0: torch.nn.functional.pad(
+            torch.tensor([0.0, 1.0], dtype=torch.float64),
+            (0, int(cfg.algo.failure_phase_num_bins) - 2),
+        )
+    }
+    mismatched_policy["verified_teacher_value_histogram_state"] = copy.deepcopy(
+        mismatched_histogram
+    )
+    mismatched_policy["failure_phase_curriculum_state"] = copy.deepcopy(
+        mismatched_histogram
+    )
+    torch.save(
+        {"policy": mismatched_policy, "vecnorm": {}, "cfg": saved_cfg},
+        mismatched_path,
+    )
+    mismatched_runtime = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    mismatched_runtime.fastsac_bc_dagger_checkpoint = str(mismatched_path)
+    with pytest.raises(ValueError, match="motion/global"):
+        _prepare_tvkd_checkpoint(mismatched_runtime)
+
+    alias_path = tmp_path / "checkpoint_tvkd_v4_alias_mismatch.pt"
+    alias_policy = copy.deepcopy(policy_state)
+    alias_policy["failure_phase_curriculum_state"]["episode_count"] = 1
+    torch.save(
+        {"policy": alias_policy, "vecnorm": {}, "cfg": saved_cfg},
+        alias_path,
+    )
+    alias_runtime = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
+    alias_runtime.fastsac_bc_dagger_checkpoint = str(alias_path)
+    with pytest.raises(ValueError, match="histogram aliases"):
+        _prepare_tvkd_checkpoint(alias_runtime)
+
     drifted = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     drifted.fastsac_bc_dagger_checkpoint = str(checkpoint_path)
     drifted.algo.train_every = int(drifted.algo.train_every) + 1
@@ -1456,14 +2095,18 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
 
     malformed_v3_path = tmp_path / "checkpoint_tvkd_v3_missing_student_fraction.pt"
     malformed_v3_policy = copy.deepcopy(policy_state)
-    malformed_v3_policy["dagger_backend_config"].pop(
-        "failure_phase_student_fraction"
+    malformed_v3_policy["training_algorithm"] = TVKD_V3_TRAINING_ALGORITHM
+    malformed_v3_policy["checkpoint_version"] = TVKD_V3_CHECKPOINT_VERSION
+    malformed_v3_policy["dagger_backend_config"] = _legacy_replay_backend(
+        float(cfg.algo.lambda_bc),
+        student_focus=None,
     )
+    malformed_v3_cfg = _legacy_saved_config(saved_cfg, include_student_focus=True)
     torch.save(
         {
             "policy": malformed_v3_policy,
             "vecnorm": {},
-            "cfg": saved_cfg,
+            "cfg": malformed_v3_cfg,
         },
         malformed_v3_path,
     )
@@ -1472,21 +2115,17 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     )
     malformed_v3_runtime.fastsac_bc_dagger_checkpoint = str(malformed_v3_path)
 
-    with pytest.raises(
-        ValueError, match="focused Student replay fraction mismatch"
-    ):
+    with pytest.raises(ValueError, match="failure_phase_student_fraction"):
         _prepare_tvkd_checkpoint(malformed_v3_runtime)
 
     previous_path = tmp_path / "checkpoint_tvkd_v2.pt"
-    previous_cfg = OmegaConf.create(
-        OmegaConf.to_container(saved_cfg, resolve=False)
-    )
-    del previous_cfg.algo.failure_phase_student_fraction
+    previous_cfg = _legacy_saved_config(saved_cfg, include_student_focus=False)
     previous_policy = copy.deepcopy(policy_state)
     previous_policy["training_algorithm"] = TVKD_PREVIOUS_TRAINING_ALGORITHM
     previous_policy["checkpoint_version"] = TVKD_PREVIOUS_CHECKPOINT_VERSION
-    previous_policy["dagger_backend_config"].pop(
-        "failure_phase_student_fraction"
+    previous_policy["dagger_backend_config"] = _legacy_replay_backend(
+        float(cfg.algo.lambda_bc),
+        student_focus=None,
     )
     previous_focus = previous_policy["teacher_value_bottleneck_replay_state"]
     for name in (
@@ -1541,9 +2180,7 @@ def test_direct_v2_resume_forces_uniform_student_replay_and_zeros_new_counters(
     policy._failure_phase_focused_rows = 0
     policy._failure_histogram_device_cache = {}
     freezes = []
-    policy.teacher_value_wrapper = SimpleNamespace(
-        freeze=lambda: freezes.append(True)
-    )
+    policy.teacher_value_wrapper = SimpleNamespace(freeze=lambda: freezes.append(True))
 
     bottleneck_state = _empty_bottleneck_checkpoint_state()
     for name in (
@@ -1556,7 +2193,10 @@ def test_direct_v2_resume_forces_uniform_student_replay_and_zeros_new_counters(
     state = {
         "training_algorithm": TVKD_PREVIOUS_TRAINING_ALGORITHM,
         "checkpoint_version": TVKD_PREVIOUS_CHECKPOINT_VERSION,
-        "dagger_backend_config": {"lambda_bc": 0.61},
+        "dagger_backend_config": _legacy_replay_backend(
+            0.61,
+            student_focus=None,
+        ),
         "teacher_value_bottleneck_replay_state": bottleneck_state,
         "frozen_teacher_state": {
             name: getattr(policy, name).state_dict()
@@ -1595,6 +2235,128 @@ def test_direct_v2_resume_forces_uniform_student_replay_and_zeros_new_counters(
     assert freezes == [True]
 
 
+def test_direct_v3_resume_preserves_cadence_and_exact_legacy_mix_but_resets_stats(
+    monkeypatch,
+):
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        train_dr_estimator=False,
+        failure_phase_num_bins=4,
+        lambda_bc=0.61,
+        failure_phase_student_fraction=0.3,
+    )
+    policy.actor = nn.Linear(1, 1)
+    policy.encoder_priv = nn.Linear(1, 1)
+    policy.critic = nn.Linear(1, 2)
+    policy.value_norm = _AffineValueNorm()
+    policy.teacher_value_bottleneck_detector = _detector()
+    policy.teacher_value_bottleneck_detector.update_residual_scale(
+        torch.full((4,), -8.0)
+    )
+    policy._reset_bottleneck_statistics()
+    policy._bottleneck_detected_count = 9
+    policy._failure_phase_histogram = torch.tensor(
+        [0.0, 2.0, 1.0, 0.0], dtype=torch.float64
+    )
+    policy._failure_phase_episode_count = 2
+    policy._failure_phase_anchor_count = 3
+    policy._failure_phase_uniform_fallback_rows = 4
+    policy._failure_phase_focused_rows = 5
+    policy._verified_failure_motion_phase_histogram = {
+        3: policy._failure_phase_histogram.clone()
+    }
+    policy._failure_histogram_device_cache = {}
+    freezes = []
+    policy.teacher_value_wrapper = SimpleNamespace(freeze=lambda: freezes.append(True))
+    state = {
+        "training_algorithm": TVKD_V3_TRAINING_ALGORITHM,
+        "checkpoint_version": TVKD_V3_CHECKPOINT_VERSION,
+        "dagger_backend_config": _legacy_replay_backend(
+            0.61,
+            student_focus=0.3,
+            alpha_cadence="critic",
+        ),
+        "teacher_value_bottleneck_replay_state": (
+            _empty_bottleneck_checkpoint_state(
+                {
+                    "bottleneck_residual_scale_ema": 6.0,
+                    "num_scale_updates": 41,
+                }
+            )
+        ),
+        "frozen_teacher_state": {
+            name: getattr(policy, name).state_dict()
+            for name in ("actor", "encoder_priv", "critic", "value_norm")
+        },
+        "failure_phase_curriculum_state": {
+            "histogram": torch.tensor([0.0, 2.0, 1.0, 0.0], dtype=torch.float64),
+            "episode_count": 2,
+            "anchor_count": 3,
+            "uniform_fallback_rows": 4,
+            "focused_rows": 5,
+        },
+        "optimizer_resume_state": {"dr_estimator_optimizer": None},
+        "num_updates": 7,
+        "sac_actor_update_count": 8,
+        "sac_alpha_update_count": 9,
+    }
+    translated = []
+    monkeypatch.setattr(
+        DistributionalFastSACTeacherBC,
+        "_load_fastsac_checkpoint_state",
+        lambda self, state, *, load_modules=True: translated.append(
+            (state, load_modules)
+        ),
+    )
+
+    with pytest.warns(UserWarning, match="Migrating a TVKD v3"):
+        policy._load_fastsac_checkpoint_state(state, load_modules=False)
+
+    expected_global = {
+        "uniform_student": 0.35,
+        "failure_student": 0.15,
+        "uniform_teacher": 0.35,
+        "failure_teacher": 0.15,
+    }
+    for purpose in ("q", "actor"):
+        for source, expected in expected_global.items():
+            assert getattr(policy.cfg, f"{purpose}_{source}_fraction") == pytest.approx(
+                expected
+            )
+    expected_perception = {
+        "uniform_student": 0.5,
+        "failure_student": 0.0,
+        "uniform_teacher": 0.35,
+        "failure_teacher": 0.15,
+    }
+    for source, expected in expected_perception.items():
+        assert getattr(policy.cfg, f"perception_{source}_fraction") == pytest.approx(
+            expected
+        )
+    assert policy.cfg.perception_replay_mode == "legacy_online_student"
+    assert policy.cfg.sac_alpha_update_cadence == "critic"
+    assert policy.cfg.bottleneck_fallback_mode == "none"
+    assert policy.cfg.bottleneck_include_unsuccessful_timeouts is True
+    assert policy.cfg.max_teacher_phase_match_distance is None
+    assert policy.teacher_value_bottleneck_detector.state_dict() == {
+        "bottleneck_residual_scale_ema": 1.0,
+        "num_scale_updates": 0,
+    }
+    assert torch.equal(
+        policy._failure_phase_histogram,
+        torch.zeros(4, dtype=torch.float64),
+    )
+    assert policy._verified_failure_motion_phase_histogram == {}
+    assert policy._bottleneck_detected_count == 0
+    assert (policy.num_updates, policy.sac_actor_update_count) == (7, 8)
+    assert policy.sac_alpha_update_count == 9
+    assert translated and translated[0][1] is False
+    assert freezes == [True]
+
+
 def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypatch):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
@@ -1604,11 +2366,16 @@ def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypat
         "joint_names": ("joint",),
         "fingerprint": "same",
     }
-    policy.cfg = SimpleNamespace(train_perception=True)
+    policy.cfg = SimpleNamespace(
+        train_perception=True,
+        q_update_to_data_ratio=1.0,
+        q_batch_size=512,
+    )
     restored = []
 
     def restore(self, state, *, load_modules=True):
         restored.append((state, load_modules))
+        self.q_update_row_credit = float(state["q_update_row_credit"])
 
     monkeypatch.setattr(
         TVKDDistributionalFastSACTeacherBC,
@@ -1642,6 +2409,7 @@ def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypat
     result = policy.load_state_dict(
         {
             "training_algorithm": TVKD_TRAINING_ALGORITHM,
+            "checkpoint_version": TVKD_CHECKPOINT_VERSION,
             "actor_backend": TVKD_ACTOR_BACKEND,
             "action_contract": {
                 "joint_names": ("joint",),
@@ -1649,6 +2417,7 @@ def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypat
             },
             "last_iter": 40,
             "next_iter": 41,
+            "q_update_row_credit": 383.0,
         }
     )
 
@@ -1663,6 +2432,9 @@ def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypat
     assert policy.actor_adapt.actor_std.grad is None
     assert policy.qnet.training is True
     assert policy.qnet_target.training is False
+    assert policy.q_update_row_credit == 0.0
+    assert policy._q_updates_due(129) == 0
+    assert policy.q_update_row_credit == pytest.approx(129.0)
     assert progress == [41]
     assert freezes == [1]
 
@@ -1674,13 +2446,14 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
         TVKDDistributionalFastSACTeacherBC
     )
     nn.Module.__init__(policy)
-    policy.cfg = SimpleNamespace(
-        train_perception=False,
-        train_dr_estimator=False,
-        failure_phase_num_bins=2,
-        lambda_bc=0.61,
-        failure_phase_student_fraction=0.3,
-    )
+    policy.cfg = TVKDDistributionalFastSACTeacherBCConfig()
+    policy.cfg.teacher_value_reward_group_fingerprint = "a" * 64
+    policy.cfg.replay_task_fingerprint = "b" * 64
+    policy.cfg.train_perception = False
+    policy.cfg.train_dr_estimator = False
+    policy.cfg.failure_phase_num_bins = 2
+    policy.cfg.lambda_bc = 0.61
+    policy.cfg.failure_phase_student_fraction = 0.3
     policy.actor = nn.Linear(1, 1)
     policy.encoder_priv = nn.Linear(1, 1)
     policy.critic = nn.Linear(1, 2)
@@ -1696,26 +2469,22 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
     policy._reset_bottleneck_statistics()
     freezes = []
     policy.teacher_value_wrapper = SimpleNamespace(freeze=lambda: freezes.append(1))
+    histogram_state = _verified_histogram_state(2)
     state = {
         "training_algorithm": TVKD_TRAINING_ALGORITHM,
         "checkpoint_version": TVKD_CHECKPOINT_VERSION,
-        "dagger_backend_config": {
-            "lambda_bc": 0.61,
-            "failure_phase_student_fraction": 0.3,
-        },
+        "dagger_backend_config": _strict_v4_backend_config(policy.cfg),
         "teacher_value_bottleneck_replay_state": (
             policy._bottleneck_replay_checkpoint_state()
+        ),
+        **_strict_v4_policy_metadata(
+            policy.cfg,
+            vecnorm_fingerprint="same-vecnorm",
+            histogram_state=histogram_state,
         ),
         "frozen_teacher_state": {
             name: getattr(policy, name).state_dict()
             for name in ("actor", "encoder_priv", "critic", "value_norm")
-        },
-        "failure_phase_curriculum_state": {
-            "histogram": torch.zeros(2, dtype=torch.float64),
-            "episode_count": 0,
-            "anchor_count": 0,
-            "uniform_fallback_rows": 0,
-            "focused_rows": 0,
         },
         "vecnorm_fingerprint": "same-vecnorm",
         "perception_initialization": {"trainable": False},
@@ -1739,6 +2508,25 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
         "_load_fastsac_checkpoint_state",
         baseline_load,
     )
+
+    drifted = copy.deepcopy(state)
+    drifted["dagger_backend_config"]["tvkd_lambda"] = (
+        float(policy.cfg.tvkd_lambda) + 0.1
+    )
+    with pytest.raises(ValueError, match="tvkd_lambda"):
+        policy._load_fastsac_checkpoint_state(drifted, load_modules=False)
+
+    drifted_cadence = copy.deepcopy(state)
+    drifted_cadence["dagger_backend_config"]["train_every"] = (
+        int(policy.cfg.train_every) + 1
+    )
+    with pytest.raises(ValueError, match="train_every"):
+        policy._load_fastsac_checkpoint_state(drifted_cadence, load_modules=False)
+
+    drifted_semantics = copy.deepcopy(state)
+    drifted_semantics["actor_learning_semantics"] = "wrong"
+    with pytest.raises(ValueError, match="actor_learning_semantics"):
+        policy._load_fastsac_checkpoint_state(drifted_semantics, load_modules=False)
 
     policy._load_fastsac_checkpoint_state(state, load_modules=True)
 
@@ -1780,13 +2568,14 @@ def test_v1_resume_discards_scheduler_state_and_starts_fresh_detector(monkeypatc
     policy._failure_phase_focused_rows = 5
     policy._failure_histogram_device_cache = {}
     freezes = []
-    policy.teacher_value_wrapper = SimpleNamespace(
-        freeze=lambda: freezes.append(True)
-    )
+    policy.teacher_value_wrapper = SimpleNamespace(freeze=lambda: freezes.append(True))
     state = {
         "training_algorithm": TVKD_LEGACY_TRAINING_ALGORITHM,
         "checkpoint_version": TVKD_LEGACY_CHECKPOINT_VERSION,
-        "dagger_backend_config": {"lambda_bc": 0.44},
+        "dagger_backend_config": _legacy_replay_backend(
+            0.44,
+            student_focus=None,
+        ),
         "teacher_value_bc_scheduler": {
             "residual_scale_ema": 99.0,
             "risk_ema": 1.0,
@@ -1841,6 +2630,102 @@ def test_v1_resume_discards_scheduler_state_and_starts_fresh_detector(monkeypatc
     assert freezes == [True]
 
 
+@pytest.mark.parametrize(
+    ("batch_size", "expected"),
+    (
+        (1, (1, 0, 0, 0)),
+        (3, (1, 1, 1, 0)),
+        (7, (3, 1, 2, 1)),
+        (128, (45, 19, 45, 19)),
+        (512, (179, 77, 179, 77)),
+        (4096, (1434, 614, 1434, 614)),
+    ),
+)
+def test_four_way_allocator_is_exact_and_deterministic_at_required_sizes(
+    batch_size,
+    expected,
+):
+    fractions = {
+        "uniform_student": 0.35,
+        "failure_student": 0.15,
+        "uniform_teacher": 0.35,
+        "failure_teacher": 0.15,
+    }
+    counts = allocate_source_counts(batch_size, fractions)
+    reverse_counts = allocate_source_counts(
+        batch_size, dict(reversed(tuple(fractions.items())))
+    )
+
+    assert tuple(counts[source] for source in REPLAY_SOURCE_ORDER) == expected
+    assert counts == reverse_counts
+    assert sum(counts.values()) == batch_size
+    assert all(count >= 0 for count in counts.values())
+
+
+@pytest.mark.parametrize("batch_size", (0, -1, 1.5, True))
+def test_four_way_allocator_rejects_invalid_batch_sizes(batch_size):
+    fractions = dict(zip(REPLAY_SOURCE_ORDER, (0.35, 0.15, 0.35, 0.15)))
+    with pytest.raises(ValueError, match="batch_size"):
+        allocate_source_counts(batch_size, fractions)
+
+
+@pytest.mark.parametrize(
+    "fractions",
+    (
+        {
+            "uniform_student": -0.01,
+            "failure_student": 0.16,
+            "uniform_teacher": 0.35,
+            "failure_teacher": 0.5,
+        },
+        {
+            "uniform_student": float("nan"),
+            "failure_student": 0.15,
+            "uniform_teacher": 0.35,
+            "failure_teacher": 0.5,
+        },
+        {
+            "uniform_student": float("inf"),
+            "failure_student": 0.15,
+            "uniform_teacher": 0.35,
+            "failure_teacher": 0.5,
+        },
+        {
+            "uniform_student": True,
+            "failure_student": 0.15,
+            "uniform_teacher": 0.35,
+            "failure_teacher": 0.5,
+        },
+        {
+            "uniform_student": 0.3,
+            "failure_student": 0.15,
+            "uniform_teacher": 0.35,
+            "failure_teacher": 0.15,
+        },
+        {
+            "uniform_student": 0.5,
+            "failure_student": 0.5,
+            "uniform_teacher": 0.0,
+        },
+        {
+            "uniform_student": 0.5,
+            "failure_student": 0.5,
+            "uniform_teacher": 0.0,
+            "failure_teacher": 0.0,
+            "unexpected": 0.0,
+        },
+    ),
+)
+def test_four_way_allocator_rejects_invalid_fraction_contracts(fractions):
+    with pytest.raises(ValueError):
+        allocate_source_counts(128, fractions)
+
+
+def test_four_way_allocator_requires_a_mapping():
+    with pytest.raises(TypeError, match="mapping"):
+        allocate_source_counts(128, (0.35, 0.15, 0.35, 0.15))
+
+
 def test_tvkd_hydra_config_inherits_source_mix_defaults_and_new_controls():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
@@ -1854,7 +2739,7 @@ def test_tvkd_hydra_config_inherits_source_mix_defaults_and_new_controls():
         )
 
     assert cfg.algo.name == "tvkd_fastsac_bc_dagger"
-    assert cfg.algo.sac_alpha_update_cadence == "critic"
+    assert cfg.algo.sac_alpha_update_cadence == "actor"
     assert cfg.algo.use_tvkd_value_shaping is True
     assert cfg.algo.tvkd_lambda == pytest.approx(0.25)
     assert cfg.algo.use_teacher_value_bottleneck_replay is True
@@ -1870,14 +2755,64 @@ def test_tvkd_hydra_config_inherits_source_mix_defaults_and_new_controls():
     assert cfg.algo.failure_phase_student_fraction == pytest.approx(0.3)
     assert cfg.algo.q_teacher_replay_ratio == pytest.approx(0.5)
     assert cfg.algo.q_updates_per_rollout == 32
+    expected_mix = {
+        "uniform_student": 0.35,
+        "failure_student": 0.15,
+        "uniform_teacher": 0.35,
+        "failure_teacher": 0.15,
+    }
+    for purpose in ("q", "actor", "perception"):
+        for source, expected in expected_mix.items():
+            assert cfg.algo[f"{purpose}_{source}_fraction"] == pytest.approx(expected)
+    assert cfg.algo.perception_replay_mode == "four_way"
+    assert cfg.algo.bottleneck_fallback_mode == "none"
+    assert cfg.algo.bottleneck_include_unsuccessful_timeouts is True
+    assert cfg.algo.max_teacher_phase_match_distance is None
 
-    cfg.algo.failure_phase_student_fraction = 1.01
-    with pytest.raises(ValueError, match="failure_phase_student_fraction"):
+    cfg.algo.q_failure_student_fraction = 1.01
+    with pytest.raises(ValueError, match="failure_student fraction"):
         validate_tvkd_fastsac_bc_dagger_config(cfg)
-    cfg.algo.failure_phase_student_fraction = 0.3
-    cfg.algo.sac_alpha_update_cadence = "actor"
-    with pytest.raises(ValueError, match="TVKD requires.*critic"):
+    cfg.algo.q_failure_student_fraction = 0.15
+    cfg.algo.sac_alpha_update_cadence = "rollout"
+    with pytest.raises(ValueError, match="sac_alpha_update_cadence"):
         validate_tvkd_fastsac_bc_dagger_config(cfg)
+
+
+def test_tvkd_hydra_resolves_three_independent_non_half_four_way_mixes():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    overrides = [
+        "task=G1/vaic/skateboard_stu",
+        "checkpoint_path=/tmp/fresh_ppo.pt",
+        "fastsac_dagger_iterations=10",
+        "algo.q_uniform_student_fraction=0.40",
+        "algo.q_failure_student_fraction=0.10",
+        "algo.q_uniform_teacher_fraction=0.30",
+        "algo.q_failure_teacher_fraction=0.20",
+        "algo.actor_uniform_student_fraction=0.20",
+        "algo.actor_failure_student_fraction=0.30",
+        "algo.actor_uniform_teacher_fraction=0.40",
+        "algo.actor_failure_teacher_fraction=0.10",
+        "algo.perception_uniform_student_fraction=0.45",
+        "algo.perception_failure_student_fraction=0.05",
+        "algo.perception_uniform_teacher_fraction=0.25",
+        "algo.perception_failure_teacher_fraction=0.25",
+    ]
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name="TVKD_fasSAC_bc_dagger", overrides=overrides)
+
+    expected = {
+        "q": (0.40, 0.10, 0.30, 0.20),
+        "actor": (0.20, 0.30, 0.40, 0.10),
+        "perception": (0.45, 0.05, 0.25, 0.25),
+    }
+    for purpose, values in expected.items():
+        resolved = tuple(
+            float(cfg.algo[f"{purpose}_{source}_fraction"])
+            for source in REPLAY_SOURCE_ORDER
+        )
+        assert resolved == pytest.approx(values)
+        assert sum(resolved) == pytest.approx(1.0)
+    tvkd_module._validate_tvkd_algorithm_config(cfg.algo)
 
 
 @pytest.mark.parametrize("fraction", (0.0, 0.1, 0.5, 1.0))
@@ -1895,10 +2830,7 @@ def test_tvkd_fresh_configurable_teacher_sources_survive_hydra_run_chdir(
         {
             "policy": {
                 "last_phase": "train",
-                **{
-                    name: {}
-                    for name in PPOVEL_TRAIN_PHASE_PARTIAL_PERCEPTION_MODULES
-                },
+                **{name: {} for name in PPOVEL_TRAIN_PHASE_PARTIAL_PERCEPTION_MODULES},
             }
         },
         checkpoint_path,
@@ -1937,3 +2869,324 @@ def test_tvkd_fresh_configurable_teacher_sources_survive_hydra_run_chdir(
         Path(cfg.algo.perception_checkpoint_path).resolve(strict=True)
         == canonical_checkpoint_path
     )
+
+
+def _v4_replay_rows(
+    count: int,
+    offset: int,
+    *,
+    phases: torch.Tensor | None = None,
+    motion_ids: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Small canonical replay payload with a complete recurrent raw window."""
+    row = torch.arange(count, dtype=torch.float32) + float(offset)
+    window = torch.arange(10, dtype=torch.float32)
+    if phases is None:
+        phases = (torch.arange(count, dtype=torch.float32) + 0.5) / count
+    if motion_ids is None:
+        motion_ids = torch.zeros(count, dtype=torch.long)
+    return {
+        "critic_observations": torch.stack((row, row + 0.5), dim=-1),
+        "actions": row[:, None] + 1.0,
+        "rewards": row + 2.0,
+        "dones": torch.zeros(count, dtype=torch.bool),
+        "truncations": torch.zeros(count, dtype=torch.bool),
+        "discounts": torch.ones(count),
+        "next_critic_observations": torch.stack((row + 4.0, row + 4.5), dim=-1),
+        REFERENCE_PHASE_KEY: phases.clone(),
+        REPLAY_TERMINATED_KEY: torch.zeros(count, dtype=torch.bool),
+        REPLAY_COMMAND_FINISHED_KEY: torch.zeros(count, dtype=torch.bool),
+        REPLAY_TIME_LIMIT_KEY: torch.zeros(count, dtype=torch.bool),
+        REPLAY_MOTION_ID_KEY: motion_ids.clone().long(),
+        PERCEPTION_DEPTH_U8_KEY: torch.zeros(count, 10, 1, 1, 1, dtype=torch.uint8),
+        PERCEPTION_POLICY_RAW_KEY: row[:, None, None] + window[None, :, None],
+        PERCEPTION_VEL_COMMAND_RAW_KEY: (
+            row[:, None, None] + window[None, :, None] + 0.25
+        ),
+        PERCEPTION_IS_INIT_KEY: torch.zeros(count, 10, dtype=torch.bool),
+    }
+
+
+def _v4_replay_mix_config() -> SimpleNamespace:
+    fractions = {
+        "q": (0.40, 0.10, 0.30, 0.20),
+        "actor": (0.20, 0.30, 0.40, 0.10),
+        "perception": (0.25, 0.25, 0.25, 0.25),
+    }
+    fields = {
+        f"{purpose}_{source}_fraction": value
+        for purpose, values in fractions.items()
+        for source, value in zip(REPLAY_SOURCE_ORDER, values)
+    }
+    return SimpleNamespace(
+        **fields,
+        q_batch_size=20,
+        dagger_batch_size=20,
+        perception_replay_batch_size=20,
+        teacher_perception_batch_size=20,
+        perception_replay_mode="four_way",
+        teacher_perception_replay_fraction=0.0,
+        failure_phase_num_bins=10,
+        max_teacher_phase_match_distance=None,
+        policy_delay=1,
+    )
+
+
+def _v4_four_way_sampling_policy(
+    *,
+    student_focus_rows: int = 12,
+    teacher_phases: torch.Tensor | None = None,
+    teacher_motion_ids: torch.Tensor | None = None,
+    verified_motion_bin: tuple[int, int] = (0, 5),
+    seed: int = 1701,
+) -> TVKDDistributionalFastSACTeacherBC:
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = _v4_replay_mix_config()
+    policy.device = torch.device("cpu")
+    policy.q_rng = torch.Generator().manual_seed(seed)
+    policy.teacher_perception_rng = torch.Generator().manual_seed(seed + 1)
+    policy.critic_update_count = 0
+    policy.q_teacher_replay = _TD3DeviceReplay(128, "cpu")
+    policy.dagger_replay = _TD3DeviceReplay(128, "cpu")
+
+    teacher_count = 40 if teacher_phases is None else int(teacher_phases.numel())
+    teacher = _v4_replay_rows(
+        teacher_count,
+        100,
+        phases=teacher_phases,
+        motion_ids=teacher_motion_ids,
+    )
+    policy.q_teacher_replay.extend(teacher)
+
+    student_count = max(40, student_focus_rows)
+    student = _v4_replay_rows(student_count, 1_000)
+    student[DAGGER_IS_STUDENT_ACTION_KEY] = torch.ones(student_count, dtype=torch.bool)
+    student[DAGGER_REPLAY_TEACHER_ACTIONS] = (
+        torch.arange(student_count, dtype=torch.float32)[:, None] + 2_000.0
+    )
+    student[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(
+        student_count, dtype=torch.bool
+    )
+    focused = torch.zeros(student_count, dtype=torch.bool)
+    if student_focus_rows:
+        focused[-student_focus_rows:] = True
+    student[FAILURE_PHASE_STUDENT_SOURCE_KEY] = focused
+    policy.dagger_replay.extend(student)
+
+    policy._prepare_dagger_learning_batch = MethodType(
+        lambda owner, batch: batch, policy
+    )
+    motion, phase_bin = verified_motion_bin
+    histogram = torch.zeros(10, dtype=torch.float64)
+    histogram[phase_bin] = 1.0
+    policy._verified_failure_motion_phase_histogram = {motion: histogram}
+    policy._teacher_phase_device_cache = {}
+    policy._teacher_phase_index_ready = False
+    policy._failure_phase_uniform_fallback_rows = 0
+    policy._failure_phase_focused_rows = 0
+    policy._failure_phase_student_uniform_fallback_rows = 0
+    policy._failure_phase_student_focused_rows = 0
+    policy._build_teacher_phase_index()
+    return policy
+
+
+def _v4_provenance_counts(batch: dict[str, torch.Tensor]) -> dict[str, int]:
+    provenance = batch[REPLAY_SAMPLE_PROVENANCE_KEY]
+    return {
+        source: int((provenance == source_id).sum().item())
+        for source_id, source in enumerate(REPLAY_SOURCE_ORDER)
+    }
+
+
+def test_v4_replay_q_uses_exact_independent_40_10_30_20_provenance():
+    policy = _v4_four_way_sampling_policy()
+
+    batch = policy._sample_balanced_q_batch()
+
+    assert _v4_provenance_counts(batch) == {
+        "uniform_student": 8,
+        "failure_student": 2,
+        "uniform_teacher": 6,
+        "failure_teacher": 4,
+    }
+    assert int(batch[DAGGER_Q_TEACHER_SOURCE_KEY].sum()) == 10
+
+
+def test_v4_replay_actor_uses_20_30_40_10_without_q_mix_leakage():
+    policy = _v4_four_way_sampling_policy()
+
+    q_batch = policy._sample_balanced_q_batch()
+    actor_batch = policy._sample_actor_batch()
+
+    assert _v4_provenance_counts(q_batch) == {
+        "uniform_student": 8,
+        "failure_student": 2,
+        "uniform_teacher": 6,
+        "failure_teacher": 4,
+    }
+    assert _v4_provenance_counts(actor_batch) == {
+        "uniform_student": 4,
+        "failure_student": 6,
+        "uniform_teacher": 8,
+        "failure_teacher": 2,
+    }
+
+
+def test_v4_replay_shortage_backfills_only_within_student_and_teacher():
+    teacher_phases = torch.full((40,), 0.95)
+    teacher_phases[0] = 0.05
+    policy = _v4_four_way_sampling_policy(
+        student_focus_rows=1,
+        teacher_phases=teacher_phases,
+        verified_motion_bin=(0, 0),
+    )
+
+    batch = policy._sample_balanced_q_batch()
+
+    assert _v4_provenance_counts(batch) == {
+        "uniform_student": 9,
+        "failure_student": 1,
+        "uniform_teacher": 9,
+        "failure_teacher": 1,
+    }
+    assert int(batch[DAGGER_Q_TEACHER_SOURCE_KEY].sum()) == 10
+    metrics = policy._replay_mix_metrics("q")
+    assert metrics["failure_student_backfill_rows"] == 1.0
+    assert metrics["failure_teacher_backfill_rows"] == 3.0
+
+
+def test_v4_replay_failure_teacher_never_crosses_motion_and_honors_distance():
+    phases = torch.tensor([0.45, 0.45, 0.45, 0.45, 0.05, 0.05])
+    motions = torch.tensor([0, 0, 1, 1, 1, 1])
+    policy = _v4_four_way_sampling_policy(
+        teacher_phases=phases,
+        teacher_motion_ids=motions,
+        verified_motion_bin=(0, 4),
+    )
+
+    indices, focused = policy._draw_teacher_indices(4, policy.q_rng, focused_count=2)
+    sampled_motion = policy.q_teacher_replay.data[REPLAY_MOTION_ID_KEY][indices]
+    assert focused.sum().item() == 2
+    assert torch.equal(sampled_motion[focused], torch.zeros(2, dtype=torch.long))
+
+    # Motion 1 has an exact bin-0 row, but the verified anchor belongs to
+    # motion 0, whose closest row is four bins away. The distance gate must
+    # backfill both requested FT rows as uniform Teacher rather than crossing.
+    policy.cfg.max_teacher_phase_match_distance = 0.1
+    histogram = torch.zeros(10, dtype=torch.float64)
+    histogram[0] = 1.0
+    policy._verified_failure_motion_phase_histogram = {0: histogram}
+    _, focused = policy._draw_teacher_indices(4, policy.q_rng, focused_count=2)
+    assert not focused.any()
+
+
+class _V4ToyTemporalDepth(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(0.5))
+        self.seen_policy_windows: list[torch.Tensor] = []
+
+    def forward(self, td: TensorDict):
+        policy = td["policy"]
+        self.seen_policy_windows.append(policy.detach().clone())
+        td["_depth_feature"] = policy[..., :1] * self.scale
+        return td
+
+
+class _V4ToyPerceptionHead(nn.Module):
+    def __init__(self, output_key: str):
+        super().__init__()
+        self.output_key = output_key
+        self.scale = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, td: TensorDict):
+        td[self.output_key] = td["_depth_feature"] * self.scale
+        return td
+
+
+class _V4ToyPrivilegedEncoder(nn.Module):
+    def forward(self, td: TensorDict):
+        td["priv_feature"] = td["priv"]
+        return td
+
+
+def test_v4_replay_perception_uses_failure_student_raw_windows_not_live_rollout(
+    monkeypatch,
+):
+    policy = _v4_four_way_sampling_policy(student_focus_rows=2)
+    for source in REPLAY_SOURCE_ORDER:
+        setattr(policy.cfg, f"perception_{source}_fraction", 0.0)
+    policy.cfg.perception_failure_student_fraction = 1.0
+    policy.cfg.perception_replay_batch_size = 2
+    policy.cfg.teacher_perception_batch_size = 2
+    policy.cfg.perception_replay_burn_in = 8
+    policy.cfg.latent_dim = 1
+    policy.cfg.num_minibatches = 1
+    policy.cfg.max_grad_norm = 10.0
+    policy.cfg.train_perception = True
+    policy.cfg.train_dr_estimator = False
+
+    raw_windows = torch.stack(
+        (
+            torch.linspace(0.1, 1.0, 10),
+            torch.linspace(1.1, 2.0, 10),
+        )
+    ).unsqueeze(-1)
+    focused_slice = slice(policy.dagger_replay.size - 2, policy.dagger_replay.size)
+    policy.dagger_replay.data[PERCEPTION_POLICY_RAW_KEY][focused_slice] = raw_windows
+    policy.dagger_replay.data["critic_observations"][focused_slice].zero_()
+
+    policy.q_critic_keys = ("priv", "object_")
+    policy._q_critic_widths = (1, 1)
+    policy._replay_object_geo = torch.zeros(1)
+    policy.depth_feature_dim = 1
+    policy._vecnorm_snapshot = lambda: {}
+    policy._normalize_replay_flat = lambda value, keys, widths, snapshot: value
+    policy._normalize_replay_value = lambda key, value, snapshot: value
+    policy.object_transform = nn.Identity()
+    policy.encoder_priv = _V4ToyPrivilegedEncoder()
+    policy.temporal_depth_gru = _V4ToyTemporalDepth()
+    policy.object_adapt = _V4ToyPerceptionHead("object_pred")
+    policy.object_pred_transform = nn.Identity()
+    policy.adapt_module = _V4ToyPerceptionHead("priv_pred")
+    policy.temporal_depth_gru_ema = copy.deepcopy(policy.temporal_depth_gru)
+    policy.object_adapt_ema = copy.deepcopy(policy.object_adapt)
+    policy.adapt_ema = copy.deepcopy(policy.adapt_module)
+    policy.adapt_loss_fn = nn.MSELoss(reduction="none")
+    parameters = list(policy.temporal_depth_gru.parameters())
+    parameters += list(policy.object_adapt.parameters())
+    parameters += list(policy.adapt_module.parameters())
+    policy.opt_adapt = torch.optim.SGD(parameters, lr=1e-3)
+    before = [parameter.detach().clone() for parameter in parameters]
+
+    # The four-way branch must not inspect this live-rollout sentinel.
+    result = policy.train_adapt(object())
+
+    assert result["adapt/perception_four_way"] == 1.0
+    assert any(not torch.equal(old, new) for old, new in zip(before, parameters))
+    assert len(policy.temporal_depth_gru.seen_policy_windows) == 2
+    for seen in policy.temporal_depth_gru.seen_policy_windows:
+        assert seen.shape == (2, 10, 1)
+        assert torch.allclose(
+            seen[:, 0, 0].sort().values,
+            torch.tensor([0.1, 1.1]),
+        )
+    metrics = policy._replay_mix_metrics("perception")
+    assert metrics["actual_failure_student_rows"] == 4.0
+    assert metrics["valid_loss_failure_student_fraction"] == 1.0
+
+    legacy_rollout = object()
+    legacy_calls = []
+    monkeypatch.setattr(
+        PPOVEL,
+        "train_adapt",
+        lambda owner, rollout: legacy_calls.append(rollout) or {"legacy": 1.0},
+    )
+    policy.cfg.perception_replay_mode = "legacy_online_student"
+    policy.cfg.teacher_perception_replay_fraction = 0.0
+    legacy_result = policy.train_adapt(legacy_rollout)
+    assert legacy_result == {"legacy": 1.0}
+    assert legacy_calls == [legacy_rollout]

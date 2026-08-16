@@ -26,8 +26,8 @@ from __future__ import annotations
 import copy
 import math
 import warnings
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields as dataclass_fields
 from typing import Callable
 
 import torch
@@ -47,25 +47,30 @@ from .fastsac_bc_dagger import (
 from .fastsac_vel import _vaic_truncation_mask
 from .ppo_bc_dagger import (
     DAGGER_IS_STUDENT_ACTION_KEY,
-    DAGGER_SAFE_TAKEOVER_KEY,
 )
 from .ppo_vel import DEPTH_KEY, OBJECT_GEO_KEY, OBJECT_KEY, VEL_CMD_KEY
 from .ppo_vel import PPOVEL
 from .td3_bc_dagger import (
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     REFERENCE_PHASE_KEY,
+    REPLAY_COMMAND_FINISHED_KEY,
+    REPLAY_MOTION_ID_KEY,
+    REPLAY_TERMINATED_KEY,
+    REPLAY_TIME_LIMIT_KEY,
     STUDENT_REPLAY_EPISODE_ID_KEY,
     STUDENT_REPLAY_EPISODE_STEP_KEY,
     _PREFILL_ENV_INDEX_KEY,
     _PREFILL_STEP_INDEX_KEY,
-    _failure_lookback_offsets,
+    allocate_source_counts,
     _project_c51_probabilities,
 )
 
-TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v3"
+TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v4"
+V3_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v3"
 PREVIOUS_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v2"
 LEGACY_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v1"
-CHECKPOINT_VERSION = 3
+CHECKPOINT_VERSION = 4
+V3_CHECKPOINT_VERSION = 3
 PREVIOUS_CHECKPOINT_VERSION = 2
 LEGACY_CHECKPOINT_VERSION = 1
 EXPECTED_ALGO_NAME = "tvkd_fastsac_bc_dagger"
@@ -76,9 +81,21 @@ EXPECTED_ALGO_TARGET = (
 CRITIC_LEARNING_SEMANTICS = (
     "frozen_raw_scale_ppo_value_potential_shaped_soft_c51_target_v1"
 )
+TEACHER_VALUE_RETURN_SEMANTICS = (
+    "source_ppo_gae_gamma_replay_discount_terminated_mask_v1"
+)
+TEACHER_VALUE_BOUNDARY_SEMANTICS = (
+    "source_ppo_physical_zero_nonphysical_done_self_bootstrap_v1"
+)
 ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_sac_plus_fixed_joint_valid_teacher_label_bc_v2"
 )
+BOTTLENECK_LOCATION_SEMANTICS = (
+    "frozen_teacher_raw_td_earliest_sustained_negative_student_v1"
+)
+VERIFIED_HISTOGRAM_SEMANTICS = "verified_teacher_value_threshold_motion_phase_v1"
+FRESH_RING_RESUME_SEMANTICS = "clear_online_rings_and_partial_row_credit_v1"
+UNBOUND_CONTRACT_FINGERPRINT = "unbound_direct_construction"
 
 LEGACY_ADAPTIVE_BC_CONFIG_FIELDS = (
     "use_adaptive_student_bc",
@@ -117,26 +134,184 @@ def _finite_scalar(name: str, value, *, positive: bool = False) -> float:
     return value
 
 
+def _required_contract_fingerprint(name: str, value) -> str:
+    """Reject placeholder metadata before it can enter an exact-resume seam."""
+    if (
+        not isinstance(value, str)
+        or value == UNBOUND_CONTRACT_FINGERPRINT
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{name} must be a bound lowercase SHA-256 fingerprint")
+    return value
+
+
+_REPLAY_MIX_SOURCES = (
+    "uniform_student",
+    "failure_student",
+    "uniform_teacher",
+    "failure_teacher",
+)
+
+
+def _legacy_global_replay_mix(
+    teacher_fraction, teacher_focus, student_focus
+) -> dict[str, float]:
+    values = {
+        "teacher fraction": teacher_fraction,
+        "Teacher focus fraction": teacher_focus,
+        "Student focus fraction": student_focus,
+    }
+    checked = {}
+    for name, value in values.items():
+        value = _finite_scalar(name, value)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must lie in [0, 1]")
+        checked[name] = value
+    teacher = checked["teacher fraction"]
+    student = 1.0 - teacher
+    return {
+        "uniform_student": student * (1.0 - checked["Student focus fraction"]),
+        "failure_student": student * checked["Student focus fraction"],
+        "uniform_teacher": teacher * (1.0 - checked["Teacher focus fraction"]),
+        "failure_teacher": teacher * checked["Teacher focus fraction"],
+    }
+
+
+def _checkpoint_replay_mix(cfg) -> dict[str, dict[str, float]]:
+    return {
+        purpose: {
+            source: float(getattr(cfg, f"{purpose}_{source}_fraction"))
+            for source in _REPLAY_MIX_SOURCES
+        }
+        for purpose in ("q", "actor", "perception")
+    }
+
+
+def _same_verified_histogram_state(left: Mapping, right: Mapping) -> bool:
+    """Compare the v4 histogram and its compatibility alias tensor-exactly."""
+    scalar_fields = (
+        "semantics",
+        "episode_count",
+        "anchor_count",
+        "uniform_fallback_rows",
+        "focused_rows",
+    )
+    if any(left.get(name) != right.get(name) for name in scalar_fields):
+        return False
+    left_histogram = left.get("histogram")
+    right_histogram = right.get("histogram")
+    if not (
+        torch.is_tensor(left_histogram)
+        and torch.is_tensor(right_histogram)
+        and torch.equal(left_histogram, right_histogram)
+    ):
+        return False
+    left_motion = left.get("motion_histograms")
+    right_motion = right.get("motion_histograms")
+    if not isinstance(left_motion, Mapping) or not isinstance(right_motion, Mapping):
+        return False
+    if set(left_motion) != set(right_motion):
+        return False
+    return all(
+        torch.is_tensor(left_motion[motion_id])
+        and torch.is_tensor(right_motion[motion_id])
+        and torch.equal(left_motion[motion_id], right_motion[motion_id])
+        for motion_id in left_motion
+    )
+
+
+def _install_v3_replay_migration(
+    cfg,
+    backend: Mapping,
+    *,
+    student_focus_default=None,
+) -> None:
+    """Install an old global mix and explicit legacy perception semantics."""
+    teacher_focus = backend.get("failure_phase_teacher_fraction")
+    student_focus = backend.get("failure_phase_student_fraction", student_focus_default)
+    q_mix = _legacy_global_replay_mix(
+        backend.get("q_teacher_replay_ratio"), teacher_focus, student_focus
+    )
+    actor_mix = _legacy_global_replay_mix(
+        backend.get("teacher_actor_replay_fraction"), teacher_focus, student_focus
+    )
+    perception_teacher = _finite_scalar(
+        "Teacher perception fraction",
+        backend.get("teacher_perception_replay_fraction"),
+    )
+    if not 0.0 <= perception_teacher <= 1.0:
+        raise ValueError("Teacher perception fraction must lie in [0, 1]")
+    teacher_focus_value = _finite_scalar("Teacher focus fraction", teacher_focus)
+    perception_mix = {
+        "uniform_student": 1.0 - perception_teacher,
+        "failure_student": 0.0,
+        "uniform_teacher": perception_teacher * (1.0 - teacher_focus_value),
+        "failure_teacher": perception_teacher * teacher_focus_value,
+    }
+    for purpose, mix in (
+        ("q", q_mix),
+        ("actor", actor_mix),
+        ("perception", perception_mix),
+    ):
+        allocate_source_counts(1, mix)
+        for source, value in mix.items():
+            setattr(cfg, f"{purpose}_{source}_fraction", float(value))
+    cadence = backend.get("sac_alpha_update_cadence", "critic")
+    if cadence not in {"actor", "critic"}:
+        raise ValueError("v3 checkpoint alpha cadence is invalid")
+    cfg.sac_alpha_update_cadence = cadence
+    cfg.q_teacher_replay_ratio = float(
+        _finite_scalar(
+            "checkpoint Q Teacher fraction",
+            backend.get("q_teacher_replay_ratio"),
+        )
+    )
+    cfg.teacher_actor_replay_fraction = float(
+        _finite_scalar(
+            "checkpoint Actor Teacher fraction",
+            backend.get("teacher_actor_replay_fraction"),
+        )
+    )
+    cfg.teacher_perception_replay_fraction = perception_teacher
+    cfg.failure_phase_teacher_fraction = teacher_focus_value
+    if hasattr(cfg, "failure_phase_student_fraction"):
+        cfg.failure_phase_student_fraction = float(student_focus)
+    cfg.perception_replay_mode = "legacy_online_student"
+    cfg.bottleneck_fallback_mode = "none"
+    cfg.bottleneck_include_unsuccessful_timeouts = True
+    cfg.max_teacher_phase_match_distance = None
+
+
 def _validate_tvkd_algorithm_config(cfg) -> None:
     """Validate controls shared by direct construction and the Hydra CLI."""
-    if getattr(cfg, "sac_alpha_update_cadence", None) != "critic":
-        raise ValueError(
-            "TVKD requires sac_alpha_update_cadence='critic' for "
-            "resume-compatible temperature updates"
-        )
+    if getattr(cfg, "sac_alpha_update_cadence", None) not in {"actor", "critic"}:
+        raise ValueError("sac_alpha_update_cadence must be 'actor' or 'critic'")
     for name in (
         "use_tvkd_value_shaping",
         "use_teacher_value_bottleneck_replay",
     ):
         if not isinstance(getattr(cfg, name), bool):
             raise ValueError(f"{name} must be boolean")
+    include_timeouts = getattr(cfg, "bottleneck_include_unsuccessful_timeouts", True)
+    if not isinstance(include_timeouts, bool):
+        raise ValueError("bottleneck_include_unsuccessful_timeouts must be boolean")
+    fallback_mode = str(getattr(cfg, "bottleneck_fallback_mode", "none"))
+    if fallback_mode not in {"none", "value_argmin"}:
+        raise ValueError("bottleneck_fallback_mode must be 'none' or 'value_argmin'")
 
-    student_fraction = _finite_scalar(
-        "failure_phase_student_fraction",
-        getattr(cfg, "failure_phase_student_fraction"),
-    )
-    if not 0.0 <= student_fraction <= 1.0:
-        raise ValueError("failure_phase_student_fraction must lie in [0, 1]")
+    for purpose in ("q", "actor", "perception"):
+        fractions = {
+            source: getattr(cfg, f"{purpose}_{source}_fraction")
+            for source in (
+                "uniform_student",
+                "failure_student",
+                "uniform_teacher",
+                "failure_teacher",
+            )
+        }
+        # The shared allocator is also the canonical strict fraction validator.
+        allocate_source_counts(1, fractions)
 
     tvkd_lambda = _finite_scalar("tvkd_lambda", getattr(cfg, "tvkd_lambda"))
     if tvkd_lambda < 0.0:
@@ -155,11 +330,7 @@ def _validate_tvkd_algorithm_config(cfg) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer")
     exclusion = getattr(cfg, "bottleneck_terminal_exclusion_steps")
-    if (
-        isinstance(exclusion, bool)
-        or not isinstance(exclusion, int)
-        or exclusion < 0
-    ):
+    if isinstance(exclusion, bool) or not isinstance(exclusion, int) or exclusion < 0:
         raise ValueError(
             "bottleneck_terminal_exclusion_steps must be a non-negative integer"
         )
@@ -169,9 +340,20 @@ def _validate_tvkd_algorithm_config(cfg) -> None:
     )
     if not 0.0 <= decay < 1.0:
         raise ValueError("bottleneck_residual_scale_ema_decay must lie in [0, 1)")
-    _finite_scalar(
-        "bottleneck_eps", getattr(cfg, "bottleneck_eps"), positive=True
-    )
+    _finite_scalar("bottleneck_eps", getattr(cfg, "bottleneck_eps"), positive=True)
+    max_distance = getattr(cfg, "max_teacher_phase_match_distance", None)
+    if max_distance is not None:
+        max_distance = _finite_scalar("max_teacher_phase_match_distance", max_distance)
+        if max_distance < 0.0:
+            raise ValueError("max_teacher_phase_match_distance must be non-negative")
+    if getattr(cfg, "teacher_value_return_semantics", None) != (
+        TEACHER_VALUE_RETURN_SEMANTICS
+    ):
+        raise ValueError("unsupported Teacher value return semantics")
+    if getattr(cfg, "teacher_value_boundary_semantics", None) != (
+        TEACHER_VALUE_BOUNDARY_SEMANTICS
+    ):
+        raise ValueError("unsupported Teacher value boundary semantics")
 
 
 @dataclass
@@ -180,8 +362,23 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
 
     _target_: str = EXPECTED_ALGO_TARGET
     name: str = EXPECTED_ALGO_NAME
-    # Preserve the v1 TVKD optimizer timescale for exact same-stage resume.
-    sac_alpha_update_cadence: str = "critic"
+    # Fresh v4 matches the parent FastSAC optimizer timescale. A v3 migration
+    # explicitly replaces this with the checkpoint's saved cadence.
+    sac_alpha_update_cadence: str = "actor"
+
+    q_uniform_student_fraction: float = 0.35
+    q_failure_student_fraction: float = 0.15
+    q_uniform_teacher_fraction: float = 0.35
+    q_failure_teacher_fraction: float = 0.15
+    actor_uniform_student_fraction: float = 0.35
+    actor_failure_student_fraction: float = 0.15
+    actor_uniform_teacher_fraction: float = 0.35
+    actor_failure_teacher_fraction: float = 0.15
+    perception_uniform_student_fraction: float = 0.35
+    perception_failure_student_fraction: float = 0.15
+    perception_uniform_teacher_fraction: float = 0.35
+    perception_failure_teacher_fraction: float = 0.15
+    perception_replay_mode: str = "four_way"
 
     use_tvkd_value_shaping: bool = True
     tvkd_lambda: float = 0.25
@@ -194,8 +391,14 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     bottleneck_terminal_exclusion_steps: int = 5
     bottleneck_residual_scale_ema_decay: float = 0.99
     bottleneck_eps: float = 1e-6
-    # Within each configured Student Q/Actor share, reserve at most 30% for
-    # exact rows around failed-episode bottlenecks. Missing rows backfill uniform.
+    bottleneck_fallback_mode: str = "none"
+    bottleneck_include_unsuccessful_timeouts: bool = True
+    max_teacher_phase_match_distance: float | None = None
+    teacher_value_return_semantics: str = TEACHER_VALUE_RETURN_SEMANTICS
+    teacher_value_boundary_semantics: str = TEACHER_VALUE_BOUNDARY_SEMANTICS
+    teacher_value_reward_group_fingerprint: str = UNBOUND_CONTRACT_FINGERPRINT
+    replay_task_fingerprint: str = UNBOUND_CONTRACT_FINGERPRINT
+    # Deprecated v3 migration input only. Canonical v4 samplers never consult it.
     failure_phase_student_fraction: float = 0.3
 
 
@@ -302,6 +505,7 @@ class TeacherValueBottleneck:
     student_candidate_count: int
     threshold_detected: bool
     used_fallback: bool
+    selection_origin: str
 
 
 class TeacherValueBottleneckDetector:
@@ -336,9 +540,7 @@ class TeacherValueBottleneckDetector:
             or terminal_exclusion_steps < 0
         ):
             raise ValueError("terminal_exclusion_steps must be non-negative")
-        decay = _finite_scalar(
-            "residual_scale_ema_decay", residual_scale_ema_decay
-        )
+        decay = _finite_scalar("residual_scale_ema_decay", residual_scale_ema_decay)
         if not 0.0 <= decay < 1.0:
             raise ValueError("residual_scale_ema_decay must lie in [0, 1)")
         self.smoothing_window = int(smoothing_window)
@@ -369,8 +571,7 @@ class TeacherValueBottleneckDetector:
             raise RuntimeError("Student Teacher TD residual contains NaN/Inf")
         absolute_mean = residual.abs().mean().item()
         self.bottleneck_residual_scale_ema = max(
-            self.residual_scale_ema_decay
-            * self.bottleneck_residual_scale_ema
+            self.residual_scale_ema_decay * self.bottleneck_residual_scale_ema
             + (1.0 - self.residual_scale_ema_decay) * absolute_mean,
             self.eps,
         )
@@ -384,14 +585,22 @@ class TeacherValueBottleneckDetector:
         reference_phase: torch.Tensor,
         true_terminal: torch.Tensor,
         timeout: torch.Tensor,
+        *,
+        fallback_mode: str = "none",
     ) -> TeacherValueBottleneck | None:
+        if fallback_mode not in {"none", "value_argmin"}:
+            raise ValueError(
+                "bottleneck fallback mode must be 'none' or 'value_argmin'"
+            )
         residual = torch.as_tensor(teacher_td_residual).detach().float().reshape(-1)
         source = torch.as_tensor(source_id).detach().long().reshape(-1)
         phase = torch.as_tensor(reference_phase).detach().float().reshape(-1)
         terminal = torch.as_tensor(true_terminal).detach().bool().reshape(-1)
         timeout = torch.as_tensor(timeout).detach().bool().reshape(-1)
         size = residual.numel()
-        if not all(value.numel() == size for value in (source, phase, terminal, timeout)):
+        if not all(
+            value.numel() == size for value in (source, phase, terminal, timeout)
+        ):
             raise ValueError("Bottleneck episode tensors must have identical length")
         if size == 0:
             self.last_diagnostics = self._empty_diagnostics()
@@ -419,9 +628,7 @@ class TeacherValueBottleneckDetector:
         if not bool(scale_population.any()):
             scale_population = student & ~terminal
         self.update_residual_scale(residual[scale_population])
-        normalized = residual / (
-            self.bottleneck_residual_scale_ema + self.eps
-        )
+        normalized = residual / (self.bottleneck_residual_scale_ema + self.eps)
 
         # A causal moving average is restarted by every Teacher-executed row.
         smoothed = torch.full_like(normalized, float("nan"))
@@ -466,16 +673,16 @@ class TeacherValueBottleneckDetector:
 
         used_fallback = False
         if selected_index is None:
+            if fallback_mode == "none":
+                self.last_diagnostics = diagnostics
+                return None
             fallback_mask = candidate
             if not bool(fallback_mask.any()):
-                diagnostics["used_fallback"] = True
                 self.last_diagnostics = diagnostics
                 return None
             fallback_indices = fallback_mask.nonzero(as_tuple=False).squeeze(-1)
             fallback_values = smoothed.index_select(0, fallback_indices)
-            selected_index = int(
-                fallback_indices[fallback_values.argmin()].item()
-            )
+            selected_index = int(fallback_indices[fallback_values.argmin()].item())
             used_fallback = True
             diagnostics["used_fallback"] = True
 
@@ -490,15 +697,14 @@ class TeacherValueBottleneckDetector:
             student_candidate_count=candidate_count,
             threshold_detected=bool(diagnostics["threshold_detected"]),
             used_fallback=used_fallback,
+            selection_origin="value_argmin" if used_fallback else "threshold",
         )
         self.last_diagnostics = diagnostics
         return result
 
     def state_dict(self) -> dict:
         return {
-            "bottleneck_residual_scale_ema": float(
-                self.bottleneck_residual_scale_ema
-            ),
+            "bottleneck_residual_scale_ema": float(self.bottleneck_residual_scale_ema),
             "num_scale_updates": int(self.num_scale_updates),
         }
 
@@ -530,35 +736,108 @@ class TeacherValueTerms:
 
 
 @torch.no_grad()
+def compute_teacher_value_continuation(
+    *,
+    teacher_v: torch.Tensor,
+    teacher_v_next: torch.Tensor,
+    terminated: torch.Tensor,
+    command_finished: torch.Tensor,
+    time_limit: torch.Tensor,
+    replay_discount: torch.Tensor | float,
+    gamma: float,
+    semantics: str = TEACHER_VALUE_BOUNDARY_SEMANTICS,
+) -> torch.Tensor:
+    """Return source-PPO-compatible discounted frozen-value continuation.
+
+    The frozen PPO Teacher was trained with the current value copied into every
+    done row and with only ``terminated`` masking its one-step value term.  Its
+    exact boundary contract is therefore different from SAC's: physical
+    termination contributes zero, while a non-physical command completion or
+    time-limit boundary self-bootstraps from ``V_T(s_t)``.  Ordinary rows use
+    ``V_T(s_{t+1})``.  Physical termination wins when reset causes coincide.
+    """
+    if semantics != TEACHER_VALUE_BOUNDARY_SEMANTICS:
+        raise ValueError(
+            f"unsupported frozen Teacher value boundary semantics {semantics!r}"
+        )
+    gamma = _finite_scalar("teacher value gamma", gamma)
+    if gamma < 0.0:
+        raise ValueError("teacher value gamma must be non-negative")
+
+    current = torch.as_tensor(teacher_v).detach().float().reshape(-1)
+    following = (
+        torch.as_tensor(teacher_v_next)
+        .detach()
+        .to(device=current.device, dtype=torch.float32)
+        .reshape(-1)
+    )
+    physical = (
+        torch.as_tensor(terminated)
+        .detach()
+        .to(device=current.device, dtype=torch.bool)
+        .reshape(-1)
+    )
+    command = (
+        torch.as_tensor(command_finished)
+        .detach()
+        .to(device=current.device, dtype=torch.bool)
+        .reshape(-1)
+    )
+    timeout = (
+        torch.as_tensor(time_limit)
+        .detach()
+        .to(device=current.device, dtype=torch.bool)
+        .reshape(-1)
+    )
+    discount = torch.as_tensor(
+        replay_discount, device=current.device, dtype=torch.float32
+    )
+    if discount.ndim == 0:
+        discount = discount.expand_as(current)
+    else:
+        discount = discount.reshape(-1)
+    values = (current, following, physical, command, timeout, discount)
+    if any(value.shape != current.shape for value in values[1:]):
+        raise ValueError("Teacher continuation tensors must have identical shape")
+    if not (
+        torch.isfinite(current).all()
+        and torch.isfinite(following).all()
+        and torch.isfinite(discount).all()
+    ):
+        raise RuntimeError("Teacher continuation contains NaN/Inf")
+
+    nonphysical_self_bootstrap = ~physical & (command | timeout)
+    continuation_value = torch.where(
+        physical,
+        torch.zeros_like(current),
+        torch.where(nonphysical_self_bootstrap, current, following),
+    )
+    continuation = gamma * discount * continuation_value
+    if not torch.isfinite(continuation).all():
+        raise RuntimeError("Discounted Teacher continuation contains NaN/Inf")
+    return continuation.detach()
+
+
+@torch.no_grad()
 def compute_teacher_value_terms(
     get_teacher_value: Callable[[torch.Tensor], torch.Tensor],
     teacher_critic_obs: torch.Tensor,
     next_teacher_critic_obs: torch.Tensor,
     raw_reward: torch.Tensor,
-    bootstrap_mask: torch.Tensor,
-    effective_discount: torch.Tensor | float,
     *,
+    terminated: torch.Tensor,
+    command_finished: torch.Tensor,
+    time_limit: torch.Tensor,
+    replay_discount: torch.Tensor | float,
+    gamma: float,
+    semantics: str = TEACHER_VALUE_BOUNDARY_SEMANTICS,
     tvkd_lambda: float,
     potential_clip: float | None = None,
 ) -> TeacherValueTerms:
-    """Compute raw-scale frozen-value shaping and raw-reward TD residual."""
+    """Compute source-PPO-compatible shaping and raw-reward TD residual."""
     raw_reward = raw_reward.detach().float().reshape(-1)
-    bootstrap = bootstrap_mask.detach().float().reshape(-1)
-    discount = torch.as_tensor(
-        effective_discount, device=raw_reward.device, dtype=torch.float32
-    )
-    if discount.ndim == 0:
-        discount = discount.expand_as(raw_reward)
-    else:
-        discount = discount.reshape(-1)
-    if not (raw_reward.shape == bootstrap.shape == discount.shape):
-        raise ValueError("Reward, bootstrap mask, and discount shapes must match")
-    if not (
-        torch.isfinite(raw_reward).all()
-        and torch.isfinite(bootstrap).all()
-        and torch.isfinite(discount).all()
-    ):
-        raise RuntimeError("TVKD reward/mask/discount contains NaN/Inf")
+    if not torch.isfinite(raw_reward).all():
+        raise RuntimeError("TVKD raw reward contains NaN/Inf")
 
     teacher_v = get_teacher_value(teacher_critic_obs).float().reshape(-1)
     teacher_v_next = get_teacher_value(next_teacher_critic_obs).float().reshape(-1)
@@ -571,10 +850,30 @@ def compute_teacher_value_terms(
         fixed_v = fixed_v.clamp(-clip, clip)
         fixed_v_next = fixed_v_next.clamp(-clip, clip)
 
-    potential_delta = discount * bootstrap * fixed_v_next - fixed_v
+    fixed_continuation = compute_teacher_value_continuation(
+        teacher_v=fixed_v,
+        teacher_v_next=fixed_v_next,
+        terminated=terminated,
+        command_finished=command_finished,
+        time_limit=time_limit,
+        replay_discount=replay_discount,
+        gamma=gamma,
+        semantics=semantics,
+    )
+    raw_continuation = compute_teacher_value_continuation(
+        teacher_v=teacher_v,
+        teacher_v_next=teacher_v_next,
+        terminated=terminated,
+        command_finished=command_finished,
+        time_limit=time_limit,
+        replay_discount=replay_discount,
+        gamma=gamma,
+        semantics=semantics,
+    )
+    potential_delta = fixed_continuation - fixed_v
     shaped_reward = raw_reward + float(tvkd_lambda) * potential_delta
     # Bottleneck detection uses raw reward and the unclipped Teacher value.
-    teacher_td_residual = raw_reward + discount * bootstrap * teacher_v_next - teacher_v
+    teacher_td_residual = raw_reward + raw_continuation - teacher_v
     for name, value in (
         ("potential delta", potential_delta),
         ("shaped reward", shaped_reward),
@@ -613,9 +912,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             smoothing_window=int(cfg.bottleneck_smoothing_window),
             min_consecutive=int(cfg.bottleneck_min_consecutive),
             terminal_exclusion_steps=int(cfg.bottleneck_terminal_exclusion_steps),
-            residual_scale_ema_decay=float(
-                cfg.bottleneck_residual_scale_ema_decay
-            ),
+            residual_scale_ema_decay=float(cfg.bottleneck_residual_scale_ema_decay),
             eps=float(cfg.bottleneck_eps),
         )
         self._bottleneck_episode_histories: list[dict[str, list]] | None = None
@@ -669,16 +966,42 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             generator=self.sac_action_rng
         )
         next_log_prob = self._normalized_action_log_prob(next_raw_log_prob)
-        bootstrap = (batch["truncations"].bool() | ~batch["dones"].bool()).float()
+        required_boundary = {
+            REPLAY_TERMINATED_KEY,
+            REPLAY_COMMAND_FINISHED_KEY,
+            REPLAY_TIME_LIMIT_KEY,
+        }
+        missing_boundary = required_boundary.difference(batch)
+        if missing_boundary:
+            raise KeyError(
+                "TVKD shaping requires explicit replay boundary metadata; missing "
+                f"{sorted(missing_boundary)}"
+            )
+        done = batch["dones"].bool()
+        terminated = batch[REPLAY_TERMINATED_KEY].bool()
+        command_finished = batch[REPLAY_COMMAND_FINISHED_KEY].bool()
+        time_limit = batch[REPLAY_TIME_LIMIT_KEY].bool()
+        known_boundary = terminated | command_finished | time_limit
+        if bool((done ^ known_boundary).any()):
+            raise RuntimeError("TVKD replay contains an unknown boundary cause")
+        expected_q_truncation = time_limit & ~command_finished & ~terminated
+        if not torch.equal(batch["truncations"].bool(), expected_q_truncation):
+            raise RuntimeError(
+                "TVKD replay Q truncation disagrees with explicit boundary metadata"
+            )
+        bootstrap = (batch["truncations"].bool() | ~done).float()
         effective_discount = float(self.cfg.gamma) * batch["discounts"]
-        teacher_discount = float(self.cfg.gamma)
         terms = compute_teacher_value_terms(
             self.get_frozen_teacher_value,
             batch["critic_observations"],
             batch["next_critic_observations"],
             batch["rewards"],
-            bootstrap,
-            teacher_discount,
+            terminated=terminated,
+            command_finished=command_finished,
+            time_limit=time_limit,
+            replay_discount=batch["discounts"],
+            gamma=float(self.cfg.gamma),
+            semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
             tvkd_lambda=float(self.cfg.tvkd_lambda),
             potential_clip=self.cfg.tvkd_potential_clip,
         )
@@ -693,8 +1016,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         )
         target_probabilities = F.softmax(target_logits, dim=-1)
         projected_heads = []
-        left_fraction = soft_reward.new_zeros(())
-        right_fraction = soft_reward.new_zeros(())
+        support_clip_fractions = []
         for head_probability in target_probabilities:
             projected, left_fraction, right_fraction = _project_c51_probabilities(
                 head_probability,
@@ -704,6 +1026,25 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 self.qnet_target.support,
             )
             projected_heads.append(projected)
+            support_clip_fractions.append((left_fraction, right_fraction))
+        if len(support_clip_fractions) != 2:
+            raise RuntimeError("TVKD C51 target must contain exactly two Q heads")
+        (
+            (q1_left_support_clip_fraction, q1_right_support_clip_fraction),
+            (q2_left_support_clip_fraction, q2_right_support_clip_fraction),
+        ) = support_clip_fractions
+        q1_support_clip_fraction = (
+            q1_left_support_clip_fraction + q1_right_support_clip_fraction
+        )
+        q2_support_clip_fraction = (
+            q2_left_support_clip_fraction + q2_right_support_clip_fraction
+        )
+        support_clip_fraction_mean = 0.5 * (
+            q1_support_clip_fraction + q2_support_clip_fraction
+        )
+        support_clip_fraction_max = torch.maximum(
+            q1_support_clip_fraction, q2_support_clip_fraction
+        )
         projected_heads = torch.stack(projected_heads, dim=0)
         projected_expected_heads = (projected_heads * self.qnet_target.support).sum(
             dim=-1
@@ -738,8 +1079,16 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             "target_distribution_entropy": selected_entropy.mean(),
             "target_select_q1_fraction": (selected_head == 0).float().mean(),
             "target_select_q2_fraction": (selected_head == 1).float().mean(),
-            "left_support_projection_clipping_fraction": left_fraction,
-            "right_support_projection_clipping_fraction": right_fraction,
+            "q1_left_support_clip_fraction": q1_left_support_clip_fraction,
+            "q1_right_support_clip_fraction": q1_right_support_clip_fraction,
+            "q2_left_support_clip_fraction": q2_left_support_clip_fraction,
+            "q2_right_support_clip_fraction": q2_right_support_clip_fraction,
+            "support_clip_fraction_mean": support_clip_fraction_mean,
+            "support_clip_fraction_max": support_clip_fraction_max,
+            "left_support_projection_clipping_fraction": 0.5
+            * (q1_left_support_clip_fraction + q2_left_support_clip_fraction),
+            "right_support_projection_clipping_fraction": 0.5
+            * (q1_right_support_clip_fraction + q2_right_support_clip_fraction),
             "target_smoothing_noise_norm": soft_reward.new_zeros(()),
             "target_noise_free_action_abs_mean": next_dist.mean.abs().mean(),
             "target_sample_action_abs_mean": next_action.abs().mean(),
@@ -767,6 +1116,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
     _soft_c51_target = _distributional_fastsac_target
 
     def _reset_bottleneck_statistics(self) -> None:
+        self._bottleneck_unsuccessful_episode_count = 0
+        self._bottleneck_episodes_with_student_candidates = 0
+        self._bottleneck_no_value_bottleneck_count = 0
+        self._bottleneck_value_argmin_ablation_count = 0
         self._bottleneck_failed_student_episode_count = 0
         self._bottleneck_student_candidate_count = 0
         self._bottleneck_detected_count = 0
@@ -789,6 +1142,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self._failure_phase_student_focused_rows = 0
         self._failure_phase_student_uniform_fallback_rows = 0
         self._last_bottleneck_metadata: dict[str, float | int | str] = {}
+        self._last_value_argmin_metadata: dict[str, float | int | str] = {}
+        self._verified_failure_motion_phase_histogram: dict[int, torch.Tensor] = {}
 
     def _reset_student_replay_episode_tracking(self) -> None:
         """Reset ephemeral IDs whose raw replay ring is intentionally fresh."""
@@ -805,15 +1160,13 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             "phase": [],
             "teacher_td_residual": [],
             "source_id": [],
+            "motion_id": [],
             "true_terminal": [],
             "timeout": [],
-            "safe_takeover": [],
         }
 
     @torch.no_grad()
-    def _batched_frozen_teacher_value(
-        self, observation: torch.Tensor
-    ) -> torch.Tensor:
+    def _batched_frozen_teacher_value(self, observation: torch.Tensor) -> torch.Tensor:
         """Evaluate each cached state once while bounding inference memory."""
         if observation.ndim != 2:
             raise ValueError("Bottleneck Teacher observations must be rank two")
@@ -852,21 +1205,39 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             num_envs, num_steps
         )
         done = rollout[DONE_KEY].reshape(num_envs, num_steps).bool()
-        truncation = _vaic_truncation_mask(rollout).reshape(
-            num_envs, num_steps
+        terminated = rollout[TERM_KEY].reshape(num_envs, num_steps).bool()
+        command_finished = (
+            rollout["next", "stats", "command_finished"]
+            .reshape(num_envs, num_steps)
+            .bool()
         )
-        bootstrap = (truncation | ~done).float()
+        time_limit = (
+            rollout["next", "stats", "episode_time_limit"]
+            .reshape(num_envs, num_steps)
+            .bool()
+        )
+        known_boundary = terminated | command_finished | time_limit
+        if bool((done ^ known_boundary).any()):
+            raise RuntimeError(
+                "Bottleneck replay has an unknown or non-done boundary cause"
+            )
+        replay_discount = rollout["next", "discount"].reshape(num_envs, num_steps)
+        truncation = _vaic_truncation_mask(rollout).reshape(num_envs, num_steps)
+        q_bootstrap = (truncation | ~done).float()
         state_rows = []
         state_ids = []
         current_state_ids = []
         next_state_ids = []
         reward_rows = []
-        bootstrap_rows = []
+        q_bootstrap_rows = []
+        terminated_rows = []
+        command_finished_rows = []
+        time_limit_rows = []
+        replay_discount_rows = []
         flat_positions = []
-        env_state_base = (
-            torch.arange(num_envs, device=student.device, dtype=torch.long)
-            * (num_steps + 1)
-        )
+        env_state_base = torch.arange(
+            num_envs, device=student.device, dtype=torch.long
+        ) * (num_steps + 1)
         # A timeout's real next observation is captured immediately before the
         # environment resets.  Give those states IDs outside the regular
         # rollout grid so they cannot alias the reset state at ``step + 1``.
@@ -882,10 +1253,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 [batch["indices"] for batch in truncation_batches], dim=0
             ).to(device=student.device, dtype=torch.long)
             captured_next_raw = torch.cat(
-                [
-                    batch["next_critic_observations"]
-                    for batch in truncation_batches
-                ],
+                [batch["next_critic_observations"] for batch in truncation_batches],
                 dim=0,
             ).to(device=student.device)
             if (
@@ -894,9 +1262,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 or captured_indices.unique().numel() != captured_indices.numel()
             ):
                 raise RuntimeError("Bottleneck timeout-final indices are invalid")
-            captured_student = student.reshape(-1).index_select(
-                0, captured_indices
-            )
+            captured_student = student.reshape(-1).index_select(0, captured_indices)
             captured_indices = captured_indices[captured_student]
             captured_next_raw = captured_next_raw[captured_student]
             virtual_ids = num_envs * (num_steps + 1) + torch.arange(
@@ -904,9 +1270,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 dtype=torch.long,
                 device=student.device,
             )
-            timeout_next_id_by_transition.index_copy_(
-                0, captured_indices, virtual_ids
-            )
+            timeout_next_id_by_transition.index_copy_(0, captured_indices, virtual_ids)
             state_rows.append(captured_next_raw)
             state_ids.append(virtual_ids)
         student_timeout = (student & truncation.bool()).reshape(-1)
@@ -934,7 +1298,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
             mask = student[:, step]
             reward_rows.append(reward[:, step][mask])
-            bootstrap_rows.append(bootstrap[:, step][mask])
+            q_bootstrap_rows.append(q_bootstrap[:, step][mask])
+            terminated_rows.append(terminated[:, step][mask])
+            command_finished_rows.append(command_finished[:, step][mask])
+            time_limit_rows.append(time_limit[:, step][mask])
+            replay_discount_rows.append(replay_discount[:, step][mask])
             env_indices = mask.nonzero(as_tuple=False).squeeze(-1)
             current_state_ids.append(env_state_base[env_indices] + step)
             flat_position = env_indices * num_steps + step
@@ -951,7 +1319,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
             flat_positions.append(flat_position)
             previous_bootstrap_student = (
-                mask & bootstrap[:, step].bool() & ~truncation[:, step]
+                mask & q_bootstrap[:, step].bool() & ~truncation[:, step]
             )
             current_raw = next_raw
 
@@ -975,20 +1343,28 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         next_ids = torch.cat(next_state_ids, dim=0)
         current_positions = torch.searchsorted(sorted_state_ids, current_ids)
         teacher_v = state_values.index_select(0, current_positions)
-        transition_bootstrap = torch.cat(bootstrap_rows, dim=0).float()
+        transition_q_bootstrap = torch.cat(q_bootstrap_rows, dim=0).float()
         teacher_v_next = torch.zeros_like(teacher_v)
-        bootstrap_rows_mask = transition_bootstrap.bool()
-        if bool(bootstrap_rows_mask.any()):
+        q_bootstrap_rows_mask = transition_q_bootstrap.bool()
+        if bool(q_bootstrap_rows_mask.any()):
             next_positions = torch.searchsorted(
-                sorted_state_ids, next_ids[bootstrap_rows_mask]
+                sorted_state_ids, next_ids[q_bootstrap_rows_mask]
             )
-            teacher_v_next[bootstrap_rows_mask] = state_values.index_select(
+            teacher_v_next[q_bootstrap_rows_mask] = state_values.index_select(
                 0, next_positions
             )
+        teacher_continuation = compute_teacher_value_continuation(
+            teacher_v=teacher_v,
+            teacher_v_next=teacher_v_next,
+            terminated=torch.cat(terminated_rows, dim=0),
+            command_finished=torch.cat(command_finished_rows, dim=0),
+            time_limit=torch.cat(time_limit_rows, dim=0),
+            replay_discount=torch.cat(replay_discount_rows, dim=0),
+            gamma=float(self.cfg.gamma),
+            semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
+        )
         transition_residual = (
-            torch.cat(reward_rows, dim=0).float()
-            + float(self.cfg.gamma) * transition_bootstrap * teacher_v_next
-            - teacher_v
+            torch.cat(reward_rows, dim=0).float() + teacher_continuation - teacher_v
         )
         if not torch.isfinite(transition_residual).all():
             raise RuntimeError("Bottleneck Teacher TD residual contains NaN/Inf")
@@ -999,62 +1375,40 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         )
         return residual_grid
 
-    def _bottleneck_anchor_indices(
-        self, history_length: int, center: int, *, legacy_terminal: bool = False
-    ) -> torch.Tensor:
-        lookback = int(self.cfg.failure_phase_lookback_steps)
-        requested = int(self.cfg.failure_phase_samples_per_failure)
-        if legacy_terminal:
-            end = history_length - 1
-            start = max(0, end - lookback)
-        else:
-            pre_steps = lookback // 2
-            post_steps = lookback - pre_steps
-            start = max(0, center - pre_steps)
-            end = min(history_length - 1, center + post_steps)
-        count = min(requested, end - start + 1)
-        indices = _failure_lookback_offsets(end - start, count) + start
-        if not legacy_terminal and not bool((indices == center).any()):
-            nearest = int((indices - center).abs().argmin().item())
-            indices[nearest] = center
-            indices = indices.sort().values.unique_consecutive()
-        return indices
-
     def _student_bottleneck_anchor_indices(
         self,
         history: Mapping[str, list],
         center: int,
-        *,
-        legacy_terminal: bool = False,
     ) -> torch.Tensor:
         """Choose actual Student rows in the same bottleneck neighborhood."""
         history_length = len(history["phase"])
         lookback = int(self.cfg.failure_phase_lookback_steps)
-        if legacy_terminal:
-            end = history_length - 1
-            start = max(0, end - lookback)
-        else:
-            pre_steps = lookback // 2
-            post_steps = lookback - pre_steps
-            start = max(0, int(center) - pre_steps)
-            end = min(history_length - 1, int(center) + post_steps)
+        pre_steps = lookback // 2
+        post_steps = lookback - pre_steps
+        start = max(0, int(center) - pre_steps)
+        end = min(history_length - 1, int(center) + post_steps)
         source = torch.tensor(history["source_id"], dtype=torch.long)
+        if "motion_id" not in history or len(history["motion_id"]) != history_length:
+            raise RuntimeError("Bottleneck history lacks aligned motion IDs")
+        motion_id = torch.tensor(history["motion_id"], dtype=torch.long)
+        center_motion_id = motion_id[int(center)]
         candidates = (
-            (source == SOURCE_STUDENT)
-            & (torch.arange(history_length) >= start)
-            & (torch.arange(history_length) <= end)
-        ).nonzero(as_tuple=False).squeeze(-1)
+            (
+                (source == SOURCE_STUDENT)
+                & (motion_id == center_motion_id)
+                & (torch.arange(history_length) >= start)
+                & (torch.arange(history_length) <= end)
+            )
+            .nonzero(as_tuple=False)
+            .squeeze(-1)
+        )
         if candidates.numel() == 0:
             return candidates
         requested = min(
             int(self.cfg.failure_phase_samples_per_failure),
             int(candidates.numel()),
         )
-        positions = (
-            torch.linspace(0, candidates.numel() - 1, requested)
-            .round()
-            .long()
-        )
+        positions = torch.linspace(0, candidates.numel() - 1, requested).round().long()
         selected = candidates.index_select(0, positions).unique(sorted=True)
         if source[int(center)] == SOURCE_STUDENT and not bool(
             (selected == int(center)).any()
@@ -1069,42 +1423,73 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         history: Mapping[str, list],
         center: int,
         replay_episode_id: int,
-        *,
-        legacy_terminal: bool = False,
     ) -> None:
-        indices = self._student_bottleneck_anchor_indices(
-            history, center, legacy_terminal=legacy_terminal
-        )
+        indices = self._student_bottleneck_anchor_indices(history, center)
         if indices.numel():
             events = getattr(self, "_pending_student_focus_events", None)
             if events is None:
                 events = []
                 self._pending_student_focus_events = events
-            events.append(
-                (int(replay_episode_id), indices.detach().cpu())
-            )
+            events.append((int(replay_episode_id), indices.detach().cpu()))
 
     @torch.no_grad()
     def _record_teacher_phase_match_distances(
-        self, anchor_phases: torch.Tensor
+        self,
+        anchor_phases: torch.Tensor,
+        anchor_motion_ids: torch.Tensor,
     ) -> None:
+        anchor_phases = anchor_phases.detach().float().cpu().reshape(-1)
+        anchor_motion_ids = anchor_motion_ids.detach().long().cpu().reshape(-1)
+        if anchor_phases.shape != anchor_motion_ids.shape:
+            raise ValueError("Teacher phase anchors and motion IDs must align")
         replay = getattr(self, "q_teacher_replay", None)
         if replay is None or int(getattr(replay, "size", 0)) < 1:
             return
         if REFERENCE_PHASE_KEY not in getattr(replay, "data", {}):
             return
-        if not bool(getattr(self, "_teacher_phase_index_ready", False)):
+        if not bool(getattr(self, "_teacher_phase_index_ready", False)) or not all(
+            hasattr(self, name)
+            for name in (
+                "_teacher_replay_phase_bins",
+                "_teacher_replay_motion_ids",
+            )
+        ):
             self._build_teacher_phase_index()
         teacher_phase = replay.data[REFERENCE_PHASE_KEY][: replay.size]
         teacher_phase = teacher_phase.reshape(replay.size, -1)[:, 0].float().cpu()
+        teacher_bins = self._teacher_replay_phase_bins
+        teacher_motion_ids = self._teacher_replay_motion_ids
         bins = int(self.cfg.failure_phase_num_bins)
-        for target in anchor_phases.detach().float().cpu():
-            risk_bin = min(int(float(target) * bins), bins - 1)
-            teacher_bin = int(self._teacher_phase_nearest_nonempty[risk_bin])
-            rows = self._teacher_phase_bin_rows[teacher_bin]
-            # Focused replay samples uniformly inside the selected occupied
-            # bin, so this is its exact expected phase distance (rather than an
-            # optimistic nearest-row distance unrelated to the sampler).
+        max_distance = getattr(self.cfg, "max_teacher_phase_match_distance", None)
+        if max_distance is not None:
+            max_distance = _finite_scalar(
+                "max_teacher_phase_match_distance", max_distance
+            )
+            if max_distance < 0.0:
+                raise ValueError(
+                    "max_teacher_phase_match_distance must be non-negative"
+                )
+        for target, motion_id in zip(anchor_phases, anchor_motion_ids, strict=True):
+            same_motion = (
+                (teacher_motion_ids == int(motion_id))
+                .nonzero(as_tuple=False)
+                .squeeze(-1)
+            )
+            if same_motion.numel() == 0:
+                # The canonical sampler will uniformly backfill this anchor.
+                # Do not report a cross-motion phase distance as a match.
+                continue
+            risk_bin = min(max(int(float(target) * bins), 0), bins - 1)
+            bin_distance = (teacher_bins.index_select(0, same_motion) - risk_bin).abs()
+            nearest_distance = int(bin_distance.min().item())
+            if (
+                max_distance is not None
+                and nearest_distance / float(bins) > max_distance
+            ):
+                continue
+            rows = same_motion[bin_distance == nearest_distance]
+            # This mirrors the canonical sampler: exact motion first, nearest
+            # occupied phase bin second, then a uniform row inside that pool.
             distance = (teacher_phase.index_select(0, rows) - target).abs().mean()
             self._bottleneck_phase_match_distance_sum += float(distance.item())
             self._bottleneck_phase_match_distance_count += 1
@@ -1114,27 +1499,55 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self,
         history: Mapping[str, list],
         center: int,
-        *,
-        legacy_terminal: bool = False,
     ) -> int:
-        indices = self._bottleneck_anchor_indices(
-            len(history["phase"]), center, legacy_terminal=legacy_terminal
-        )
-        phases = torch.tensor(
-            [history["phase"][int(index)] for index in indices],
-            dtype=torch.float64,
-        )
+        # The verified histogram contains only the exact onset selected by the
+        # sustained Teacher-value detector.  Neighborhood Student rows are still
+        # marked separately, but their phases are not promoted to verified
+        # Teacher anchors.
+        center = int(center)
+        phases = torch.tensor([history["phase"][center]], dtype=torch.float64)
+        if "motion_id" not in history or len(history["motion_id"]) != len(
+            history["phase"]
+        ):
+            raise RuntimeError("Bottleneck history lacks aligned motion IDs")
+        motion_id = int(history["motion_id"][center])
+        if motion_id < 0:
+            raise RuntimeError("Bottleneck history contains a negative motion ID")
+        motion_ids = torch.tensor([motion_id], dtype=torch.long)
         bins = int(self.cfg.failure_phase_num_bins)
         bin_indices = torch.floor(phases * bins).long().clamp_(0, bins - 1)
         self._failure_phase_histogram.index_add_(
             0, bin_indices, torch.ones_like(phases)
+        )
+        motion_histograms = getattr(
+            self, "_verified_failure_motion_phase_histogram", None
+        )
+        if motion_histograms is None:
+            motion_histograms = {}
+            self._verified_failure_motion_phase_histogram = motion_histograms
+        if not isinstance(motion_histograms, dict):
+            raise RuntimeError("Verified motion histogram state must be a dict")
+        motion_histogram = motion_histograms.get(motion_id)
+        if motion_histogram is None:
+            motion_histogram = torch.zeros(bins, dtype=torch.float64, device="cpu")
+            motion_histograms[motion_id] = motion_histogram
+        if (
+            motion_histogram.shape != (bins,)
+            or motion_histogram.dtype != torch.float64
+            or motion_histogram.device.type != "cpu"
+        ):
+            raise RuntimeError(
+                "Verified motion histogram must be CPU float64 with one value per bin"
+            )
+        motion_histogram.index_add_(
+            0, bin_indices, torch.ones_like(phases, dtype=torch.float64)
         )
         count = int(phases.numel())
         self._failure_phase_episode_count += 1
         self._failure_phase_anchor_count += count
         self._bottleneck_teacher_sequences_inserted += 1
         self._bottleneck_teacher_transitions_inserted += count
-        self._record_teacher_phase_match_distances(phases)
+        self._record_teacher_phase_match_distances(phases, motion_ids)
         self._failure_histogram_device_cache.clear()
         return count
 
@@ -1178,21 +1591,29 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         phase = torch.tensor(history["phase"], dtype=torch.float32)
         terminal = torch.tensor(history["true_terminal"], dtype=torch.bool)
         timeout = torch.tensor(history["timeout"], dtype=torch.bool)
+        fallback_mode = str(getattr(self.cfg, "bottleneck_fallback_mode", "none"))
         result = self.teacher_value_bottleneck_detector.detect(
-            residual, source, phase, terminal, timeout
+            residual,
+            source,
+            phase,
+            terminal,
+            timeout,
+            fallback_mode=fallback_mode,
         )
         diagnostics = self.teacher_value_bottleneck_detector.last_diagnostics
-        self._bottleneck_student_candidate_count += int(
-            diagnostics["student_candidate_count"]
-        )
+        candidate_count = int(diagnostics["student_candidate_count"])
+        self._bottleneck_student_candidate_count += candidate_count
+        if candidate_count:
+            self._bottleneck_episodes_with_student_candidates += 1
         if bool(diagnostics["no_candidate"]):
             self._bottleneck_no_candidate_count += 1
 
-        if result is not None:
-            if result.threshold_detected:
-                self._bottleneck_detected_count += 1
-            if result.used_fallback:
-                self._bottleneck_fallback_count += 1
+        if result is None:
+            self._bottleneck_no_value_bottleneck_count += 1
+            return 0
+
+        if result.threshold_detected:
+            self._bottleneck_detected_count += 1
             self._record_bottleneck_selection(
                 episode_id=episode_id,
                 step=result.index,
@@ -1200,7 +1621,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 score=result.score,
                 raw_residual=result.raw_teacher_td_residual,
                 normalized_residual=result.normalized_teacher_td_residual,
-                fallback="argmin" if result.used_fallback else "none",
+                fallback="none",
             )
             if replay_episode_id is not None:
                 self._queue_student_bottleneck_rows(
@@ -1208,43 +1629,47 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 )
             return self._register_bottleneck_teacher_sequence(history, result.index)
 
-        # A very short episode can contain only an excluded terminal Student
-        # transition. Preserve the old failure-phase replay as the final safe
-        # fallback, but never do this for a Teacher-only episode (filtered by
-        # the caller).
-        self._bottleneck_fallback_count += 1
-        center = len(history["phase"]) - 1
-        student_indices = (source == SOURCE_STUDENT).nonzero(as_tuple=False).squeeze(-1)
-        selected = int(student_indices[-1].item())
-        scale = (
-            self.teacher_value_bottleneck_detector.bottleneck_residual_scale_ema
-            + float(self.cfg.bottleneck_eps)
-        )
-        self._record_bottleneck_selection(
-            episode_id=episode_id,
-            step=center,
-            phase=float(phase[center]),
-            score=0.0,
-            raw_residual=float(residual[selected]),
-            normalized_residual=float(residual[selected] / scale),
-            fallback="legacy_failure_phase",
-        )
-        if replay_episode_id is not None:
-            self._queue_student_bottleneck_rows(
-                history,
-                center,
-                replay_episode_id,
-                legacy_terminal=True,
+        if result.selection_origin != "value_argmin" or not result.used_fallback:
+            raise RuntimeError(
+                "Bottleneck detector returned an unknown selection origin"
             )
-        return self._register_bottleneck_teacher_sequence(
-            history, center, legacy_terminal=True
-        )
+        # ``value_argmin`` is an explicit ablation diagnostic.  It never updates
+        # the verified histogram or the verified Failure Student pool.
+        self._bottleneck_fallback_count += 1
+        self._bottleneck_value_argmin_ablation_count += 1
+        self._bottleneck_no_value_bottleneck_count += 1
+        self._last_value_argmin_metadata = {
+            "student_episode_id": int(episode_id),
+            "selected_step": int(result.index),
+            "selected_phase": float(result.phase),
+            "score": float(result.score),
+            "raw_teacher_td_residual": float(result.raw_teacher_td_residual),
+            "normalized_teacher_td_residual": float(
+                result.normalized_teacher_td_residual
+            ),
+            "selection_origin": "value_argmin",
+        }
+        return 0
 
     @torch.no_grad()
     def _update_failure_phase_histogram(self, rollout: TensorDict) -> int:
-        """Replace terminal lookback anchors with Student bottleneck anchors."""
+        """Register only value-verified onsets from unsuccessful episodes."""
         if not bool(self.cfg.use_teacher_value_bottleneck_replay):
-            return super()._update_failure_phase_histogram(rollout)
+            # Disabling value bottlenecks leaves both focused sources empty.  In
+            # particular, never fall through to the parent's terminal-lookback
+            # curriculum.
+            self._bottleneck_episode_histories = None
+            self._reset_student_replay_episode_tracking()
+            histogram = getattr(self, "_failure_phase_histogram", None)
+            motion_histograms = getattr(
+                self, "_verified_failure_motion_phase_histogram", None
+            )
+            if (torch.is_tensor(histogram) and bool((histogram != 0).any())) or (
+                isinstance(motion_histograms, Mapping) and bool(motion_histograms)
+            ):
+                self._reset_failure_curriculum_state()
+            self._verified_failure_motion_phase_histogram = {}
+            return 0
         if len(rollout.batch_size) != 2:
             raise ValueError("bottleneck tracking requires an [env,time] rollout")
         if not isinstance(getattr(self, "_rollout_final_batch", None), Mapping):
@@ -1270,19 +1695,55 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             return value[..., 0]
 
         phase = grid(self._reference_phase(rollout))
+        raw_motion_id = rollout.get(REPLAY_MOTION_ID_KEY, None)
+        command_manager = getattr(getattr(self, "env", None), "command_manager", None)
+        dataset = getattr(command_manager, "dataset", None)
+        num_motions = getattr(dataset, "num_motions", None)
+        if callable(num_motions):
+            num_motions = num_motions()
+        if num_motions is not None:
+            if isinstance(num_motions, bool):
+                raise RuntimeError("Command dataset has an invalid motion count")
+            num_motions = int(num_motions)
+            if num_motions < 1:
+                raise RuntimeError("Command dataset must contain at least one motion")
+        if raw_motion_id is None:
+            if num_motions != 1:
+                raise KeyError(
+                    "Bottleneck tracking requires replay_motion_id for multi-motion "
+                    "or unknown-motion rollouts"
+                )
+            motion_id = torch.zeros_like(phase, dtype=torch.long)
+        else:
+            raw_motion_id = raw_motion_id.reshape(num_envs, num_steps, -1)
+            if raw_motion_id.shape[-1] != 1:
+                raise ValueError("replay_motion_id must have one scalar per step")
+            raw_motion_id = raw_motion_id[..., 0]
+            if raw_motion_id.dtype == torch.bool:
+                raise ValueError("replay_motion_id cannot be boolean")
+            if raw_motion_id.is_floating_point():
+                if not torch.isfinite(raw_motion_id).all() or not torch.equal(
+                    raw_motion_id, raw_motion_id.round()
+                ):
+                    raise ValueError("replay_motion_id must contain finite integers")
+            motion_id = raw_motion_id.long()
+            if bool((motion_id < 0).any()):
+                raise ValueError("replay_motion_id cannot be negative")
+            if num_motions is not None and bool((motion_id >= num_motions).any()):
+                raise ValueError("replay_motion_id exceeds the command dataset")
         student = grid(rollout[DAGGER_IS_STUDENT_ACTION_KEY], boolean=True)
-        safe_takeover_value = rollout.get(DAGGER_SAFE_TAKEOVER_KEY, None)
-        safe_takeover = (
-            torch.zeros_like(student)
-            if safe_takeover_value is None
-            else grid(safe_takeover_value, boolean=True)
-        )
         done = grid(rollout[DONE_KEY], boolean=True)
         terminated = grid(rollout[TERM_KEY], boolean=True)
         command_finished = grid(
             rollout["next", "stats", "command_finished"], boolean=True
         )
-        timeout = _vaic_truncation_mask(rollout).reshape(num_envs, num_steps)
+        time_limit = grid(rollout["next", "stats", "episode_time_limit"], boolean=True)
+        known_boundary = terminated | command_finished | time_limit
+        if bool((done ^ known_boundary).any()):
+            raise RuntimeError(
+                "Bottleneck episode contains an unknown or non-done boundary cause"
+            )
+        timeout = time_limit & ~command_finished & ~terminated
         is_init_value = rollout.get("is_init", None)
         is_init = (
             torch.zeros_like(done)
@@ -1290,7 +1751,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             else grid(is_init_value, boolean=True)
         )
         residual = self._student_teacher_td_residual_grid(rollout, student)
-        true_terminal = done & terminated & ~command_finished
+        true_terminal = done & terminated
         packed = torch.stack(
             (
                 phase.float(),
@@ -1301,12 +1762,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 timeout.float(),
                 command_finished.float(),
                 is_init.float(),
-                safe_takeover.float(),
             ),
             dim=-1,
         ).detach()
         if packed.device.type != "cpu":
             packed = packed.cpu()
+        motion_id = motion_id.detach()
+        if motion_id.device.type != "cpu":
+            motion_id = motion_id.cpu()
 
         histories = self._bottleneck_episode_histories
         if histories is None or len(histories) != num_envs:
@@ -1320,12 +1783,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             env_episode_steps = [0 for _ in range(num_envs)]
         if env_episode_steps is None or len(env_episode_steps) != num_envs:
             raise RuntimeError("Student replay episode-step tracking is misaligned")
-        episode_id_grid = torch.full(
-            (num_envs, num_steps), -1, dtype=torch.long
-        )
-        episode_step_grid = torch.full(
-            (num_envs, num_steps), -1, dtype=torch.long
-        )
+        episode_id_grid = torch.full((num_envs, num_steps), -1, dtype=torch.long)
+        episode_step_grid = torch.full((num_envs, num_steps), -1, dtype=torch.long)
         anchors_added = 0
         for env_index in range(num_envs):
             history = histories[env_index]
@@ -1353,30 +1812,24 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 history["source_id"].append(
                     SOURCE_STUDENT if is_student else SOURCE_UNIFORM_TEACHER
                 )
+                history["motion_id"].append(int(motion_id[env_index, step].item()))
                 history["true_terminal"].append(bool(row[4]))
                 history["timeout"].append(bool(row[5]))
-                history["safe_takeover"].append(bool(row[8]))
 
-                physical_failure = bool(row[3] and row[4] and not row[6])
-                causal_window = int(self.cfg.failure_phase_lookback_steps) + 1
-                recent_sources = history["source_id"][-causal_window:]
-                recent_takeovers = history["safe_takeover"][-causal_window:]
-                causal_student_control = (
-                    recent_sources[-1] == SOURCE_STUDENT
-                    or (
-                        len(recent_sources) >= 2
-                        and recent_sources[-2] == SOURCE_STUDENT
+                if bool(row[3]) and not bool(row[6]):
+                    self._bottleneck_unsuccessful_episode_count += 1
+                    include_timeout = bool(
+                        getattr(
+                            self.cfg,
+                            "bottleneck_include_unsuccessful_timeouts",
+                            True,
+                        )
                     )
-                    or any(recent_takeovers)
-                )
-                if (
-                    physical_failure
-                    and causal_student_control
-                    and SOURCE_STUDENT in history["source_id"]
-                ):
-                    anchors_added += self._process_failed_student_episode(
-                        history, replay_episode_id=replay_episode_id
-                    )
+                    outcome_is_eligible = not bool(row[5]) or include_timeout
+                    if outcome_is_eligible and SOURCE_STUDENT in history["source_id"]:
+                        anchors_added += self._process_failed_student_episode(
+                            history, replay_episode_id=replay_episode_id
+                        )
                 env_episode_steps[env_index] = replay_episode_step + 1
                 if bool(row[3]):
                     history = self._new_bottleneck_episode_history()
@@ -1451,9 +1904,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 replay.data[STUDENT_REPLAY_EPISODE_STEP_KEY][: replay.size],
                 event_keys_cpu.to(replay.device),
             )
-            replay.data[FAILURE_PHASE_STUDENT_SOURCE_KEY][
-                : replay.size
-            ].logical_or_(matched)
+            replay.data[FAILURE_PHASE_STUDENT_SOURCE_KEY][: replay.size].logical_or_(
+                matched
+            )
             if bool(matched.any()):
                 found_keys.append(row_keys[matched].detach().cpu().unique())
             replay._valid_index_cache.pop(FAILURE_PHASE_STUDENT_SOURCE_KEY, None)
@@ -1492,9 +1945,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 transitions[FAILURE_PHASE_STUDENT_SOURCE_KEY] = matched
                 yield transitions
         finally:
-            found = (
-                torch.cat(found_keys).unique().numel() if found_keys else 0
-            )
+            found = torch.cat(found_keys).unique().numel() if found_keys else 0
             requested = int(event_keys_cpu.numel())
             self._student_focus_rows_marked = int(
                 getattr(self, "_student_focus_rows_marked", 0)
@@ -1519,6 +1970,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
     def _failure_teacher_buffer_size(self) -> int:
         """Return the effective successful-Teacher pool behind focused replay."""
+        if self._has_canonical_replay_mix():
+            rows, _ = self._verified_teacher_focus_pool()
+            return int(rows.numel())
         if not bool(getattr(self, "_teacher_phase_index_ready", False)):
             return 0
         histogram = getattr(self, "_failure_phase_histogram", None)
@@ -1537,12 +1991,24 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         match_count = max(self._bottleneck_phase_match_distance_count, 1)
         detector = self.teacher_value_bottleneck_detector
         return {
+            "unsuccessful_episode_count": float(
+                self._bottleneck_unsuccessful_episode_count
+            ),
+            "episodes_with_student_candidates": float(
+                self._bottleneck_episodes_with_student_candidates
+            ),
+            "value_detected_count": float(self._bottleneck_detected_count),
+            "no_value_bottleneck_count": float(
+                self._bottleneck_no_value_bottleneck_count
+            ),
+            "value_argmin_ablation_count": float(
+                self._bottleneck_value_argmin_ablation_count
+            ),
+            "candidate_count": float(self._bottleneck_student_candidate_count),
             "failed_student_episode_count": float(
                 self._bottleneck_failed_student_episode_count
             ),
-            "student_candidate_count": float(
-                self._bottleneck_student_candidate_count
-            ),
+            "student_candidate_count": float(self._bottleneck_student_candidate_count),
             "detected_count": float(self._bottleneck_detected_count),
             "fallback_count": float(self._bottleneck_fallback_count),
             "no_candidate_count": float(self._bottleneck_no_candidate_count),
@@ -1550,15 +2016,17 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             "selected_phase_mean": self._bottleneck_selected_phase_sum / selected,
             "score_mean": self._bottleneck_score_sum / selected,
             "score_max": float(self._bottleneck_score_max),
-            "raw_td_residual_mean": (
+            "raw_td_residual_mean": (self._bottleneck_raw_td_residual_sum / selected),
+            "raw_teacher_td_residual_mean": (
                 self._bottleneck_raw_td_residual_sum / selected
             ),
             "normalized_td_residual_mean": (
                 self._bottleneck_normalized_td_residual_sum / selected
             ),
-            "residual_scale_ema": float(
-                detector.bottleneck_residual_scale_ema
+            "normalized_teacher_td_residual_mean": (
+                self._bottleneck_normalized_td_residual_sum / selected
             ),
+            "residual_scale_ema": float(detector.bottleneck_residual_scale_ema),
             # The repository implements Failure Teacher as a virtual focused
             # source over the successful Teacher ring. These two values count
             # registered phase sequences/anchors, not copied replay tensors.
@@ -1571,9 +2039,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             "phase_match_distance_mean": (
                 self._bottleneck_phase_match_distance_sum / match_count
             ),
-            "failure_teacher_buffer_size": float(
-                self._failure_teacher_buffer_size()
+            "teacher_phase_match_distance": (
+                self._bottleneck_phase_match_distance_sum / match_count
             ),
+            "failure_teacher_buffer_size": float(self._failure_teacher_buffer_size()),
             "student_focus_pool_size": float(
                 self.dagger_replay.valid_count(FAILURE_PHASE_STUDENT_SOURCE_KEY)
                 if FAILURE_PHASE_STUDENT_SOURCE_KEY in self.dagger_replay.data
@@ -1588,16 +2057,19 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 self._failure_phase_student_uniform_fallback_rows
             ),
             "student_focus_fraction_config": float(
-                self.cfg.failure_phase_student_fraction
+                self._replay_mix_fractions("q")["failure_student"]
+                / max(
+                    self._replay_mix_fractions("q")["uniform_student"]
+                    + self._replay_mix_fractions("q")["failure_student"],
+                    torch.finfo(torch.float32).eps,
+                )
             ),
-            "student_focus_q_global_fraction_cap": (
-                1.0 - float(self.cfg.q_teacher_replay_ratio)
-            )
-            * float(self.cfg.failure_phase_student_fraction),
-            "student_focus_actor_global_fraction_cap": (
-                1.0 - float(self.cfg.teacher_actor_replay_fraction)
-            )
-            * float(self.cfg.failure_phase_student_fraction),
+            "student_focus_q_global_fraction_cap": float(
+                self._replay_mix_fractions("q")["failure_student"]
+            ),
+            "student_focus_actor_global_fraction_cap": float(
+                self._replay_mix_fractions("actor")["failure_student"]
+            ),
         }
 
     def train_op(self, tensordict):
@@ -1644,12 +2116,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         info["source/teacher_action_execution_ratio"] = float(
             info.get("fastsac/teacher_source_fraction", 0.0)
         )
-        info["source/actor_bottleneck_student_fraction"] = (
-            self._mean_optional_metric(
-                actor_metrics, "actor_failure_phase_student_fraction"
-            )
+        info["source/actor_bottleneck_student_fraction"] = self._mean_optional_metric(
+            actor_metrics, "actor_failure_phase_student_fraction"
         )
-        info["tvkd/method_distributional_tvkd_fastsac_teacher_bc_v3"] = 1.0
+        info["tvkd/method_distributional_tvkd_fastsac_teacher_bc_v4"] = 1.0
         self._last_tvkd_diagnostics = {
             key: float(value)
             for key, value in info.items()
@@ -1679,11 +2149,41 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     "bottleneck_terminal_exclusion_steps",
                     "bottleneck_residual_scale_ema_decay",
                     "bottleneck_eps",
+                    "bottleneck_fallback_mode",
+                    "bottleneck_include_unsuccessful_timeouts",
+                    "max_teacher_phase_match_distance",
+                    "perception_replay_mode",
+                    "teacher_value_return_semantics",
+                    "teacher_value_boundary_semantics",
+                    "teacher_value_reward_group_fingerprint",
+                    "replay_task_fingerprint",
                     "failure_phase_student_fraction",
                     "value_norm",
                 )
             }
         )
+        for purpose in ("q", "actor", "perception"):
+            for source in (
+                "uniform_student",
+                "failure_student",
+                "uniform_teacher",
+                "failure_teacher",
+            ):
+                name = f"{purpose}_{source}_fraction"
+                common[name] = getattr(self.cfg, name)
+        # The inherited checkpoint surfaces historically selected only a
+        # subset of PPO/DAgger fields. V4 direct/programmatic resume promises
+        # the same exact algorithm contract as the CLI, so retain every
+        # behavior-affecting structured-config field. Identity/source-location
+        # fields do not alter the already embedded policy and are excluded.
+        non_behavioral = {"_target_", "name", "checkpoint_path"}
+        for field in dataclass_fields(TVKDDistributionalFastSACTeacherBCConfig):
+            if field.name in non_behavioral:
+                continue
+            value = copy.deepcopy(getattr(self.cfg, field.name))
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                value = tuple(value)
+            common.setdefault(field.name, value)
         common.update(
             {
                 "method": TRAINING_ALGORITHM,
@@ -1701,6 +2201,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "teacher_value_source": "frozen_checkpoint_ppo_critic",
                 "teacher_value_output_scale": "valuenorm_denormalized_sum_groups",
                 "teacher_value_norm_enabled": bool(self.cfg.value_norm),
+                "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
+                "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
+                "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
             }
         )
         return metadata
@@ -1717,21 +2220,68 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             histogram = torch.zeros(
                 int(self.cfg.failure_phase_num_bins), dtype=torch.float64
             )
+        expected_shape = (int(self.cfg.failure_phase_num_bins),)
+        if (
+            histogram.dtype != torch.float64
+            or histogram.shape != expected_shape
+            or not torch.isfinite(histogram).all()
+            or bool((histogram < 0.0).any())
+            or not torch.equal(histogram, histogram.round())
+        ):
+            raise RuntimeError("Verified global histogram state is invalid")
+        motion_histograms = getattr(
+            self, "_verified_failure_motion_phase_histogram", {}
+        )
+        if not isinstance(motion_histograms, Mapping):
+            raise RuntimeError("Verified motion histogram state must be a mapping")
+        histogram = histogram.detach().to(device="cpu", dtype=torch.float64).clone()
+        serialized_motion_histograms = {}
+        for motion_id, value in motion_histograms.items():
+            if (
+                isinstance(motion_id, bool)
+                or not isinstance(motion_id, int)
+                or motion_id < 0
+                or not torch.is_tensor(value)
+                or value.dtype != torch.float64
+                or value.shape != histogram.shape
+                or not torch.isfinite(value).all()
+                or bool((value < 0.0).any())
+                or not torch.equal(value, value.round())
+            ):
+                raise RuntimeError("Verified motion histogram state is invalid")
+            serialized_motion_histograms[motion_id] = (
+                value.detach().to(device="cpu").clone()
+            )
+        motion_total = torch.zeros_like(histogram)
+        for value in serialized_motion_histograms.values():
+            motion_total.add_(value)
+        if not torch.equal(motion_total, histogram):
+            raise RuntimeError("Verified global/motion histograms disagree")
+        counters = {}
+        for name in (
+            "episode_count",
+            "anchor_count",
+            "uniform_fallback_rows",
+            "focused_rows",
+        ):
+            value = getattr(self, f"_failure_phase_{name}", 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(f"Verified histogram {name} is invalid")
+            counters[name] = value
+        if int(histogram.sum().item()) != counters["anchor_count"]:
+            raise RuntimeError("Verified histogram/anchor count mismatch")
         return {
-            "histogram": histogram.detach()
-            .to(device="cpu", dtype=torch.float64)
-            .clone(),
-            "episode_count": int(getattr(self, "_failure_phase_episode_count", 0)),
-            "anchor_count": int(getattr(self, "_failure_phase_anchor_count", 0)),
-            "uniform_fallback_rows": int(
-                getattr(self, "_failure_phase_uniform_fallback_rows", 0)
-            ),
-            "focused_rows": int(getattr(self, "_failure_phase_focused_rows", 0)),
+            "semantics": VERIFIED_HISTOGRAM_SEMANTICS,
+            "histogram": histogram,
+            **counters,
+            "motion_histograms": serialized_motion_histograms,
         }
 
     def _load_failure_curriculum_checkpoint_state(self, state: Mapping) -> None:
         if not isinstance(state, Mapping):
             raise ValueError("TVKD checkpoint lacks failure curriculum state")
+        if state.get("semantics") != VERIFIED_HISTOGRAM_SEMANTICS:
+            raise ValueError("TVKD verified histogram semantics mismatch")
         histogram = state.get("histogram")
         expected_bins = int(self.cfg.failure_phase_num_bins)
         if (
@@ -1756,11 +2306,37 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             counters[name] = int(value)
         if int(histogram.sum().item()) != counters["anchor_count"]:
             raise ValueError("TVKD failure curriculum histogram/anchor count mismatch")
+        motion_histograms = state.get("motion_histograms")
+        if not isinstance(motion_histograms, Mapping):
+            raise ValueError("TVKD verified histogram lacks motion partitions")
+        restored_motion_histograms: dict[int, torch.Tensor] = {}
+        for motion_id, value in motion_histograms.items():
+            if (
+                isinstance(motion_id, bool)
+                or not isinstance(motion_id, int)
+                or motion_id < 0
+                or not torch.is_tensor(value)
+                or value.dtype != torch.float64
+                or value.shape != (expected_bins,)
+                or not torch.isfinite(value).all()
+                or bool((value < 0.0).any())
+                or not torch.equal(value, value.round())
+            ):
+                raise ValueError("TVKD verified motion histogram is invalid")
+            restored_motion_histograms[int(motion_id)] = (
+                value.detach().to(device="cpu").clone()
+            )
+        motion_total = torch.zeros_like(histogram)
+        for value in restored_motion_histograms.values():
+            motion_total.add_(value)
+        if not torch.equal(motion_total, histogram):
+            raise ValueError("TVKD verified motion/global histogram counts disagree")
         self._failure_phase_histogram = histogram.detach().to(device="cpu").clone()
         self._failure_phase_episode_count = counters["episode_count"]
         self._failure_phase_anchor_count = counters["anchor_count"]
         self._failure_phase_uniform_fallback_rows = counters["uniform_fallback_rows"]
         self._failure_phase_focused_rows = counters["focused_rows"]
+        self._verified_failure_motion_phase_histogram = restored_motion_histograms
         self._failure_histogram_device_cache.clear()
 
     def _reset_failure_curriculum_state(self) -> None:
@@ -1771,11 +2347,25 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self._failure_phase_anchor_count = 0
         self._failure_phase_uniform_fallback_rows = 0
         self._failure_phase_focused_rows = 0
+        self._verified_failure_motion_phase_histogram = {}
         self._failure_histogram_device_cache.clear()
 
     def _bottleneck_replay_checkpoint_state(self) -> dict:
         return {
+            "location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
             "detector": self.teacher_value_bottleneck_detector.state_dict(),
+            "unsuccessful_episode_count": int(
+                self._bottleneck_unsuccessful_episode_count
+            ),
+            "episodes_with_student_candidates": int(
+                self._bottleneck_episodes_with_student_candidates
+            ),
+            "no_value_bottleneck_count": int(
+                self._bottleneck_no_value_bottleneck_count
+            ),
+            "value_argmin_ablation_count": int(
+                self._bottleneck_value_argmin_ablation_count
+            ),
             "failed_student_episode_count": int(
                 self._bottleneck_failed_student_episode_count
             ),
@@ -1793,14 +2383,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             "phase_match_distance_count": int(
                 self._bottleneck_phase_match_distance_count
             ),
-            "next_student_episode_id": int(
-                self._bottleneck_next_student_episode_id
-            ),
+            "next_student_episode_id": int(self._bottleneck_next_student_episode_id),
             "student_focus_rows_marked": int(self._student_focus_rows_marked),
             "student_focus_rows_missing": int(self._student_focus_rows_missing),
-            "student_focus_sampled_rows": int(
-                self._failure_phase_student_focused_rows
-            ),
+            "student_focus_sampled_rows": int(self._failure_phase_student_focused_rows),
             "student_focus_uniform_fallback_rows": int(
                 self._failure_phase_student_uniform_fallback_rows
             ),
@@ -1816,16 +2402,25 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 self._bottleneck_phase_match_distance_sum
             ),
             "last_metadata": copy.deepcopy(self._last_bottleneck_metadata),
+            "last_value_argmin_metadata": copy.deepcopy(
+                self._last_value_argmin_metadata
+            ),
         }
 
     def _load_bottleneck_replay_checkpoint_state(self, state: Mapping) -> None:
         if not isinstance(state, Mapping):
             raise ValueError("TVKD checkpoint lacks bottleneck replay state")
+        if state.get("location_semantics") != BOTTLENECK_LOCATION_SEMANTICS:
+            raise ValueError("TVKD checkpoint bottleneck semantics mismatch")
         detector_state = state.get("detector")
         if not isinstance(detector_state, Mapping):
             raise ValueError("TVKD checkpoint lacks bottleneck detector state")
         self.teacher_value_bottleneck_detector.load_state_dict(detector_state)
         integer_fields = (
+            "unsuccessful_episode_count",
+            "episodes_with_student_candidates",
+            "no_value_bottleneck_count",
+            "value_argmin_ablation_count",
             "failed_student_episode_count",
             "student_candidate_count",
             "detected_count",
@@ -1872,13 +2467,26 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         metadata = state.get("last_metadata", {})
         if not isinstance(metadata, Mapping):
             raise ValueError("TVKD bottleneck replay metadata is invalid")
+        argmin_metadata = state.get("last_value_argmin_metadata", {})
+        if not isinstance(argmin_metadata, Mapping):
+            raise ValueError("TVKD value-argmin metadata is invalid")
 
+        self._bottleneck_unsuccessful_episode_count = integers[
+            "unsuccessful_episode_count"
+        ]
+        self._bottleneck_episodes_with_student_candidates = integers[
+            "episodes_with_student_candidates"
+        ]
+        self._bottleneck_no_value_bottleneck_count = integers[
+            "no_value_bottleneck_count"
+        ]
+        self._bottleneck_value_argmin_ablation_count = integers[
+            "value_argmin_ablation_count"
+        ]
         self._bottleneck_failed_student_episode_count = integers[
             "failed_student_episode_count"
         ]
-        self._bottleneck_student_candidate_count = integers[
-            "student_candidate_count"
-        ]
+        self._bottleneck_student_candidate_count = integers["student_candidate_count"]
         self._bottleneck_detected_count = integers["detected_count"]
         self._bottleneck_fallback_count = integers["fallback_count"]
         self._bottleneck_no_candidate_count = integers["no_candidate_count"]
@@ -1892,9 +2500,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self._bottleneck_phase_match_distance_count = integers[
             "phase_match_distance_count"
         ]
-        self._bottleneck_next_student_episode_id = integers[
-            "next_student_episode_id"
-        ]
+        self._bottleneck_next_student_episode_id = integers["next_student_episode_id"]
         self._student_focus_rows_marked = integers["student_focus_rows_marked"]
         self._student_focus_rows_missing = integers["student_focus_rows_missing"]
         self._failure_phase_student_focused_rows = integers[
@@ -1911,10 +2517,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self._bottleneck_normalized_td_residual_sum = floats[
             "normalized_td_residual_sum"
         ]
-        self._bottleneck_phase_match_distance_sum = floats[
-            "phase_match_distance_sum"
-        ]
+        self._bottleneck_phase_match_distance_sum = floats["phase_match_distance_sum"]
         self._last_bottleneck_metadata = copy.deepcopy(dict(metadata))
+        self._last_value_argmin_metadata = copy.deepcopy(dict(argmin_metadata))
 
     def _fastsac_checkpoint_state(self):
         # The baseline seam intentionally omits the frozen PPO modules because
@@ -1932,12 +2537,58 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             optimizer_state["dr_estimator_optimizer"] = optimizer.state_dict()
         else:
             optimizer_state["dr_estimator_optimizer"] = None
+        replay_mix_state = {
+            purpose: {
+                source: float(getattr(self.cfg, f"{purpose}_{source}_fraction"))
+                for source in (
+                    "uniform_student",
+                    "failure_student",
+                    "uniform_teacher",
+                    "failure_teacher",
+                )
+            }
+            for purpose in ("q", "actor", "perception")
+        }
+        vecnorm_fingerprint = getattr(self, "_replay_vecnorm_fingerprint", None)
+        if not isinstance(vecnorm_fingerprint, str) or not vecnorm_fingerprint:
+            raise RuntimeError("TVKD checkpoint lacks its Teacher VecNorm fingerprint")
+        reward_fingerprint = _required_contract_fingerprint(
+            "Teacher reward-group fingerprint",
+            getattr(self.cfg, "teacher_value_reward_group_fingerprint", None),
+        )
+        task_fingerprint = _required_contract_fingerprint(
+            "replay task fingerprint",
+            getattr(self.cfg, "replay_task_fingerprint", None),
+        )
+        verified_histogram_state = self._failure_curriculum_checkpoint_state()
         state.update(
             {
                 "training_algorithm": TRAINING_ALGORITHM,
                 "checkpoint_version": CHECKPOINT_VERSION,
                 "critic_learning_semantics": CRITIC_LEARNING_SEMANTICS,
                 "actor_learning_semantics": ACTOR_LEARNING_SEMANTICS,
+                "q_backend_config": {
+                    "target_semantics": CRITIC_LEARNING_SEMANTICS,
+                    "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
+                    "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
+                    "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+                },
+                "replay_mix_state": replay_mix_state,
+                "perception_replay_mode": str(self.cfg.perception_replay_mode),
+                "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
+                "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+                "teacher_value_return_semantics": str(
+                    self.cfg.teacher_value_return_semantics
+                ),
+                "teacher_value_boundary_semantics": str(
+                    self.cfg.teacher_value_boundary_semantics
+                ),
+                "teacher_value_gamma": float(self.cfg.gamma),
+                "teacher_value_reward_group_fingerprint": reward_fingerprint,
+                "teacher_value_vecnorm_fingerprint": vecnorm_fingerprint,
+                "replay_task_fingerprint": task_fingerprint,
+                "verified_teacher_value_histogram_state": (verified_histogram_state),
+                "fresh_ring_resume_semantics": FRESH_RING_RESUME_SEMANTICS,
                 "teacher_value_bottleneck_replay_state": (
                     self._bottleneck_replay_checkpoint_state()
                 ),
@@ -1945,9 +2596,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     name: copy.deepcopy(getattr(self, name).state_dict())
                     for name in self._frozen_teacher_module_names()
                 },
-                "failure_phase_curriculum_state": (
-                    self._failure_curriculum_checkpoint_state()
-                ),
+                # Compatibility alias. The semantics sentinel prevents a v3
+                # mixed-origin histogram from being mistaken for v4 verified data.
+                "failure_phase_curriculum_state": verified_histogram_state,
                 "num_updates": int(self.num_updates),
                 "sac_actor_update_count": int(
                     getattr(
@@ -1981,8 +2632,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             algorithm == PREVIOUS_TRAINING_ALGORITHM
             and version == PREVIOUS_CHECKPOINT_VERSION
         )
+        v3 = algorithm == V3_TRAINING_ALGORITHM and version == V3_CHECKPOINT_VERSION
         current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
-        if not (legacy or previous or current):
+        if not (legacy or previous or v3 or current):
             raise ValueError("not a TVKD FastSAC Teacher-BC checkpoint")
         backend = state.get("dagger_backend_config")
         if not isinstance(backend, Mapping):
@@ -1997,23 +2649,134 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             abs_tol=1e-12,
         ):
             raise ValueError("TVKD resume fixed BC coefficient mismatch")
-        if previous:
-            # v2 had no focused Student partition. Normalize here as well as
-            # in the dedicated entrypoint so programmatic checkpoint loads
-            # cannot silently enable a v3-only replay source.
-            self.cfg.failure_phase_student_fraction = 0.0
+        if legacy or previous or v3:
+            # Programmatic loads must perform the same explicit schema
+            # migration as the Hydra entrypoint. In particular, v3 perception
+            # remains the historical online-Student mode and the saved alpha
+            # cadence is preserved rather than inheriting the fresh-v4 actor
+            # default.
+            _install_v3_replay_migration(
+                self.cfg,
+                backend,
+                student_focus_default=(0.0 if legacy or previous else None),
+            )
         if current:
-            saved_student_fraction = _finite_scalar(
-                "checkpoint failure_phase_student_fraction",
-                backend.get("failure_phase_student_fraction"),
+            expected_backend = self._checkpoint_config()
+            if set(backend) != set(expected_backend):
+                missing = sorted(set(expected_backend).difference(backend))
+                unexpected = sorted(set(backend).difference(expected_backend))
+                raise ValueError(
+                    "TVKD resume algorithm config keys mismatch: "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
+            for name, expected_value in expected_backend.items():
+                if backend[name] != expected_value:
+                    raise ValueError(f"TVKD resume config mismatch at {name!r}")
+
+            expected_mix = _checkpoint_replay_mix(self.cfg)
+            saved_mix = state.get("replay_mix_state")
+            if not isinstance(saved_mix, Mapping):
+                raise ValueError("TVKD v4 checkpoint lacks replay mix state")
+            normalized_mix: dict[str, dict[str, float]] = {}
+            for purpose, expected in expected_mix.items():
+                saved_purpose = saved_mix.get(purpose)
+                if not isinstance(saved_purpose, Mapping):
+                    raise ValueError(f"TVKD v4 checkpoint lacks {purpose!r} replay mix")
+                normalized_mix[purpose] = {}
+                for source, expected_value in expected.items():
+                    saved_value = _finite_scalar(
+                        f"checkpoint {purpose} {source} fraction",
+                        saved_purpose.get(source),
+                    )
+                    normalized_mix[purpose][source] = saved_value
+                    if not math.isclose(
+                        saved_value,
+                        expected_value,
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    ):
+                        raise ValueError(
+                            f"TVKD resume replay mix mismatch at {purpose}.{source}"
+                        )
+                allocate_source_counts(1, normalized_mix[purpose])
+
+            exact_metadata = {
+                "critic_learning_semantics": CRITIC_LEARNING_SEMANTICS,
+                "actor_learning_semantics": ACTOR_LEARNING_SEMANTICS,
+                "perception_replay_mode": str(self.cfg.perception_replay_mode),
+                "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
+                "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+                "teacher_value_return_semantics": str(
+                    self.cfg.teacher_value_return_semantics
+                ),
+                "teacher_value_boundary_semantics": str(
+                    self.cfg.teacher_value_boundary_semantics
+                ),
+                "teacher_value_reward_group_fingerprint": str(
+                    self.cfg.teacher_value_reward_group_fingerprint
+                ),
+                "teacher_value_vecnorm_fingerprint": getattr(
+                    self, "_replay_vecnorm_fingerprint", None
+                ),
+                "replay_task_fingerprint": str(self.cfg.replay_task_fingerprint),
+                "fresh_ring_resume_semantics": FRESH_RING_RESUME_SEMANTICS,
+            }
+            _required_contract_fingerprint(
+                "runtime Teacher reward-group fingerprint",
+                exact_metadata["teacher_value_reward_group_fingerprint"],
+            )
+            _required_contract_fingerprint(
+                "runtime replay task fingerprint",
+                exact_metadata["replay_task_fingerprint"],
+            )
+            for name, expected in exact_metadata.items():
+                if not isinstance(expected, str) or not expected:
+                    raise ValueError(f"TVKD runtime lacks required metadata {name!r}")
+                if state.get(name) != expected:
+                    raise ValueError(f"TVKD resume metadata mismatch at {name!r}")
+            q_backend = state.get("q_backend_config")
+            if not isinstance(q_backend, Mapping):
+                raise ValueError("TVKD v4 checkpoint lacks Q backend metadata")
+            expected_q_metadata = {
+                "target_semantics": CRITIC_LEARNING_SEMANTICS,
+                "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
+                "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
+                "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+            }
+            for name, expected in expected_q_metadata.items():
+                if q_backend.get(name) != expected:
+                    raise ValueError(
+                        f"TVKD resume Q backend metadata mismatch at {name!r}"
+                    )
+            saved_gamma = _finite_scalar(
+                "checkpoint Teacher value gamma",
+                state.get("teacher_value_gamma"),
             )
             if not math.isclose(
-                saved_student_fraction,
-                float(self.cfg.failure_phase_student_fraction),
+                saved_gamma,
+                float(self.cfg.gamma),
                 rel_tol=0.0,
                 abs_tol=1e-12,
             ):
-                raise ValueError("TVKD resume focused Student fraction mismatch")
+                raise ValueError("TVKD resume Teacher value gamma mismatch")
+            for name in (
+                "sac_alpha_update_cadence",
+                "perception_replay_mode",
+                "perception_replay_batch_size",
+                "use_tvkd_value_shaping",
+                "use_teacher_value_bottleneck_replay",
+                "bottleneck_threshold",
+                "bottleneck_smoothing_window",
+                "bottleneck_min_consecutive",
+                "bottleneck_terminal_exclusion_steps",
+                "bottleneck_residual_scale_ema_decay",
+                "bottleneck_eps",
+                "bottleneck_fallback_mode",
+                "bottleneck_include_unsuccessful_timeouts",
+                "max_teacher_phase_match_distance",
+            ):
+                if backend.get(name) != getattr(self.cfg, name):
+                    raise ValueError(f"TVKD resume config mismatch at {name!r}")
         if legacy:
             warnings.warn(
                 "Migrating a TVKD v1 adaptive-BC checkpoint to fixed BC and "
@@ -2030,15 +2793,38 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 UserWarning,
                 stacklevel=2,
             )
+        elif v3:
+            warnings.warn(
+                "Migrating a TVKD v3 checkpoint to v4: the saved alpha "
+                "cadence and model/optimizer state are retained, while raw "
+                "rings, detector statistics, and the mixed-origin histogram "
+                "are reset.",
+                UserWarning,
+                stacklevel=2,
+            )
         bottleneck_state = state.get("teacher_value_bottleneck_replay_state")
-        if (current or previous) and not isinstance(bottleneck_state, Mapping):
+        if (current or previous or v3) and not isinstance(bottleneck_state, Mapping):
             raise ValueError("TVKD checkpoint lacks bottleneck replay state")
         frozen_teacher_state = state.get("frozen_teacher_state")
         if not isinstance(frozen_teacher_state, Mapping):
             raise ValueError("TVKD checkpoint lacks frozen Teacher value state")
-        failure_curriculum_state = state.get("failure_phase_curriculum_state")
+        failure_curriculum_state = (
+            state.get("verified_teacher_value_histogram_state")
+            if current
+            else state.get("failure_phase_curriculum_state")
+        )
         if not isinstance(failure_curriculum_state, Mapping):
             raise ValueError("TVKD checkpoint lacks failure curriculum state")
+        if current:
+            compatibility_histogram = state.get("failure_phase_curriculum_state")
+            if not isinstance(compatibility_histogram, Mapping):
+                raise ValueError(
+                    "TVKD v4 checkpoint lacks histogram compatibility state"
+                )
+            if not _same_verified_histogram_state(
+                compatibility_histogram, failure_curriculum_state
+            ):
+                raise ValueError("TVKD v4 verified histogram aliases are inconsistent")
         optimizer_state = state.get("optimizer_resume_state")
         if not isinstance(optimizer_state, Mapping):
             raise ValueError("TVKD checkpoint lacks optimizer state")
@@ -2124,24 +2910,16 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                         f"TVKD checkpoint lacks frozen Teacher module {name!r}"
                     )
                 getattr(self, name).load_state_dict(module_state, strict=True)
-        if legacy:
-            # Never reuse the v1 scheduler's residual scale: that state belonged
-            # to a different Actor-control mechanism. Start the detector from
-            # its documented neutral scale and discard terminal-phase anchors.
+        if legacy or previous or v3:
+            # Pre-v4 detector scales and phase anchors were collected under
+            # terminal/recent-control gates and could contain argmin or legacy
+            # fallbacks. They are never promoted to the verified v4
+            # threshold-only curriculum.
             self.teacher_value_bottleneck_detector.bottleneck_residual_scale_ema = 1.0
             self.teacher_value_bottleneck_detector.num_scale_updates = 0
             self._reset_bottleneck_statistics()
             self._reset_failure_curriculum_state()
         else:
-            if previous:
-                bottleneck_state = dict(bottleneck_state)
-                for name in (
-                    "student_focus_rows_marked",
-                    "student_focus_rows_missing",
-                    "student_focus_sampled_rows",
-                    "student_focus_uniform_fallback_rows",
-                ):
-                    bottleneck_state.setdefault(name, 0)
             self._load_bottleneck_replay_checkpoint_state(bottleneck_state)
             self._load_failure_curriculum_checkpoint_state(failure_curriculum_state)
         restored_diagnostics = state.get("last_tvkd_diagnostics", {})
@@ -2164,6 +2942,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             raise ValueError("TVKD inference checkpoint version is invalid")
         if (algorithm, version) not in {
             (TRAINING_ALGORITHM, CHECKPOINT_VERSION),
+            (V3_TRAINING_ALGORITHM, V3_CHECKPOINT_VERSION),
             (PREVIOUS_TRAINING_ALGORITHM, PREVIOUS_CHECKPOINT_VERSION),
             (LEGACY_TRAINING_ALGORITHM, LEGACY_CHECKPOINT_VERSION),
         }:
@@ -2200,7 +2979,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
     def state_dict(self):
         state = DistributionalFastSACTeacherBC.state_dict(self)
         state["replay_resume_semantics"] = (
-            "model_optimizer_policy_rng_bottleneck_resume_with_fresh_raw_ring_rebuild_v3"
+            "model_optimizer_policy_rng_verified_bottleneck_resume_with_"
+            "fresh_raw_ring_and_row_credit_rebuild_v4"
         )
         return state
 
@@ -2211,6 +2991,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         # then deliberately rebuilds both raw online replay rings.
         if state_dict.get("training_algorithm") not in {
             TRAINING_ALGORITHM,
+            V3_TRAINING_ALGORITHM,
             PREVIOUS_TRAINING_ALGORITHM,
             LEGACY_TRAINING_ALGORITHM,
         }:
@@ -2233,6 +3014,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
         self.dagger_replay.clear()
         self.q_teacher_replay.clear()
+        # The restored partial UTD debt belongs to rows in the discarded
+        # rings. It must not combine with the first rows of the rebuilt rings.
+        self.q_update_row_credit = 0.0
         self._teacher_prefill_complete = False
         self.teacher_prefill_rollout_count = 0
         self.teacher_prefill_environment_steps = 0
@@ -2279,7 +3063,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
 __all__ = [
     "ACTOR_BACKEND",
+    "BOTTLENECK_LOCATION_SEMANTICS",
     "CHECKPOINT_VERSION",
+    "FRESH_RING_RESUME_SEMANTICS",
     "LEGACY_ADAPTIVE_BC_CONFIG_FIELDS",
     "LEGACY_CHECKPOINT_VERSION",
     "LEGACY_TRAINING_ALGORITHM",
@@ -2288,13 +3074,19 @@ __all__ = [
     "SOURCE_FAILURE_TEACHER",
     "SOURCE_STUDENT",
     "SOURCE_UNIFORM_TEACHER",
+    "TEACHER_VALUE_BOUNDARY_SEMANTICS",
+    "TEACHER_VALUE_RETURN_SEMANTICS",
     "TRAINING_ALGORITHM",
+    "V3_CHECKPOINT_VERSION",
+    "V3_TRAINING_ALGORITHM",
+    "VERIFIED_HISTOGRAM_SEMANTICS",
     "FrozenTeacherValueWrapper",
     "TeacherValueBottleneck",
     "TeacherValueBottleneckDetector",
     "TeacherValueTerms",
     "TVKDDistributionalFastSACTeacherBC",
     "TVKDDistributionalFastSACTeacherBCConfig",
+    "compute_teacher_value_continuation",
     "compute_teacher_value_terms",
     "_validate_tvkd_algorithm_config",
 ]

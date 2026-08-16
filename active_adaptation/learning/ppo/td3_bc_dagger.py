@@ -132,6 +132,27 @@ PERCEPTION_IS_INIT_KEY = "perception_is_init"
 REFERENCE_PHASE_KEY = "reference_phase"
 FAILURE_PHASE_TEACHER_SOURCE_KEY = "failure_phase_teacher_source"
 FAILURE_PHASE_STUDENT_SOURCE_KEY = "failure_phase_student_source"
+REPLAY_INTRINSIC_FOCUSED_KEY = "replay_intrinsic_focused"
+REPLAY_SAMPLE_PROVENANCE_KEY = "_replay_sample_provenance"
+REPLAY_SAMPLE_PHYSICAL_INDEX_KEY = "_replay_sample_physical_index"
+REPLAY_SAMPLE_IS_TEACHER_KEY = "_replay_sample_is_teacher"
+REPLAY_TERMINATED_KEY = "replay_terminated"
+REPLAY_COMMAND_FINISHED_KEY = "replay_command_finished"
+REPLAY_TIME_LIMIT_KEY = "replay_time_limit"
+REPLAY_MOTION_ID_KEY = "replay_motion_id"
+
+REPLAY_SOURCE_ORDER = (
+    "uniform_student",
+    "failure_student",
+    "uniform_teacher",
+    "failure_teacher",
+)
+(
+    REPLAY_SOURCE_UNIFORM_STUDENT,
+    REPLAY_SOURCE_FAILURE_STUDENT,
+    REPLAY_SOURCE_UNIFORM_TEACHER,
+    REPLAY_SOURCE_FAILURE_TEACHER,
+) = range(len(REPLAY_SOURCE_ORDER))
 STUDENT_REPLAY_EPISODE_ID_KEY = "student_replay_episode_id"
 STUDENT_REPLAY_EPISODE_STEP_KEY = "student_replay_episode_step"
 _PREFILL_ENV_INDEX_KEY = "_teacher_prefill_env_index"
@@ -209,6 +230,17 @@ _Q_REPLAY_FIELDS = (
     *_PERCEPTION_REPLAY_FIELDS,
 )
 
+# TVKD v4 needs the exact boundary cause and motion identity in its replay
+# rows.  Keep these fields separate from the long-standing TD3 Q schema so
+# legacy/base policies and replay fixtures retain their original contract.
+# Canonical four-way policies opt into the extended storage schema below.
+_V4_REPLAY_CONTEXT_FIELDS = (
+    REPLAY_TERMINATED_KEY,
+    REPLAY_COMMAND_FINISHED_KEY,
+    REPLAY_TIME_LIMIT_KEY,
+    REPLAY_MOTION_ID_KEY,
+)
+
 
 def _failure_lookback_offsets(
     lookback_steps: int,
@@ -263,6 +295,63 @@ def _source_counts(
         int(math.floor(teacher_count * float(failure_within_teacher_fraction) + 0.5)),
     )
     return batch_size - teacher_count, teacher_count - focused_count, focused_count
+
+
+def allocate_source_counts(
+    batch_size: int,
+    fractions: Mapping[str, float],
+) -> dict[str, int]:
+    """Allocate exactly ``batch_size`` rows by deterministic largest remainder.
+
+    Ties are resolved by :data:`REPLAY_SOURCE_ORDER`, independent of the input
+    mapping's insertion order.  Fractions are validated here as well as by the
+    structured algorithm validator because this helper is a public unit seam.
+    """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, Integral):
+        raise ValueError("batch_size must be a positive integer")
+    batch_size = int(batch_size)
+    if batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    if not isinstance(fractions, Mapping):
+        raise TypeError("fractions must be a mapping")
+    if set(fractions) != set(REPLAY_SOURCE_ORDER):
+        raise ValueError(
+            "fractions must contain exactly " + ", ".join(REPLAY_SOURCE_ORDER)
+        )
+
+    values: list[float] = []
+    for name in REPLAY_SOURCE_ORDER:
+        value = fractions[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} fraction must be a finite number")
+        value = float(value)
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} fraction must lie in [0,1]")
+        values.append(value)
+    total = math.fsum(values)
+    if abs(total - 1.0) >= 1e-8:
+        raise ValueError(f"source fractions must sum to 1; got {total!r}")
+
+    exact = [batch_size * value for value in values]
+    floors = [int(math.floor(value)) for value in exact]
+    remaining = batch_size - sum(floors)
+    if not 0 <= remaining <= len(REPLAY_SOURCE_ORDER):
+        # With the supported batch sizes this can only be reached by fractions
+        # whose small sum error is amplified by an implausibly large batch.
+        raise ValueError("source fractions cannot be allocated at this batch size")
+    ranking = sorted(
+        range(len(REPLAY_SOURCE_ORDER)),
+        key=lambda index: (-(exact[index] - floors[index]), index),
+    )
+    for index in ranking[:remaining]:
+        floors[index] += 1
+    counts = dict(zip(REPLAY_SOURCE_ORDER, floors))
+    if (
+        any(value < 0 for value in counts.values())
+        or sum(counts.values()) != batch_size
+    ):
+        raise RuntimeError("largest-remainder allocation violated its row contract")
+    return counts
 
 
 def _masked_feature_mean(error: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -1099,6 +1188,10 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     perception_replay_burn_in: int = 8
     perception_encode_microbatch_size: int = 128
     teacher_perception_batch_size: int = 128
+    # Baseline TD3/FastSAC retains the historical live-rollout Student path.
+    # TVKD v4 overrides this to ``four_way`` and supplies canonical fractions.
+    perception_replay_mode: str = "legacy_online_student"
+    perception_replay_batch_size: int = 128
     # Teacher-replay-only supervised updates performed exactly once after the
     # successful-only prefill ring reaches capacity and before Student control
     # begins. Zero keeps the old no-warm-up behavior.
@@ -1313,6 +1406,18 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
         td[TD3_EXPLORATORY_STUDENT_ACTION_KEY] = exploratory_student
         td[TD3_COLLECTOR_NOISE_KEY] = collector_noise
         td[TD3_BETA_KEY] = torch.full_like(discrepancy_rms, float(scheduled_beta))
+        motion_ids = getattr(
+            getattr(getattr(owner, "env", None), "command_manager", None),
+            "motion_ids",
+            None,
+        )
+        if torch.is_tensor(motion_ids):
+            motion_ids = motion_ids.detach().to(device=valid.device, dtype=torch.long)
+            if motion_ids.numel() != valid.numel():
+                raise RuntimeError(
+                    "command motion_ids do not match rollout environments"
+                )
+            td[REPLAY_MOTION_ID_KEY] = motion_ids.reshape(valid.shape)
         return td
 
 
@@ -1635,6 +1740,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "perception_replay_burn_in",
             "perception_encode_microbatch_size",
             "teacher_perception_batch_size",
+            "perception_replay_batch_size",
             "failure_phase_lookback_steps",
             "failure_phase_samples_per_failure",
             "failure_phase_num_bins",
@@ -1643,6 +1749,60 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             value = getattr(cfg, name)
             if isinstance(value, bool) or int(value) < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        perception_replay_mode = str(
+            getattr(cfg, "perception_replay_mode", "legacy_online_student")
+        )
+        if perception_replay_mode not in ("legacy_online_student", "four_way"):
+            raise ValueError(
+                "perception_replay_mode must be 'legacy_online_student' or 'four_way'"
+            )
+        if perception_replay_mode == "four_way" and bool(cfg.train_dr_estimator):
+            raise ValueError(
+                "four_way perception replay has no raw replay target for the "
+                "DR estimator; set train_dr_estimator=false"
+            )
+        canonical_names = tuple(
+            f"{purpose}_{source}_fraction"
+            for purpose in ("q", "actor", "perception")
+            for source in REPLAY_SOURCE_ORDER
+        )
+        present_canonical = tuple(
+            name for name in canonical_names if hasattr(cfg, name)
+        )
+        if present_canonical and len(present_canonical) != len(canonical_names):
+            missing = sorted(set(canonical_names).difference(present_canonical))
+            raise ValueError(
+                "canonical four-way replay mix is incomplete; missing "
+                + ", ".join(missing)
+            )
+        if present_canonical:
+            for purpose in ("q", "actor", "perception"):
+                allocate_source_counts(
+                    1,
+                    {
+                        source: getattr(cfg, f"{purpose}_{source}_fraction")
+                        for source in REPLAY_SOURCE_ORDER
+                    },
+                )
+        if perception_replay_mode == "four_way" and not present_canonical:
+            raise ValueError(
+                "perception_replay_mode='four_way' requires all canonical replay fractions"
+            )
+        if perception_replay_mode == "four_way" and bool(cfg.train_dr_estimator):
+            raise ValueError(
+                "four-way perception replay does not store the DR-estimator target"
+            )
+        max_phase_distance = getattr(cfg, "max_teacher_phase_match_distance", None)
+        if max_phase_distance is not None and (
+            isinstance(max_phase_distance, bool)
+            or not isinstance(max_phase_distance, (int, float))
+            or not math.isfinite(float(max_phase_distance))
+            or float(max_phase_distance) < 0.0
+        ):
+            raise ValueError(
+                "max_teacher_phase_match_distance must be null or finite and "
+                "non-negative"
+            )
         q_update_to_data_ratio = getattr(cfg, "q_update_to_data_ratio", None)
         if q_update_to_data_ratio is not None and (
             isinstance(q_update_to_data_ratio, bool)
@@ -2112,7 +2272,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         rows may execute the deterministic Student as an environment fallback,
         but are never staged as Teacher replay data.
         """
-        required = set(_Q_REPLAY_FIELDS).union(
+        replay_fields = self._q_replay_storage_fields()
+        required = set(replay_fields).union(
             _PREFILL_INTERNAL_FIELDS,
             {
                 DAGGER_TEACHER_ACTION_VALID_KEY,
@@ -2240,7 +2401,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         replay_device = self.q_teacher_replay.device
         payload = {
-            key: transitions[key].detach().to(replay_device) for key in _Q_REPLAY_FIELDS
+            key: transitions[key].detach().to(replay_device) for key in replay_fields
         }
         committed_rows = 0
         discarded_rows = 0
@@ -2282,7 +2443,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if chunks:
                 episode = {
                     key: torch.cat([chunk[key] for chunk in chunks], dim=0)
-                    for key in _Q_REPLAY_FIELDS
+                    for key in replay_fields
                 }
                 rows = self.q_teacher_replay.extend(episode)
             else:
@@ -2507,6 +2668,426 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             getattr(self, "_failure_histogram_device_cache", {}).clear()
         return anchors_added
 
+    def _has_canonical_replay_mix(self) -> bool:
+        return all(
+            hasattr(self.cfg, f"{purpose}_{source}_fraction")
+            for purpose in ("q", "actor", "perception")
+            for source in REPLAY_SOURCE_ORDER
+        )
+
+    def _q_replay_storage_fields(self) -> tuple[str, ...]:
+        """Return the replay schema selected by the algorithm contract."""
+        if self._has_canonical_replay_mix():
+            return (*_Q_REPLAY_FIELDS, *_V4_REPLAY_CONTEXT_FIELDS)
+        return _Q_REPLAY_FIELDS
+
+    def _replay_mix_fractions(self, purpose: str) -> dict[str, float]:
+        """Resolve one purpose's global four-way source fractions.
+
+        Canonical v4 fields are authoritative when present.  The derived branch
+        exists only to retain the exact source meaning of older TD3/FastSAC
+        configs; it is not used to represent a v4 TVKD experiment.
+        """
+        if purpose not in ("q", "actor", "perception"):
+            raise ValueError(f"unknown replay mix purpose={purpose!r}")
+        if self._has_canonical_replay_mix():
+            fractions = {
+                source: float(getattr(self.cfg, f"{purpose}_{source}_fraction"))
+                for source in REPLAY_SOURCE_ORDER
+            }
+            # Validate without changing the configured values.
+            allocate_source_counts(1, fractions)
+            return fractions
+
+        teacher_fraction = {
+            "q": float(getattr(self.cfg, "q_teacher_replay_ratio", 0.5)),
+            "actor": float(getattr(self.cfg, "teacher_actor_replay_fraction", 0.0)),
+            "perception": float(
+                getattr(self.cfg, "teacher_perception_replay_fraction", 0.0)
+            ),
+        }[purpose]
+        teacher_failure = float(
+            getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)
+        )
+        student_failure = float(
+            getattr(self.cfg, "failure_phase_student_fraction", 0.0)
+        )
+        student_fraction = 1.0 - teacher_fraction
+        return {
+            "uniform_student": student_fraction * (1.0 - student_failure),
+            "failure_student": student_fraction * student_failure,
+            "uniform_teacher": teacher_fraction * (1.0 - teacher_failure),
+            "failure_teacher": teacher_fraction * teacher_failure,
+        }
+
+    def _replay_source_counts(self, purpose: str, batch_size: int) -> dict[str, int]:
+        if self._has_canonical_replay_mix():
+            return allocate_source_counts(
+                int(batch_size), self._replay_mix_fractions(purpose)
+            )
+
+        # Preserve legacy nested half-up rounding byte-for-byte.  Largest
+        # remainder is mandatory only for canonical v4 source fractions.
+        teacher_fraction = {
+            "q": float(getattr(self.cfg, "q_teacher_replay_ratio", 0.5)),
+            "actor": float(getattr(self.cfg, "teacher_actor_replay_fraction", 0.0)),
+            "perception": float(
+                getattr(self.cfg, "teacher_perception_replay_fraction", 0.0)
+            ),
+        }[purpose]
+        student_count, uniform_teacher, failure_teacher = _source_counts(
+            int(batch_size),
+            teacher_fraction,
+            float(getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)),
+        )
+        failure_student = (
+            0
+            if student_count == 0
+            else _source_counts(
+                student_count,
+                1.0,
+                float(getattr(self.cfg, "failure_phase_student_fraction", 0.0)),
+            )[2]
+        )
+        return {
+            "uniform_student": student_count - failure_student,
+            "failure_student": failure_student,
+            "uniform_teacher": uniform_teacher,
+            "failure_teacher": failure_teacher,
+        }
+
+    def _student_intrinsic_focused_mask(self, indices: torch.Tensor) -> torch.Tensor:
+        replay = self.dagger_replay
+        key = (
+            REPLAY_INTRINSIC_FOCUSED_KEY
+            if REPLAY_INTRINSIC_FOCUSED_KEY in replay.data
+            else FAILURE_PHASE_STUDENT_SOURCE_KEY
+        )
+        if key not in replay.data:
+            return torch.zeros(indices.shape, dtype=torch.bool, device=indices.device)
+        replay_indices = indices.to(replay.device)
+        result = replay.data[key].index_select(0, replay_indices).reshape(-1).bool()
+        return result if result.device == indices.device else result.to(indices.device)
+
+    def _verified_teacher_focus_pool(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return unique eligible FT rows and their verified-anchor weights.
+
+        The pool is built on CPU and cached by the complete motion histogram,
+        phase-distance contract, and immutable Teacher replay size.  Assigning
+        anchor weight to rows only after same-motion nearest-phase matching
+        prevents phase aliases between different motions.
+        """
+        mapping = getattr(self, "_verified_failure_motion_phase_histogram", None)
+        if not isinstance(mapping, Mapping) or not mapping:
+            empty_rows = torch.empty(0, dtype=torch.long)
+            return empty_rows, torch.empty(0, dtype=torch.float64)
+        if not bool(getattr(self, "_teacher_phase_index_ready", False)):
+            self._build_teacher_phase_index()
+
+        bin_count = int(self.cfg.failure_phase_num_bins)
+        normalized: list[tuple[int, torch.Tensor]] = []
+        for raw_motion, raw_histogram in sorted(
+            mapping.items(), key=lambda item: int(item[0])
+        ):
+            if not torch.is_tensor(raw_histogram) or raw_histogram.shape != (
+                bin_count,
+            ):
+                raise ValueError(
+                    "verified failure motion histogram has an invalid shape"
+                )
+            histogram = raw_histogram.detach().to(device="cpu", dtype=torch.float64)
+            if not torch.isfinite(histogram).all() or bool((histogram < 0).any()):
+                raise ValueError("verified failure motion histogram is invalid")
+            normalized.append((int(raw_motion), histogram))
+
+        max_distance = getattr(self.cfg, "max_teacher_phase_match_distance", None)
+        if max_distance is not None:
+            if (
+                isinstance(max_distance, bool)
+                or not isinstance(max_distance, (int, float))
+                or not math.isfinite(float(max_distance))
+                or float(max_distance) < 0.0
+            ):
+                raise ValueError(
+                    "max_teacher_phase_match_distance must be null or finite and "
+                    "non-negative"
+                )
+            max_distance = float(max_distance)
+        signature = (
+            int(self.q_teacher_replay.size),
+            bin_count,
+            max_distance,
+            tuple(
+                (motion, tuple(float(value) for value in histogram.tolist()))
+                for motion, histogram in normalized
+            ),
+        )
+        cached = getattr(self, "_verified_teacher_focus_pool_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 3 and cached[0] == signature:
+            return cached[1], cached[2]
+
+        row_weights = torch.zeros(int(self.q_teacher_replay.size), dtype=torch.float64)
+        teacher_motion = self._teacher_replay_motion_ids
+        teacher_bins = self._teacher_replay_phase_bins
+        for motion, histogram in normalized:
+            same_motion = (teacher_motion == motion).nonzero(as_tuple=False).squeeze(-1)
+            if same_motion.numel() == 0:
+                continue
+            motion_bins = teacher_bins.index_select(0, same_motion)
+            for risk_bin in (
+                (histogram > 0).nonzero(as_tuple=False).squeeze(-1).tolist()
+            ):
+                distances = (motion_bins - int(risk_bin)).abs()
+                nearest_distance = int(distances.min().item())
+                if (
+                    max_distance is not None
+                    and nearest_distance / float(bin_count) > max_distance
+                ):
+                    continue
+                pool = same_motion[distances == nearest_distance]
+                # Preserve anchor-frequency weighting without making a dense
+                # phase bin more likely solely because it contains more rows.
+                row_weights[pool] += float(histogram[risk_bin]) / int(pool.numel())
+
+        rows = (row_weights > 0).nonzero(as_tuple=False).squeeze(-1)
+        weights = row_weights.index_select(0, rows)
+        self._verified_teacher_focus_pool_cache = (signature, rows, weights)
+        return rows, weights
+
+    def _teacher_intrinsic_focused_mask(self, indices: torch.Tensor) -> torch.Tensor:
+        """Return dynamic membership in the current verified Teacher focus pool."""
+        if indices.numel() == 0:
+            return torch.zeros(indices.shape, dtype=torch.bool, device=indices.device)
+        if self._has_canonical_replay_mix():
+            rows, _ = self._verified_teacher_focus_pool()
+            if rows.numel() == 0:
+                return torch.zeros(
+                    indices.shape, dtype=torch.bool, device=indices.device
+                )
+            result = torch.isin(indices.detach().long().cpu(), rows)
+            return result.to(indices.device)
+
+        histogram = getattr(self, "_failure_phase_histogram", None)
+        if (
+            not torch.is_tensor(histogram)
+            or not bool((histogram > 0).any())
+            or REFERENCE_PHASE_KEY not in self.q_teacher_replay.data
+        ):
+            return torch.zeros(indices.shape, dtype=torch.bool, device=indices.device)
+        if not bool(getattr(self, "_teacher_phase_index_ready", False)):
+            self._build_teacher_phase_index()
+        risk_bins = (histogram > 0).nonzero(as_tuple=False).squeeze(-1)
+        teacher_bins = self._teacher_phase_nearest_nonempty.index_select(
+            0, risk_bins.cpu()
+        ).unique()
+        replay_indices = indices.to(self.q_teacher_replay.device)
+        phase = self.q_teacher_replay.data[REFERENCE_PHASE_KEY].index_select(
+            0, replay_indices
+        )
+        phase = phase.reshape(indices.numel(), -1)[:, 0].float().clamp(0.0, 1.0)
+        bins = (
+            torch.floor(phase * int(self.cfg.failure_phase_num_bins))
+            .long()
+            .clamp_(0, int(self.cfg.failure_phase_num_bins) - 1)
+        )
+        teacher_bins = teacher_bins.to(bins.device)
+        result = (bins.unsqueeze(-1) == teacher_bins).any(dim=-1)
+        return result if result.device == indices.device else result.to(indices.device)
+
+    def _attach_replay_sample_metadata(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        teacher_indices: torch.Tensor,
+        student_indices: torch.Tensor,
+        teacher_failure: torch.Tensor,
+        student_failure: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Attach batch-only provenance without overwriting intrinsic metadata."""
+        row_count = int(teacher_indices.numel() + student_indices.numel())
+        if not batch:
+            raise RuntimeError("cannot attach replay metadata to an empty batch")
+        device = next(iter(batch.values())).device
+        teacher_failure = teacher_failure.reshape(-1).bool().to(device)
+        student_failure = student_failure.reshape(-1).bool().to(device)
+        if teacher_failure.numel() != teacher_indices.numel():
+            raise ValueError("Teacher failure provenance is misaligned")
+        if student_failure.numel() != student_indices.numel():
+            raise ValueError("Student failure provenance is misaligned")
+        provenance = torch.cat(
+            (
+                torch.where(
+                    teacher_failure,
+                    torch.full_like(
+                        teacher_failure, REPLAY_SOURCE_FAILURE_TEACHER, dtype=torch.long
+                    ),
+                    torch.full_like(
+                        teacher_failure, REPLAY_SOURCE_UNIFORM_TEACHER, dtype=torch.long
+                    ),
+                ),
+                torch.where(
+                    student_failure,
+                    torch.full_like(
+                        student_failure, REPLAY_SOURCE_FAILURE_STUDENT, dtype=torch.long
+                    ),
+                    torch.full_like(
+                        student_failure, REPLAY_SOURCE_UNIFORM_STUDENT, dtype=torch.long
+                    ),
+                ),
+            )
+        )
+        intrinsic = torch.cat(
+            (
+                self._teacher_intrinsic_focused_mask(teacher_indices).to(device),
+                self._student_intrinsic_focused_mask(student_indices).to(device),
+            )
+        )
+        # The two replay rings may live on a different device from each other
+        # in test seams, and an empty single-source placeholder is CPU by
+        # default.  Normalize before concatenation so the zero-share edges are
+        # just as safe as a genuinely mixed batch.
+        physical_indices = torch.cat(
+            (
+                teacher_indices.reshape(-1).to(device=device, dtype=torch.long),
+                student_indices.reshape(-1).to(device=device, dtype=torch.long),
+            )
+        )
+        is_teacher = torch.cat(
+            (
+                torch.ones(teacher_indices.numel(), dtype=torch.bool, device=device),
+                torch.zeros(student_indices.numel(), dtype=torch.bool, device=device),
+            )
+        )
+        if provenance.numel() != row_count or intrinsic.numel() != row_count:
+            raise RuntimeError("replay metadata row count is inconsistent")
+        batch[REPLAY_SAMPLE_PROVENANCE_KEY] = provenance
+        batch[REPLAY_INTRINSIC_FOCUSED_KEY] = intrinsic.bool()
+        batch[REPLAY_SAMPLE_PHYSICAL_INDEX_KEY] = physical_indices
+        batch[REPLAY_SAMPLE_IS_TEACHER_KEY] = is_teacher
+        # Deprecated compatibility masks remain provenance-only.
+        batch[DAGGER_Q_TEACHER_SOURCE_KEY] = is_teacher
+        batch[FAILURE_PHASE_TEACHER_SOURCE_KEY] = (
+            provenance == REPLAY_SOURCE_FAILURE_TEACHER
+        )
+        batch[FAILURE_PHASE_STUDENT_SOURCE_KEY] = (
+            provenance == REPLAY_SOURCE_FAILURE_STUDENT
+        )
+        return batch
+
+    def _reset_replay_mix_rollout_metrics(self) -> None:
+        self._replay_mix_rollout_metrics: dict[str, dict[str, float]] = {}
+
+    def _record_replay_mix_batch(
+        self,
+        purpose: str,
+        batch: Mapping[str, torch.Tensor],
+        requested_counts: Mapping[str, int],
+        *,
+        valid_mask: torch.Tensor | None = None,
+    ) -> None:
+        provenance = batch[REPLAY_SAMPLE_PROVENANCE_KEY].reshape(-1).long()
+        intrinsic = batch[REPLAY_INTRINSIC_FOCUSED_KEY].reshape(-1).bool()
+        physical = batch[REPLAY_SAMPLE_PHYSICAL_INDEX_KEY].reshape(-1).long()
+        is_teacher = batch[REPLAY_SAMPLE_IS_TEACHER_KEY].reshape(-1).bool()
+        rows = int(provenance.numel())
+        if not (
+            intrinsic.numel() == rows
+            and physical.numel() == rows
+            and is_teacher.numel() == rows
+        ):
+            raise ValueError("replay metric metadata is misaligned")
+        accumulator = self._replay_mix_rollout_metrics.setdefault(
+            purpose,
+            {
+                "batches": 0.0,
+                "rows": 0.0,
+                "intrinsic_focused_rows": 0.0,
+                "failure_provenance_rows": 0.0,
+                "uniform_intrinsic_rows": 0.0,
+                "uniform_rows": 0.0,
+                "duplicate_rows": 0.0,
+                "valid_rows": 0.0,
+                **{f"requested_{source}_rows": 0.0 for source in REPLAY_SOURCE_ORDER},
+                **{f"actual_{source}_rows": 0.0 for source in REPLAY_SOURCE_ORDER},
+                **{f"valid_{source}_rows": 0.0 for source in REPLAY_SOURCE_ORDER},
+            },
+        )
+        accumulator["batches"] += 1.0
+        accumulator["rows"] += float(rows)
+        failure = (provenance == REPLAY_SOURCE_FAILURE_STUDENT) | (
+            provenance == REPLAY_SOURCE_FAILURE_TEACHER
+        )
+        uniform = ~failure
+        accumulator["intrinsic_focused_rows"] += float(intrinsic.sum().item())
+        accumulator["failure_provenance_rows"] += float(failure.sum().item())
+        accumulator["uniform_intrinsic_rows"] += float(
+            (uniform & intrinsic).sum().item()
+        )
+        accumulator["uniform_rows"] += float(uniform.sum().item())
+        composite = physical + is_teacher.long() * int(self.dagger_replay.capacity)
+        accumulator["duplicate_rows"] += float(rows - int(composite.unique().numel()))
+        if valid_mask is None:
+            valid = torch.ones(rows, dtype=torch.bool, device=provenance.device)
+        else:
+            valid = valid_mask.reshape(-1).bool().to(provenance.device)
+            if valid.numel() != rows:
+                raise ValueError("perception valid mask is misaligned")
+        accumulator["valid_rows"] += float(valid.sum().item())
+        for source_id, source in enumerate(REPLAY_SOURCE_ORDER):
+            source_mask = provenance == source_id
+            accumulator[f"requested_{source}_rows"] += float(
+                int(requested_counts[source])
+            )
+            accumulator[f"actual_{source}_rows"] += float(source_mask.sum().item())
+            accumulator[f"valid_{source}_rows"] += float(
+                (source_mask & valid).sum().item()
+            )
+
+    def _replay_mix_metrics(self, purpose: str) -> dict[str, float]:
+        fractions = self._replay_mix_fractions(purpose)
+        accumulator = self._replay_mix_rollout_metrics.get(purpose, {})
+        rows = float(accumulator.get("rows", 0.0))
+        valid_rows = float(accumulator.get("valid_rows", 0.0))
+        result: dict[str, float] = {}
+        for source in REPLAY_SOURCE_ORDER:
+            requested = float(accumulator.get(f"requested_{source}_rows", 0.0))
+            actual = float(accumulator.get(f"actual_{source}_rows", 0.0))
+            valid = float(accumulator.get(f"valid_{source}_rows", 0.0))
+            result[f"configured_{source}_fraction"] = float(fractions[source])
+            result[f"requested_{source}_rows"] = requested
+            result[f"requested_{source}_fraction"] = requested / max(rows, 1.0)
+            result[f"actual_{source}_rows"] = actual
+            result[f"actual_{source}_fraction"] = actual / max(rows, 1.0)
+            result[f"final_{source}_rows"] = actual
+            result[f"valid_loss_{source}_fraction"] = valid / max(valid_rows, 1.0)
+        result["failure_student_backfill_rows"] = max(
+            result["requested_failure_student_rows"]
+            - result["actual_failure_student_rows"],
+            0.0,
+        )
+        result["failure_teacher_backfill_rows"] = max(
+            result["requested_failure_teacher_rows"]
+            - result["actual_failure_teacher_rows"],
+            0.0,
+        )
+        result["intrinsic_focused_row_fraction"] = float(
+            accumulator.get("intrinsic_focused_rows", 0.0)
+        ) / max(rows, 1.0)
+        result["failure_stratum_provenance_fraction"] = float(
+            accumulator.get("failure_provenance_rows", 0.0)
+        ) / max(rows, 1.0)
+        result["duplicate_row_fraction"] = float(
+            accumulator.get("duplicate_rows", 0.0)
+        ) / max(rows, 1.0)
+        result["uniform_draw_intrinsic_focused_fraction"] = float(
+            accumulator.get("uniform_intrinsic_rows", 0.0)
+        ) / max(float(accumulator.get("uniform_rows", 0.0)), 1.0)
+        result["sampled_rows"] = rows
+        result["valid_loss_rows"] = valid_rows
+        return result
+
     @torch.no_grad()
     def _build_teacher_phase_index(self) -> None:
         """Index immutable Teacher rows by reference phase for focused draws."""
@@ -2521,6 +3102,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         phase = phase.reshape(self.q_teacher_replay.size, -1)[:, 0]
         phase = phase.detach().float().cpu().clamp(0.0, 1.0)
         phase_bins = torch.floor(phase * bins).long().clamp_(0, bins - 1)
+        motion_ids = self.q_teacher_replay.data.get(REPLAY_MOTION_ID_KEY)
+        if motion_ids is None:
+            if self._has_canonical_replay_mix():
+                raise KeyError("canonical Teacher replay lacks replay_motion_id")
+            motion_ids = torch.zeros(self.q_teacher_replay.size, dtype=torch.long)
+        else:
+            motion_ids = (
+                motion_ids[: self.q_teacher_replay.size]
+                .reshape(self.q_teacher_replay.size, -1)[:, 0]
+                .detach()
+                .long()
+                .cpu()
+            )
         rows = tuple(
             (phase_bins == bin_index).nonzero(as_tuple=False).squeeze(-1)
             for bin_index in range(bins)
@@ -2547,6 +3141,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._teacher_phase_flat_rows = flat_rows
         self._teacher_phase_bin_starts = starts
         self._teacher_phase_bin_counts = counts
+        self._teacher_replay_phase_bins = phase_bins
+        self._teacher_replay_motion_ids = motion_ids
         getattr(self, "_teacher_phase_device_cache", {}).clear()
         self._teacher_phase_index_ready = True
 
@@ -2592,6 +3188,70 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         return entry[1]
 
     @torch.no_grad()
+    def _draw_verified_motion_teacher_indices(
+        self,
+        count: int,
+        generator: torch.Generator,
+        *,
+        focused_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draw unique canonical FT rows, backfilling shortage with uniform Teacher."""
+        generator_device = torch.device(generator.device)
+
+        def _uniform(draw_count: int) -> torch.Tensor:
+            return torch.randint(
+                0,
+                self.q_teacher_replay.size,
+                (draw_count,),
+                device=generator_device,
+                generator=generator,
+            )
+
+        if focused_count == 0:
+            return (
+                _uniform(count),
+                torch.zeros(count, dtype=torch.bool, device=generator_device),
+            )
+        focused_pool, focused_weights = self._verified_teacher_focus_pool()
+        actual_focused = min(focused_count, int(focused_pool.numel()))
+        if actual_focused == 0:
+            self._failure_phase_uniform_fallback_rows = (
+                int(getattr(self, "_failure_phase_uniform_fallback_rows", 0))
+                + focused_count
+            )
+            return (
+                _uniform(count),
+                torch.zeros(count, dtype=torch.bool, device=generator_device),
+            )
+        weights = focused_weights.to(generator_device)
+        focused_positions = torch.multinomial(
+            weights,
+            actual_focused,
+            replacement=False,
+            generator=generator,
+        )
+        focused_rows = focused_pool.to(generator_device).index_select(
+            0, focused_positions
+        )
+        uniform_count = count - actual_focused
+        indices = torch.cat((_uniform(uniform_count), focused_rows), dim=0)
+        focused = torch.cat(
+            (
+                torch.zeros(uniform_count, dtype=torch.bool, device=generator_device),
+                torch.ones(actual_focused, dtype=torch.bool, device=generator_device),
+            )
+        )
+        self._failure_phase_focused_rows = (
+            int(getattr(self, "_failure_phase_focused_rows", 0)) + actual_focused
+        )
+        self._failure_phase_uniform_fallback_rows = (
+            int(getattr(self, "_failure_phase_uniform_fallback_rows", 0))
+            + focused_count
+            - actual_focused
+        )
+        return indices, focused
+
+    @torch.no_grad()
     def _draw_teacher_indices(
         self,
         count: int,
@@ -2606,6 +3266,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError("Teacher sample counts are invalid")
         if self.q_teacher_replay.size < 1:
             raise RuntimeError("cannot sample an empty Teacher replay")
+        if self._has_canonical_replay_mix():
+            return self._draw_verified_motion_teacher_indices(
+                count, generator, focused_count=focused_count
+            )
         generator_device = torch.device(generator.device)
         uniform_count = count - focused_count
 
@@ -2704,10 +3368,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         all_student = replay._valid_indices(DAGGER_IS_STUDENT_ACTION_KEY)
         if all_student.numel() < 1:
             raise RuntimeError("Cannot sample before a Student row exists")
-        if FAILURE_PHASE_STUDENT_SOURCE_KEY not in replay.data:
+        focused_key = (
+            REPLAY_INTRINSIC_FOCUSED_KEY
+            if REPLAY_INTRINSIC_FOCUSED_KEY in replay.data
+            else FAILURE_PHASE_STUDENT_SOURCE_KEY
+        )
+        if focused_key not in replay.data:
             empty = torch.empty(0, dtype=torch.long, device=replay.device)
             return all_student, empty
-        focused = replay._valid_indices(FAILURE_PHASE_STUDENT_SOURCE_KEY)
+        focused = replay._valid_indices(focused_key)
         return all_student, focused
 
     @torch.no_grad()
@@ -2764,21 +3433,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         focused = torch.cat(
             (
-                torch.zeros(
-                    uniform_count, dtype=torch.bool, device=generator_device
-                ),
-                torch.ones(
-                    actual_focused, dtype=torch.bool, device=generator_device
-                ),
+                torch.zeros(uniform_count, dtype=torch.bool, device=generator_device),
+                torch.ones(actual_focused, dtype=torch.bool, device=generator_device),
             )
         )
         shortfall = focused_count - actual_focused
-        self._failure_phase_student_focused_rows = int(
-            getattr(self, "_failure_phase_student_focused_rows", 0)
-        ) + actual_focused
-        self._failure_phase_student_uniform_fallback_rows = int(
-            getattr(self, "_failure_phase_student_uniform_fallback_rows", 0)
-        ) + shortfall
+        self._failure_phase_student_focused_rows = (
+            int(getattr(self, "_failure_phase_student_focused_rows", 0))
+            + actual_focused
+        )
+        self._failure_phase_student_uniform_fallback_rows = (
+            int(getattr(self, "_failure_phase_student_uniform_fallback_rows", 0))
+            + shortfall
+        )
         return indices, focused
 
     @torch.no_grad()
@@ -2813,38 +3480,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         if update_count < 0:
             raise ValueError("update_count must be non-negative")
         batch_size = int(self.cfg.q_batch_size)
-        (
-            student_count,
-            q_uniform_teacher_count,
-            q_focused_count,
-        ) = _source_counts(
-            batch_size,
-            float(getattr(self.cfg, "q_teacher_replay_ratio", 0.5)),
-            float(self.cfg.failure_phase_teacher_fraction),
-        )
-        teacher_count = q_uniform_teacher_count + q_focused_count
+        q_counts = self._replay_source_counts("q", batch_size)
+        student_count = q_counts["uniform_student"] + q_counts["failure_student"]
+        q_focused_count = q_counts["failure_teacher"]
+        teacher_count = q_counts["uniform_teacher"] + q_focused_count
         actor_batch_size = int(self.cfg.dagger_batch_size)
-        actor_main_count, _, actor_focused_count = _source_counts(
-            actor_batch_size,
-            float(self.cfg.teacher_actor_replay_fraction),
-            float(self.cfg.failure_phase_teacher_fraction),
+        actor_counts = self._replay_source_counts("actor", actor_batch_size)
+        actor_main_count = (
+            actor_counts["uniform_student"] + actor_counts["failure_student"]
         )
-        actor_teacher_count = actor_batch_size - actor_main_count
-        student_failure_fraction = float(
-            getattr(self.cfg, "failure_phase_student_fraction", 0.0)
-        )
-        q_student_focused_count = (
-            0
-            if student_count == 0
-            else _source_counts(student_count, 1.0, student_failure_fraction)[2]
-        )
-        actor_student_focused_count = (
-            0
-            if actor_main_count == 0
-            else _source_counts(
-                actor_main_count, 1.0, student_failure_fraction
-            )[2]
-        )
+        actor_focused_count = actor_counts["failure_teacher"]
+        actor_teacher_count = actor_counts["uniform_teacher"] + actor_focused_count
+        q_student_focused_count = q_counts["failure_student"]
+        actor_student_focused_count = actor_counts["failure_student"]
         generator_device = torch.device(self.q_rng.device)
         if update_count == 0:
             return ()
@@ -2852,9 +3500,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         records = []
         for update_index in range(update_count):
             teacher_draw = None
-            teacher_focused = torch.zeros(
-                0, dtype=torch.bool, device=generator_device
-            )
+            teacher_focused = torch.zeros(0, dtype=torch.bool, device=generator_device)
             if teacher_count:
                 teacher_indices, teacher_focused = self._draw_teacher_indices(
                     teacher_count,
@@ -2864,9 +3510,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 teacher_draw = len(index_draws)
                 index_draws.append(teacher_indices)
             student_draw = None
-            student_focused = torch.zeros(
-                0, dtype=torch.bool, device=generator_device
-            )
+            student_focused = torch.zeros(0, dtype=torch.bool, device=generator_device)
             if student_count:
                 (
                     student_indices,
@@ -2951,11 +3595,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 if student_draw is None
                 else cpu_draws[student_draw]
             )
-            actor_indices = (
-                None
-                if actor_draw is None
-                else cpu_draws[actor_draw]
-            )
+            actor_indices = None if actor_draw is None else cpu_draws[actor_draw]
             actor_teacher_indices = (
                 None if actor_teacher_draw is None else cpu_draws[actor_teacher_draw]
             )
@@ -3157,6 +3797,20 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                             selected
                         ]
 
+            motion_id = current.get(REPLAY_MOTION_ID_KEY, None)
+            if motion_id is None:
+                dataset = getattr(
+                    getattr(getattr(self, "env", None), "command_manager", None),
+                    "dataset",
+                    None,
+                )
+                num_motions = len(getattr(dataset, "lengths", ()))
+                if num_motions > 1:
+                    raise RuntimeError(
+                        "multi-motion replay requires rollout-time replay_motion_id"
+                    )
+                motion_id = torch.zeros(int(n), dtype=torch.long, device=current.device)
+
             transitions = {
                 "critic_observations": self._cat_replay_sources(
                     current, self.q_critic_keys
@@ -3181,6 +3835,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "discounts": current["next", "discount"].reshape(int(n)),
                 "next_critic_observations": next_critic,
                 REFERENCE_PHASE_KEY: self._reference_phase(current).reshape(int(n)),
+                REPLAY_TERMINATED_KEY: current[TERM_KEY].reshape(int(n)).bool(),
+                REPLAY_COMMAND_FINISHED_KEY: current[
+                    "next", "stats", "command_finished"
+                ]
+                .reshape(int(n))
+                .bool(),
+                REPLAY_TIME_LIMIT_KEY: current["next", "stats", "episode_time_limit"]
+                .reshape(int(n))
+                .bool(),
+                REPLAY_MOTION_ID_KEY: motion_id.reshape(int(n)).long(),
                 _PREFILL_ENV_INDEX_KEY: torch.arange(
                     int(n), device=current.device, dtype=torch.long
                 ),
@@ -3542,17 +4206,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         return actor_metrics
 
     def _q_backend_metadata(self):
-        q_teacher_fraction = float(self.cfg.q_teacher_replay_ratio)
-        q_student_rows, q_uniform_teacher_rows, q_focused_teacher_rows = (
-            _source_counts(
-                int(self.cfg.q_batch_size),
-                q_teacher_fraction,
-                float(getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)),
-            )
+        q_fractions = self._replay_mix_fractions("q")
+        actor_fractions = self._replay_mix_fractions("actor")
+        perception_fractions = self._replay_mix_fractions("perception")
+        q_counts = self._replay_source_counts("q", int(self.cfg.q_batch_size))
+        q_student_rows = q_counts["uniform_student"] + q_counts["failure_student"]
+        q_teacher_rows = q_counts["uniform_teacher"] + q_counts["failure_teacher"]
+        q_teacher_fraction = (
+            q_fractions["uniform_teacher"] + q_fractions["failure_teacher"]
         )
-        q_teacher_rows = q_uniform_teacher_rows + q_focused_teacher_rows
-        legacy_half_mix = int(self.cfg.q_batch_size) % 2 == 0 and math.isclose(
-            q_teacher_fraction, 0.5, rel_tol=0.0, abs_tol=1e-12
+        legacy_half_mix = (
+            not self._has_canonical_replay_mix()
+            and int(self.cfg.q_batch_size) % 2 == 0
+            and math.isclose(q_teacher_fraction, 0.5, rel_tol=0.0, abs_tol=1e-12)
         )
         return {
             "actor_obs_keys": list(self.q_actor_keys),
@@ -3605,8 +4271,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_realized_teacher_fraction": (
                 q_teacher_rows / int(self.cfg.q_batch_size)
             ),
-            "actor_teacher_replay_fraction": float(
-                self.cfg.teacher_actor_replay_fraction
+            "actor_teacher_replay_fraction": (
+                actor_fractions["uniform_teacher"] + actor_fractions["failure_teacher"]
+            ),
+            "q_replay_source_fractions": q_fractions,
+            "actor_replay_source_fractions": actor_fractions,
+            "perception_replay_source_fractions": perception_fractions,
+            "perception_replay_mode": str(
+                getattr(self.cfg, "perception_replay_mode", "legacy_online_student")
             ),
             "actor_replay_mix_semantics": (
                 "combined_rl_bc_on_prefill_teacher_and_student_executed_rows_v2"
@@ -3676,6 +4348,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "perception_replay_burn_in",
             "perception_encode_microbatch_size",
             "teacher_perception_batch_size",
+            "perception_replay_mode",
+            "perception_replay_batch_size",
             "teacher_perception_warmup_steps",
             "perception_depth_codec",
             "load_pretrained_perception",
@@ -3683,47 +4357,46 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "train_perception",
             "save_teacher_buffer",
         )
-        return {
+        result = {
             **{name: getattr(self.cfg, name) for name in names},
             "method": TRAINING_ALGORITHM,
             "actor_output": "ppo_physical_proposal_tanh_bounded_raw_joint_command",
             "bc_loss": "joint_normalized_raw_mean_teacher_smooth_l1",
         }
+        # Canonical v4 fields are intentionally flat so Hydra structured config,
+        # checkpoint diffing, and downstream audit tooling all see the same keys.
+        for purpose in ("q", "actor", "perception"):
+            for source in REPLAY_SOURCE_ORDER:
+                name = f"{purpose}_{source}_fraction"
+                if hasattr(self.cfg, name):
+                    result[name] = getattr(self.cfg, name)
+        return result
 
     def _sample_balanced_q_batch(self, sample_plan: _TD3ReplaySamplePlan | None = None):
-        curriculum_enabled = hasattr(self.cfg, "failure_phase_teacher_fraction")
         batch_size = int(self.cfg.q_batch_size)
-        failure_fraction = float(
-            getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)
-        )
-        (
-            student_count,
-            uniform_teacher_count,
-            focused_teacher_count,
-        ) = _source_counts(
-            batch_size,
-            float(getattr(self.cfg, "q_teacher_replay_ratio", 0.5)),
-            failure_fraction if curriculum_enabled else 0.0,
-        )
-        teacher_count = uniform_teacher_count + focused_teacher_count
-        q_fields = tuple(_Q_REPLAY_FIELDS)
-        student_failure_fraction = float(
-            getattr(self.cfg, "failure_phase_student_fraction", 0.0)
-        )
-        student_curriculum_enabled = hasattr(
-            self.cfg, "failure_phase_student_fraction"
-        )
-        focused_student_count = (
-            0
-            if student_count == 0
-            else _source_counts(student_count, 1.0, student_failure_fraction)[2]
-        )
+        requested_counts = self._replay_source_counts("q", batch_size)
+        focused_student_count = requested_counts["failure_student"]
+        focused_teacher_count = requested_counts["failure_teacher"]
+        student_count = requested_counts["uniform_student"] + focused_student_count
+        teacher_count = requested_counts["uniform_teacher"] + focused_teacher_count
+        q_fields = self._q_replay_storage_fields()
+        if not self._has_canonical_replay_mix():
+            # Legacy unit/checkpoint seams may predate explicit boundary fields.
+            if teacher_count and student_count:
+                available = set(self.q_teacher_replay.data).intersection(
+                    self.dagger_replay.data
+                )
+            elif teacher_count:
+                available = set(self.q_teacher_replay.data)
+            else:
+                available = set(self.dagger_replay.data)
+            q_fields = tuple(key for key in q_fields if key in available)
         teacher = None
         student = None
+        teacher_indices = torch.empty(0, dtype=torch.long)
+        student_indices = torch.empty(0, dtype=torch.long)
         if sample_plan is None:
-            focused_teacher = torch.zeros(
-                0, dtype=torch.bool, device=self.device
-            )
+            focused_teacher = torch.zeros(0, dtype=torch.bool, device=self.device)
             if teacher_count:
                 teacher_indices, focused_teacher = self._sample_teacher_indices(
                     teacher_count,
@@ -3737,9 +4410,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     fields=q_fields,
                 )
                 focused_teacher = focused_teacher.to(self.device)
-            focused_student = torch.zeros(
-                0, dtype=torch.bool, device=self.device
-            )
+            focused_student = torch.zeros(0, dtype=torch.bool, device=self.device)
             if student_count:
                 (
                     student_indices,
@@ -3760,6 +4431,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 batch_size, device=self.device, generator=self.q_rng
             )
         else:
+            teacher_indices = sample_plan.teacher_indices
+            student_indices = sample_plan.student_indices
             if sample_plan.teacher_indices.numel() != teacher_count:
                 raise ValueError("Teacher replay sample plan has the wrong row count")
             if sample_plan.student_indices.numel() != student_count:
@@ -3792,7 +4465,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if permutation.shape != (batch_size,):
                 raise ValueError("Q replay sample plan has the wrong permutation shape")
         if teacher is None:
-            if student is None:  # pragma: no cover - batch_size validation prevents this
+            if (
+                student is None
+            ):  # pragma: no cover - batch_size validation prevents this
                 raise RuntimeError("Q replay mix contains no source rows")
             mixed = dict(student)
         elif student is None:
@@ -3801,29 +4476,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             mixed = {
                 key: torch.cat((teacher[key], student[key]), dim=0) for key in teacher
             }
-        mixed[DAGGER_Q_TEACHER_SOURCE_KEY] = torch.cat(
-            (
-                torch.ones(teacher_count, dtype=torch.bool, device=self.device),
-                torch.zeros(student_count, dtype=torch.bool, device=self.device),
-            )
+        self._attach_replay_sample_metadata(
+            mixed,
+            teacher_indices=teacher_indices,
+            student_indices=student_indices,
+            teacher_failure=focused_teacher,
+            student_failure=focused_student,
         )
-        if curriculum_enabled:
-            mixed[FAILURE_PHASE_TEACHER_SOURCE_KEY] = torch.cat(
-                (
-                    focused_teacher,
-                    torch.zeros(student_count, dtype=torch.bool, device=self.device),
-                )
-            )
-        if student_curriculum_enabled:
-            mixed[FAILURE_PHASE_STUDENT_SOURCE_KEY] = torch.cat(
-                (
-                    torch.zeros(
-                        teacher_count, dtype=torch.bool, device=self.device
-                    ),
-                    focused_student,
-                )
-            )
-        return {key: value[permutation] for key, value in mixed.items()}
+        mixed = {key: value[permutation] for key, value in mixed.items()}
+        if not hasattr(self, "_replay_mix_rollout_metrics"):
+            self._reset_replay_mix_rollout_metrics()
+        self._record_replay_mix_batch("q", mixed, requested_counts)
+        return mixed
 
     def _sample_actor_batch(
         self,
@@ -3840,27 +4504,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             *_PERCEPTION_REPLAY_FIELDS,
         )
         batch_size = int(self.cfg.dagger_batch_size)
-        fraction = float(getattr(self.cfg, "teacher_actor_replay_fraction", 0.0))
-        curriculum_enabled = hasattr(self.cfg, "failure_phase_teacher_fraction")
-        failure_fraction = float(
-            getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)
+        canonical_mix = self._has_canonical_replay_mix()
+        curriculum_enabled = canonical_mix or hasattr(
+            self.cfg, "failure_phase_teacher_fraction"
         )
-        main_count, uniform_teacher_count, focused_teacher_count = _source_counts(
-            batch_size,
-            fraction,
-            failure_fraction if curriculum_enabled else 0.0,
-        )
-        teacher_count = uniform_teacher_count + focused_teacher_count
-        student_failure_fraction = float(
-            getattr(self.cfg, "failure_phase_student_fraction", 0.0)
-        )
-        student_curriculum_enabled = hasattr(
-            self.cfg, "failure_phase_student_fraction"
-        )
-        focused_student_count = (
-            0
-            if main_count == 0
-            else _source_counts(main_count, 1.0, student_failure_fraction)[2]
+        requested_counts = self._replay_source_counts("actor", batch_size)
+        focused_student_count = requested_counts["failure_student"]
+        focused_teacher_count = requested_counts["failure_teacher"]
+        main_count = requested_counts["uniform_student"] + focused_student_count
+        teacher_count = requested_counts["uniform_teacher"] + focused_teacher_count
+        student_curriculum_enabled = (
+            hasattr(self.cfg, "failure_phase_student_fraction") or canonical_mix
         )
 
         # Keep the old operation and RNG sequence byte-for-byte at the
@@ -3893,9 +4547,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         self.device,
                         self.q_rng,
                         valid_key=(
-                            DAGGER_IS_STUDENT_ACTION_KEY
-                            if curriculum_enabled
-                            else None
+                            DAGGER_IS_STUDENT_ACTION_KEY if curriculum_enabled else None
                         ),
                         fields=main_fields,
                     )
@@ -3913,15 +4565,27 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     if student_focused is None
                     else student_focused.to(self.device)
                 )
-            if curriculum_enabled:
-                batch[DAGGER_Q_TEACHER_SOURCE_KEY] = torch.zeros(
-                    batch_size, dtype=torch.bool, device=self.device
+            if canonical_mix:
+                self._attach_replay_sample_metadata(
+                    batch,
+                    teacher_indices=torch.empty(0, dtype=torch.long),
+                    student_indices=indices,
+                    teacher_failure=torch.empty(0, dtype=torch.bool),
+                    student_failure=focused_student,
                 )
-                batch[FAILURE_PHASE_TEACHER_SOURCE_KEY] = torch.zeros(
-                    batch_size, dtype=torch.bool, device=self.device
-                )
-            if student_curriculum_enabled:
-                batch[FAILURE_PHASE_STUDENT_SOURCE_KEY] = focused_student
+                if not hasattr(self, "_replay_mix_rollout_metrics"):
+                    self._reset_replay_mix_rollout_metrics()
+                self._record_replay_mix_batch("actor", batch, requested_counts)
+            else:
+                if curriculum_enabled:
+                    batch[DAGGER_Q_TEACHER_SOURCE_KEY] = torch.zeros(
+                        batch_size, dtype=torch.bool, device=self.device
+                    )
+                    batch[FAILURE_PHASE_TEACHER_SOURCE_KEY] = torch.zeros(
+                        batch_size, dtype=torch.bool, device=self.device
+                    )
+                if student_curriculum_enabled:
+                    batch[FAILURE_PHASE_STUDENT_SOURCE_KEY] = focused_student
             return self._prepare_dagger_learning_batch(batch)
 
         teacher_fields = (
@@ -3975,9 +4639,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
 
         main = None
-        focused_student = torch.zeros(
-            main_count, dtype=torch.bool, device=self.device
-        )
+        focused_student = torch.zeros(main_count, dtype=torch.bool, device=self.device)
         if main_count:
             if indices is None:
                 if student_curriculum_enabled:
@@ -4002,9 +4664,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         self.device,
                         self.q_rng,
                         valid_key=(
-                            DAGGER_IS_STUDENT_ACTION_KEY
-                            if curriculum_enabled
-                            else None
+                            DAGGER_IS_STUDENT_ACTION_KEY if curriculum_enabled else None
                         ),
                         fields=main_fields,
                     )
@@ -4028,31 +4688,115 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             batch = {
                 key: torch.cat((teacher[key], main[key]), dim=0) for key in main_fields
             }
-        batch[DAGGER_Q_TEACHER_SOURCE_KEY] = torch.cat(
-            (
-                torch.ones(teacher_count, dtype=torch.bool, device=self.device),
-                torch.zeros(main_count, dtype=torch.bool, device=self.device),
+        if canonical_mix:
+            student_indices = (
+                torch.empty(0, dtype=torch.long) if indices is None else indices
             )
-        )
-        if curriculum_enabled:
-            batch[FAILURE_PHASE_TEACHER_SOURCE_KEY] = torch.cat(
+            self._attach_replay_sample_metadata(
+                batch,
+                teacher_indices=teacher_indices,
+                student_indices=student_indices,
+                teacher_failure=focused_teacher,
+                student_failure=focused_student,
+            )
+            if not hasattr(self, "_replay_mix_rollout_metrics"):
+                self._reset_replay_mix_rollout_metrics()
+            self._record_replay_mix_batch("actor", batch, requested_counts)
+        else:
+            batch[DAGGER_Q_TEACHER_SOURCE_KEY] = torch.cat(
                 (
-                    focused_teacher,
+                    torch.ones(teacher_count, dtype=torch.bool, device=self.device),
                     torch.zeros(main_count, dtype=torch.bool, device=self.device),
                 )
             )
-        if student_curriculum_enabled:
-            batch[FAILURE_PHASE_STUDENT_SOURCE_KEY] = torch.cat(
-                (
-                    torch.zeros(
-                        teacher_count, dtype=torch.bool, device=self.device
-                    ),
-                    focused_student,
+            if curriculum_enabled:
+                batch[FAILURE_PHASE_TEACHER_SOURCE_KEY] = torch.cat(
+                    (
+                        focused_teacher,
+                        torch.zeros(main_count, dtype=torch.bool, device=self.device),
+                    )
                 )
-            )
+            if student_curriculum_enabled:
+                batch[FAILURE_PHASE_STUDENT_SOURCE_KEY] = torch.cat(
+                    (
+                        torch.zeros(
+                            teacher_count, dtype=torch.bool, device=self.device
+                        ),
+                        focused_student,
+                    )
+                )
         return self._prepare_dagger_learning_batch(batch)
 
-    def _teacher_perception_replay_loss(self) -> dict[str, torch.Tensor]:
+    def _sample_four_way_perception_batch(
+        self,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+        batch_size = int(
+            getattr(
+                self.cfg,
+                "perception_replay_batch_size",
+                self.cfg.teacher_perception_batch_size,
+            )
+        )
+        requested_counts = self._replay_source_counts("perception", batch_size)
+        student_count = (
+            requested_counts["uniform_student"] + requested_counts["failure_student"]
+        )
+        teacher_count = (
+            requested_counts["uniform_teacher"] + requested_counts["failure_teacher"]
+        )
+        fields = ("critic_observations", *_PERCEPTION_REPLAY_FIELDS)
+        teacher_indices = torch.empty(0, dtype=torch.long)
+        student_indices = torch.empty(0, dtype=torch.long)
+        teacher_failure = torch.empty(0, dtype=torch.bool)
+        student_failure = torch.empty(0, dtype=torch.bool)
+        teacher = None
+        student = None
+        if teacher_count:
+            teacher_indices, teacher_failure = self._sample_teacher_indices(
+                teacher_count,
+                self.teacher_perception_rng,
+                focused_count=requested_counts["failure_teacher"],
+            )
+            teacher = _sample_replay_by_indices(
+                self.q_teacher_replay,
+                teacher_indices,
+                self.device,
+                fields=fields,
+            )
+        if student_count:
+            student_indices, student_failure = self._sample_student_indices(
+                student_count,
+                self.teacher_perception_rng,
+                focused_count=requested_counts["failure_student"],
+            )
+            student = _sample_replay_by_indices(
+                self.dagger_replay,
+                student_indices,
+                self.device,
+                fields=fields,
+            )
+        if teacher is None and student is None:  # pragma: no cover - validated mix
+            raise RuntimeError("four-way perception replay contains no rows")
+        if teacher is None:
+            batch = dict(student)
+        elif student is None:
+            batch = dict(teacher)
+        else:
+            batch = {
+                key: torch.cat((teacher[key], student[key]), dim=0) for key in fields
+            }
+        self._attach_replay_sample_metadata(
+            batch,
+            teacher_indices=teacher_indices,
+            student_indices=student_indices,
+            teacher_failure=teacher_failure,
+            student_failure=student_failure,
+        )
+        return batch, requested_counts
+
+    def _teacher_perception_replay_loss(
+        self, *, four_way: bool = False
+    ) -> dict[str, torch.Tensor]:
         """Recompute one supervised perception loss from frozen Teacher inputs.
 
         The replay is authoritative only for model inputs.  Learned recurrent
@@ -4060,32 +4804,59 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         modules are rerun from a zero boundary through the raw burn-in window.
         The privileged target is reconstructed from the current replay state.
         """
-        if self.q_teacher_replay.size < 1:
+        teacher_rows_required = True
+        if four_way:
+            replay_batch_size = int(
+                getattr(
+                    self.cfg,
+                    "perception_replay_batch_size",
+                    self.cfg.teacher_perception_batch_size,
+                )
+            )
+            perception_counts = self._replay_source_counts(
+                "perception", replay_batch_size
+            )
+            teacher_rows_required = (
+                perception_counts["uniform_teacher"]
+                + perception_counts["failure_teacher"]
+                > 0
+            )
+        if self.q_teacher_replay.size < 1 and teacher_rows_required:
             raise RuntimeError(
                 "teacher_perception_replay_fraction requires non-empty q_teacher_replay"
             )
         if self._replay_object_geo is None:
             raise RuntimeError("Teacher perception replay has no object geometry")
 
-        fields = ("critic_observations", *_PERCEPTION_REPLAY_FIELDS)
-        batch_size = int(self.cfg.teacher_perception_batch_size)
-        focused_count = _source_counts(
-            batch_size,
-            1.0,
-            float(getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)),
-        )[2]
-        indices, focused_teacher = self._sample_teacher_indices(
-            batch_size,
-            self.teacher_perception_rng,
-            focused_count=focused_count,
-        )
-        batch = _sample_replay_by_indices(
-            self.q_teacher_replay,
-            indices,
-            self.device,
-            fields=fields,
-        )
-        focused_teacher = focused_teacher.to(self.device)
+        requested_counts = None
+        if four_way:
+            batch, requested_counts = self._sample_four_way_perception_batch()
+            provenance = batch[REPLAY_SAMPLE_PROVENANCE_KEY]
+            focused_teacher = provenance == REPLAY_SOURCE_FAILURE_TEACHER
+            focused_student = provenance == REPLAY_SOURCE_FAILURE_STUDENT
+            teacher_source = batch[REPLAY_SAMPLE_IS_TEACHER_KEY].bool()
+        else:
+            fields = ("critic_observations", *_PERCEPTION_REPLAY_FIELDS)
+            batch_size = int(self.cfg.teacher_perception_batch_size)
+            focused_count = _source_counts(
+                batch_size,
+                1.0,
+                float(getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)),
+            )[2]
+            indices, focused_teacher = self._sample_teacher_indices(
+                batch_size,
+                self.teacher_perception_rng,
+                focused_count=focused_count,
+            )
+            batch = _sample_replay_by_indices(
+                self.q_teacher_replay,
+                indices,
+                self.device,
+                fields=fields,
+            )
+            focused_teacher = focused_teacher.to(self.device)
+            focused_student = torch.zeros_like(focused_teacher)
+            teacher_source = torch.ones_like(focused_teacher)
         batch = PPOBCDaggerFinetune._prepare_dagger_learning_batch(self, batch)
         critic_chunks = batch["critic_observations"].split(
             self._q_critic_widths, dim=-1
@@ -4169,8 +4940,24 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         priv_error = self.adapt_loss_fn(
             student[PRIV_PRED_KEY][:, -2], target[PRIV_FEATURE_KEY]
         )
-        object_loss = (object_error * valid.unsqueeze(-1)).mean()
-        priv_loss = (priv_error * valid.unsqueeze(-1)).mean()
+        if four_way:
+            # A reset-invalid row must not dilute the configured replay mix or
+            # loss scale.  Source composition is already expressed by sampling;
+            # there is no additional Student/Teacher coefficient here.
+            object_loss = _masked_feature_mean(object_error, ~reset)
+            priv_loss = _masked_feature_mean(priv_error, ~reset)
+        else:
+            # Preserve the legacy Teacher-replay loss scale for old configs.
+            object_loss = (object_error * valid.unsqueeze(-1)).mean()
+            priv_loss = (priv_error * valid.unsqueeze(-1)).mean()
+        if four_way:
+            if requested_counts is None:  # pragma: no cover - branch invariant
+                raise RuntimeError("four-way perception counts are unavailable")
+            if not hasattr(self, "_replay_mix_rollout_metrics"):
+                self._reset_replay_mix_rollout_metrics()
+            self._record_replay_mix_batch(
+                "perception", batch, requested_counts, valid_mask=~reset
+            )
         return {
             "priv_loss": priv_loss,
             "object_loss": object_loss,
@@ -4182,6 +4969,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "valid_fraction": valid.mean(),
             "rows": priv_loss.new_tensor(float(row_count)),
             "failure_phase_teacher_fraction": focused_teacher.float().mean(),
+            "failure_phase_student_fraction": focused_student.float().mean(),
+            "teacher_source_fraction": teacher_source.float().mean(),
+            "student_source_fraction": (~teacher_source).float().mean(),
         }
 
     @set_recurrent_mode(True)
@@ -4289,6 +5079,114 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._last_teacher_perception_warmup_metrics = copy.deepcopy(metrics)
         return metrics
 
+    def _train_adapt_four_way(self) -> dict[str, float]:
+        """Run main perception updates entirely from the four replay strata."""
+        if self.opt_adapt is None:
+            raise RuntimeError("four-way perception replay requires opt_adapt")
+        if bool(self.cfg.train_dr_estimator):
+            raise RuntimeError(
+                "four-way perception replay has no raw replay target for the DR "
+                "estimator; disable train_dr_estimator or use legacy mode"
+            )
+
+        infos: list[dict[str, torch.Tensor]] = []
+        update_count = 2 * int(self.cfg.num_minibatches)
+        for _ in range(update_count):
+            self.opt_adapt.zero_grad(set_to_none=True)
+            replay = self._teacher_perception_replay_loss(four_way=True)
+            (replay["priv_loss"] + replay["object_loss"]).backward()
+
+            depth_params = list(self.temporal_depth_gru.parameters())
+            depth_parameter_norms = [
+                parameter.grad.detach().norm(2)
+                for parameter in depth_params
+                if parameter.grad is not None
+            ]
+            depth_grad_norm = (
+                torch.stack(depth_parameter_norms).norm(2)
+                if depth_parameter_norms
+                else torch.zeros((), device=self.device)
+            )
+            all_params = list(self.adapt_module.parameters())
+            all_params += list(self.object_adapt.parameters())
+            all_params += depth_params
+            grad_norm = nn.utils.clip_grad_norm_(
+                all_params, float(self.cfg.max_grad_norm)
+            )
+            self.opt_adapt.step()
+
+            zero = replay["priv_loss"].new_zeros(())
+            infos.append(
+                {
+                    "adapt/priv_loss": replay["priv_loss"].detach(),
+                    "adapt/object_loss": replay["object_loss"].detach(),
+                    "adapt/online_priv_loss": zero,
+                    "adapt/online_object_loss": zero,
+                    "adapt/teacher_replay_priv_loss": replay["priv_loss"].detach(),
+                    "adapt/teacher_replay_object_loss": replay["object_loss"].detach(),
+                    "adapt/teacher_replay_fraction": replay[
+                        "teacher_source_fraction"
+                    ].detach(),
+                    "adapt/teacher_replay_valid_fraction": replay[
+                        "valid_fraction"
+                    ].detach(),
+                    "adapt/teacher_replay_rows": replay["rows"].detach(),
+                    "adapt/online_student_fraction": zero,
+                    "adapt/replay_student_fraction": replay[
+                        "student_source_fraction"
+                    ].detach(),
+                    "adapt/replay_teacher_fraction": replay[
+                        "teacher_source_fraction"
+                    ].detach(),
+                    "adapt/failure_phase_student_fraction": replay[
+                        "failure_phase_student_fraction"
+                    ].detach(),
+                    "adapt/failure_phase_teacher_fraction": replay[
+                        "failure_phase_teacher_fraction"
+                    ].detach(),
+                    "adapt/grad_norm": torch.as_tensor(grad_norm).detach(),
+                    "adapt/depth_grad_norm": depth_grad_norm.detach(),
+                    "adapt/priv_feature_norm": replay["priv_feature_norm"].detach(),
+                    "adapt/priv_pred_norm": replay["priv_pred_norm"].detach(),
+                    "adapt/depth_feature_norm": replay["depth_feature_norm"].detach(),
+                    "adapt/teacher_replay_priv_feature_norm": replay[
+                        "priv_feature_norm"
+                    ].detach(),
+                    "adapt/teacher_replay_priv_pred_norm": replay[
+                        "priv_pred_norm"
+                    ].detach(),
+                    "adapt/teacher_replay_depth_feature_norm": replay[
+                        "depth_feature_norm"
+                    ].detach(),
+                }
+            )
+
+        # Match the legacy perception optimizer cadence: one EMA update after
+        # exactly 2 * num_minibatches replay-only optimizer steps.
+        soft_copy_(self.adapt_module, self.adapt_ema, 0.04)
+        soft_copy_(self.object_adapt, self.object_adapt_ema, 0.04)
+        soft_copy_(self.temporal_depth_gru, self.temporal_depth_gru_ema, 0.04)
+
+        result = {
+            key: torch.stack([item[key].float() for item in infos]).mean().item()
+            for key in sorted(infos[0])
+        }
+        with torch.no_grad():
+            squared_error = torch.zeros((), device=self.device)
+            parameter_count = 0
+            for online, ema in zip(
+                self.temporal_depth_gru.parameters(),
+                self.temporal_depth_gru_ema.parameters(),
+            ):
+                squared_error += (online - ema).square().sum()
+                parameter_count += online.numel()
+            result["adapt/depth_ema_rms_gap"] = (
+                (squared_error / max(parameter_count, 1)).sqrt().item()
+            )
+        result["adapt/perception_frozen"] = 0.0
+        result["adapt/perception_four_way"] = 1.0
+        return result
+
     @set_recurrent_mode(True)
     def train_adapt(self, tensordict: TensorDict):
         """Mix frozen-Teacher raw replay into the existing adaptation steps."""
@@ -4302,6 +5200,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "adapt/grad_norm": 0.0,
                 "adapt/depth_grad_norm": 0.0,
             }
+        if (
+            str(getattr(self.cfg, "perception_replay_mode", "legacy_online_student"))
+            == "four_way"
+        ):
+            # Deliberately do not inspect or transform ``tensordict`` here: in
+            # v4 it is not an implicit fifth perception source.
+            return self._train_adapt_four_way()
         fraction = float(self.cfg.teacher_perception_replay_fraction)
         curriculum_enabled = hasattr(self.cfg, "failure_phase_teacher_fraction")
         if fraction == 0.0 and not curriculum_enabled:
@@ -4557,6 +5462,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     def train_op(self, tensordict):
         """Collect locked transitions and run Phase-1 TD3/BC updates only."""
+        self._reset_replay_mix_rollout_metrics()
         teacher_prefill_active = self._teacher_prefill_active()
         collect_teacher_q = self._collect_teacher_q_replay_this_rollout()
         rollout = tensordict.exclude("stats")
@@ -4617,7 +5523,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     teacher_indices = teacher_executed.nonzero(as_tuple=False).squeeze(
                         -1
                     )
-                    q_teacher = _stage_rows(_Q_REPLAY_FIELDS, teacher_indices)
+                    q_teacher = _stage_rows(
+                        self._q_replay_storage_fields(), teacher_indices
+                    )
                     teacher_rows_appended += self.q_teacher_replay.extend(q_teacher)
                     del q_teacher, teacher_indices
                 del teacher_executed
@@ -4721,6 +5629,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "td3/replay_size": self.dagger_replay.size,
                 "td3/replay_seen": self.dagger_replay.seen,
                 "td3/replay_ready": 0.0,
+                "td3/perception_replay_ready": 0.0,
                 "td3/actor_update_count": self.actor_update_count,
                 "td3/critic_update_count": self.critic_update_count,
                 "td3/q_update_to_data_ratio_config": (
@@ -4732,7 +5641,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     getattr(self, "q_update_row_credit", 0.0)
                 ),
                 "td3/q_teacher_replay_fraction_config": float(
-                    getattr(self.cfg, "q_teacher_replay_ratio", 0.5)
+                    self._replay_mix_fractions("q")["uniform_teacher"]
+                    + self._replay_mix_fractions("q")["failure_teacher"]
                 ),
                 "td3/actor_updates_this_rollout": 0,
                 "td3/critic_updates_this_rollout": 0,
@@ -4750,6 +5660,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 ),
             }
             info.update({f"td3/{key}": value for key, value in warmup_metrics.items()})
+            for purpose in ("q", "actor", "perception"):
+                info.update(
+                    {
+                        f"replay/{purpose}/{name}": value
+                        for name, value in self._replay_mix_metrics(purpose).items()
+                    }
+                )
             self._last_td3_diagnostics = {
                 key: float(value)
                 for key, value in info.items()
@@ -4761,35 +5678,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         actor_metrics: list[dict[str, torch.Tensor]] = []
         student_q_rows = self.dagger_replay.valid_count(DAGGER_IS_STUDENT_ACTION_KEY)
         learning_starts = int(self.cfg.td3_learning_starts)
-        q_student_count, q_uniform_teacher_count, q_focused_teacher_count = (
-            _source_counts(
-                int(self.cfg.q_batch_size),
-                float(getattr(self.cfg, "q_teacher_replay_ratio", 0.5)),
-                float(getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)),
-            )
+        q_counts = self._replay_source_counts("q", int(self.cfg.q_batch_size))
+        q_student_count = q_counts["uniform_student"] + q_counts["failure_student"]
+        q_teacher_count = q_counts["uniform_teacher"] + q_counts["failure_teacher"]
+        actor_counts = self._replay_source_counts(
+            "actor", int(self.cfg.dagger_batch_size)
         )
-        q_teacher_count = q_uniform_teacher_count + q_focused_teacher_count
-        (
-            actor_student_count,
-            actor_uniform_teacher_count,
-            actor_focused_teacher_count,
-        ) = _source_counts(
-            int(self.cfg.dagger_batch_size),
-            float(self.cfg.teacher_actor_replay_fraction),
-            float(getattr(self.cfg, "failure_phase_teacher_fraction", 0.0)),
+        actor_student_count = (
+            actor_counts["uniform_student"] + actor_counts["failure_student"]
         )
         actor_teacher_count = (
-            actor_uniform_teacher_count + actor_focused_teacher_count
+            actor_counts["uniform_teacher"] + actor_counts["failure_teacher"]
         )
         teacher_replay_required = q_teacher_count > 0 or actor_teacher_count > 0
         student_replay_required = q_student_count > 0 or actor_student_count > 0
         replay_ready = (
-            (
-                not teacher_replay_required
-                or self.q_teacher_replay.size >= learning_starts
-            )
-            and (not student_replay_required or student_q_rows >= learning_starts)
-        )
+            not teacher_replay_required or self.q_teacher_replay.size >= learning_starts
+        ) and (not student_replay_required or student_q_rows >= learning_starts)
         if replay_ready:
             q_updates = self._q_updates_due(appended)
             sample_plans = None
@@ -4801,7 +5706,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             ):
                 sample_plans = (
                     self._prefetch_curriculum_sample_plans(q_updates)
-                    if hasattr(self.cfg, "failure_phase_teacher_fraction")
+                    if self._has_canonical_replay_mix()
+                    or hasattr(self.cfg, "failure_phase_teacher_fraction")
                     else _prefetch_td3_replay_sample_plans(
                         self.dagger_replay,
                         self.q_teacher_replay,
@@ -4810,9 +5716,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         update_count=q_updates,
                         policy_delay=int(self.cfg.policy_delay),
                         critic_update_count=int(self.critic_update_count),
-                        q_teacher_replay_ratio=float(
-                            self.cfg.q_teacher_replay_ratio
-                        ),
+                        q_teacher_replay_ratio=float(self.cfg.q_teacher_replay_ratio),
                         teacher_actor_replay_fraction=float(
                             self.cfg.teacher_actor_replay_fraction
                         ),
@@ -4863,8 +5767,45 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     actor_metrics.append(delayed)
             del sample_plans
 
-        # Retain the existing supervised student-perception update unchanged.
-        adapt_info = self.train_adapt(rollout.copy())
+        perception_four_way = (
+            str(getattr(self.cfg, "perception_replay_mode", "legacy_online_student"))
+            == "four_way"
+        )
+        perception_replay_ready = True
+        if perception_four_way and bool(self.cfg.train_perception):
+            perception_counts = self._replay_source_counts(
+                "perception", int(self.cfg.perception_replay_batch_size)
+            )
+            perception_teacher_required = (
+                perception_counts["uniform_teacher"]
+                + perception_counts["failure_teacher"]
+                > 0
+            )
+            perception_student_required = (
+                perception_counts["uniform_student"]
+                + perception_counts["failure_student"]
+                > 0
+            )
+            perception_replay_ready = (
+                not perception_teacher_required or self.q_teacher_replay.size > 0
+            ) and (not perception_student_required or student_q_rows > 0)
+
+        if perception_replay_ready:
+            adapt_info = self.train_adapt(rollout.copy())
+        else:
+            # An entire provenance ring can be unavailable on the first main
+            # rollout (for example when beta selected Teacher everywhere).
+            # Focus-pool shortage itself never blocks: the samplers backfill it
+            # from the same provenance's uniform ring.
+            adapt_info = {
+                "adapt/perception_frozen": 0.0,
+                "adapt/perception_four_way": 1.0,
+                "adapt/perception_replay_deferred": 1.0,
+                "adapt/priv_loss": 0.0,
+                "adapt/object_loss": 0.0,
+                "adapt/grad_norm": 0.0,
+                "adapt/depth_grad_norm": 0.0,
+            }
         self.num_updates += 1
         self.dagger_rollout_count += 1
         self.dagger_environment_steps += int(self.cfg.train_every)
@@ -4982,11 +5923,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 if getattr(self.cfg, "q_update_to_data_ratio", None) is None
                 else float(self.cfg.q_update_to_data_ratio)
             ),
-            "td3/q_update_row_credit": float(
-                getattr(self, "q_update_row_credit", 0.0)
-            ),
+            "td3/q_update_row_credit": float(getattr(self, "q_update_row_credit", 0.0)),
             "td3/q_teacher_replay_fraction_config": float(
-                getattr(self.cfg, "q_teacher_replay_ratio", 0.5)
+                self._replay_mix_fractions("q")["uniform_teacher"]
+                + self._replay_mix_fractions("q")["failure_teacher"]
             ),
             "td3/q_sampled_rows_this_rollout": (
                 len(critic_metrics) * int(self.cfg.q_batch_size)
@@ -5000,6 +5940,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "td3/actor_updates_this_rollout": len(actor_metrics),
             "td3/critic_updates_this_rollout": len(critic_metrics),
             "td3/replay_ready": float(replay_ready),
+            "td3/perception_replay_ready": float(perception_replay_ready),
             "td3/replay_size": self.dagger_replay.size,
             "td3/replay_seen": self.dagger_replay.seen,
             "td3/student_replay_rows_this_rollout": appended,
@@ -5037,6 +5978,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "dagger/beta_teacher_fraction": rollout_fraction(DAGGER_BETA_TEACHER_KEY),
         }
         info.update(adapt_info)
+        for purpose in ("q", "actor", "perception"):
+            info.update(
+                {
+                    f"replay/{purpose}/{name}": value
+                    for name, value in self._replay_mix_metrics(purpose).items()
+                }
+            )
         self._last_td3_diagnostics = {
             key: float(value)
             for key, value in info.items()
@@ -5066,9 +6014,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             },
             "actor_update_count": int(self.actor_update_count),
             "critic_update_count": int(self.critic_update_count),
-            "q_update_row_credit": float(
-                getattr(self, "q_update_row_credit", 0.0)
-            ),
+            "q_update_row_credit": float(getattr(self, "q_update_row_credit", 0.0)),
             "dagger_rollout_count": int(self.dagger_rollout_count),
             "dagger_environment_steps": int(self.dagger_environment_steps),
             "teacher_prefill_rollout_count": int(self.teacher_prefill_rollout_count),
