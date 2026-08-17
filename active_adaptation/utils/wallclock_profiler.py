@@ -747,6 +747,16 @@ def instrument_training_policy(
             "replay_sample_plan_prefetch_calls",
         ),
         MethodProfileSpec(
+            "_ensure_teacher_actor_cache_current",
+            "teacher_actor_cache_ensure",
+            "teacher_actor_cache_ensure_calls",
+        ),
+        MethodProfileSpec(
+            "_rebuild_teacher_actor_cache",
+            "teacher_actor_cache_rebuild",
+            "teacher_actor_cache_rebuild_calls",
+        ),
+        MethodProfileSpec(
             "_prepare_dagger_learning_batch",
             "replay_batch_preparation",
             "replay_batch_preparation_calls",

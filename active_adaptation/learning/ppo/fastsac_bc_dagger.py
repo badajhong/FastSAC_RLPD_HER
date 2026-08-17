@@ -1,6 +1,6 @@
 """Distributional FastSAC with exact mean-action Teacher BC.
 
-This backend deliberately reuses the raw recurrent replay, Teacher-only
+This backend deliberately reuses the Teacher-only
 prefill, DAgger source selection, timeout handling, and twin-C51 topology from
 ``td3_bc_dagger``.  The learning rule itself is SAC:
 
@@ -12,7 +12,10 @@ prefill, DAgger source selection, timeout handling, and twin-C51 topology from
   expected return; and
 * there is a target critic but no target Actor or TD3 smoothing noise.
 
-Replay observations remain input-authoritative for Q and Actor updates.
+Student replay keeps the exact carried-hidden Actor inputs seen at collection;
+successful Teacher episodes are re-encoded with the current EMA perception
+modules through a non-serialized sidecar.  Replay observations therefore remain
+input-authoritative for Q and Actor updates without a zero-hidden approximation.
 Perception itself is trained only from the current live Student rollout through
 the exact PPOVEL finetune path; it never samples the replay rings.  The
 duplicate Teacher H5 export remains disabled.
@@ -64,13 +67,15 @@ from .ppo_vel import (
     PPOVEL,
 )
 from .td3_bc_dagger import (
+    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
     PERCEPTION_PREFILL_DISABLED_SEMANTICS,
-    PERCEPTION_REPLAY_SEMANTICS,
     REPLAY_MOTION_ID_KEY,
+    STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY,
+    TEACHER_EPISODE_SIDECAR_SEMANTICS,
     TD3_BETA_KEY,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
@@ -87,7 +92,8 @@ from .td3_bc_dagger import (
 
 
 TRAINING_ALGORITHM = "distributional_fastsac_teacher_bc_v1"
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 5
+PREVIOUS_CHECKPOINT_VERSION = 4
 ACTOR_BACKEND = "ppo_vel_smooth_bounded_normalized_std_tanh_fastsac_bc_v2"
 _LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION = 3
 _LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND = (
@@ -260,6 +266,13 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         owner = self._owner
         teacher_prefill_active = owner._teacher_prefill_active()
         raw_student_mean = owner._student_raw_action_proposal(td)
+        cache_enabled = getattr(
+            owner, "_student_collection_actor_cache_enabled", lambda: False
+        )
+        if cache_enabled():
+            td[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
+                owner._collection_actor_observations(td)
+            )
         for scratch_key in (
             "_depth_feature",
             OBJECT_PRED_KEY,
@@ -514,6 +527,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         self.alpha_update_count = 0
         self._last_fastsac_diagnostics: dict[str, float] = {}
+
+    def _student_collection_actor_cache_enabled(self) -> bool:
+        """Use live carried-hidden Actor inputs in the locked online mode."""
+        return str(
+            getattr(self.cfg, "perception_replay_mode", "legacy_online_student")
+        ) == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
 
     @staticmethod
     def _validate_td3_config(cfg) -> None:
@@ -1396,6 +1415,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         legacy_v3 = checkpoint_version == _LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION
         if checkpoint_version not in (
             _LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION,
+            PREVIOUS_CHECKPOINT_VERSION,
             CHECKPOINT_VERSION,
         ):
             raise ValueError("distributional FastSAC checkpoint version mismatch")
@@ -1503,9 +1523,18 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "action_contract": copy.deepcopy(self._fastsac_action_contract),
                 "q_backend_config": self._q_backend_metadata(),
                 "replay_resume_semantics": (
-                    "fresh_only_online_raw_perception_rings_not_serialized_v1"
+                    "fresh_only_online_exact_actor_rings_and_teacher_episode_"
+                    "sidecars_not_serialized_v2"
                 ),
-                "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
+                "perception_replay_semantics": (
+                    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                ),
+                "actor_replay_observation_semantics": (
+                    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                ),
+                "teacher_episode_sidecar_semantics": (
+                    TEACHER_EPISODE_SIDECAR_SEMANTICS
+                ),
                 "perception_training_semantics": (
                     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
                 ),
@@ -1529,7 +1558,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         algorithm = state_dict.get("training_algorithm")
         if algorithm == TRAINING_ALGORITHM:
             raise ValueError(
-                "FastSAC raw-perception replay is fresh-only; same-stage resume "
+                "FastSAC Actor replay and Teacher episode sidecars are fresh-only; "
+                "same-stage resume "
                 "is intentionally unsupported"
             )
         if algorithm is not None:
@@ -1580,6 +1610,7 @@ __all__ = [
     "ACTION_CONTRACT_SEMANTICS",
     "ACTOR_BACKEND",
     "CHECKPOINT_VERSION",
+    "PREVIOUS_CHECKPOINT_VERSION",
     "TRAINING_ALGORITHM",
     "DistributionalFastSACTeacherBC",
     "DistributionalFastSACTeacherBCConfig",

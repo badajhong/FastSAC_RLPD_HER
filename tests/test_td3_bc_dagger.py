@@ -48,6 +48,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     PERCEPTION_REPLAY_SEMANTICS,
     PERCEPTION_VEL_COMMAND_RAW_KEY,
     PERCEPTION_WARMSTART_MODE_FRESH,
+    PREVIOUS_CHECKPOINT_VERSION,
     PRETRAINED_PERCEPTION_MODULES,
     REFERENCE_PHASE_KEY,
     REPLAY_INTRINSIC_FOCUSED_KEY,
@@ -56,6 +57,9 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     REPLAY_SAMPLE_PHYSICAL_INDEX_KEY,
     REPLAY_SAMPLE_PROVENANCE_KEY,
     REPLAY_SOURCE_ORDER,
+    STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY,
+    STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY,
+    TEACHER_EPISODE_STEP_KEY,
     TD3_BETA_KEY,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
@@ -68,6 +72,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     _PREFILL_ENV_INDEX_KEY,
     _PREFILL_STEP_INDEX_KEY,
     _PREFILL_TERMINATED_KEY,
+    _PERCEPTION_REPLAY_FIELDS,
     _Q_REPLAY_FIELDS,
     _TD3DeviceReplay,
     _apply_student_collector_noise,
@@ -519,7 +524,7 @@ def test_depth_uint8_codec_rejects_noncanonical_values(invalid):
 
 
 def test_raw_perception_replay_public_field_contract_has_no_priv_pred_latent():
-    assert CHECKPOINT_VERSION == 4
+    assert CHECKPOINT_VERSION == 5
     assert PERCEPTION_REPLAY_SEMANTICS
     assert (
         PERCEPTION_DEPTH_U8_KEY,
@@ -890,6 +895,134 @@ def test_timeout_replay_next_slot_uses_captured_true_final_raw_state():
     assert first["next_critic_observations"][0, 0].item() == 377.0
 
 
+def _enable_collection_actor_cache_for_raw_fixture(policy):
+    policy._q_actor_dim = 1
+    policy._student_collection_actor_cache_enabled = lambda: True
+    policy._materialize_collection_actor_observations = MethodType(
+        lambda owner, td: td["cache_oracle"].detach(), policy
+    )
+
+
+def test_collection_actor_cache_uses_following_final_and_true_timeout_states():
+    ordinary = _raw_transition_policy()
+    _enable_collection_actor_cache_for_raw_fixture(ordinary)
+    rollout = _raw_transition_td(torch.arange(10).reshape(1, 10))
+    rollout[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
+        torch.arange(10, dtype=torch.float32).reshape(1, 10, 1) + 400.0
+    )
+    final = _raw_final_td(10.0)
+    final["cache_oracle"] = torch.tensor([[999.0]])
+    ordinary.capture_rollout_final_observation(final)
+
+    first, second = tuple(ordinary._dagger_transition_chunks(rollout))
+
+    assert set(_PERCEPTION_REPLAY_FIELDS).isdisjoint(first)
+    assert set(_PERCEPTION_REPLAY_FIELDS).isdisjoint(second)
+    assert first[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY].item() == 408.0
+    assert first[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY].item() == 409.0
+    assert second[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY].item() == 409.0
+    assert second[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY].item() == 999.0
+
+    timeout = _raw_transition_policy()
+    _enable_collection_actor_cache_for_raw_fixture(timeout)
+    timeout_rollout = _raw_transition_td(
+        torch.arange(10).reshape(1, 10), truncation_step=8
+    )
+    timeout_rollout[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
+        torch.arange(10, dtype=torch.float32).reshape(1, 10, 1) + 400.0
+    )
+    timeout_capture = timeout_rollout[:, 8].clone()
+    true_timeout_final = _raw_final_td(77.0)
+    for key in (
+        "depth",
+        "policy",
+        "vel_command",
+        "object_geo_",
+        "critic_raw",
+        "is_init",
+    ):
+        timeout_capture["next", key] = true_timeout_final[key]
+    timeout_capture["next", "cache_oracle"] = torch.tensor([[777.0]])
+    timeout.capture_truncation_final_observations(timeout_capture, step=8)
+    final = _raw_final_td(10.0)
+    final["cache_oracle"] = torch.tensor([[999.0]])
+    timeout.capture_rollout_final_observation(final)
+
+    timeout_first = next(timeout._dagger_transition_chunks(timeout_rollout))
+
+    assert timeout_first["truncations"].item() is True
+    assert (
+        timeout_first[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY].item()
+        == 777.0
+    )
+    assert (
+        timeout_first[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY].item()
+        != 409.0
+    )
+
+
+def test_timeout_collection_actor_cache_materializes_at_full_env_batch_geometry():
+    policy = _raw_transition_policy()
+    _enable_collection_actor_cache_for_raw_fixture(policy)
+    observed_batch_sizes = []
+
+    def materialize(owner, td):
+        observed_batch_sizes.append(tuple(td.batch_size))
+        return td["cache_oracle"].detach()
+
+    policy._materialize_collection_actor_observations = MethodType(
+        materialize, policy
+    )
+    rollout = _raw_transition_td(torch.arange(40).reshape(4, 10))
+    rollout["next", "done"][:, 8] = torch.tensor([False, True, False, True])
+    rollout["next", "stats", "episode_time_limit"][:, 8] = torch.tensor(
+        [False, True, False, True]
+    )
+    capture = rollout[:, 8].clone()
+    capture["next", "depth"] = torch.zeros(4, 1, 1, 1)
+    capture["next", "policy"] = torch.zeros(4, 1)
+    capture["next", "vel_command"] = torch.zeros(4, 1)
+    capture["next", "object_geo_"] = torch.tensor([1.0, 2.0]).expand(4, 2)
+    capture["next", "critic_raw"] = torch.zeros(4, 1)
+    capture["next", "is_init"] = torch.zeros(4, dtype=torch.bool)
+    capture["next", "cache_oracle"] = torch.arange(4.0).unsqueeze(-1) + 700.0
+
+    policy.capture_truncation_final_observations(capture, step=8)
+
+    assert observed_batch_sizes == [(4,)]
+    captured = policy._truncation_final_batches[0]
+    assert torch.equal(captured["indices"], torch.tensor([18, 38]))
+    assert torch.equal(
+        captured[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY],
+        torch.tensor([[701.0], [703.0]]),
+    )
+
+
+def test_collection_actor_cache_created_under_inference_is_backward_safe():
+    policy = _collection_prepare_policy()
+    with torch.inference_mode():
+        td = TensorDict(
+            {
+                "vel": torch.tensor([[1.0], [2.0]]),
+                "policy": torch.tensor([[3.0], [4.0]]),
+                "priv_pred": torch.tensor([[5.0], [6.0]]),
+            },
+            batch_size=(2,),
+        )
+        cached = policy._collection_actor_observations(td)
+
+    assert not cached.is_inference()
+    assert not cached.requires_grad
+    replay = _TD3DeviceReplay(4, "cpu")
+    replay.extend({STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY: cached})
+    stored = replay.data[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY][:2]
+    assert not stored.is_inference()
+    actor = nn.Linear(3, 1, bias=False)
+    actor(stored).sum().backward()
+    assert actor.weight.grad is not None
+    assert torch.isfinite(actor.weight.grad).all()
+
+
 class _NoOpPerceptionModule(nn.Module):
     def forward(self, td):
         return td
@@ -985,6 +1118,129 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
     }
     assert {"observations", "next_observations", "priv_pred"}.isdisjoint(
         _Q_REPLAY_FIELDS
+    )
+
+
+def _collection_prepare_policy():
+    policy = _bare_policy(perception_replay_mode="online_student_rollout")
+    policy._q_actor_dim = 3
+    policy.q_actor_keys = ("vel", "policy", "priv_pred")
+    policy._q_actor_widths = (1, 1, 1)
+    policy.q_critic_keys = ("critic",)
+    policy._q_critic_widths = (1,)
+    policy._vecnorm_snapshot = lambda: None
+    policy._normalize_replay_flat = MethodType(
+        lambda owner, value, keys, widths, snapshot: value, policy
+    )
+    policy._student_collection_actor_cache_enabled = lambda: True
+    return policy
+
+
+def test_collection_actor_prepare_uses_generic_cache_for_both_sources():
+    policy = _collection_prepare_policy()
+    calls = []
+
+    def reencode(owner, batch, *, include_current, include_next):
+        row_count = int(batch[PERCEPTION_POLICY_RAW_KEY].shape[0])
+        calls.append((row_count, include_current, include_next))
+        result = {}
+        if include_current:
+            result["observations"] = torch.full((row_count, 3), 100.0)
+        if include_next:
+            result["next_observations"] = torch.full((row_count, 3), 200.0)
+        return result
+
+    policy._reencode_perception_windows = MethodType(reencode, policy)
+    row_count = 4
+    raw = {
+        PERCEPTION_DEPTH_U8_KEY: torch.zeros(
+            row_count, 10, 1, 1, 1, dtype=torch.uint8
+        ),
+        PERCEPTION_POLICY_RAW_KEY: torch.zeros(row_count, 10, 1),
+        PERCEPTION_VEL_COMMAND_RAW_KEY: torch.zeros(row_count, 10, 1),
+        PERCEPTION_IS_INIT_KEY: torch.zeros(row_count, 10, dtype=torch.bool),
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.zeros(row_count, 1),
+        "next_critic_observations": torch.zeros(row_count, 1),
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([True, False, True, False]),
+        STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY: torch.arange(
+            row_count * 3, dtype=torch.float32
+        ).reshape(row_count, 3),
+        STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY: (
+            torch.arange(row_count * 3, dtype=torch.float32).reshape(row_count, 3)
+            + 50.0
+        ),
+    }
+
+    prepared = policy._prepare_dagger_learning_batch(raw)
+
+    assert calls == []
+    assert torch.equal(
+        prepared["observations"],
+        raw[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY],
+    )
+    assert torch.equal(
+        prepared["next_observations"],
+        raw[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY],
+    )
+
+
+def test_collection_actor_prepare_fails_closed_when_student_cache_is_missing():
+    policy = _collection_prepare_policy()
+    policy._reencode_perception_windows = MethodType(
+        lambda owner, batch, *, include_current, include_next: {
+            "observations": torch.zeros(batch[PERCEPTION_IS_INIT_KEY].shape[0], 3)
+        },
+        policy,
+    )
+    batch = {
+        PERCEPTION_DEPTH_U8_KEY: torch.zeros(2, 10, 1, 1, 1, dtype=torch.uint8),
+        PERCEPTION_POLICY_RAW_KEY: torch.zeros(2, 10, 1),
+        PERCEPTION_VEL_COMMAND_RAW_KEY: torch.zeros(2, 10, 1),
+        PERCEPTION_IS_INIT_KEY: torch.zeros(2, 10, dtype=torch.bool),
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.zeros(2, 1),
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([True, False]),
+    }
+
+    with pytest.raises(KeyError, match="missing Actor cache"):
+        policy._prepare_dagger_learning_batch(batch)
+
+
+def test_collection_actor_cache_bypasses_nonidentity_vecnorm():
+    policy = _collection_prepare_policy()
+    normalized = []
+
+    def nonidentity_normalize(owner, value, keys, widths, snapshot):
+        normalized.append(tuple(keys))
+        return value + 123.0
+
+    policy._normalize_replay_flat = MethodType(nonidentity_normalize, policy)
+    policy._reencode_perception_windows = MethodType(
+        lambda *args, **kwargs: pytest.fail(
+            "all-Student collection caches must bypass perception re-encoding"
+        ),
+        policy,
+    )
+    current_cache = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    next_cache = current_cache + 10.0
+    batch = {
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.zeros(2, 1),
+        "critic_observations": torch.tensor([[7.0], [8.0]]),
+        "next_critic_observations": torch.tensor([[9.0], [10.0]]),
+        STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY: current_cache,
+        STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY: next_cache,
+    }
+
+    prepared = policy._prepare_dagger_learning_batch(batch)
+
+    assert normalized == [("critic",), ("critic",)]
+    assert torch.equal(prepared["observations"], current_cache)
+    assert torch.equal(prepared["next_observations"], next_cache)
+    assert torch.equal(
+        prepared["critic_observations"], batch["critic_observations"] + 123.0
+    )
+    assert torch.equal(
+        prepared["next_critic_observations"],
+        batch["next_critic_observations"] + 123.0,
     )
 
 
@@ -1571,8 +1827,10 @@ def test_teacher_perception_warmup_is_teacher_only_once_and_hard_syncs_ema():
     policy.cfg.teacher_perception_warmup_steps = 3
     policy._teacher_perception_warmup_complete = False
     policy._teacher_perception_warmup_updates = 0
+    replay_size = policy.q_teacher_replay.size
     replay_before = {
-        key: value.clone() for key, value in policy.q_teacher_replay.data.items()
+        key: value[:replay_size].clone()
+        for key, value in policy.q_teacher_replay.data.items()
     }
     online_before = {
         name: copy.deepcopy(getattr(policy, name).state_dict())
@@ -1602,7 +1860,7 @@ def test_teacher_perception_warmup_is_teacher_only_once_and_hard_syncs_ema():
             getattr(policy, ema_name).state_dict(),
         )
     for key, expected in replay_before.items():
-        assert torch.equal(policy.q_teacher_replay.data[key], expected)
+        assert torch.equal(policy.q_teacher_replay.data[key][:replay_size], expected)
 
     parameters_after_first = {
         name: copy.deepcopy(getattr(policy, name).state_dict())
@@ -1826,6 +2084,187 @@ def _prefill_event_rollout(
             ),
         },
         batch_size=(1, steps),
+    )
+
+
+class _EpisodeCacheDepthEMA(nn.Module):
+    def forward(self, td):
+        policy = td["policy"]
+        count, steps = policy.shape[:2]
+        td["_depth_feature"] = torch.zeros(count, steps, 1)
+        td["next", "depth_hx"] = torch.zeros(count, steps, 1)
+        return td
+
+
+class _EpisodeCacheAdaptEMA(nn.Module):
+    def __init__(self, scale: float = 1.0):
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(scale), requires_grad=False)
+        self.calls = 0
+
+    def forward(self, td):
+        self.calls += 1
+        policy = td["policy"][..., 0]
+        is_init = td["is_init"].reshape(*policy.shape, -1).bool().any(dim=-1)
+        hx = td["adapt_hx"][:, 0, 0]
+        values = []
+        for step in range(policy.shape[1]):
+            hx = torch.where(is_init[:, step], torch.zeros_like(hx), hx)
+            hx = hx + policy[:, step] * self.scale
+            values.append(hx)
+        td["priv_pred"] = torch.stack(values, dim=1).unsqueeze(-1)
+        td["next", "adapt_hx"] = hx[:, None, None].expand(
+            -1, policy.shape[1], -1
+        )
+        return td
+
+
+def _collection_exact_prefill_policy(capacity: int = 3):
+    policy = _raw_transition_policy()
+    policy.q_teacher_replay = _TD3DeviceReplay(capacity, "cpu")
+    _initialize_prefill_episode_state(policy)
+    policy._student_collection_actor_cache_enabled = lambda: True
+    policy._q_actor_dim = 3
+    policy.q_actor_keys = ("vel_command", "policy", "priv_pred")
+    policy._q_actor_widths = (1, 1, 1)
+    policy.depth_feature_dim = 1
+    policy.cfg.latent_dim = 1
+    policy.cfg.train_every = 2
+    policy.cfg.perception_encode_microbatch_size = 1
+    policy.cfg.use_object_adapt = False
+    policy._replay_vecnorm_fingerprint = "fixture-vecnorm"
+    policy._vecnorm_snapshot = lambda: None
+    policy._normalize_replay_value = lambda key, value, snapshot: value
+    policy.temporal_depth_gru_ema = _EpisodeCacheDepthEMA()
+    policy.adapt_ema = _EpisodeCacheAdaptEMA()
+    policy._ensure_teacher_episode_cache_state()
+    return policy
+
+
+def _collection_prefill_rollout(values, *, is_init, success=False):
+    values = torch.as_tensor(values, dtype=torch.float32).reshape(1, -1)
+    resets = torch.as_tensor(is_init, dtype=torch.bool).reshape(1, -1)
+    rollout = _raw_transition_td(values, is_init=resets)
+    rollout["next", "terminated"] = torch.zeros_like(rollout["next", "done"])
+    if success:
+        rollout["next", "done"][0, -1] = True
+        command_finished = torch.zeros_like(rollout["next", "done"])
+        command_finished[0, -1] = True
+        rollout["next", "stats", "command_finished"] = command_finished
+    return rollout
+
+
+def test_collection_exact_teacher_journal_survives_capacity_crossing_and_refreshes():
+    policy = _collection_exact_prefill_policy(capacity=3)
+    first = _prefill_episode_rows([101, 102], [0, 0], step_indices=[0, 1])
+    second = _prefill_episode_rows(
+        [103, 104],
+        [0, 0],
+        done=[False, True],
+        command_finished=[False, True],
+        step_indices=[0, 1],
+    )
+
+    assert policy._stage_teacher_prefill_rows(
+        first,
+        _collection_prefill_rollout([1, 2], is_init=[True, False]),
+    ) == (0, 0)
+    assert policy._stage_teacher_prefill_rows(
+        second,
+        _collection_prefill_rollout(
+            [3, 4], is_init=[False, False], success=True
+        ),
+    ) == (4, 0)
+    assert policy.q_teacher_replay.size == 3
+    assert torch.equal(
+        policy.q_teacher_replay.data[TEACHER_EPISODE_STEP_KEY][:3],
+        torch.tensor([1, 2, 3]),
+    )
+    assert policy._teacher_episode_store.node_count == 4
+
+    policy._freeze_teacher_episode_replay()
+    assert policy._teacher_episode_store.frozen
+    assert policy._teacher_episode_store.node_count == 4
+    policy._ensure_teacher_actor_cache_current()
+
+    expected_current = torch.tensor(
+        [[202.0, 102.0, 203.0], [203.0, 103.0, 306.0], [204.0, 104.0, 410.0]]
+    )
+    expected_next = torch.tensor(
+        [[203.0, 103.0, 306.0], [204.0, 104.0, 410.0], [204.0, 104.0, 410.0]]
+    )
+    physical_indices = torch.arange(3)
+    assert torch.equal(
+        policy._teacher_actor_observations_for_indices(
+            physical_indices, next_state=False
+        ),
+        expected_current,
+    )
+    assert torch.equal(
+        policy._teacher_actor_observations_for_indices(
+            physical_indices, next_state=True
+        ),
+        expected_next,
+    )
+    assert STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY not in (
+        policy.q_teacher_replay.data
+    )
+    assert STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY not in (
+        policy.q_teacher_replay.data
+    )
+    assert not set(_PERCEPTION_REPLAY_FIELDS).intersection(
+        policy.q_teacher_replay.data
+    )
+
+    initial_calls = policy.adapt_ema.calls
+    policy._ensure_teacher_actor_cache_current()
+    assert policy.adapt_ema.calls == initial_calls
+    policy.adapt_ema.scale.fill_(2.0)
+    policy._mark_perception_ema_updated()
+    policy._ensure_teacher_actor_cache_current()
+    assert policy.adapt_ema.calls > initial_calls
+    assert torch.equal(
+        policy._teacher_actor_observations_for_indices(
+            physical_indices, next_state=False
+        )[:, -1],
+        torch.tensor([406.0, 612.0, 820.0]),
+    )
+
+
+def test_collection_exact_raw_only_prefix_is_discarded_at_reset():
+    policy = _collection_exact_prefill_policy(capacity=2)
+    invalid = _prefill_episode_rows(
+        [11, 12],
+        [0, 0],
+        valid=[False, False],
+        is_student=[True, True],
+    )
+    policy._stage_teacher_prefill_rows(
+        invalid,
+        _collection_prefill_rollout([1, 2], is_init=[True, False]),
+    )
+    assert policy._teacher_prefill_pending_rows() == 0
+
+    successful = _prefill_episode_rows(
+        [21, 22],
+        [0, 0],
+        done=[False, True],
+        command_finished=[False, True],
+    )
+    committed, discarded = policy._stage_teacher_prefill_rows(
+        successful,
+        _collection_prefill_rollout(
+            [5, 6], is_init=[True, False], success=True
+        ),
+    )
+
+    assert (committed, discarded) == (2, 0)
+    assert policy._teacher_prefill_incomplete_episodes == 1
+    assert policy._teacher_episode_store.episode_count == 1
+    assert policy._teacher_episode_store.node_count == 2
+    assert torch.equal(
+        policy.q_teacher_replay.data[TEACHER_EPISODE_STEP_KEY][:2],
+        torch.tensor([0, 1]),
     )
 
 
@@ -2432,6 +2871,85 @@ def _sampling_policy(replay_type, seed: int, device):
     return policy
 
 
+def test_collection_cache_sampling_preserves_indices_sources_and_rng_order():
+    baseline = _sampling_policy(_TD3DeviceReplay, 907, "cpu")
+    cached = _sampling_policy(_TD3DeviceReplay, 907, "cpu")
+    cached._q_actor_dim = 3
+    cached._student_collection_actor_cache_enabled = lambda: True
+    capacity = cached.dagger_replay.capacity
+    current_cache = torch.arange(capacity * 3, dtype=torch.float32).reshape(
+        capacity, 3
+    )
+    next_cache = current_cache + 10_000.0
+    teacher_capacity = cached.q_teacher_replay.capacity
+    teacher_current_cache = (
+        torch.arange(teacher_capacity * 3, dtype=torch.float32).reshape(
+            teacher_capacity, 3
+        )
+        + 20_000.0
+    )
+    teacher_next_cache = teacher_current_cache + 10_000.0
+    cached.dagger_replay.data[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
+        current_cache.clone()
+    )
+    cached.dagger_replay.data[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY] = (
+        next_cache.clone()
+    )
+    cached._teacher_actor_observations_for_indices = MethodType(
+        lambda owner, physical_indices, *, next_state: (
+            teacher_next_cache if next_state else teacher_current_cache
+        )
+        .index_select(0, physical_indices.to("cpu"))
+        .to(owner.device),
+        cached,
+    )
+
+    baseline_q = baseline._sample_balanced_q_batch()
+    baseline_actor = baseline._sample_actor_batch()
+    cached_q = cached._sample_balanced_q_batch()
+    cached_actor = cached._sample_actor_batch()
+
+    for key in (
+        REPLAY_SAMPLE_PHYSICAL_INDEX_KEY,
+        REPLAY_SAMPLE_IS_TEACHER_KEY,
+        REPLAY_SAMPLE_PROVENANCE_KEY,
+        DAGGER_Q_TEACHER_SOURCE_KEY,
+    ):
+        assert torch.equal(cached_q[key], baseline_q[key])
+    for key in (
+        DAGGER_Q_TEACHER_SOURCE_KEY,
+        FAILURE_PHASE_TEACHER_SOURCE_KEY,
+    ):
+        assert torch.equal(cached_actor[key], baseline_actor[key])
+    assert torch.equal(cached_q["actions"], baseline_q["actions"])
+    assert torch.equal(
+        cached_actor[DAGGER_REPLAY_TEACHER_ACTIONS],
+        baseline_actor[DAGGER_REPLAY_TEACHER_ACTIONS],
+    )
+    assert torch.equal(cached.q_rng.get_state(), baseline.q_rng.get_state())
+
+    q_student = ~cached_q[DAGGER_Q_TEACHER_SOURCE_KEY]
+    q_indices = cached_q[REPLAY_SAMPLE_PHYSICAL_INDEX_KEY][q_student]
+    assert torch.equal(
+        cached_q[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY][q_student],
+        next_cache.index_select(0, q_indices),
+    )
+    assert torch.equal(
+        cached_q[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY][~q_student],
+        teacher_next_cache.index_select(
+            0,
+            cached_q[REPLAY_SAMPLE_PHYSICAL_INDEX_KEY][~q_student],
+        ),
+    )
+    actor_indices = (
+        cached_actor["critic_observations"][:, 0] - 1_000.0
+    ).long()
+    assert torch.equal(
+        cached_actor[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY],
+        current_cache.index_select(0, actor_indices),
+    )
+
+
 def _curriculum_sampling_policy(
     seed: int = 853,
     device="cpu",
@@ -2560,6 +3078,92 @@ def test_configurable_q_and_actor_mixes_match_direct_and_prefetched_sampling(
     )
     assert planned_actor_teacher_count == actor_teacher_count
     assert planned_actor_student_count == 20 - actor_teacher_count
+
+
+def test_collection_cache_mixed_sources_match_direct_and_prefetched_rng():
+    direct, _ = _curriculum_sampling_policy(919)
+    prefetched, _ = _curriculum_sampling_policy(919)
+    capacity = direct.dagger_replay.capacity
+    current_cache = torch.arange(capacity * 3, dtype=torch.float32).reshape(
+        capacity, 3
+    )
+    next_cache = current_cache + 10_000.0
+    teacher_capacity = direct.q_teacher_replay.capacity
+    teacher_current_cache = (
+        torch.arange(teacher_capacity * 3, dtype=torch.float32).reshape(
+            teacher_capacity, 3
+        )
+        + 20_000.0
+    )
+    teacher_next_cache = teacher_current_cache + 10_000.0
+    for policy in (direct, prefetched):
+        policy._q_actor_dim = 3
+        policy._student_collection_actor_cache_enabled = lambda: True
+        policy.dagger_replay.data[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
+            current_cache.clone()
+        )
+        policy.dagger_replay.data[
+            STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY
+        ] = next_cache.clone()
+        policy._teacher_actor_observations_for_indices = MethodType(
+            lambda owner, physical_indices, *, next_state: (
+                teacher_next_cache if next_state else teacher_current_cache
+            )
+            .index_select(0, physical_indices.to("cpu"))
+            .to(owner.device),
+            policy,
+        )
+
+    expected_q = direct._sample_balanced_q_batch()
+    expected_actor = direct._sample_actor_batch()
+    plan = prefetched._prefetch_curriculum_sample_plans(1)[0]
+    actual_q = prefetched._sample_balanced_q_batch(plan)
+    actual_actor = prefetched._sample_actor_batch(
+        plan.actor_indices,
+        plan.actor_teacher_indices,
+        plan.actor_teacher_focused,
+        plan.actor_student_focused,
+    )
+
+    _assert_nested_equal(actual_q, expected_q)
+    _assert_nested_equal(actual_actor, expected_actor)
+    assert torch.equal(direct.q_rng.get_state(), prefetched.q_rng.get_state())
+    assert set(_PERCEPTION_REPLAY_FIELDS).isdisjoint(actual_q)
+    assert set(_PERCEPTION_REPLAY_FIELDS).isdisjoint(actual_actor)
+    for batch, key, student_values, teacher_values in (
+        (
+            actual_q,
+            STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY,
+            next_cache,
+            teacher_next_cache,
+        ),
+        (
+            actual_actor,
+            STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY,
+            current_cache,
+            teacher_current_cache,
+        ),
+        ):
+        teacher = batch[DAGGER_Q_TEACHER_SOURCE_KEY]
+        if REPLAY_SAMPLE_PHYSICAL_INDEX_KEY in batch:
+            physical = batch[REPLAY_SAMPLE_PHYSICAL_INDEX_KEY]
+        else:
+            # Legacy configurable mixes do not expose audit metadata on Actor
+            # batches; the fixture's critic value is an exact row-id oracle.
+            physical = torch.where(
+                teacher,
+                batch["critic_observations"][:, 0] - 100.0,
+                batch["critic_observations"][:, 0] - 1_000.0,
+            ).long()
+        assert teacher.any() and (~teacher).any()
+        assert torch.equal(
+            batch[key][teacher],
+            teacher_values.index_select(0, physical[teacher]),
+        )
+        assert torch.equal(
+            batch[key][~teacher],
+            student_values.index_select(0, physical[~teacher]),
+        )
 
 
 @pytest.mark.parametrize("q_fraction", (0.0, 1.0))
@@ -3877,7 +4481,12 @@ def _install_tiny_inference_perception_stack(policy, seed: int) -> None:
             setattr(policy, name, nn.Linear(2, 2))
 
 
-def test_td3_inference_loader_restores_models_without_training_state():
+@pytest.mark.parametrize(
+    "checkpoint_version", (CHECKPOINT_VERSION, PREVIOUS_CHECKPOINT_VERSION)
+)
+def test_td3_inference_loader_restores_models_without_training_state(
+    checkpoint_version,
+):
     source = _checkpoint_test_policy(1200, with_actor_target=True)
     _install_tiny_inference_perception_stack(source, 1201)
     _take_optimizer_step(source.actor_adapt, source.actor_optimizer)
@@ -3911,6 +4520,7 @@ def test_td3_inference_loader_restores_models_without_training_state():
             "perception_initialization": {"loaded": True, "mode": "test"},
         }
     )
+    state["checkpoint_version"] = checkpoint_version
 
     restored = _checkpoint_test_policy(2200, with_actor_target=True)
     _install_tiny_inference_perception_stack(restored, 2201)

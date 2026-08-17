@@ -4,7 +4,8 @@ This entrypoint is intentionally layered on top of the repository's current
 ``DistributionalFastSACTeacherBC`` implementation.  It therefore preserves
 the existing stochastic Student rollout, frozen successful-Teacher prefill,
 independently configured Student/Teacher Q and Actor mixtures, PPOVEL-style
-live Student perception training, raw recurrent replay for Q/Actor inputs,
+live Student perception training, collection-exact Student Actor inputs plus
+current-EMA full-episode Teacher Actor inputs,
 timeout-final-observation handling, twin C51 critics, and target-update cadence.
 
 The two additions are deliberately narrow:
@@ -52,6 +53,7 @@ from .ppo_bc_dagger import (
 from .ppo_vel import DEPTH_KEY, OBJECT_GEO_KEY, OBJECT_KEY, VEL_CMD_KEY
 from .ppo_vel import PPOVEL
 from .td3_bc_dagger import (
+    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
@@ -62,18 +64,21 @@ from .td3_bc_dagger import (
     REPLAY_TIME_LIMIT_KEY,
     STUDENT_REPLAY_EPISODE_ID_KEY,
     STUDENT_REPLAY_EPISODE_STEP_KEY,
+    TEACHER_EPISODE_SIDECAR_SEMANTICS,
     _PREFILL_ENV_INDEX_KEY,
     _PREFILL_STEP_INDEX_KEY,
     allocate_source_counts,
     _project_c51_probabilities,
 )
 
-TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v5"
+TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v6"
+V5_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v5"
 V4_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v4"
 V3_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v3"
 PREVIOUS_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v2"
 LEGACY_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v1"
-CHECKPOINT_VERSION = 5
+CHECKPOINT_VERSION = 6
+V5_CHECKPOINT_VERSION = 5
 V4_CHECKPOINT_VERSION = 4
 V3_CHECKPOINT_VERSION = 3
 PREVIOUS_CHECKPOINT_VERSION = 2
@@ -101,7 +106,18 @@ BOTTLENECK_LOCATION_SEMANTICS = (
 VERIFIED_HISTOGRAM_SEMANTICS = (
     "verified_teacher_value_pre_onset_student_motion_phase_v2"
 )
-FRESH_RING_RESUME_SEMANTICS = "clear_online_rings_and_partial_row_credit_v1"
+V5_FRESH_RING_RESUME_SEMANTICS = "clear_online_rings_and_partial_row_credit_v1"
+FRESH_RING_RESUME_SEMANTICS = (
+    "clear_online_rings_teacher_episode_sidecars_and_partial_row_credit_v2"
+)
+V5_REPLAY_RESUME_SEMANTICS = (
+    "model_optimizer_policy_rng_verified_bottleneck_resume_with_"
+    "fresh_raw_ring_and_row_credit_rebuild_v5"
+)
+REPLAY_RESUME_SEMANTICS = (
+    "model_optimizer_policy_rng_verified_bottleneck_resume_with_fresh_exact_"
+    "actor_rings_teacher_episode_sidecars_and_row_credit_rebuild_v6"
+)
 UNBOUND_CONTRACT_FINGERPRINT = "unbound_direct_construction"
 
 # Replay cache: frozen PPO Teacher values precomputed once per transition and
@@ -2672,7 +2688,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         info["source/actor_bottleneck_student_fraction"] = self._mean_optional_metric(
             actor_metrics, "actor_failure_phase_student_fraction"
         )
-        info["tvkd/method_distributional_tvkd_fastsac_teacher_bc_v5"] = 1.0
+        info["tvkd/method_distributional_tvkd_fastsac_teacher_bc_v6"] = 1.0
         self._last_tvkd_diagnostics = {
             key: float(value)
             for key, value in info.items()
@@ -3132,6 +3148,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "perception_training_semantics": (
                     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
                 ),
+                "actor_replay_observation_semantics": (
+                    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                ),
+                "teacher_episode_sidecar_semantics": (
+                    TEACHER_EPISODE_SIDECAR_SEMANTICS
+                ),
                 "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                 "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
                 "teacher_value_return_semantics": str(
@@ -3191,13 +3213,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         )
         v3 = algorithm == V3_TRAINING_ALGORITHM and version == V3_CHECKPOINT_VERSION
         v4 = algorithm == V4_TRAINING_ALGORITHM and version == V4_CHECKPOINT_VERSION
+        v5 = algorithm == V5_TRAINING_ALGORITHM and version == V5_CHECKPOINT_VERSION
         current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
         if v4:
             raise ValueError(
                 "TVKD v4 resume is incompatible with the v5 raw-residual "
                 "pre-onset replay contract; start v5 from the frozen PPO source"
             )
-        if not (legacy or previous or v3 or current):
+        if not (legacy or previous or v3 or v5 or current):
             raise ValueError("not a TVKD FastSAC Teacher-BC checkpoint")
         backend = state.get("dagger_backend_config")
         if not isinstance(backend, Mapping):
@@ -3222,8 +3245,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 backend,
                 student_focus_default=(0.0 if legacy or previous else None),
             )
-        if current:
+        if v5 or current:
+            contract_label = "v6" if current else "v5"
             expected_backend = self._checkpoint_config()
+            if v5:
+                expected_backend["method"] = V5_TRAINING_ALGORITHM
             if set(backend) != set(expected_backend):
                 missing = sorted(set(expected_backend).difference(backend))
                 unexpected = sorted(set(backend).difference(expected_backend))
@@ -3238,12 +3264,17 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             expected_mix = _checkpoint_replay_mix(self.cfg)
             saved_mix = state.get("replay_mix_state")
             if not isinstance(saved_mix, Mapping):
-                raise ValueError("TVKD v5 checkpoint lacks replay mix state")
+                raise ValueError(
+                    f"TVKD {contract_label} checkpoint lacks replay mix state"
+                )
             normalized_mix: dict[str, dict[str, float]] = {}
             for purpose, expected in expected_mix.items():
                 saved_purpose = saved_mix.get(purpose)
                 if not isinstance(saved_purpose, Mapping):
-                    raise ValueError(f"TVKD v5 checkpoint lacks {purpose!r} replay mix")
+                    raise ValueError(
+                        f"TVKD {contract_label} checkpoint lacks {purpose!r} "
+                        "replay mix"
+                    )
                 normalized_mix[purpose] = {}
                 for source, expected_value in expected.items():
                     saved_value = _finite_scalar(
@@ -3284,8 +3315,29 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     self, "_replay_vecnorm_fingerprint", None
                 ),
                 "replay_task_fingerprint": str(self.cfg.replay_task_fingerprint),
-                "fresh_ring_resume_semantics": FRESH_RING_RESUME_SEMANTICS,
+                "fresh_ring_resume_semantics": (
+                    FRESH_RING_RESUME_SEMANTICS
+                    if current
+                    else V5_FRESH_RING_RESUME_SEMANTICS
+                ),
             }
+            if current:
+                exact_metadata.update(
+                    {
+                        "actor_replay_observation_semantics": (
+                            COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                        ),
+                        "teacher_episode_sidecar_semantics": (
+                            TEACHER_EPISODE_SIDECAR_SEMANTICS
+                        ),
+                    }
+                )
+            if "replay_resume_semantics" in state:
+                exact_metadata["replay_resume_semantics"] = (
+                    REPLAY_RESUME_SEMANTICS
+                    if current
+                    else V5_REPLAY_RESUME_SEMANTICS
+                )
             _required_contract_fingerprint(
                 "runtime Teacher reward-group fingerprint",
                 exact_metadata["teacher_value_reward_group_fingerprint"],
@@ -3301,7 +3353,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     raise ValueError(f"TVKD resume metadata mismatch at {name!r}")
             q_backend = state.get("q_backend_config")
             if not isinstance(q_backend, Mapping):
-                raise ValueError("TVKD v5 checkpoint lacks Q backend metadata")
+                raise ValueError(
+                    f"TVKD {contract_label} checkpoint lacks Q backend metadata"
+                )
             expected_q_metadata = {
                 "target_semantics": CRITIC_LEARNING_SEMANTICS,
                 "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
@@ -3367,29 +3421,42 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 UserWarning,
                 stacklevel=2,
             )
+        elif v5:
+            warnings.warn(
+                "Migrating a TVKD v5 checkpoint to v6: model, optimizer, RNG, "
+                "bottleneck, and verified-histogram state are retained; the "
+                "non-serialized replay rings and Teacher episode/current-EMA "
+                "cache sidecars are rebuilt from empty state.",
+                UserWarning,
+                stacklevel=2,
+            )
         bottleneck_state = state.get("teacher_value_bottleneck_replay_state")
-        if (current or previous or v3) and not isinstance(bottleneck_state, Mapping):
+        if (current or v5 or previous or v3) and not isinstance(
+            bottleneck_state, Mapping
+        ):
             raise ValueError("TVKD checkpoint lacks bottleneck replay state")
         frozen_teacher_state = state.get("frozen_teacher_state")
         if not isinstance(frozen_teacher_state, Mapping):
             raise ValueError("TVKD checkpoint lacks frozen Teacher value state")
         failure_curriculum_state = (
             state.get("verified_teacher_value_histogram_state")
-            if current
+            if current or v5
             else state.get("failure_phase_curriculum_state")
         )
         if not isinstance(failure_curriculum_state, Mapping):
             raise ValueError("TVKD checkpoint lacks failure curriculum state")
-        if current:
+        if current or v5:
             compatibility_histogram = state.get("failure_phase_curriculum_state")
             if not isinstance(compatibility_histogram, Mapping):
                 raise ValueError(
-                    "TVKD v5 checkpoint lacks histogram compatibility state"
+                    "TVKD v5+ checkpoint lacks histogram compatibility state"
                 )
             if not _same_verified_histogram_state(
                 compatibility_histogram, failure_curriculum_state
             ):
-                raise ValueError("TVKD v5 verified histogram aliases are inconsistent")
+                raise ValueError(
+                    "TVKD v5+ verified histogram aliases are inconsistent"
+                )
         optimizer_state = state.get("optimizer_resume_state")
         if not isinstance(optimizer_state, Mapping):
             raise ValueError("TVKD checkpoint lacks optimizer state")
@@ -3505,6 +3572,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             raise ValueError("TVKD inference checkpoint version is invalid")
         if (algorithm, version) not in {
             (TRAINING_ALGORITHM, CHECKPOINT_VERSION),
+            (V5_TRAINING_ALGORITHM, V5_CHECKPOINT_VERSION),
             (V4_TRAINING_ALGORITHM, V4_CHECKPOINT_VERSION),
             (V3_TRAINING_ALGORITHM, V3_CHECKPOINT_VERSION),
             (PREVIOUS_TRAINING_ALGORITHM, PREVIOUS_CHECKPOINT_VERSION),
@@ -3542,19 +3610,18 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
     def state_dict(self):
         state = DistributionalFastSACTeacherBC.state_dict(self)
-        state["replay_resume_semantics"] = (
-            "model_optimizer_policy_rng_verified_bottleneck_resume_with_"
-            "fresh_raw_ring_and_row_credit_rebuild_v5"
-        )
+        state["replay_resume_semantics"] = REPLAY_RESUME_SEMANTICS
         return state
 
     def load_state_dict(self, state_dict, strict=True):
         # Fresh training remains the baseline's rigorously validated PPO-source
         # transfer. Same-stage TVKD continuation restores every model,
         # optimizer, RNG, counter, failure curriculum, and bottleneck state,
-        # then deliberately rebuilds both raw online replay rings.
+        # then deliberately rebuilds both online replay rings and every
+        # non-serialized Teacher episode/current-EMA cache sidecar.
         if state_dict.get("training_algorithm") not in {
             TRAINING_ALGORITHM,
+            V5_TRAINING_ALGORITHM,
             V4_TRAINING_ALGORITHM,
             V3_TRAINING_ALGORITHM,
             PREVIOUS_TRAINING_ALGORITHM,
@@ -3586,6 +3653,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self.teacher_prefill_rollout_count = 0
         self.teacher_prefill_environment_steps = 0
         self._teacher_prefill_pending = None
+        self._reset_teacher_episode_cache_state()
         self._teacher_prefill_successful_episodes = 0
         self._teacher_prefill_failed_episodes = 0
         self._teacher_prefill_timeout_episodes = 0
@@ -3636,12 +3704,17 @@ __all__ = [
     "LEGACY_TRAINING_ALGORITHM",
     "PREVIOUS_CHECKPOINT_VERSION",
     "PREVIOUS_TRAINING_ALGORITHM",
+    "REPLAY_RESUME_SEMANTICS",
     "SOURCE_FAILURE_TEACHER",
     "SOURCE_STUDENT",
     "SOURCE_UNIFORM_TEACHER",
     "TEACHER_VALUE_BOUNDARY_SEMANTICS",
     "TEACHER_VALUE_RETURN_SEMANTICS",
     "TRAINING_ALGORITHM",
+    "V5_CHECKPOINT_VERSION",
+    "V5_FRESH_RING_RESUME_SEMANTICS",
+    "V5_REPLAY_RESUME_SEMANTICS",
+    "V5_TRAINING_ALGORITHM",
     "V4_CHECKPOINT_VERSION",
     "V4_TRAINING_ALGORITHM",
     "V3_CHECKPOINT_VERSION",

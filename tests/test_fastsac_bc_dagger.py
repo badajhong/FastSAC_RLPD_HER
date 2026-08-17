@@ -41,6 +41,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
+    PREVIOUS_CHECKPOINT_VERSION,
     TRAINING_ALGORITHM,
     DistributionalFastSACTeacherBC,
     DistributionalFastSACTeacherBCConfig,
@@ -1256,8 +1257,17 @@ def _install_tiny_fastsac_inference_perception_stack(policy, seed: int) -> None:
             setattr(policy, name, nn.Linear(2, 2))
 
 
-@pytest.mark.parametrize("legacy_v3", (False, True))
-def test_fastsac_inference_loader_restores_models_without_training_state(legacy_v3):
+@pytest.mark.parametrize(
+    ("legacy_v3", "checkpoint_version"),
+    (
+        (False, CHECKPOINT_VERSION),
+        (False, PREVIOUS_CHECKPOINT_VERSION),
+        (True, 3),
+    ),
+)
+def test_fastsac_inference_loader_restores_models_without_training_state(
+    legacy_v3, checkpoint_version
+):
     source = _checkpoint_policy(1300)
     _install_tiny_fastsac_inference_perception_stack(source, 1301)
     _optimizer_step(
@@ -1297,6 +1307,7 @@ def test_fastsac_inference_loader_restores_models_without_training_state(legacy_
             "perception_initialization": {"loaded": True, "mode": "test"},
         }
     )
+    state["checkpoint_version"] = checkpoint_version
     if legacy_v3:
         # V3 stored the effective log std directly and allowed the learned
         # tensor to move beyond the hard-clamp ceiling.

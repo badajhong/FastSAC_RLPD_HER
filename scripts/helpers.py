@@ -461,6 +461,7 @@ def _load_policy_checkpoint(
         "distributional_tvkd_fastsac_teacher_bc_v3",
         "distributional_tvkd_fastsac_teacher_bc_v4",
         "distributional_tvkd_fastsac_teacher_bc_v5",
+        "distributional_tvkd_fastsac_teacher_bc_v6",
     }
     if inference_only and algorithm in replayless_inference_algorithms:
         loader = getattr(policy, "load_inference_state_dict", None)
@@ -517,6 +518,7 @@ def _fill_replayless_inference_algo_defaults(
         "distributional_tvkd_fastsac_teacher_bc_v3",
         "distributional_tvkd_fastsac_teacher_bc_v4",
         "distributional_tvkd_fastsac_teacher_bc_v5",
+        "distributional_tvkd_fastsac_teacher_bc_v6",
     }:
         from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
             TVKDDistributionalFastSACTeacherBCConfig,
@@ -547,6 +549,7 @@ def _fill_replayless_inference_algo_defaults(
             "distributional_tvkd_fastsac_teacher_bc_v3",
             "distributional_tvkd_fastsac_teacher_bc_v4",
             "distributional_tvkd_fastsac_teacher_bc_v5",
+            "distributional_tvkd_fastsac_teacher_bc_v6",
         }:
             # ValueNorm changes the module type, so it must be selected from
             # the checkpoint before policy construction even when an eval

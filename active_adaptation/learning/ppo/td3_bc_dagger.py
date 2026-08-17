@@ -1,11 +1,11 @@
 """C51 distributional TD3 with bounded raw-action Teacher BC.
 
-This module implements ``distributional_td3_teacher_bc_v1``.  Version 4 keeps
-the locked VAIC Actor, observation, DAgger, timeout, action, and C51 interfaces,
-but makes replay perception-input authoritative: it stores finite raw recurrent
-windows and re-encodes them with the current EMA perception modules instead of
-persisting collection-time ``priv_pred`` latents.  The duplicate teacher H5
-export is deliberately disabled.
+This module implements ``distributional_td3_teacher_bc_v1``.  Version 5 keeps
+the locked VAIC Actor, observation, DAgger, timeout, action, and C51 interfaces.
+FastSAC/TVKD Student replay stores the exact flat Actor inputs produced by live
+carried-hidden collection; successful Teacher replay stores each raw episode
+once and reconstructs it with the current EMA from its real reset.  Legacy TD3
+keeps its finite raw-window path.  The duplicate teacher H5 export is disabled.
 """
 
 from __future__ import annotations
@@ -92,10 +92,18 @@ from .ppo_vel import (
     VEL_CMD_KEY,
     set_recurrent_mode,
 )
+from .teacher_episode_replay import (
+    CurrentEMATeacherActorCache,
+    TeacherActorCacheLineage,
+    TeacherBoundaryCause,
+    TeacherEpisodeSequenceStore,
+    classify_teacher_boundary,
+)
 
 
 TRAINING_ALGORITHM = "distributional_td3_teacher_bc_v1"
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 5
+PREVIOUS_CHECKPOINT_VERSION = 4
 ACTOR_BACKEND = "ppo_vel_physical_mean_tanh_bounded_td3_bc_v1"
 ACTION_CONTRACT_SEMANTICS = (
     "finite_raw_joint_action_support_with_jointwise_normalized_q_bc_v1"
@@ -126,12 +134,22 @@ PERCEPTION_PREFILL_DISABLED_SEMANTICS = (
     "disabled_for_ppovel_live_student_rollout_v1"
 )
 
-# Authoritative perception replay fields.  These contain only sensor/model
-# inputs; collection-time priv_pred/depth_hx/adapt_hx are deliberately absent.
+# Authoritative raw perception fields.  Legacy TD3 stores ten-frame windows;
+# FastSAC/TVKD store each successful Teacher episode once in a sidecar and keep
+# the exact flat Actor inputs produced by the live carried-hidden Student
+# collector under the two generic replay keys below.
 PERCEPTION_DEPTH_U8_KEY = "perception_depth_u8"
 PERCEPTION_POLICY_RAW_KEY = "perception_policy_raw"
 PERCEPTION_VEL_COMMAND_RAW_KEY = "perception_vel_command_raw"
 PERCEPTION_IS_INIT_KEY = "perception_is_init"
+REPLAY_ACTOR_OBSERVATIONS_KEY = "replay_actor_observations"
+REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY = "replay_next_actor_observations"
+# Transitional internal aliases keep the Student collection patch isolated;
+# Teacher episode replay can populate the same generic schema directly.
+STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY = REPLAY_ACTOR_OBSERVATIONS_KEY
+STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY = (
+    REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY
+)
 REFERENCE_PHASE_KEY = "reference_phase"
 FAILURE_PHASE_TEACHER_SOURCE_KEY = "failure_phase_teacher_source"
 FAILURE_PHASE_STUDENT_SOURCE_KEY = "failure_phase_student_source"
@@ -143,6 +161,19 @@ REPLAY_TERMINATED_KEY = "replay_terminated"
 REPLAY_COMMAND_FINISHED_KEY = "replay_command_finished"
 REPLAY_TIME_LIMIT_KEY = "replay_time_limit"
 REPLAY_MOTION_ID_KEY = "replay_motion_id"
+TEACHER_EPISODE_UID_KEY = "teacher_episode_uid"
+TEACHER_EPISODE_STEP_KEY = "teacher_episode_step"
+_TEACHER_PENDING_EPISODE_STEP_KEY = "_teacher_pending_episode_step"
+TEACHER_ACTOR_CACHE_ENCODER_SEMANTICS = (
+    "full_success_episode_current_ema_carried_hidden_v1"
+)
+COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS = (
+    "student_collection_carried_hidden_current_next_plus_teacher_success_"
+    "episode_current_ema_v1"
+)
+TEACHER_EPISODE_SIDECAR_SEMANTICS = (
+    "fresh_nonserialized_success_episode_raw_journal_and_current_ema_cache_v1"
+)
 
 REPLAY_SOURCE_ORDER = (
     "uniform_student",
@@ -1289,6 +1320,13 @@ class _DistributionalTD3DaggerRolloutPolicy(_DaggerRolloutPolicy):
         owner = self._owner
         teacher_prefill_active = owner._teacher_prefill_active()
         raw_student_action = owner._student_raw_action_proposal(td)
+        cache_enabled = getattr(
+            owner, "_student_collection_actor_cache_enabled", lambda: False
+        )
+        if cache_enabled():
+            td[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
+                owner._collection_actor_observations(td)
+            )
         for scratch_key in (
             "_depth_feature",
             OBJECT_PRED_KEY,
@@ -1608,6 +1646,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         # This prevents the prefix of a later-failed Teacher trajectory from
         # leaking into the frozen Teacher replay.
         self._teacher_prefill_pending: list[list[dict[str, torch.Tensor]]] | None = None
+        self._teacher_prefill_raw_pending: (
+            list[list[dict[str, torch.Tensor]]] | None
+        ) = None
+        self._teacher_episode_store = TeacherEpisodeSequenceStore(
+            is_init_key=PERCEPTION_IS_INIT_KEY
+        )
+        self._teacher_actor_cache = CurrentEMATeacherActorCache(self._q_actor_dim)
+        self._perception_ema_generation = 0
+        self._teacher_ring_cache_lineage: TeacherActorCacheLineage | None = None
+        self._teacher_episode_device_raw_fields = None
+        self._teacher_episode_device_raw_lineage = None
         self._teacher_prefill_successful_episodes = 0
         self._teacher_prefill_failed_episodes = 0
         self._teacher_prefill_timeout_episodes = 0
@@ -2235,6 +2284,123 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         bounded = center + scale * torch.tanh((raw_mean - center) / scale)
         return self._project_execution_action(bounded)
 
+    def _student_collection_actor_cache_enabled(self) -> bool:
+        """Whether replay consumes collection-time carried-hidden Student inputs.
+
+        Baseline TD3 keeps its historical raw-window/current-EMA contract.  The
+        FastSAC backend overrides this seam for its locked
+        ``online_student_rollout`` perception mode.
+        """
+        return False
+
+    def _teacher_episode_cache_enabled(self) -> bool:
+        """Use the full-episode Teacher cache only with collection-exact replay."""
+        return self._student_collection_actor_cache_enabled()
+
+    def _ensure_teacher_episode_cache_state(self) -> None:
+        """Lazily install sidecar state for focused/unit construction seams."""
+        if not hasattr(self, "_teacher_episode_store"):
+            self._teacher_episode_store = TeacherEpisodeSequenceStore(
+                is_init_key=PERCEPTION_IS_INIT_KEY
+            )
+        if not hasattr(self, "_teacher_actor_cache"):
+            self._teacher_actor_cache = CurrentEMATeacherActorCache(
+                self._q_actor_dim
+            )
+        if not hasattr(self, "_perception_ema_generation"):
+            self._perception_ema_generation = 0
+        if not hasattr(self, "_teacher_ring_cache_lineage"):
+            self._teacher_ring_cache_lineage = None
+        if not hasattr(self, "_teacher_episode_device_raw_fields"):
+            self._teacher_episode_device_raw_fields = None
+        if not hasattr(self, "_teacher_episode_device_raw_lineage"):
+            self._teacher_episode_device_raw_lineage = None
+        if not hasattr(self, "_teacher_prefill_raw_pending"):
+            self._teacher_prefill_raw_pending = None
+
+    def _reset_teacher_episode_cache_state(self) -> None:
+        """Rebuild non-serialized Teacher replay sidecars from an empty lineage.
+
+        Checkpoints deliberately contain neither replay rows nor the raw episode
+        journal/current-EMA cache that interprets those rows.  A same-instance
+        model restore must therefore discard every sidecar together, otherwise
+        a stale episode UID or EMA lineage can alias rows collected after load.
+        """
+        self._teacher_prefill_raw_pending = None
+        self._teacher_episode_store = TeacherEpisodeSequenceStore(
+            is_init_key=PERCEPTION_IS_INIT_KEY
+        )
+        self._teacher_actor_cache = CurrentEMATeacherActorCache(self._q_actor_dim)
+        self._perception_ema_generation = 0
+        self._teacher_ring_cache_lineage = None
+        self._teacher_episode_device_raw_fields = None
+        self._teacher_episode_device_raw_lineage = None
+
+    def _teacher_actor_cache_lineage(self) -> TeacherActorCacheLineage:
+        self._ensure_teacher_episode_cache_state()
+        store = self._teacher_episode_store
+        if not store.frozen:
+            raise RuntimeError("Teacher episode journal must be frozen before caching")
+        vecnorm_fingerprint = getattr(self, "_replay_vecnorm_fingerprint", None)
+        object_geo_fingerprint = getattr(
+            self, "_replay_object_geo_fingerprint", None
+        )
+        if not isinstance(vecnorm_fingerprint, str) or not vecnorm_fingerprint:
+            raise RuntimeError("Teacher Actor cache requires a VecNorm fingerprint")
+        if not isinstance(object_geo_fingerprint, str) or not object_geo_fingerprint:
+            raise RuntimeError("Teacher Actor cache requires object-geometry lineage")
+        raw_lineage = store.lineage
+        return TeacherActorCacheLineage(
+            raw_store_id=raw_lineage.store_id,
+            raw_generation=raw_lineage.generation,
+            ema_generation=int(self._perception_ema_generation),
+            vecnorm_fingerprint=vecnorm_fingerprint,
+            object_geo_fingerprint=object_geo_fingerprint,
+            encoder_semantics=TEACHER_ACTOR_CACHE_ENCODER_SEMANTICS,
+        )
+
+    def _mark_perception_ema_updated(self) -> None:
+        """Invalidate only the recomputable Teacher cache after an EMA update."""
+        if not self._teacher_episode_cache_enabled():
+            return
+        self._ensure_teacher_episode_cache_state()
+        self._perception_ema_generation += 1
+        self._teacher_actor_cache.invalidate()
+        self._teacher_ring_cache_lineage = None
+
+    @torch.no_grad()
+    def _collection_actor_observations(self, td: TensorDict) -> torch.Tensor:
+        """Flatten the exact normalized Actor inputs already present in ``td``."""
+        chunks: list[torch.Tensor] = []
+        for key, width in zip(self.q_actor_keys, self._q_actor_widths):
+            if key not in td.keys(True, True):
+                raise KeyError(
+                    f"Student collection Actor cache is missing input {key!r}"
+                )
+            value = td[key]
+            if int(value.shape[-1]) != int(width):
+                raise ValueError(
+                    f"Student collection Actor input {key!r} has width "
+                    f"{int(value.shape[-1])}; expected {int(width)}"
+                )
+            if tuple(value.shape[:-1]) != tuple(td.batch_size):
+                raise ValueError(
+                    f"Student collection Actor input {key!r} is batch-misaligned"
+                )
+            chunks.append(value)
+        observations = torch.cat(chunks, dim=-1)
+        if observations.shape != (*td.batch_size, self._q_actor_dim):
+            raise RuntimeError("Student collection Actor cache has an invalid shape")
+        if not torch.isfinite(observations).all():
+            raise RuntimeError("Student collection Actor cache contains NaN/Inf")
+        # Collection runs inside ``torch.inference_mode()``.  An inference
+        # tensor cannot subsequently be saved for backward by the Actor even
+        # though the cached observations themselves never require gradients.
+        # Clone with inference mode explicitly disabled so replay always owns
+        # a regular detached tensor.
+        with torch.inference_mode(False):
+            return observations.detach().clone()
+
     def _actor_dist_from_flat_module(self, module: nn.Module, actor_obs: torch.Tensor):
         vel_dim = int(self.observation_spec[VEL_CMD_KEY].shape[-1])
         policy_dim = int(self.observation_spec[OBS_KEY].shape[-1])
@@ -2316,6 +2482,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self._teacher_prefill_pending = [[] for _ in range(num_envs)]
         elif len(pending) < num_envs:
             pending.extend([] for _ in range(num_envs - len(pending)))
+        if self._teacher_episode_cache_enabled():
+            self._ensure_teacher_episode_cache_state()
+            raw_pending = self._teacher_prefill_raw_pending
+            if raw_pending is None:
+                self._teacher_prefill_raw_pending = [
+                    [] for _ in range(num_envs)
+                ]
+            elif len(raw_pending) < num_envs:
+                raw_pending.extend(
+                    [] for _ in range(num_envs - len(raw_pending))
+                )
 
     @torch.no_grad()
     def _post_process_teacher_prefill_episode(
@@ -2354,6 +2531,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         rows may execute the deterministic Student as an environment fallback,
         but are never staged as Teacher replay data.
         """
+        collection_exact = self._teacher_episode_cache_enabled()
+        if collection_exact and rollout is None:
+            raise ValueError(
+                "collection-exact Teacher prefill requires the full [env,time] rollout"
+            )
         replay_fields = self._q_replay_prefill_storage_fields()
         required = set(replay_fields).union(
             _PREFILL_INTERNAL_FIELDS,
@@ -2416,6 +2598,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 .bool()
                 .cpu()
             )
+            time_limit = transitions.get(REPLAY_TIME_LIMIT_KEY, None)
+            time_limit = (
+                torch.zeros(row_count, dtype=torch.bool)
+                if time_limit is None
+                else time_limit.reshape(row_count).detach().bool().cpu()
+            )
             is_init = (
                 transitions[PERCEPTION_IS_INIT_KEY][:, -2]
                 .reshape(row_count, -1)
@@ -2460,10 +2648,20 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     _event_grid(rollout[DONE_KEY]).long(),
                     _event_grid(rollout[TERM_KEY]).long(),
                     _event_grid(rollout["next", "stats", "command_finished"]).long(),
+                    _event_grid(
+                        rollout["next", "stats", "episode_time_limit"]
+                        if (
+                            "next",
+                            "stats",
+                            "episode_time_limit",
+                        )
+                        in rollout.keys(True, True)
+                        else torch.zeros_like(rollout[DONE_KEY])
+                    ).long(),
                     is_init_grid.long(),
                 ),
                 dim=-1,
-            ).reshape(-1, 6)
+            ).reshape(-1, 7)
             if event_metadata.device.type != "cpu":
                 event_metadata = event_metadata.to("cpu")
             event_env = event_metadata[:, 0]
@@ -2471,7 +2669,26 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             done = event_metadata[:, 2].bool()
             terminated = event_metadata[:, 3].bool()
             command_finished = event_metadata[:, 4].bool()
-            is_init = event_metadata[:, 5].bool()
+            time_limit = event_metadata[:, 5].bool()
+            is_init = event_metadata[:, 6].bool()
+
+        raw_rollout = None
+        if collection_exact:
+            if rollout is None:  # pragma: no cover - guarded above
+                raise RuntimeError("collection-exact prefill lost its rollout")
+            raw_rollout = self._raw_perception_values(rollout)
+            if any(
+                tuple(value.shape[:2]) != (num_envs, num_steps)
+                for value in raw_rollout.values()
+            ):
+                raise ValueError("Teacher raw episode journal is rollout-misaligned")
+            # One coalesced device-to-host transfer per field.  Copying each
+            # environment slice independently would issue up to 4 * num_envs
+            # tiny transfers every prefill rollout.
+            raw_rollout = {
+                key: value.detach().to(device="cpu").contiguous()
+                for key, value in raw_rollout.items()
+            }
 
         maximum_env = int(event_env.max().item())
         if int(event_env.min().item()) < 0:
@@ -2480,6 +2697,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         pending = self._teacher_prefill_pending
         if pending is None:  # pragma: no cover - guarded by initializer above
             raise RuntimeError("Teacher prefill pending storage was not initialized")
+        raw_pending = (
+            self._teacher_prefill_raw_pending if collection_exact else None
+        )
+        if collection_exact and raw_pending is None:
+            raise RuntimeError("Teacher raw episode pending storage was not initialized")
 
         replay_device = self.q_teacher_replay.device
         payload = {
@@ -2489,6 +2711,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         discarded_rows = 0
 
         def _append_segment(env_index: int, start_step: int, stop_step: int) -> None:
+            raw_offset = 0
+            if collection_exact:
+                if raw_pending is None or raw_rollout is None:  # pragma: no cover
+                    raise RuntimeError("Teacher raw episode journal is unavailable")
+                raw_offset = sum(
+                    int(chunk[PERCEPTION_IS_INIT_KEY].shape[0])
+                    for chunk in raw_pending[env_index]
+                )
+                raw_pending[env_index].append(
+                    {
+                        key: value[env_index, start_step:stop_step]
+                        .detach()
+                        .contiguous()
+                        .clone()
+                        for key, value in raw_rollout.items()
+                    }
+                )
             selected = (
                 (
                     (payload_env == env_index)
@@ -2502,13 +2741,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if selected.numel() == 0:
                 return
             selected = selected.to(replay_device)
-            pending[env_index].append(
-                {key: value.index_select(0, selected) for key, value in payload.items()}
-            )
+            chunk = {
+                key: value.index_select(0, selected) for key, value in payload.items()
+            }
+            if collection_exact:
+                selected_cpu = selected.to(device="cpu")
+                chunk[_TEACHER_PENDING_EPISODE_STEP_KEY] = (
+                    payload_step.index_select(0, selected_cpu)
+                    - int(start_step)
+                    + int(raw_offset)
+                ).to(replay_device)
+            pending[env_index].append(chunk)
 
         def _discard(env_index: int, kind: str) -> int:
             rows = self._prefill_pending_row_count(pending[env_index])
             pending[env_index].clear()
+            if raw_pending is not None:
+                raw_pending[env_index].clear()
             if kind == "failed":
                 self._teacher_prefill_failed_episodes += 1
             elif kind == "timeout":
@@ -2522,16 +2771,67 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         def _commit(env_index: int) -> int:
             chunks = pending[env_index]
+            raw_chunks = None if raw_pending is None else raw_pending[env_index]
+            if collection_exact:
+                if not raw_chunks:
+                    raise RuntimeError(
+                        "successful Teacher boundary lacks a raw episode journal"
+                    )
+                starts_at_reset = bool(
+                    raw_chunks[0][PERCEPTION_IS_INIT_KEY]
+                    .reshape(int(raw_chunks[0][PERCEPTION_IS_INIT_KEY].shape[0]), -1)
+                    .bool()
+                    .any(dim=-1)[0]
+                )
+                if not starts_at_reset:
+                    nonlocal discarded_rows
+                    discarded_rows += _discard(env_index, "incomplete")
+                    return 0
             if chunks:
                 episode = {
                     key: torch.cat([chunk[key] for chunk in chunks], dim=0)
                     for key in replay_fields
                 }
                 episode = self._post_process_teacher_prefill_episode(episode)
-                rows = self.q_teacher_replay.extend(episode)
+                if collection_exact:
+                    if raw_chunks is None:  # pragma: no cover - guarded above
+                        raise RuntimeError("Teacher raw episode journal vanished")
+                    episode_steps = torch.cat(
+                        [
+                            chunk[_TEACHER_PENDING_EPISODE_STEP_KEY]
+                            for chunk in chunks
+                        ],
+                        dim=0,
+                    ).long()
+                    raw_episode = {
+                        key: torch.cat(
+                            [chunk[key] for chunk in raw_chunks], dim=0
+                        )
+                        for key in _PERCEPTION_REPLAY_FIELDS
+                    }
+                    self._ensure_teacher_episode_cache_state()
+                    episode_uid = self._teacher_episode_store.allocate_episode_uid()
+                    self._teacher_episode_store.commit_successful_episode(
+                        episode_uid,
+                        raw_episode,
+                        boundary_cause=TeacherBoundaryCause.SUCCESS_COMMAND,
+                    )
+                    episode[TEACHER_EPISODE_UID_KEY] = torch.full_like(
+                        episode_steps, episode_uid
+                    )
+                    episode[TEACHER_EPISODE_STEP_KEY] = episode_steps
+                    try:
+                        rows = self.q_teacher_replay.extend(episode)
+                    except Exception:
+                        self._teacher_episode_store.rollback_episode(episode_uid)
+                        raise
+                else:
+                    rows = self.q_teacher_replay.extend(episode)
             else:
                 rows = 0
             chunks.clear()
+            if raw_chunks is not None:
+                raw_chunks.clear()
             self._teacher_prefill_successful_episodes += 1
             return rows
 
@@ -2545,13 +2845,33 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 if bool(is_init[row]):
                     if step > segment_start_step:
                         _append_segment(int(env_index), segment_start_step, step)
-                    if pending[int(env_index)]:
+                    if pending[int(env_index)] or bool(
+                        raw_pending is not None and raw_pending[int(env_index)]
+                    ):
                         discarded_rows += _discard(int(env_index), "incomplete")
                     segment_start_step = step
                 if not bool(done[row]):
                     continue
                 _append_segment(int(env_index), segment_start_step, step + 1)
-                if bool(terminated[row]):
+                if collection_exact:
+                    cause = classify_teacher_boundary(
+                        done=True,
+                        terminated=bool(terminated[row]),
+                        command_finished=bool(command_finished[row]),
+                        time_limit=bool(time_limit[row]),
+                    )
+                    if cause is TeacherBoundaryCause.TERMINATED:
+                        discarded_rows += _discard(int(env_index), "failed")
+                    elif cause is TeacherBoundaryCause.SUCCESS_COMMAND:
+                        committed_rows += _commit(int(env_index))
+                    elif cause is TeacherBoundaryCause.TIME_LIMIT:
+                        discarded_rows += _discard(int(env_index), "timeout")
+                    else:
+                        _discard(int(env_index), "incomplete")
+                        raise RuntimeError(
+                            "Teacher prefill encountered an unclassified done boundary"
+                        )
+                elif bool(terminated[row]):
                     discarded_rows += _discard(int(env_index), "failed")
                 elif bool(command_finished[row]):
                     committed_rows += _commit(int(env_index))
@@ -2570,19 +2890,51 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         pending = self._teacher_prefill_pending
         if pending is None:
             return 0
+        raw_pending = getattr(self, "_teacher_prefill_raw_pending", None)
         discarded = 0
-        for chunks in pending:
+        for env_index, chunks in enumerate(pending):
             rows = self._prefill_pending_row_count(chunks)
-            if rows:
+            has_raw = bool(
+                raw_pending is not None
+                and env_index < len(raw_pending)
+                and raw_pending[env_index]
+            )
+            if rows or has_raw:
                 discarded += rows
                 self._teacher_prefill_incomplete_episodes += 1
                 self._teacher_prefill_discarded_rows += rows
                 chunks.clear()
+                if raw_pending is not None and env_index < len(raw_pending):
+                    raw_pending[env_index].clear()
         return discarded
 
     def _teacher_prefill_pending_rows(self) -> int:
         pending = self._teacher_prefill_pending or ()
         return sum(self._prefill_pending_row_count(chunks) for chunks in pending)
+
+    @torch.no_grad()
+    def _freeze_teacher_episode_replay(self) -> None:
+        """Freeze/GC complete raw episodes referenced by the full Teacher FIFO."""
+        if not self._teacher_episode_cache_enabled():
+            return
+        self._ensure_teacher_episode_cache_state()
+        if self._teacher_episode_store.frozen:
+            return
+        if self.q_teacher_replay.size != self.q_teacher_replay.capacity:
+            raise RuntimeError(
+                "Teacher episode replay can freeze only after its FIFO is full"
+            )
+        for key in (TEACHER_EPISODE_UID_KEY, TEACHER_EPISODE_STEP_KEY):
+            if key not in self.q_teacher_replay.data:
+                raise KeyError(f"Teacher FIFO is missing episode lineage {key!r}")
+        size = int(self.q_teacher_replay.size)
+        self._teacher_episode_store.freeze(
+            self.q_teacher_replay.data[TEACHER_EPISODE_UID_KEY][:size],
+            self.q_teacher_replay.data[TEACHER_EPISODE_STEP_KEY][:size],
+        )
+        self._teacher_actor_cache.invalidate()
+        self._teacher_ring_cache_lineage = None
+        self._teacher_prefill_raw_pending = None
 
     def _reference_phase(self, td: TensorDict) -> torch.Tensor:
         """Return the raw normalized reference phase used by the simulator."""
@@ -2760,9 +3112,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     def _q_replay_storage_fields(self) -> tuple[str, ...]:
         """Return the replay schema selected by the algorithm contract."""
-        if self._has_canonical_replay_mix():
-            return (*_Q_REPLAY_FIELDS, *_V4_REPLAY_CONTEXT_FIELDS)
-        return _Q_REPLAY_FIELDS
+        fields = (
+            (*_Q_REPLAY_FIELDS, *_V4_REPLAY_CONTEXT_FIELDS)
+            if self._has_canonical_replay_mix()
+            else _Q_REPLAY_FIELDS
+        )
+        if self._teacher_episode_cache_enabled():
+            return tuple(
+                key for key in fields if key not in _PERCEPTION_REPLAY_FIELDS
+            )
+        return fields
 
     def _replay_mix_fractions(self, purpose: str) -> dict[str, float]:
         """Resolve one purpose's global four-way source fractions.
@@ -3834,13 +4193,311 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         }
 
     @torch.no_grad()
-    def _prepare_raw_final_state(self, td: TensorDict) -> dict[str, torch.Tensor]:
-        return {
+    def _materialize_collection_actor_observations(
+        self, td: TensorDict
+    ) -> torch.Tensor:
+        """Advance a cloned state through the live EMA perception stack once.
+
+        This is used only for a rollout-final continuation or a true pre-reset
+        timeout final.  Ordinary next states reuse the following rollout row's
+        already-materialized cache and therefore require no extra encoder pass.
+        """
+        if hasattr(self, "temporal_depth_gru_ema"):
+            self.temporal_depth_gru_ema(td)
+        else:
+            reference = td[OBS_KEY]
+            td["_depth_feature"] = torch.zeros(
+                *td.batch_size,
+                self.depth_feature_dim,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+        if bool(self.cfg.use_object_adapt):
+            self.object_adapt_ema(td)
+            self.object_pred_transform(td)
+        self.adapt_ema(td)
+        return self._collection_actor_observations(td)
+
+    @torch.no_grad()
+    def _rebuild_teacher_actor_cache(
+        self, lineage: TeacherActorCacheLineage
+    ) -> None:
+        """Stream complete Teacher episodes through the current EMA exactly."""
+        self._ensure_teacher_episode_cache_state()
+        store = self._teacher_episode_store
+        if not store.frozen:
+            raise RuntimeError("Teacher Actor cache requires a frozen episode store")
+        if self._replay_object_geo is None:
+            raise RuntimeError("Teacher Actor cache lacks object geometry")
+
+        # Keep the derived cache on the learning device.  Copying every
+        # 525-wide state back to the CPU ring (and then copying sampled rows
+        # to CUDA again) made an exact refresh substantially slower than the
+        # legacy ten-frame path.  A single device cache lets the recurrent
+        # stream publish without per-chunk D2H synchronization; Q/Actor later
+        # gather only the Teacher rows that their unchanged replay indices
+        # selected.
+        actor_by_node = self._teacher_actor_cache.allocate_build_tensor(
+            store, device=self.device
+        )
+        write_counts = torch.zeros(
+            store.node_count, dtype=torch.int16, device=self.device
+        )
+        snapshot = self._vecnorm_snapshot()
+        time_chunk_size = max(1, int(self.cfg.train_every))
+        node_budget = max(
+            1,
+            int(self.cfg.perception_encode_microbatch_size)
+            * (int(self.cfg.perception_replay_burn_in) + 2),
+        )
+        episode_batch_size = max(1, node_budget // time_chunk_size)
+        geometry = self._replay_object_geo.to(self.device)
+        raw_lineage = store.lineage
+        device_raw_lineage = (
+            raw_lineage.store_id,
+            raw_lineage.generation,
+            str(torch.device(self.device)),
+        )
+        if self._teacher_episode_device_raw_lineage != device_raw_lineage:
+            # The Teacher store is immutable after prefill.  Upload its
+            # compact, frame-once raw tensors once and reuse them across all
+            # later EMA generations.  Only the derived Actor cache is
+            # invalidated after perception learning.
+            self._teacher_episode_device_raw_fields = {
+                key: value.to(self.device).contiguous()
+                for key, value in store.raw_fields.items()
+            }
+            self._teacher_episode_device_raw_lineage = device_raw_lineage
+        device_raw_fields = self._teacher_episode_device_raw_fields
+        if device_raw_fields is None:  # pragma: no cover - guarded above
+            raise RuntimeError("Teacher raw device mirror is unavailable")
+        current_group = None
+        depth_state = None
+        adapt_state = None
+
+        with set_recurrent_mode(True):
+            for chunk in store.iter_sequence_chunks(
+                episode_batch_size=episode_batch_size,
+                time_chunk_size=time_chunk_size,
+                raw_fields=device_raw_fields,
+            ):
+                if current_group != chunk.group_id:
+                    current_group = chunk.group_id
+                    depth_state = torch.zeros(
+                        chunk.group_size,
+                        self.depth_feature_dim,
+                        device=self.device,
+                    )
+                    adapt_state = torch.zeros(
+                        chunk.group_size,
+                        int(self.cfg.latent_dim),
+                        device=self.device,
+                    )
+                if depth_state is None or adapt_state is None:  # pragma: no cover
+                    raise RuntimeError("Teacher recurrent cache state is unavailable")
+
+                positions = chunk.batch_positions.to(
+                    device=self.device, dtype=torch.long
+                )
+                count, sequence_length = chunk.valid.shape
+                depth_u8 = chunk.raw_fields[PERCEPTION_DEPTH_U8_KEY].to(
+                    self.device
+                )
+                policy_raw = chunk.raw_fields[PERCEPTION_POLICY_RAW_KEY].to(
+                    self.device
+                )
+                vel_raw = chunk.raw_fields[PERCEPTION_VEL_COMMAND_RAW_KEY].to(
+                    self.device
+                )
+                depth = self._normalize_replay_value(
+                    DEPTH_KEY, _decode_replay_depth_u8(depth_u8), snapshot
+                )
+                policy = self._normalize_replay_value(
+                    OBS_KEY, policy_raw, snapshot
+                )
+                vel = self._normalize_replay_value(VEL_CMD_KEY, vel_raw, snapshot)
+                depth_hx = depth_state.index_select(0, positions)
+                adapt_hx = adapt_state.index_select(0, positions)
+                td = TensorDict(
+                    {
+                        DEPTH_KEY: depth,
+                        OBS_KEY: policy,
+                        VEL_CMD_KEY: vel,
+                        OBJECT_GEO_KEY: geometry.to(dtype=policy.dtype)
+                        .view(1, 1, -1)
+                        .expand(count, sequence_length, -1),
+                        "is_init": chunk.raw_fields[PERCEPTION_IS_INIT_KEY].to(
+                            self.device
+                        ),
+                        "depth_hx": depth_hx.unsqueeze(1).expand(
+                            count, sequence_length, -1
+                        ),
+                        "adapt_hx": adapt_hx.unsqueeze(1).expand(
+                            count, sequence_length, -1
+                        ),
+                    },
+                    batch_size=(count, sequence_length),
+                    device=self.device,
+                )
+                if hasattr(self, "temporal_depth_gru_ema"):
+                    self.temporal_depth_gru_ema(td)
+                    if ("next", "depth_hx") not in td.keys(True, True):
+                        raise RuntimeError(
+                            "Teacher cache requires the locked recurrent depth EMA"
+                        )
+                    depth_state.index_copy_(
+                        0, positions, td["next", "depth_hx"][:, -1]
+                    )
+                else:
+                    td["_depth_feature"] = torch.zeros(
+                        count,
+                        sequence_length,
+                        self.depth_feature_dim,
+                        device=self.device,
+                        dtype=policy.dtype,
+                    )
+                if bool(self.cfg.use_object_adapt):
+                    self.object_adapt_ema(td)
+                    self.object_pred_transform(td)
+                self.adapt_ema(td)
+                if ("next", "adapt_hx") not in td.keys(True, True):
+                    raise RuntimeError(
+                        "Teacher cache requires the locked recurrent adaptation EMA"
+                    )
+                adapt_state.index_copy_(
+                    0, positions, td["next", "adapt_hx"][:, -1]
+                )
+                actor_parts = []
+                for key, width in zip(self.q_actor_keys, self._q_actor_widths):
+                    if key not in td.keys(True, True):
+                        raise KeyError(
+                            f"Teacher Actor cache is missing input {key!r}"
+                        )
+                    value = td[key]
+                    if int(value.shape[-1]) != int(width):
+                        raise ValueError(
+                            f"Teacher Actor cache input {key!r} has width "
+                            f"{int(value.shape[-1])}; expected {int(width)}"
+                        )
+                    actor_parts.append(value)
+                actor = torch.cat(actor_parts, dim=-1)
+                if actor.shape != (*td.batch_size, self._q_actor_dim):
+                    raise RuntimeError("Teacher Actor cache has an invalid shape")
+                valid_device = chunk.valid.to(self.device)
+                node_indices = chunk.flat_node_indices[chunk.valid].to(self.device)
+                actor_by_node.index_copy_(
+                    0,
+                    node_indices,
+                    actor[valid_device].float(),
+                )
+                write_counts.index_add_(
+                    0,
+                    node_indices,
+                    torch.ones_like(node_indices, dtype=write_counts.dtype),
+                )
+
+        if not bool((write_counts == 1).all()):
+            raise RuntimeError(
+                "Teacher Actor cache must materialize every node exactly once"
+            )
+        self._teacher_actor_cache.publish(lineage, store, actor_by_node)
+
+    @torch.no_grad()
+    def _ensure_teacher_actor_cache_current(self) -> None:
+        """Refresh one device-resident Teacher cache per EMA lineage."""
+        if not self._teacher_episode_cache_enabled():
+            return
+        self._ensure_teacher_episode_cache_state()
+        lineage = self._teacher_actor_cache_lineage()
+        if (
+            self._teacher_ring_cache_lineage == lineage
+            and self._teacher_actor_cache.lineage == lineage
+            and self._teacher_actor_cache.ready
+        ):
+            return
+        if (
+            self._teacher_actor_cache.lineage != lineage
+            or not self._teacher_actor_cache.ready
+        ):
+            self._rebuild_teacher_actor_cache(lineage)
+
+        size = int(self.q_teacher_replay.size)
+        if size < 1:
+            raise RuntimeError("Teacher Actor cache cannot populate an empty FIFO")
+        for key in (TEACHER_EPISODE_UID_KEY, TEACHER_EPISODE_STEP_KEY):
+            if key not in self.q_teacher_replay.data:
+                raise KeyError(f"Teacher FIFO lacks cache lineage key {key!r}")
+        self._teacher_ring_cache_lineage = lineage
+
+    @torch.no_grad()
+    def _teacher_actor_observations_for_indices(
+        self,
+        physical_indices: torch.Tensor,
+        *,
+        next_state: bool,
+    ) -> torch.Tensor:
+        """Gather current-lineage Teacher Actor inputs for sampled FIFO rows."""
+        self._ensure_teacher_actor_cache_current()
+        lineage = self._teacher_actor_cache_lineage()
+        if self._teacher_ring_cache_lineage != lineage:
+            raise RuntimeError("Teacher FIFO Actor cache lineage is stale")
+        indices = physical_indices.reshape(-1).to(
+            device=self.q_teacher_replay.device, dtype=torch.long
+        )
+        if bool((indices < 0).any()) or bool(
+            (indices >= int(self.q_teacher_replay.size)).any()
+        ):
+            raise IndexError("Teacher Actor cache sample index is outside the FIFO")
+        episode_uids = self.q_teacher_replay.data[
+            TEACHER_EPISODE_UID_KEY
+        ].index_select(0, indices)
+        episode_steps = self.q_teacher_replay.data[
+            TEACHER_EPISODE_STEP_KEY
+        ].index_select(0, indices)
+        return self._teacher_actor_cache.gather(
+            self._teacher_episode_store,
+            episode_uids,
+            episode_steps,
+            lineage=lineage,
+            next_state=next_state,
+            output_device=self.device,
+        )
+
+    @torch.no_grad()
+    def _prepare_raw_final_state(
+        self,
+        td: TensorDict,
+        *,
+        collection_actor_observations: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        result = {
             **self._raw_perception_values(td),
             "next_critic_observations": self._cat_replay_sources(
                 td, self.q_critic_keys
             ).clone(),
         }
+        if self._student_collection_actor_cache_enabled():
+            if collection_actor_observations is None:
+                collection_actor_observations = (
+                    self._materialize_collection_actor_observations(td)
+                )
+            expected_shape = (*td.batch_size, self._q_actor_dim)
+            if collection_actor_observations.shape != expected_shape:
+                raise ValueError(
+                    "Student final-state collection Actor cache is batch-misaligned"
+                )
+            if (
+                not collection_actor_observations.is_floating_point()
+                or not torch.isfinite(collection_actor_observations).all()
+            ):
+                raise ValueError(
+                    "Student final-state collection Actor cache contains NaN/Inf"
+                )
+            with torch.inference_mode(False):
+                result[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
+                    collection_actor_observations.detach().clone()
+                )
+        return result
 
     @torch.no_grad()
     def capture_truncation_final_observations(self, td: TensorDict, step: int):
@@ -3853,7 +4510,24 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         if not truncations.any():
             return
         indices = truncations.nonzero(as_tuple=False).squeeze(-1)
-        values = self._prepare_raw_final_state(td["next"][indices].clone())
+        # Run the perception stack once at its normal full-environment batch
+        # geometry, then retain only true timeout rows.  Subset execution can
+        # select a different compiled kernel (and introduce numerical jitter)
+        # from the live collector path.
+        full_next = td["next"].clone()
+        full_collection_actor = None
+        if self._student_collection_actor_cache_enabled():
+            full_collection_actor = self._materialize_collection_actor_observations(
+                full_next
+            )
+        values = self._prepare_raw_final_state(
+            td["next"][indices].clone(),
+            collection_actor_observations=(
+                None
+                if full_collection_actor is None
+                else full_collection_actor.index_select(0, indices)
+            ),
+        )
         values["indices"] = indices * int(self.cfg.train_every) + int(step)
         self._truncation_final_batches.append(values)
 
@@ -3884,22 +4558,52 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         burn_in = int(self.cfg.perception_replay_burn_in)
         final_batch = self._rollout_final_batch
         self._rollout_final_batch = None
-        raw_current = self._raw_perception_values(td)
+        collection_cache_enabled = self._student_collection_actor_cache_enabled()
+        raw_current = (
+            None if collection_cache_enabled else self._raw_perception_values(td)
+        )
+        collection_actor = None
+        if collection_cache_enabled:
+            if STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY not in td.keys(True, True):
+                raise KeyError(
+                    "FastSAC Student rollout is missing its collection Actor cache"
+                )
+            if STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY not in final_batch:
+                raise KeyError(
+                    "FastSAC rollout-final state is missing its collection Actor cache"
+                )
+            collection_actor = td[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY]
+            expected_shape = (int(n), int(t), self._q_actor_dim)
+            if collection_actor.shape != expected_shape:
+                raise ValueError(
+                    "FastSAC Student rollout collection Actor cache is misaligned"
+                )
+            final_actor = final_batch[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY]
+            if final_actor.shape != (int(n), self._q_actor_dim):
+                raise ValueError(
+                    "FastSAC rollout-final collection Actor cache is misaligned"
+                )
 
         history_count = int(self._perception_replay_history_count)
-        if self._perception_replay_history is None:
-            history = {key: value[:, :0] for key, value in raw_current.items()}
-        else:
-            history = self._perception_replay_history
-            if any(value.shape[0] != int(n) for value in history.values()):
-                raise RuntimeError("raw perception replay environment count changed")
-
+        history = {}
         sequence = {}
-        for key, current_value in raw_current.items():
-            final_value = final_batch[key].reshape(int(n), *current_value.shape[2:])
-            sequence[key] = torch.cat(
-                (history[key], current_value, final_value.unsqueeze(1)), dim=1
-            )
+        if not collection_cache_enabled:
+            if raw_current is None:  # pragma: no cover - branch invariant
+                raise RuntimeError("legacy replay lost its raw perception inputs")
+            if self._perception_replay_history is None:
+                history = {key: value[:, :0] for key, value in raw_current.items()}
+            else:
+                history = self._perception_replay_history
+                if any(value.shape[0] != int(n) for value in history.values()):
+                    raise RuntimeError("raw perception replay environment count changed")
+
+            for key, current_value in raw_current.items():
+                final_value = final_batch[key].reshape(
+                    int(n), *current_value.shape[2:]
+                )
+                sequence[key] = torch.cat(
+                    (history[key], current_value, final_value.unsqueeze(1)), dim=1
+                )
 
         truncation_batches = self._truncation_final_batches
         self._truncation_final_batches = []
@@ -3919,11 +4623,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             position = history_count + step
             if position < burn_in:
                 continue
-            window_values = {
-                key: value[:, position - burn_in : position + 2]
-                for key, value in sequence.items()
-            }
-            if any(value.shape[1] != burn_in + 2 for value in window_values.values()):
+            window_values = (
+                {}
+                if collection_cache_enabled
+                else {
+                    key: value[:, position - burn_in : position + 2]
+                    for key, value in sequence.items()
+                }
+            )
+            if not collection_cache_enabled and any(
+                value.shape[1] != burn_in + 2
+                for value in window_values.values()
+            ):
                 raise RuntimeError("raw perception replay window has invalid length")
 
             if step + 1 < int(t):
@@ -3934,6 +4645,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 next_critic = final_batch["next_critic_observations"].reshape(
                     int(n), self._q_critic_dim
                 )
+            if collection_cache_enabled:
+                current_actor = collection_actor[:, step].reshape(
+                    int(n), self._q_actor_dim
+                )
+                next_actor = (
+                    collection_actor[:, step + 1]
+                    if step + 1 < int(t)
+                    else final_batch[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY]
+                ).reshape(int(n), self._q_actor_dim)
 
             if truncation_finals is not None:
                 flat_indices = truncation_finals["indices"].long()
@@ -3948,11 +4668,29 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         env_indices,
                         truncation_finals["next_critic_observations"][selected],
                     )
-                    for key in _PERCEPTION_REPLAY_FIELDS:
-                        window_values[key] = window_values[key].clone()
-                        window_values[key][env_indices, -1] = truncation_finals[key][
-                            selected
-                        ]
+                    if not collection_cache_enabled:
+                        for key in _PERCEPTION_REPLAY_FIELDS:
+                            window_values[key] = window_values[key].clone()
+                            window_values[key][env_indices, -1] = truncation_finals[
+                                key
+                            ][selected]
+                    if collection_cache_enabled:
+                        if (
+                            STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY
+                            not in truncation_finals
+                        ):
+                            raise KeyError(
+                                "pure-timeout final is missing its carried-hidden "
+                                "Student Actor cache"
+                            )
+                        next_actor = next_actor.clone()
+                        next_actor.index_copy_(
+                            0,
+                            env_indices,
+                            truncation_finals[
+                                STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY
+                            ][selected],
+                        )
 
             motion_id = current.get(REPLAY_MOTION_ID_KEY, None)
             if motion_id is None:
@@ -4026,6 +4764,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 ),
                 TD3_BETA_KEY: current[TD3_BETA_KEY].reshape(int(n)),
             }
+            if collection_cache_enabled:
+                transitions[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = current_actor
+                transitions[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY] = (
+                    next_actor
+                )
             transitions, valid = _filter_replay_rows(
                 current, transitions, DAGGER_REPLAY_MIN_STEP_COUNT
             )
@@ -4039,11 +4782,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     used_truncation_finals += int(valid[env_indices].sum().item())
             yield transitions
 
-        combined_history = {
-            key: torch.cat((history[key], value), dim=1)[:, -burn_in:].detach()
-            for key, value in raw_current.items()
-        }
-        self._perception_replay_history = combined_history
+        if collection_cache_enabled:
+            self._perception_replay_history = None
+        else:
+            if raw_current is None:  # pragma: no cover - branch invariant
+                raise RuntimeError("legacy replay lost its raw perception inputs")
+            combined_history = {
+                key: torch.cat((history[key], value), dim=1)[:, -burn_in:].detach()
+                for key, value in raw_current.items()
+            }
+            self._perception_replay_history = combined_history
         self._perception_replay_history_count = min(burn_in, history_count + int(t))
         self._last_truncation_finals_used = used_truncation_finals
 
@@ -4154,17 +4902,56 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         return result
 
     def _prepare_dagger_learning_batch(self, batch):
-        """Normalize critic inputs and materialize only needed Actor states."""
+        """Normalize critic inputs and materialize only needed Actor states.
+
+        FastSAC/TVKD batches already contain source-specific flat Actor inputs:
+        collection-time carried-hidden values for Student rows and reset-exact
+        current-EMA values from the successful-episode cache for Teacher rows.
+        Baseline TD3 never enables this cache and follows its raw-window path.
+        """
         prepared = PPOBCDaggerFinetune._prepare_dagger_learning_batch(self, batch)
         include_current = DAGGER_REPLAY_TEACHER_ACTIONS in batch
         include_next = "next_critic_observations" in batch
-        prepared.update(
-            self._reencode_perception_windows(
-                prepared,
-                include_current=include_current,
-                include_next=include_next,
+        if not self._student_collection_actor_cache_enabled():
+            prepared.update(
+                self._reencode_perception_windows(
+                    prepared,
+                    include_current=include_current,
+                    include_next=include_next,
+                )
             )
+            return prepared
+        requested = tuple(
+            item
+            for item in (
+                (
+                    "observations",
+                    REPLAY_ACTOR_OBSERVATIONS_KEY,
+                    include_current,
+                ),
+                (
+                    "next_observations",
+                    REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY,
+                    include_next,
+                ),
+            )
+            if item[2]
         )
+        for output_key, cache_key, _ in requested:
+            cache = batch.get(cache_key, None)
+            if cache is None:
+                raise KeyError(
+                    f"collection-exact replay is missing Actor cache {cache_key!r}"
+                )
+            if cache.ndim != 2 or cache.shape[-1] != self._q_actor_dim:
+                raise ValueError(
+                    f"collection-exact Actor cache {cache_key!r} is misaligned"
+                )
+            if not cache.is_floating_point() or not torch.isfinite(cache).all():
+                raise ValueError(
+                    f"collection-exact Actor cache {cache_key!r} is invalid"
+                )
+            prepared[output_key] = cache
         return prepared
 
     @torch.no_grad()
@@ -4548,6 +5335,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         focused_teacher_count = requested_counts["failure_teacher"]
         student_count = requested_counts["uniform_student"] + focused_student_count
         teacher_count = requested_counts["uniform_teacher"] + focused_teacher_count
+        if (
+            teacher_count
+            and self._teacher_episode_cache_enabled()
+            and bool(getattr(self, "_teacher_prefill_complete", False))
+        ):
+            self._ensure_teacher_actor_cache_current()
         q_fields = self._q_replay_storage_fields()
         if not self._has_canonical_replay_mix():
             # Legacy unit/checkpoint seams may predate explicit boundary fields.
@@ -4560,6 +5353,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             else:
                 available = set(self.dagger_replay.data)
             q_fields = tuple(key for key in q_fields if key in available)
+        collection_cache_enabled = self._student_collection_actor_cache_enabled()
+        student_q_fields = q_fields
+        if collection_cache_enabled:
+            cache_key = REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY
+            if student_count and cache_key not in self.dagger_replay.data:
+                raise RuntimeError(
+                    "Student Q replay lacks collection-exact next Actor observations"
+                )
+            # Teacher Actor inputs live once in the current-EMA device cache;
+            # only Student rows own self-contained collection-time cache
+            # fields in their CPU FIFO.
+            student_q_fields = (*q_fields, cache_key)
         teacher = None
         student = None
         teacher_indices = torch.empty(0, dtype=torch.long)
@@ -4593,7 +5398,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     self.dagger_replay,
                     student_indices,
                     self.device,
-                    fields=q_fields,
+                    fields=student_q_fields,
                 )
                 focused_student = focused_student.to(self.device)
             permutation = torch.randperm(
@@ -4618,7 +5423,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     self.dagger_replay,
                     sample_plan.student_indices,
                     self.device,
-                    fields=q_fields,
+                    fields=student_q_fields,
                 )
             focused_teacher = (
                 torch.zeros(teacher_count, dtype=torch.bool, device=self.device)
@@ -4633,6 +5438,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             permutation = sample_plan.permutation
             if permutation.shape != (batch_size,):
                 raise ValueError("Q replay sample plan has the wrong permutation shape")
+        if collection_cache_enabled and teacher is not None:
+            teacher[REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY] = (
+                self._teacher_actor_observations_for_indices(
+                    teacher_indices, next_state=True
+                )
+            )
         if teacher is None:
             if (
                 student is None
@@ -4666,11 +5477,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         student_focused: torch.Tensor | None = None,
     ):
         """Sample one mixed Actor batch without changing the zero-share path."""
+        collection_cache_enabled = self._student_collection_actor_cache_enabled()
         main_fields = (
             "critic_observations",
             DAGGER_REPLAY_TEACHER_ACTIONS,
             DAGGER_TEACHER_ACTION_VALID_KEY,
-            *_PERCEPTION_REPLAY_FIELDS,
+            *(
+                (REPLAY_ACTOR_OBSERVATIONS_KEY,)
+                if collection_cache_enabled
+                else _PERCEPTION_REPLAY_FIELDS
+            ),
         )
         batch_size = int(self.cfg.dagger_batch_size)
         canonical_mix = self._has_canonical_replay_mix()
@@ -4682,6 +5498,21 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         focused_teacher_count = requested_counts["failure_teacher"]
         main_count = requested_counts["uniform_student"] + focused_student_count
         teacher_count = requested_counts["uniform_teacher"] + focused_teacher_count
+        if (
+            teacher_count
+            and self._teacher_episode_cache_enabled()
+            and bool(getattr(self, "_teacher_prefill_complete", False))
+        ):
+            self._ensure_teacher_actor_cache_current()
+        student_actor_fields = main_fields
+        if collection_cache_enabled:
+            if (
+                main_count
+                and REPLAY_ACTOR_OBSERVATIONS_KEY not in self.dagger_replay.data
+            ):
+                raise RuntimeError(
+                    "Student Actor replay lacks collection-exact Actor observations"
+                )
         student_curriculum_enabled = (
             hasattr(self.cfg, "failure_phase_student_fraction") or canonical_mix
         )
@@ -4707,7 +5538,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         self.dagger_replay,
                         indices,
                         self.device,
-                        fields=main_fields,
+                        fields=student_actor_fields,
                     )
                     focused_student = focused_student.to(self.device)
                 else:
@@ -4718,7 +5549,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         valid_key=(
                             DAGGER_IS_STUDENT_ACTION_KEY if curriculum_enabled else None
                         ),
-                        fields=main_fields,
+                        fields=student_actor_fields,
                     )
                     focused_student = torch.zeros(
                         batch_size, dtype=torch.bool, device=self.device
@@ -4727,7 +5558,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 if indices.numel() != batch_size:
                     raise ValueError("Actor replay sample plan has the wrong row count")
                 batch = self.dagger_replay.sample_by_indices(
-                    indices, self.device, fields=main_fields
+                    indices, self.device, fields=student_actor_fields
                 )
                 focused_student = (
                     torch.zeros(batch_size, dtype=torch.bool, device=self.device)
@@ -4760,10 +5591,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         teacher_fields = (
             "critic_observations",
             "actions",
-            *_PERCEPTION_REPLAY_FIELDS,
+            *(() if collection_cache_enabled else _PERCEPTION_REPLAY_FIELDS),
         )
         if teacher_indices is None:
-            if curriculum_enabled:
+            if curriculum_enabled or collection_cache_enabled:
+                # The device-resident Teacher cache is addressed by the exact
+                # physical FIFO rows selected for this Actor update.  Draw
+                # those indices explicitly even for legacy/no-curriculum
+                # fixtures; this preserves the replay RNG sequence used by
+                # ``_TD3DeviceReplay.sample`` while making cache addressing
+                # fail-closed and auditable.
                 teacher_indices, focused_teacher = self._sample_teacher_indices(
                     teacher_count,
                     self.q_rng,
@@ -4802,6 +5639,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 if teacher_focused is None
                 else teacher_focused.to(self.device)
             )
+        if collection_cache_enabled:
+            if teacher_indices is None:
+                raise RuntimeError(
+                    "collection-exact Teacher Actor sampling requires physical indices"
+                )
+            teacher[REPLAY_ACTOR_OBSERVATIONS_KEY] = (
+                self._teacher_actor_observations_for_indices(
+                    teacher_indices, next_state=False
+                )
+            )
         teacher[DAGGER_REPLAY_TEACHER_ACTIONS] = teacher.pop("actions")
         teacher[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(
             teacher_count, dtype=torch.bool, device=self.device
@@ -4824,7 +5671,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         self.dagger_replay,
                         indices,
                         self.device,
-                        fields=main_fields,
+                        fields=student_actor_fields,
                     )
                     focused_student = focused_student.to(self.device)
                 else:
@@ -4835,13 +5682,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         valid_key=(
                             DAGGER_IS_STUDENT_ACTION_KEY if curriculum_enabled else None
                         ),
-                        fields=main_fields,
+                        fields=student_actor_fields,
                     )
             else:
                 if indices.numel() != main_count:
                     raise ValueError("Actor replay sample plan has the wrong row count")
                 main = self.dagger_replay.sample_by_indices(
-                    indices, self.device, fields=main_fields
+                    indices, self.device, fields=student_actor_fields
                 )
                 focused_student = (
                     torch.zeros(main_count, dtype=torch.bool, device=self.device)
@@ -5358,7 +6205,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     @set_recurrent_mode(True)
     def train_adapt(self, tensordict: TensorDict):
-        """Mix frozen-Teacher raw replay into the existing adaptation steps."""
+        """Train perception under the selected live or compatibility contract."""
         if not bool(self.cfg.train_perception):
             # Frozen perception is inference-only: do not construct an online
             # graph, step its optimizer, or advance any EMA weights.
@@ -5798,6 +6645,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     self._discard_unresolved_teacher_prefill_rows()
                 )
                 teacher_rows_discarded += teacher_unresolved_rows_discarded
+                self._freeze_teacher_episode_replay()
             elif self.teacher_prefill_rollout_count >= int(
                 self.cfg.teacher_prefill_max_rollouts
             ):
@@ -5818,6 +6666,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 self._build_teacher_phase_index()
             if self._teacher_prefill_complete:
                 warmup_metrics = self._run_teacher_perception_warmup()
+                self._ensure_teacher_actor_cache_current()
             prefill_progress = self.q_teacher_replay.size / max(
                 self.q_teacher_replay.capacity, 1
             )
@@ -5923,6 +6772,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             not teacher_replay_required or self.q_teacher_replay.size >= learning_starts
         ) and (not student_replay_required or student_q_rows >= learning_starts)
         if replay_ready:
+            if teacher_replay_required:
+                self._ensure_teacher_actor_cache_current()
             q_updates = self._q_updates_due(appended)
             sample_plans = None
             if (
@@ -6018,7 +6869,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             ) and (not perception_student_required or student_q_rows > 0)
 
         if perception_replay_ready:
-            adapt_info = self.train_adapt(rollout.copy())
+            cache_keys = tuple(
+                key
+                for key in (
+                    REPLAY_ACTOR_OBSERVATIONS_KEY,
+                    REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY,
+                )
+                if key in rollout.keys(True, True)
+            )
+            perception_rollout = rollout.exclude(*cache_keys)
+            adapt_info = self.train_adapt(perception_rollout)
+            if bool(getattr(self.cfg, "train_perception", True)):
+                self._mark_perception_ema_updated()
         else:
             # An entire provenance ring can be unavailable on the first main
             # rollout (for example when beta selected Teacher everywhere).
@@ -6334,7 +7196,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         """
         if state_dict.get("training_algorithm") != TRAINING_ALGORITHM:
             raise ValueError("not a distributional TD3 Teacher-BC checkpoint")
-        if int(state_dict.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
+        if int(state_dict.get("checkpoint_version", -1)) not in (
+            PREVIOUS_CHECKPOINT_VERSION,
+            CHECKPOINT_VERSION,
+        ):
             raise ValueError("distributional TD3 checkpoint version mismatch")
         if state_dict.get("actor_backend") != ACTOR_BACKEND:
             raise ValueError("distributional TD3 actor backend mismatch")
@@ -6403,9 +7268,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     "exact_issued_action_with_separate_teacher_student_noise_metadata_v1"
                 ),
                 "replay_resume_semantics": (
-                    "fresh_only_online_raw_perception_rings_not_serialized_v2"
+                    "fresh_only_online_rings_and_teacher_sidecars_not_serialized_v3"
                 ),
                 "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
+                "actor_replay_observation_semantics": (
+                    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                    if self._student_collection_actor_cache_enabled()
+                    else PERCEPTION_REPLAY_SEMANTICS
+                ),
+                "teacher_episode_sidecar_semantics": (
+                    TEACHER_EPISODE_SIDECAR_SEMANTICS
+                    if self._teacher_episode_cache_enabled()
+                    else "disabled"
+                ),
                 "perception_training_semantics": (
                     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
                     if str(

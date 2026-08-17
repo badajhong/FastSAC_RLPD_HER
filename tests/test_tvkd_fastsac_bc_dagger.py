@@ -61,6 +61,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     V3_TRAINING_ALGORITHM as TVKD_V3_TRAINING_ALGORITHM,
     V4_CHECKPOINT_VERSION as TVKD_V4_CHECKPOINT_VERSION,
     V4_TRAINING_ALGORITHM as TVKD_V4_TRAINING_ALGORITHM,
+    V5_CHECKPOINT_VERSION as TVKD_V5_CHECKPOINT_VERSION,
+    V5_TRAINING_ALGORITHM as TVKD_V5_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
@@ -268,6 +270,12 @@ def _strict_v5_policy_metadata(
         "perception_training_semantics": (
             tvkd_module.ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
         ),
+        "actor_replay_observation_semantics": (
+            tvkd_module.COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+        ),
+        "teacher_episode_sidecar_semantics": (
+            tvkd_module.TEACHER_EPISODE_SIDECAR_SEMANTICS
+        ),
         "bottleneck_location_semantics": (tvkd_module.BOTTLENECK_LOCATION_SEMANTICS),
         "bottleneck_fallback_mode": str(cfg.bottleneck_fallback_mode),
         "teacher_value_return_semantics": str(cfg.teacher_value_return_semantics),
@@ -281,6 +289,7 @@ def _strict_v5_policy_metadata(
         "verified_teacher_value_histogram_state": copy.deepcopy(histogram_state),
         "failure_phase_curriculum_state": copy.deepcopy(histogram_state),
         "fresh_ring_resume_semantics": tvkd_module.FRESH_RING_RESUME_SEMANTICS,
+        "replay_resume_semantics": tvkd_module.REPLAY_RESUME_SEMANTICS,
         "q_backend_config": {
             "target_semantics": tvkd_module.CRITIC_LEARNING_SEMANTICS,
             "failure_phase_replay_semantics": (
@@ -2292,6 +2301,7 @@ def test_unsuccessful_episode_without_threshold_crossing_creates_no_focus():
         TVKD_PREVIOUS_TRAINING_ALGORITHM,
         TVKD_V3_TRAINING_ALGORITHM,
         TVKD_V4_TRAINING_ALGORITHM,
+        TVKD_V5_TRAINING_ALGORITHM,
         TVKD_TRAINING_ALGORITHM,
     ),
 )
@@ -2309,9 +2319,13 @@ def test_tvkd_inference_forces_checkpoint_value_norm_before_construction(algorit
     assert "value_norm" in result["checkpoint"]
 
 
-def test_tvkd_v5_version_identity_keeps_v4_as_an_inference_only_pair():
-    assert TVKD_TRAINING_ALGORITHM == "distributional_tvkd_fastsac_teacher_bc_v5"
-    assert TVKD_CHECKPOINT_VERSION == 5
+def test_tvkd_v6_version_identity_preserves_v5_for_safe_migration():
+    assert TVKD_TRAINING_ALGORITHM == "distributional_tvkd_fastsac_teacher_bc_v6"
+    assert TVKD_CHECKPOINT_VERSION == 6
+    assert TVKD_V5_TRAINING_ALGORITHM == (
+        "distributional_tvkd_fastsac_teacher_bc_v5"
+    )
+    assert TVKD_V5_CHECKPOINT_VERSION == 5
     assert TVKD_V4_TRAINING_ALGORITHM == ("distributional_tvkd_fastsac_teacher_bc_v4")
     assert TVKD_V4_CHECKPOINT_VERSION == 4
     assert TVKD_V3_TRAINING_ALGORITHM == ("distributional_tvkd_fastsac_teacher_bc_v3")
@@ -2333,7 +2347,10 @@ def test_tvkd_v4_training_resume_is_rejected_under_v5_sampler():
         )
 
 
-def test_tvkd_v5_inference_uses_the_replayless_model_only_loader():
+@pytest.mark.parametrize(
+    "algorithm", (TVKD_V5_TRAINING_ALGORITHM, TVKD_TRAINING_ALGORITHM)
+)
+def test_tvkd_v5_v6_inference_uses_the_replayless_model_only_loader(algorithm):
     calls = []
 
     class _InferencePolicy:
@@ -2343,16 +2360,16 @@ def test_tvkd_v5_inference_uses_the_replayless_model_only_loader():
 
         def load_state_dict(self, state):
             del state
-            raise AssertionError("v5 inference must not enter the training loader")
+            raise AssertionError("TVKD inference must not enter the training loader")
 
     result = _load_policy_checkpoint(
         _InferencePolicy(),
-        {"training_algorithm": TVKD_TRAINING_ALGORITHM},
+        {"training_algorithm": algorithm},
         inference_only=True,
     )
 
     assert result == ["model-only"]
-    assert calls == [(TVKD_TRAINING_ALGORITHM, True)]
+    assert calls == [(algorithm, True)]
 
 
 def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch):
@@ -2432,7 +2449,7 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
     assert not any(key.startswith("bc_scheduler/") for key in info)
 
 
-def test_tvkd_v5_checkpoint_saves_student_focus_and_detector_state(
+def test_tvkd_v6_checkpoint_saves_state_and_accepts_safe_v5_migration(
     monkeypatch,
 ):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
@@ -2515,6 +2532,12 @@ def test_tvkd_v5_checkpoint_saves_student_focus_and_detector_state(
     state = policy._fastsac_checkpoint_state()
     assert state["training_algorithm"] == TVKD_TRAINING_ALGORITHM
     assert state["checkpoint_version"] == TVKD_CHECKPOINT_VERSION
+    assert state["actor_replay_observation_semantics"] == (
+        tvkd_module.COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+    )
+    assert state["teacher_episode_sidecar_semantics"] == (
+        tvkd_module.TEACHER_EPISODE_SIDECAR_SEMANTICS
+    )
     assert state["dagger_backend_config"]["lambda_bc"] == pytest.approx(0.73)
     assert state["dagger_backend_config"][
         "failure_phase_student_fraction"
@@ -2590,6 +2613,23 @@ def test_tvkd_v5_checkpoint_saves_student_focus_and_detector_state(
         "distributional_fastsac_teacher_bc"
     )
     assert translated[0][1] is False
+
+    v5_state = copy.deepcopy(state)
+    v5_state["training_algorithm"] = TVKD_V5_TRAINING_ALGORITHM
+    v5_state["checkpoint_version"] = TVKD_V5_CHECKPOINT_VERSION
+    v5_state["fresh_ring_resume_semantics"] = (
+        tvkd_module.V5_FRESH_RING_RESUME_SEMANTICS
+    )
+    v5_state["replay_resume_semantics"] = tvkd_module.V5_REPLAY_RESUME_SEMANTICS
+    v5_state["dagger_backend_config"]["method"] = TVKD_V5_TRAINING_ALGORITHM
+    v5_state.pop("actor_replay_observation_semantics")
+    v5_state.pop("teacher_episode_sidecar_semantics")
+    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v6"):
+        policy._load_fastsac_checkpoint_state(v5_state, load_modules=False)
+    assert len(translated) == 2
+    assert translated[-1][0]["checkpoint_version"] == (
+        tvkd_module.BASE_FASTSAC_CHECKPOINT_VERSION
+    )
 
 
 def test_v5_checkpoint_rejects_binwise_motion_histogram_mismatch(monkeypatch):
@@ -2802,6 +2842,45 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     assert cfg._tvkd_model_only_resume is True
     assert cfg._bc_dagger_fresh_source is True
     assert cfg.algo.value_norm is False
+
+    v5_policy_state = copy.deepcopy(policy_state)
+    v5_policy_state["training_algorithm"] = TVKD_V5_TRAINING_ALGORITHM
+    v5_policy_state["checkpoint_version"] = TVKD_V5_CHECKPOINT_VERSION
+    v5_policy_state["fresh_ring_resume_semantics"] = (
+        tvkd_module.V5_FRESH_RING_RESUME_SEMANTICS
+    )
+    v5_policy_state["replay_resume_semantics"] = (
+        tvkd_module.V5_REPLAY_RESUME_SEMANTICS
+    )
+    v5_policy_state["dagger_backend_config"]["method"] = (
+        TVKD_V5_TRAINING_ALGORITHM
+    )
+    v5_policy_state.pop("actor_replay_observation_semantics")
+    v5_policy_state.pop("teacher_episode_sidecar_semantics")
+    v5_checkpoint_path = checkpoint_path.with_name("checkpoint_v5.pt")
+    torch.save(
+        {
+            "policy": v5_policy_state,
+            "vecnorm": {},
+            "cfg": saved_cfg,
+        },
+        v5_checkpoint_path,
+    )
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        v5_cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "fastsac_dagger_iterations=100",
+                f"fastsac_bc_dagger_checkpoint={v5_checkpoint_path}",
+            ],
+        )
+    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v6"):
+        v5_result = _prepare_tvkd_checkpoint(v5_cfg)
+    assert v5_result == {
+        "path": str(v5_checkpoint_path.resolve()),
+        "rollout_count": 600,
+    }
 
     mix_overrides = [
         "algo.q_teacher_replay_ratio=0.5",
@@ -3263,7 +3342,16 @@ def test_direct_v3_resume_preserves_cadence_and_exact_legacy_mix_but_resets_stat
     assert freezes == [True]
 
 
-def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypatch):
+@pytest.mark.parametrize(
+    ("algorithm", "version"),
+    (
+        (TVKD_TRAINING_ALGORITHM, TVKD_CHECKPOINT_VERSION),
+        (TVKD_V5_TRAINING_ALGORITHM, TVKD_V5_CHECKPOINT_VERSION),
+    ),
+)
+def test_public_tvkd_resume_rebuilds_rings_and_teacher_sidecars(
+    monkeypatch, algorithm, version
+):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
@@ -3277,6 +3365,18 @@ def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypat
         q_update_to_data_ratio=1.0,
         q_batch_size=512,
     )
+    policy._q_actor_dim = 1
+    stale_episode_store = object()
+    stale_actor_cache = object()
+    policy._teacher_episode_store = stale_episode_store
+    policy._teacher_actor_cache = stale_actor_cache
+    policy._teacher_prefill_raw_pending = [[{"stale": torch.tensor(1.0)}]]
+    policy._perception_ema_generation = 17
+    policy._teacher_ring_cache_lineage = object()
+    policy._teacher_episode_device_raw_fields = {
+        "stale": torch.tensor([1.0])
+    }
+    policy._teacher_episode_device_raw_lineage = object()
     restored = []
 
     def restore(self, state, *, load_modules=True):
@@ -3314,8 +3414,8 @@ def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypat
 
     result = policy.load_state_dict(
         {
-            "training_algorithm": TVKD_TRAINING_ALGORITHM,
-            "checkpoint_version": TVKD_CHECKPOINT_VERSION,
+            "training_algorithm": algorithm,
+            "checkpoint_version": version,
             "actor_backend": TVKD_ACTOR_BACKEND,
             "action_contract": {
                 "joint_names": ("joint",),
@@ -3331,6 +3431,16 @@ def test_public_tvkd_resume_calls_full_seam_then_rebuilds_online_rings(monkeypat
     assert restored and restored[0][1] is True
     assert policy.dagger_replay.cleared == 1
     assert policy.q_teacher_replay.cleared == 1
+    assert policy._teacher_episode_store is not stale_episode_store
+    assert policy._teacher_actor_cache is not stale_actor_cache
+    assert policy._teacher_episode_store.episode_count == 0
+    assert policy._teacher_actor_cache.ready is False
+    assert policy._teacher_actor_cache.actor_dim == 1
+    assert policy._teacher_prefill_raw_pending is None
+    assert policy._perception_ema_generation == 0
+    assert policy._teacher_ring_cache_lineage is None
+    assert policy._teacher_episode_device_raw_fields is None
+    assert policy._teacher_episode_device_raw_lineage is None
     assert policy._teacher_prefill_complete is False
     assert policy.teacher_prefill_rollout_count == 0
     assert policy.actor_adapt.training is True
