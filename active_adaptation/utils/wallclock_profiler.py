@@ -691,6 +691,11 @@ def instrument_training_policy(
     """
     specs = (
         MethodProfileSpec(
+            "train_op",
+            "training_operation",
+            "training_operation_calls",
+        ),
+        MethodProfileSpec(
             "_student_raw_action_proposal",
             "student_inference",
             "student_inference_calls",
@@ -735,6 +740,42 @@ def instrument_training_policy(
             "perception_samples",
             row_counter="perception_sample_rows",
             rows_from_result=True,
+        ),
+        MethodProfileSpec(
+            "_prefetch_curriculum_sample_plans",
+            "replay_sample_plan_prefetch",
+            "replay_sample_plan_prefetch_calls",
+        ),
+        MethodProfileSpec(
+            "_prepare_dagger_learning_batch",
+            "replay_batch_preparation",
+            "replay_batch_preparation_calls",
+            row_counter="replay_batch_preparation_rows",
+        ),
+        MethodProfileSpec(
+            "_record_replay_mix_batch",
+            "replay_mix_diagnostics",
+            "replay_mix_diagnostic_calls",
+        ),
+        MethodProfileSpec(
+            "_replay_mix_metrics",
+            "replay_mix_metrics",
+            "replay_mix_metric_calls",
+        ),
+        MethodProfileSpec(
+            "_update_failure_phase_histogram",
+            "failure_phase_bookkeeping",
+            "failure_phase_bookkeeping_calls",
+        ),
+        MethodProfileSpec(
+            "_student_teacher_td_residual_grid",
+            "teacher_value_rollout_grid",
+            "teacher_value_rollout_grid_calls",
+        ),
+        MethodProfileSpec(
+            "_record_teacher_phase_match_distances",
+            "teacher_phase_match_diagnostics",
+            "teacher_phase_match_diagnostic_calls",
         ),
         MethodProfileSpec(
             "_reencode_perception_windows",

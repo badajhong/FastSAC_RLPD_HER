@@ -21,7 +21,7 @@ algo:
   # cadence as a legacy compatibility contract.
   sac_alpha_update_cadence: actor
 
-  # Canonical global four-way replay mixtures. Each objective owns an
+  # Canonical Q/Actor four-way replay mixtures. Each replay objective owns an
   # independent distribution whose four entries sum to exactly one. Focused
   # shortages backfill only into the uniform source of the same provenance.
   q_uniform_student_fraction: 0.35
@@ -34,14 +34,24 @@ algo:
   actor_uniform_teacher_fraction: 0.35
   actor_failure_teacher_fraction: 0.15
 
-  perception_uniform_student_fraction: 0.35
-  perception_failure_student_fraction: 0.15
-  perception_uniform_teacher_fraction: 0.35
-  perception_failure_teacher_fraction: 0.15
-  perception_replay_mode: four_way
+  # Perception matches PPOVEL finetune: train twice over the complete current
+  # recurrent Student rollout and never sample perception rows from replay.
+  perception_uniform_student_fraction: 1.0
+  perception_failure_student_fraction: 0.0
+  perception_uniform_teacher_fraction: 0.0
+  perception_failure_teacher_fraction: 0.0
+  perception_replay_mode: online_student_rollout
 
-  # Scientific-main bottlenecks are verified solely by a sustained frozen
-  # Teacher-value residual. No terminal/legacy location fallback is allowed.
+  # Physical-failure prevention curriculum: raw production residual MA(5),
+  # three consecutive endpoints below -0.05, then only replay-valid Student
+  # rows within the ten transition steps before onset. No onset/post-onset or
+  # older-row backfill is allowed.
+  bottleneck_threshold: 0.05
+  bottleneck_smoothing_window: 5
+  bottleneck_min_consecutive: 3
+  bottleneck_terminal_exclusion_steps: 5
+  failure_phase_lookback_steps: 10
+  failure_phase_samples_per_failure: 10
   bottleneck_fallback_mode: none
-  bottleneck_include_unsuccessful_timeouts: true
+  bottleneck_include_unsuccessful_timeouts: false
   max_teacher_phase_match_distance: null

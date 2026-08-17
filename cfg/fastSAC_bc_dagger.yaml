@@ -54,12 +54,12 @@ algo:
   # ceiling; failed and timed-out trajectories never reach frozen replay.
   # Source fractions change sampling/loss weights, not this ring's allocation.
   teacher_prefill_max_rollouts: 1000
-  # Actor replay and perception supervision independently accept any Teacher
-  # share/weight in [0, 1]; each remainder comes from live Student data.
-  # Within each Teacher allocation, 30% is phase-focused and safely falls back
-  # to uniform Teacher sampling until a Student failure supplies risk phases.
+  # Actor replay accepts an independent Teacher share. Perception is different:
+  # it follows PPOVEL finetune exactly and learns only from the current live
+  # recurrent Student rollout, never from either replay ring.
   teacher_actor_replay_fraction: 0.5
-  teacher_perception_replay_fraction: 0.5
+  teacher_perception_replay_fraction: 0.0
+  perception_replay_mode: online_student_rollout
   failure_phase_teacher_fraction: 0.3
   # Each failed Student episode contributes ten evenly spaced reference-phase
   # samples from the inclusive [done - 50, done] interval.  The histogram is
@@ -80,15 +80,16 @@ algo:
   # a smaller GPU cannot accommodate the temporary activation memory.
   perception_encode_microbatch_size: 512
   teacher_perception_batch_size: 128
-  # One-shot Teacher-only perception updates at the prefill/main boundary.
-  # Set 0 to disable. Online weights are hard-synchronized to EMA afterward.
-  teacher_perception_warmup_steps: 128
+  # Teacher-only perception warm-up is disabled by the live Student contract.
+  teacher_perception_warmup_steps: 0
   perception_depth_codec: uint8_div_100_v1
   # Optional perception warm start.  A Student checkpoint must contain the
   # complete online + EMA depth/object/adaptation stack.  Alternatively this
   # may equal the train-phase PPO checkpoint_path: PPOVEL-compatible loading
   # then restores its object/adaptation online + EMA modules, initializes the
   # absent depth CNN/GRU modules freshly, and requires train_perception=true.
+  # With live-only perception and zero Teacher warm-up, that partial case has
+  # the same fresh-depth first rollout as PPOVEL finetune by design.
   load_pretrained_perception: false
   perception_checkpoint_path: null
   # Disable only to freeze a successfully loaded complete perception stack.

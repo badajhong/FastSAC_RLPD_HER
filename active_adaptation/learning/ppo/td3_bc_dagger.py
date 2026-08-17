@@ -122,6 +122,9 @@ TEACHER_PREFILL_SEMANTICS = (
 PERCEPTION_PREFILL_WARMUP_SEMANTICS = (
     "teacher_raw_replay_supervised_online_updates_then_hard_ema_sync_v1"
 )
+PERCEPTION_PREFILL_DISABLED_SEMANTICS = (
+    "disabled_for_ppovel_live_student_rollout_v1"
+)
 
 # Authoritative perception replay fields.  These contain only sensor/model
 # inputs; collection-time priv_pred/depth_hx/adapt_hx are deliberately absent.
@@ -181,6 +184,10 @@ FAILURE_PHASE_REPLAY_SEMANTICS = (
 )
 PERCEPTION_REPLAY_SEMANTICS = (
     "raw_input_current_ema_reencode_zero_boundary_burn_in_8_v1"
+)
+ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE = "online_student_rollout"
+ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS = (
+    "ppovel_live_recurrent_student_rollout_2epoch_v1"
 )
 PERCEPTION_DEPTH_CODEC = "uint8_div_100_v1"
 PERCEPTION_WARMSTART_SEMANTICS = (
@@ -1198,8 +1205,10 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     perception_replay_burn_in: int = 8
     perception_encode_microbatch_size: int = 128
     teacher_perception_batch_size: int = 128
-    # Baseline TD3/FastSAC retains the historical live-rollout Student path.
-    # TVKD v4 overrides this to ``four_way`` and supplies canonical fractions.
+    # ``online_student_rollout`` delegates perception training exactly to
+    # PPOVEL.train_adapt: two epochs over the current recurrent rollout and no
+    # perception replay sampling.  The older modes remain available only for
+    # explicitly configured TD3/checkpoint-compatibility paths.
     perception_replay_mode: str = "legacy_online_student"
     perception_replay_batch_size: int = 128
     # Teacher-replay-only supervised updates performed exactly once after the
@@ -1771,9 +1780,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         perception_replay_mode = str(
             getattr(cfg, "perception_replay_mode", "legacy_online_student")
         )
-        if perception_replay_mode not in ("legacy_online_student", "four_way"):
+        if perception_replay_mode not in (
+            "legacy_online_student",
+            "four_way",
+            ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
+        ):
             raise ValueError(
-                "perception_replay_mode must be 'legacy_online_student' or 'four_way'"
+                "perception_replay_mode must be 'online_student_rollout', "
+                "'legacy_online_student', or 'four_way'"
             )
         if perception_replay_mode == "four_way" and bool(cfg.train_dr_estimator):
             raise ValueError(
@@ -1843,6 +1857,34 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError(
                 "teacher_perception_warmup_steps must be a non-negative integer"
             )
+        if perception_replay_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE:
+            if float(cfg.teacher_perception_replay_fraction) != 0.0:
+                raise ValueError(
+                    "online_student_rollout perception requires "
+                    "teacher_perception_replay_fraction=0"
+                )
+            if int(warmup_steps) != 0:
+                raise ValueError(
+                    "online_student_rollout perception requires "
+                    "teacher_perception_warmup_steps=0"
+                )
+            if present_canonical:
+                expected_perception_mix = {
+                    "uniform_student": 1.0,
+                    "failure_student": 0.0,
+                    "uniform_teacher": 0.0,
+                    "failure_teacher": 0.0,
+                }
+                for source, expected in expected_perception_mix.items():
+                    actual = float(
+                        getattr(cfg, f"perception_{source}_fraction")
+                    )
+                    if actual != expected:
+                        raise ValueError(
+                            "online_student_rollout perception requires "
+                            "perception_uniform_student_fraction=1 and every "
+                            "perception replay fraction=0"
+                        )
         if int(cfg.q_teacher_buffer_capacity) < int(cfg.td3_learning_starts):
             raise ValueError("q_teacher_buffer_capacity must cover td3_learning_starts")
         for name in (
@@ -2810,6 +2852,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         result = replay.data[key].index_select(0, replay_indices).reshape(-1).bool()
         return result if result.device == indices.device else result.to(indices.device)
 
+    def _teacher_phase_match_pool(
+        self,
+        motion_id: int,
+        risk_bin: int,
+    ) -> tuple[int, torch.Tensor] | None:
+        """Return the nearest same-motion phase rows in ascending replay order."""
+        teacher_motion = self._teacher_replay_motion_ids
+        same_motion = (
+            (teacher_motion == int(motion_id)).nonzero(as_tuple=False).squeeze(-1)
+        )
+        if same_motion.numel() == 0:
+            return None
+        motion_bins = self._teacher_replay_phase_bins.index_select(0, same_motion)
+        distances = (motion_bins - int(risk_bin)).abs()
+        nearest_distance = int(distances.min().item())
+        return nearest_distance, same_motion[distances == nearest_distance]
+
     def _verified_teacher_focus_pool(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2885,24 +2944,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             return cached[1], cached[2]
 
         row_weights = torch.zeros(int(self.q_teacher_replay.size), dtype=torch.float64)
-        teacher_motion = self._teacher_replay_motion_ids
-        teacher_bins = self._teacher_replay_phase_bins
         for motion, histogram in normalized:
-            same_motion = (teacher_motion == motion).nonzero(as_tuple=False).squeeze(-1)
-            if same_motion.numel() == 0:
-                continue
-            motion_bins = teacher_bins.index_select(0, same_motion)
             for risk_bin in (
                 (histogram > 0).nonzero(as_tuple=False).squeeze(-1).tolist()
             ):
-                distances = (motion_bins - int(risk_bin)).abs()
-                nearest_distance = int(distances.min().item())
+                match = self._teacher_phase_match_pool(motion, int(risk_bin))
+                if match is None:
+                    continue
+                nearest_distance, pool = match
                 if (
                     max_distance is not None
                     and nearest_distance / float(bin_count) > max_distance
                 ):
                     continue
-                pool = same_motion[distances == nearest_distance]
                 # Preserve anchor-frequency weighting without making a dense
                 # phase bin more likely solely because it contains more rows.
                 row_weights[pool] += float(histogram[risk_bin]) / int(pool.numel())
@@ -4383,6 +4437,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "perception_replay_mode": str(
                 getattr(self.cfg, "perception_replay_mode", "legacy_online_student")
             ),
+            "perception_training_semantics": (
+                ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                if str(
+                    getattr(
+                        self.cfg,
+                        "perception_replay_mode",
+                        "legacy_online_student",
+                    )
+                )
+                == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+                else PERCEPTION_REPLAY_SEMANTICS
+            ),
             "actor_replay_mix_semantics": (
                 "combined_rl_bc_on_prefill_teacher_and_student_executed_rows_v2"
             ),
@@ -5303,9 +5369,67 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "adapt/grad_norm": 0.0,
                 "adapt/depth_grad_norm": 0.0,
             }
+        perception_mode = str(
+            getattr(self.cfg, "perception_replay_mode", "legacy_online_student")
+        )
+        if perception_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE:
+            reset = tensordict["is_init"].bool()
+            student_source = tensordict.get(DAGGER_IS_STUDENT_ACTION_KEY, None)
+            if student_source is not None:
+                while student_source.ndim < reset.ndim:
+                    student_source = student_source.unsqueeze(-1)
+                while reset.ndim < student_source.ndim:
+                    reset = reset.unsqueeze(-1)
+                teacher_controlled = (~reset) & ~student_source.bool()
+                if bool(teacher_controlled.any()):
+                    raise RuntimeError(
+                        "online_student_rollout perception received a "
+                        "Teacher-controlled live transition"
+                    )
+            # This is deliberately a direct delegation, not a reimplementation:
+            # PPOVEL owns the recurrent [num_envs, train_every] minibatching,
+            # reset masking, two optimizer epochs, gradient clipping, and the
+            # single online-to-EMA update.  No replay sampler or zero-state
+            # recurrent reconstruction is reachable from this branch.
+            result = PPOVEL.train_adapt(self, tensordict)
+            if student_source is None:
+                online_student_fraction = (~reset).float().mean().item()
+            else:
+                online_student_fraction = (
+                    (~reset) & student_source.bool()
+                ).float().mean().item()
+            result.update(
+                {
+                    "adapt/perception_frozen": 0.0,
+                    "adapt/perception_online_student_rollout": 1.0,
+                    "adapt/perception_four_way": 0.0,
+                    "adapt/perception_replay_rows": 0.0,
+                    "adapt/perception_live_rows": float(
+                        math.prod(tensordict.batch_size)
+                    ),
+                    "adapt/perception_optimizer_steps": float(
+                        2 * int(self.cfg.num_minibatches)
+                    ),
+                    "adapt/perception_sequence_length": float(
+                        tensordict.batch_size[-1]
+                    ),
+                    "adapt/online_priv_loss": result["adapt/priv_loss"],
+                    "adapt/online_object_loss": result["adapt/object_loss"],
+                    "adapt/online_student_fraction": online_student_fraction,
+                    "adapt/teacher_replay_priv_loss": 0.0,
+                    "adapt/teacher_replay_object_loss": 0.0,
+                    "adapt/teacher_replay_fraction": 0.0,
+                    "adapt/teacher_replay_rows": 0.0,
+                    "adapt/teacher_replay_valid_fraction": 0.0,
+                    "adapt/replay_student_fraction": 0.0,
+                    "adapt/replay_teacher_fraction": 0.0,
+                    "adapt/failure_phase_student_fraction": 0.0,
+                    "adapt/failure_phase_teacher_fraction": 0.0,
+                }
+            )
+            return result
         if (
-            str(getattr(self.cfg, "perception_replay_mode", "legacy_online_student"))
-            == "four_way"
+            perception_mode == "four_way"
         ):
             # Deliberately do not inspect or transform ``tensordict`` here: in
             # v4 it is not an implicit fifth perception source.
@@ -6282,6 +6406,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     "fresh_only_online_raw_perception_rings_not_serialized_v2"
                 ),
                 "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
+                "perception_training_semantics": (
+                    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                    if str(
+                        getattr(
+                            self.cfg,
+                            "perception_replay_mode",
+                            "legacy_online_student",
+                        )
+                    )
+                    == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+                    else PERCEPTION_REPLAY_SEMANTICS
+                ),
                 "perception_prefill_warmup_semantics": (
                     PERCEPTION_PREFILL_WARMUP_SEMANTICS
                 ),

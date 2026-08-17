@@ -30,6 +30,9 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     TRAINING_ALGORITHM,
     _validate_fastsac_entropy_target_controls,
 )
+from active_adaptation.learning.ppo.td3_bc_dagger import (
+    ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
+)
 
 try:
     from .train import run_training
@@ -286,6 +289,47 @@ def _validate_failure_phase_teacher_sampling(cfg: DictConfig) -> None:
         raise ValueError(
             "algo.failure_phase_samples_per_failure cannot exceed the inclusive "
             "algo.failure_phase_lookback_steps + 1 interval"
+        )
+
+
+def _validate_online_student_perception_contract(cfg: DictConfig) -> None:
+    """Lock fresh FastSAC perception to PPOVEL's live-rollout optimizer."""
+    mode = str(cfg.algo.get("perception_replay_mode", ""))
+    if mode != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE:
+        raise ValueError(
+            "FastSAC perception requires "
+            "algo.perception_replay_mode='online_student_rollout'"
+        )
+    if float(cfg.algo.get("teacher_perception_replay_fraction", math.nan)) != 0.0:
+        raise ValueError(
+            "FastSAC live-rollout perception requires "
+            "algo.teacher_perception_replay_fraction=0"
+        )
+    if int(cfg.algo.get("teacher_perception_warmup_steps", -1)) != 0:
+        raise ValueError(
+            "FastSAC live-rollout perception requires "
+            "algo.teacher_perception_warmup_steps=0"
+        )
+    canonical = {
+        "perception_uniform_student_fraction": 1.0,
+        "perception_failure_student_fraction": 0.0,
+        "perception_uniform_teacher_fraction": 0.0,
+        "perception_failure_teacher_fraction": 0.0,
+    }
+    for name, expected in canonical.items():
+        if name in cfg.algo and float(cfg.algo.get(name)) != expected:
+            raise ValueError(
+                "FastSAC live-rollout perception requires canonical mix "
+                "US=1, FS=UT=FT=0"
+            )
+    if (
+        str(cfg.algo.get("dagger_control_mode", "")) != "beta"
+        or float(cfg.algo.get("dagger_beta_start", math.nan)) != 0.0
+        or float(cfg.algo.get("dagger_beta_end", math.nan)) != 0.0
+    ):
+        raise ValueError(
+            "FastSAC live Student perception requires beta control with "
+            "algo.dagger_beta_start=algo.dagger_beta_end=0"
         )
 
 
@@ -659,6 +703,7 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     _validate_failure_phase_teacher_sampling(cfg)
     _validate_replay_contract(cfg)
     _validate_sac_controls(cfg)
+    _validate_online_student_perception_contract(cfg)
 
     if not math.isclose(
         float(cfg.algo.get("q_update_to_data_ratio", math.nan)),
@@ -782,7 +827,8 @@ def main(cfg: DictConfig):
         f"lambda_bc={float(cfg.algo.lambda_bc):g}, "
         f"alpha_init={float(cfg.algo.sac_alpha_init):g}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence} "
-        f"(every {int(cfg.algo.sac_policy_frequency)} Critic updates)"
+        f"(every {int(cfg.algo.sac_policy_frequency)} Critic updates); "
+        "perception=live Student rollout only (PPOVEL finetune)"
     )
     return run_training(cfg)
 

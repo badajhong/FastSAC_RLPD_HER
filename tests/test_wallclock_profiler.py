@@ -42,6 +42,24 @@ class _Policy:
     def _actor_update(self, batch):
         return batch
 
+    def _record_teacher_phase_match_distances(self, phases, motion_ids):
+        return phases, motion_ids
+
+    def _update_failure_phase_histogram(self, batch):
+        rows = next(iter(batch.values())).shape[0]
+        phases = torch.zeros(rows)
+        self._record_teacher_phase_match_distances(
+            phases, torch.zeros(rows, dtype=torch.long)
+        )
+        return rows
+
+    def _prepare_dagger_learning_batch(self, batch):
+        return batch
+
+    def train_op(self, batch):
+        self._update_failure_phase_histogram(batch)
+        return self._prepare_dagger_learning_batch(batch)
+
 
 def test_phase_window_profiles_methods_and_restores_them(tmp_path):
     config = WallClockProfileConfig(
@@ -71,6 +89,7 @@ def test_phase_window_profiles_methods_and_restores_them(tmp_path):
     policy._teacher_action(observations)
     policy._batched_frozen_teacher_value(observations)
     policy._critic_update({"critic_observations": observations})
+    policy.train_op({"critic_observations": observations})
     policy.dagger_replay.extend({"x": torch.ones(5, 2)})
     profiler.increment("environment_states", 10)
     profiler.end_rollout(6, phase_rollout=1)
@@ -91,7 +110,14 @@ def test_phase_window_profiles_methods_and_restores_them(tmp_path):
     assert summary["counters"]["teacher_value_target_states"] == 7
     assert summary["counters"]["frozen_teacher_rollout_grid_states"] == 5
     assert summary["counters"]["replay_insert_rows"] == 5
+    assert summary["counters"]["training_operation_calls"] == 1
+    assert summary["counters"]["failure_phase_bookkeeping_calls"] == 1
+    assert summary["counters"]["teacher_phase_match_diagnostic_calls"] == 1
+    assert summary["counters"]["replay_batch_preparation_rows"] == 5
     assert summary["blocks"]["c51_q_forward_backward"]["calls"] == 2
+    assert summary["blocks"]["training_operation"]["calls"] == 1
+    assert summary["blocks"]["failure_phase_bookkeeping"]["calls"] == 1
+    assert summary["blocks"]["teacher_phase_match_diagnostics"]["calls"] == 1
     # Grid inference must not be misclassified as target-time Teacher value.
     assert summary["blocks"]["teacher_value_inside_tvkd_target"]["calls"] == 2
 

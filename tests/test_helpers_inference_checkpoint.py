@@ -143,7 +143,9 @@ def test_legacy_fastsac_inference_config_uses_checkpoint_then_defaults():
     assert "sac_policy_frequency" in filled["checkpoint"]
     assert "sac_initial_action_std" in filled["checkpoint"]
     # Fields introduced after that checkpoint use current construction defaults.
-    assert cfg.algo.teacher_perception_warmup_steps == 128
+    assert cfg.algo.teacher_perception_warmup_steps == 0
+    assert cfg.algo.teacher_perception_replay_fraction == 0.0
+    assert cfg.algo.perception_replay_mode == "online_student_rollout"
     assert cfg.algo.teacher_actor_replay_fraction == 0.5
     assert cfg.algo.teacher_perception_batch_size == 128
     assert cfg.algo.load_pretrained_perception is False

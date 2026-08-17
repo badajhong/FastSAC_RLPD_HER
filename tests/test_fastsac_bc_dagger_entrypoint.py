@@ -44,7 +44,7 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "dagger_batch_size": 4096,
                 "teacher_prefill_max_rollouts": 10,
                 "teacher_actor_replay_fraction": 0.5,
-                "teacher_perception_replay_fraction": 0.5,
+                "teacher_perception_replay_fraction": 0.0,
                 "failure_phase_teacher_fraction": 0.3,
                 "failure_phase_lookback_steps": 50,
                 "failure_phase_samples_per_failure": 10,
@@ -54,9 +54,10 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                     sac_entry.EXPECTED_REPLAY_RAW_OBSERVATION_KEYS
                 ),
                 "perception_replay_burn_in": 8,
+                "perception_replay_mode": "online_student_rollout",
                 "perception_encode_microbatch_size": 128,
                 "teacher_perception_batch_size": 128,
-                "teacher_perception_warmup_steps": 128,
+                "teacher_perception_warmup_steps": 0,
                 "perception_depth_codec": "uint8_div_100_v1",
                 "load_pretrained_perception": False,
                 "perception_checkpoint_path": None,
@@ -174,7 +175,8 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     assert cfg.algo.teacher_prefill_max_rollouts == 1000
     assert "teacher_prefill_rollouts" not in cfg.algo
     assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.5)
-    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.5)
+    assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.0)
+    assert cfg.algo.perception_replay_mode == "online_student_rollout"
     assert cfg.algo.failure_phase_teacher_fraction == pytest.approx(0.3)
     assert cfg.algo.failure_phase_lookback_steps == 50
     assert cfg.algo.failure_phase_samples_per_failure == 10
@@ -188,7 +190,7 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     ) == pytest.approx(0.35)
     assert cfg.algo.teacher_perception_batch_size == 128
     assert cfg.algo.perception_encode_microbatch_size == 512
-    assert cfg.algo.teacher_perception_warmup_steps == 128
+    assert cfg.algo.teacher_perception_warmup_steps == 0
     assert cfg.algo.load_pretrained_perception is False
     assert cfg.algo.perception_checkpoint_path is None
     assert cfg.algo.train_perception is True
@@ -403,7 +405,6 @@ def test_teacher_replay_fractions_must_be_finite_unit_interval(field, value):
     "field",
     (
         "teacher_actor_replay_fraction",
-        "teacher_perception_replay_fraction",
         "q_teacher_replay_ratio",
     ),
 )
@@ -413,6 +414,44 @@ def test_teacher_source_fractions_are_cli_configurable(field, fraction):
     cfg.algo[field] = fraction
 
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize("fraction", (0.1, 0.5, 1.0))
+def test_teacher_perception_replay_fraction_is_locked_off(fraction):
+    cfg = _cfg()
+    cfg.algo.teacher_perception_replay_fraction = fraction
+
+    with pytest.raises(ValueError, match="teacher_perception_replay_fraction=0"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_live_student_perception_mode_and_teacher_warmup_are_locked():
+    cfg = _cfg()
+    cfg.algo.perception_replay_mode = "four_way"
+    with pytest.raises(ValueError, match="online_student_rollout"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    cfg = _cfg()
+    cfg.algo.teacher_perception_warmup_steps = 1
+    with pytest.raises(ValueError, match="teacher_perception_warmup_steps=0"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("dagger_control_mode", "safe"),
+        ("dagger_control_mode", "hybrid"),
+        ("dagger_beta_start", 0.1),
+        ("dagger_beta_end", 0.1),
+    ),
+)
+def test_entrypoint_locks_live_perception_to_pure_student_control(field, value):
+    cfg = _cfg()
+    cfg.algo[field] = value
+
+    with pytest.raises(ValueError, match="beta"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
 def test_configurable_source_mixes_accept_odd_batch_sizes():

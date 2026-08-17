@@ -12,9 +12,10 @@ prefill, DAgger source selection, timeout handling, and twin-C51 topology from
   expected return; and
 * there is a target critic but no target Actor or TD3 smoothing noise.
 
-Replay perception remains input-authoritative.  Collection-time ``priv_pred``
-and recurrent hidden states are never treated as durable replay features, and
-the duplicate Teacher H5 export remains disabled.
+Replay observations remain input-authoritative for Q and Actor updates.
+Perception itself is trained only from the current live Student rollout through
+the exact PPOVEL finetune path; it never samples the replay rings.  The
+duplicate Teacher H5 export remains disabled.
 """
 
 from __future__ import annotations
@@ -65,10 +66,11 @@ from .ppo_vel import (
 from .td3_bc_dagger import (
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
-    PERCEPTION_PREFILL_WARMUP_SEMANTICS,
+    ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
+    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
+    PERCEPTION_PREFILL_DISABLED_SEMANTICS,
     PERCEPTION_REPLAY_SEMANTICS,
     REPLAY_MOTION_ID_KEY,
-    TEACHER_PREFILL_SEMANTICS,
     TD3_BETA_KEY,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
@@ -105,6 +107,10 @@ ACTOR_LEARNING_SEMANTICS = (
 ENTROPY_SEMANTICS = (
     "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
     "auto_temperature_delayed_actor_cadence_v3"
+)
+FASTSAC_TEACHER_PREFILL_SEMANTICS = (
+    "forced_valid_teacher_successful_episode_commit_until_replay_capacity_"
+    "then_main_live_student_perception_v1"
 )
 _CRITIC_CADENCE_ENTROPY_SEMANTICS = (
     "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
@@ -202,6 +208,12 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # Process larger replay chunks on the target 5090 so the increased Q UTD
     # does not multiply small depth-encoder launches.
     perception_encode_microbatch_size: int = 512
+    # Match PPOVEL finetune exactly for perception: every main iteration uses
+    # only its live recurrent Student rollout (for the production setup,
+    # [512, 32]), with no Teacher/Student perception replay or prefill warm-up.
+    teacher_perception_replay_fraction: float = 0.0
+    perception_replay_mode: str = ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+    teacher_perception_warmup_steps: int = 0
 
     eta_sac: float = 1e-4
     lambda_bc: float = 1.0
@@ -513,6 +525,31 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         base_cfg = copy.copy(cfg)
         base_cfg.eta_td3 = float(cfg.eta_sac)
         DistributionalTD3TeacherBC._validate_td3_config(base_cfg)
+        if str(cfg.perception_replay_mode) != (
+            ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+        ):
+            raise ValueError(
+                "FastSAC perception is locked to online_student_rollout"
+            )
+        if float(cfg.teacher_perception_replay_fraction) != 0.0:
+            raise ValueError(
+                "FastSAC online Student perception requires "
+                "teacher_perception_replay_fraction=0"
+            )
+        if int(cfg.teacher_perception_warmup_steps) != 0:
+            raise ValueError(
+                "FastSAC online Student perception requires "
+                "teacher_perception_warmup_steps=0"
+            )
+        if (
+            str(cfg.dagger_control_mode) != "beta"
+            or float(cfg.dagger_beta_start) != 0.0
+            or float(cfg.dagger_beta_end) != 0.0
+        ):
+            raise ValueError(
+                "FastSAC live Student perception requires beta control with "
+                "dagger_beta_start=dagger_beta_end=0"
+            )
         exact_zero = (
             "eta_td3",
             "target_policy_noise_std",
@@ -1469,10 +1506,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "fresh_only_online_raw_perception_rings_not_serialized_v1"
                 ),
                 "perception_replay_semantics": PERCEPTION_REPLAY_SEMANTICS,
-                "perception_prefill_warmup_semantics": (
-                    PERCEPTION_PREFILL_WARMUP_SEMANTICS
+                "perception_training_semantics": (
+                    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
                 ),
-                "teacher_prefill_semantics": TEACHER_PREFILL_SEMANTICS,
+                "perception_prefill_warmup_semantics": (
+                    PERCEPTION_PREFILL_DISABLED_SEMANTICS
+                ),
+                "teacher_prefill_semantics": FASTSAC_TEACHER_PREFILL_SEMANTICS,
                 "perception_initialization": copy.deepcopy(
                     self._perception_initialization
                 ),

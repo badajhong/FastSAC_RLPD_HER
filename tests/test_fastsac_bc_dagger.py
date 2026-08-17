@@ -26,6 +26,7 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
 )
 from active_adaptation.learning.ppo.ppo_vel import PPOVEL
 from active_adaptation.learning.ppo.td3_bc_dagger import (
+    ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     PRETRAINED_PERCEPTION_MODULES,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
@@ -187,6 +188,9 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
+    assert cfg.perception_replay_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+    assert cfg.teacher_perception_replay_fraction == 0.0
+    assert cfg.teacher_perception_warmup_steps == 0
 
 
 def test_config_allows_explicit_pure_sac_ablation_without_inherited_td3_eta():
@@ -253,7 +257,6 @@ def test_config_rejects_unknown_temperature_update_cadence():
     "field",
     (
         "teacher_actor_replay_fraction",
-        "teacher_perception_replay_fraction",
         "q_teacher_replay_ratio",
     ),
 )
@@ -263,6 +266,41 @@ def test_backend_accepts_configurable_teacher_source_fractions(field, fraction):
     setattr(cfg, field, fraction)
 
     DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize("fraction", (0.1, 0.5, 1.0))
+def test_backend_rejects_teacher_perception_replay(fraction):
+    cfg = DistributionalFastSACTeacherBCConfig(
+        teacher_perception_replay_fraction=fraction
+    )
+
+    with pytest.raises(ValueError, match="teacher_perception_replay_fraction=0"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize("mode", ("legacy_online_student", "four_way"))
+def test_backend_locks_perception_to_live_student_rollout(mode):
+    cfg = DistributionalFastSACTeacherBCConfig(perception_replay_mode=mode)
+
+    with pytest.raises(ValueError, match="online_student_rollout|four_way"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("dagger_control_mode", "safe"),
+        ("dagger_control_mode", "hybrid"),
+        ("dagger_beta_start", 0.1),
+        ("dagger_beta_end", 0.1),
+    ),
+)
+def test_backend_locks_live_perception_to_pure_student_control(field, value):
+    cfg = DistributionalFastSACTeacherBCConfig()
+    setattr(cfg, field, value)
+
+    with pytest.raises(ValueError, match="beta"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
 def test_backend_locks_row_level_q_utd_to_one():

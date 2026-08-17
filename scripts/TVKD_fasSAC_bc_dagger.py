@@ -31,14 +31,14 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     LEGACY_ADAPTIVE_BC_CONFIG_FIELDS,
     LEGACY_CHECKPOINT_VERSION,
     LEGACY_TRAINING_ALGORITHM,
+    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
     PREVIOUS_CHECKPOINT_VERSION,
     PREVIOUS_TRAINING_ALGORITHM,
     FRESH_RING_RESUME_SEMANTICS,
-    REPLAY_TEACHER_V_CURRENT_KEY,
-    REPLAY_TEACHER_V_NEXT_KEY,
-    TEACHER_VALUE_CACHE_SEMANTICS,
     V3_CHECKPOINT_VERSION,
     V3_TRAINING_ALGORITHM,
+    V4_CHECKPOINT_VERSION,
+    V4_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
@@ -250,7 +250,7 @@ def _validate_tvkd_resume_policy_state(
     require_student_focus_counters: bool = False,
 ) -> None:
     """Fail before W&B/Isaac startup when continuation state is incomplete."""
-    current_v4 = (
+    current_v5 = (
         policy_state.get("training_algorithm") == TRAINING_ALGORITHM
         and policy_state.get("checkpoint_version") == CHECKPOINT_VERSION
     )
@@ -388,21 +388,12 @@ def _validate_tvkd_resume_policy_state(
         )
         if not isinstance(detector, Mapping):
             raise ValueError("TVKD resume checkpoint lacks bottleneck detector state")
-        if current_v4 and bottleneck.get("location_semantics") != (
+        if current_v5 and bottleneck.get("location_semantics") != (
             BOTTLENECK_LOCATION_SEMANTICS
         ):
-            raise ValueError("TVKD v4 bottleneck location semantics mismatch")
-        scale = detector.get("bottleneck_residual_scale_ema")
-        if (
-            isinstance(scale, bool)
-            or not isinstance(scale, (int, float))
-            or not math.isfinite(float(scale))
-            or float(scale) <= 0.0
-        ):
-            raise ValueError("TVKD resume bottleneck residual scale is invalid")
-        updates = detector.get("num_scale_updates", 0)
-        if isinstance(updates, bool) or not isinstance(updates, int) or updates < 0:
-            raise ValueError("TVKD resume bottleneck scale update count is invalid")
+            raise ValueError("TVKD v5 bottleneck location semantics mismatch")
+        if current_v5 and detector:
+            raise ValueError("TVKD v5 raw bottleneck detector state must be empty")
         bottleneck_counter_names = [
             "failed_student_episode_count",
             "student_candidate_count",
@@ -424,7 +415,7 @@ def _validate_tvkd_resume_policy_state(
                     "student_focus_uniform_fallback_rows",
                 )
             )
-        if current_v4:
+        if current_v5:
             bottleneck_counter_names.extend(
                 (
                     "unsuccessful_episode_count",
@@ -447,7 +438,11 @@ def _validate_tvkd_resume_policy_state(
         for name in (
             *nonnegative_float_fields,
             "raw_td_residual_sum",
-            "normalized_td_residual_sum",
+            (
+                "smoothed_td_residual_sum"
+                if current_v5
+                else "normalized_td_residual_sum"
+            ),
         ):
             value = bottleneck.get(name)
             if (
@@ -459,20 +454,20 @@ def _validate_tvkd_resume_policy_state(
                 raise ValueError(f"TVKD resume bottleneck state {name} is invalid")
         if not isinstance(bottleneck.get("last_metadata", {}), Mapping):
             raise ValueError("TVKD resume bottleneck metadata is invalid")
-        if current_v4 and not isinstance(
+        if current_v5 and not isinstance(
             bottleneck.get("last_value_argmin_metadata", {}), Mapping
         ):
             raise ValueError("TVKD resume value-argmin metadata is invalid")
 
     failure = policy_state.get(
         "verified_teacher_value_histogram_state"
-        if current_v4
+        if current_v5
         else "failure_phase_curriculum_state"
     )
     if not isinstance(failure, Mapping):
         raise ValueError("TVKD resume failure histogram state is missing")
-    if current_v4 and failure.get("semantics") != VERIFIED_HISTOGRAM_SEMANTICS:
-        raise ValueError("TVKD v4 verified histogram semantics mismatch")
+    if current_v5 and failure.get("semantics") != VERIFIED_HISTOGRAM_SEMANTICS:
+        raise ValueError("TVKD v5 verified histogram semantics mismatch")
     histogram = failure.get("histogram")
     if (
         not torch.is_tensor(histogram)
@@ -497,10 +492,10 @@ def _validate_tvkd_resume_policy_state(
         failure_counters[name] = value
     if int(histogram.sum().item()) != failure_counters["anchor_count"]:
         raise ValueError("TVKD resume failure histogram/anchor count mismatch")
-    if current_v4:
+    if current_v5:
         motion_histograms = failure.get("motion_histograms")
         if not isinstance(motion_histograms, Mapping):
-            raise ValueError("TVKD v4 histogram lacks motion partitions")
+            raise ValueError("TVKD v5 histogram lacks motion partitions")
         motion_total = torch.zeros_like(histogram)
         for motion_id, motion_histogram in motion_histograms.items():
             if (
@@ -514,10 +509,10 @@ def _validate_tvkd_resume_policy_state(
                 or bool((motion_histogram < 0.0).any())
                 or not torch.equal(motion_histogram, motion_histogram.round())
             ):
-                raise ValueError("TVKD v4 motion histogram is invalid")
+                raise ValueError("TVKD v5 motion histogram is invalid")
             motion_total.add_(motion_histogram)
         if not torch.equal(motion_total, histogram):
-            raise ValueError("TVKD v4 motion/global histogram counts disagree")
+            raise ValueError("TVKD v5 motion/global histogram counts disagree")
 
     action_contract = policy_state.get("action_contract")
     if not isinstance(
@@ -568,15 +563,15 @@ _FOUR_WAY_SUFFIXES = (
 )
 
 
-def _validate_v4_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None:
-    """Validate the scientific v4 metadata before simulator construction."""
+def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None:
+    """Validate the scientific v5 metadata before simulator construction."""
     replay_mix = policy_state.get("replay_mix_state")
     if not isinstance(replay_mix, Mapping):
-        raise ValueError("TVKD v4 checkpoint lacks replay mix state")
+        raise ValueError("TVKD v5 checkpoint lacks replay mix state")
     for purpose in ("q", "actor", "perception"):
         saved = replay_mix.get(purpose)
         if not isinstance(saved, Mapping):
-            raise ValueError(f"TVKD v4 checkpoint lacks {purpose!r} replay mix")
+            raise ValueError(f"TVKD v5 checkpoint lacks {purpose!r} replay mix")
         total = 0.0
         for source in _FOUR_WAY_SUFFIXES:
             value = saved.get(source)
@@ -589,16 +584,19 @@ def _validate_v4_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
                     float(value), float(expected), rel_tol=0.0, abs_tol=1e-12
                 )
             ):
-                raise ValueError(f"TVKD v4 replay mix mismatch at {purpose}.{source}")
+                raise ValueError(f"TVKD v5 replay mix mismatch at {purpose}.{source}")
             total += float(value)
         if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-8):
-            raise ValueError(f"TVKD v4 {purpose} replay mix does not sum to one")
+            raise ValueError(f"TVKD v5 {purpose} replay mix does not sum to one")
 
     vecnorm_fingerprint = policy_state.get("vecnorm_fingerprint")
     exact = {
         "critic_learning_semantics": CRITIC_LEARNING_SEMANTICS,
         "actor_learning_semantics": ACTOR_LEARNING_SEMANTICS,
         "perception_replay_mode": str(cfg.algo.perception_replay_mode),
+        "perception_training_semantics": (
+            ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+        ),
         "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
         "bottleneck_fallback_mode": str(cfg.algo.bottleneck_fallback_mode),
         "teacher_value_return_semantics": str(cfg.algo.teacher_value_return_semantics),
@@ -616,10 +614,10 @@ def _validate_v4_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         if not isinstance(expected, str) or not expected:
             raise ValueError(f"TVKD runtime lacks required metadata {name!r}")
         if policy_state.get(name) != expected:
-            raise ValueError(f"TVKD v4 metadata mismatch at {name!r}")
+            raise ValueError(f"TVKD v5 metadata mismatch at {name!r}")
     q_backend = policy_state.get("q_backend_config")
     if not isinstance(q_backend, Mapping):
-        raise ValueError("TVKD v4 checkpoint lacks Q backend metadata")
+        raise ValueError("TVKD v5 checkpoint lacks Q backend metadata")
     expected_q_metadata = {
         "target_semantics": CRITIC_LEARNING_SEMANTICS,
         "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
@@ -628,7 +626,7 @@ def _validate_v4_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
     }
     for name, expected in expected_q_metadata.items():
         if q_backend.get(name) != expected:
-            raise ValueError(f"TVKD v4 Q backend metadata mismatch at {name!r}")
+            raise ValueError(f"TVKD v5 Q backend metadata mismatch at {name!r}")
     gamma = policy_state.get("teacher_value_gamma")
     if (
         isinstance(gamma, bool)
@@ -638,18 +636,18 @@ def _validate_v4_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
             float(gamma), float(cfg.algo.gamma), rel_tol=0.0, abs_tol=1e-12
         )
     ):
-        raise ValueError("TVKD v4 Teacher value gamma mismatch")
+        raise ValueError("TVKD v5 Teacher value gamma mismatch")
     verified = policy_state.get("verified_teacher_value_histogram_state")
     if (
         not isinstance(verified, Mapping)
         or verified.get("semantics") != VERIFIED_HISTOGRAM_SEMANTICS
     ):
-        raise ValueError("TVKD v4 checkpoint lacks verified histogram semantics")
+        raise ValueError("TVKD v5 checkpoint lacks verified histogram semantics")
     compatibility = policy_state.get("failure_phase_curriculum_state")
     if not isinstance(compatibility, Mapping) or not _same_verified_histogram_state(
         verified, compatibility
     ):
-        raise ValueError("TVKD v4 verified histogram aliases are inconsistent")
+        raise ValueError("TVKD v5 verified histogram aliases are inconsistent")
 
 
 def _legacy_fraction(name: str, value) -> float:
@@ -678,10 +676,10 @@ def _legacy_four_way_mix(
     }
 
 
-def _install_legacy_v4_replay_contract(
+def _install_legacy_v5_replay_contract(
     cfg: DictConfig, backend: Mapping, *, student_focus_default: float
 ) -> dict[str, object]:
-    """Derive an explicit v4 contract from a v1-v3 nested replay mixture."""
+    """Migrate old Q/Actor mixes and adopt live Student perception."""
     teacher_focus = _legacy_fraction(
         "failure_phase_teacher_fraction",
         backend.get("failure_phase_teacher_fraction"),
@@ -700,15 +698,15 @@ def _install_legacy_v4_replay_contract(
         teacher_focus=teacher_focus,
         student_focus=student_focus,
     )
-    perception_teacher = _legacy_fraction(
+    _legacy_fraction(
         "teacher_perception_replay_fraction",
         backend.get("teacher_perception_replay_fraction"),
     )
     perception_mix = {
-        "uniform_student": 1.0 - perception_teacher,
+        "uniform_student": 1.0,
         "failure_student": 0.0,
-        "uniform_teacher": perception_teacher * (1.0 - teacher_focus),
-        "failure_teacher": perception_teacher * teacher_focus,
+        "uniform_teacher": 0.0,
+        "failure_teacher": 0.0,
     }
     cadence = backend.get("sac_alpha_update_cadence", "critic")
     if cadence not in {"actor", "critic"}:
@@ -721,7 +719,8 @@ def _install_legacy_v4_replay_contract(
             "teacher_actor_replay_fraction",
             backend.get("teacher_actor_replay_fraction"),
         )
-        cfg.algo.teacher_perception_replay_fraction = perception_teacher
+        cfg.algo.teacher_perception_replay_fraction = 0.0
+        cfg.algo.teacher_perception_warmup_steps = 0
         cfg.algo.failure_phase_teacher_fraction = teacher_focus
         for purpose, mix in (
             ("q", q_mix),
@@ -730,9 +729,9 @@ def _install_legacy_v4_replay_contract(
         ):
             for source, fraction in mix.items():
                 cfg.algo[f"{purpose}_{source}_fraction"] = fraction
-        cfg.algo.perception_replay_mode = "legacy_online_student"
+        cfg.algo.perception_replay_mode = "online_student_rollout"
         cfg.algo.bottleneck_fallback_mode = "none"
-        cfg.algo.bottleneck_include_unsuccessful_timeouts = True
+        cfg.algo.bottleneck_include_unsuccessful_timeouts = False
         cfg.algo.max_teacher_phase_match_distance = None
         cfg.algo.sac_alpha_update_cadence = cadence
         cfg.algo.failure_phase_student_fraction = student_focus
@@ -746,9 +745,11 @@ def _install_legacy_v4_replay_contract(
             )
             for source, fraction in mix.items()
         },
-        "perception_replay_mode": "legacy_online_student",
+        "teacher_perception_replay_fraction": 0.0,
+        "teacher_perception_warmup_steps": 0,
+        "perception_replay_mode": "online_student_rollout",
         "bottleneck_fallback_mode": "none",
-        "bottleneck_include_unsuccessful_timeouts": True,
+        "bottleneck_include_unsuccessful_timeouts": False,
         "max_teacher_phase_match_distance": None,
         "sac_alpha_update_cadence": cadence,
     }
@@ -790,29 +791,38 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
         and version == PREVIOUS_CHECKPOINT_VERSION
     )
     v3 = algorithm == V3_TRAINING_ALGORITHM and version == V3_CHECKPOINT_VERSION
+    v4 = algorithm == V4_TRAINING_ALGORITHM and version == V4_CHECKPOINT_VERSION
     current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
+    if v4:
+        raise ValueError(
+            "TVKD v4 checkpoints cannot resume under the v5 raw-residual "
+            "pre-onset sampler; start v5 from the frozen PPO checkpoint"
+        )
     if not (legacy or previous or v3 or current):
         raise ValueError("fastsac_bc_dagger_checkpoint is not a TVKD checkpoint")
     if legacy:
         warnings.warn(
             "TVKD v1 adaptive BC state will be ignored; resume uses the fixed "
-            "baseline BC coefficient and a fresh bottleneck residual scale.",
+            "baseline BC coefficient, PPOVEL live Student perception, and the "
+            "stateless raw-residual detector.",
             UserWarning,
             stacklevel=2,
         )
     elif previous:
         warnings.warn(
             "TVKD v2 checkpoints predate focused Student replay; continuation "
-            "preserves their replay behavior with "
-            "failure_phase_student_fraction=0.0.",
+            "preserves their Q/Actor replay behavior with "
+            "failure_phase_student_fraction=0.0 and switches perception to "
+            "the PPOVEL live Student rollout.",
             UserWarning,
             stacklevel=2,
         )
     elif v3:
         warnings.warn(
-            "Migrating a TVKD v3 checkpoint to the v4 replay/value contract: "
-            "model and optimizer state are retained, perception uses its explicit "
-            "legacy-online mode, and detector/verified-histogram state is reset.",
+            "Migrating a TVKD v3 checkpoint to the v5 replay/value contract: "
+            "model and optimizer state are retained, perception switches to "
+            "the PPOVEL live Student rollout, and detector/verified-histogram "
+            "state is reset.",
             UserWarning,
             stacklevel=2,
         )
@@ -852,7 +862,7 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
         raise ValueError("TVKD resume fixed BC coefficient mismatch")
     migration_fields: dict[str, object] = {}
     if legacy or previous or v3:
-        migration_fields = _install_legacy_v4_replay_contract(
+        migration_fields = _install_legacy_v5_replay_contract(
             cfg,
             backend,
             student_focus_default=(
@@ -913,8 +923,6 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
             "bottleneck_smoothing_window",
             "bottleneck_min_consecutive",
             "bottleneck_terminal_exclusion_steps",
-            "bottleneck_residual_scale_ema_decay",
-            "bottleneck_eps",
             "failure_phase_student_fraction",
         ):
             source_algo_contract[name] = runtime_algo_contract[name]
@@ -924,10 +932,21 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
         source_algo_contract.setdefault("failure_phase_student_fraction", 0.0)
     if legacy or previous or v3:
         # These controls did not exist in the saved schema.  They are explicit
-        # migration semantics, not claims that the old run used v4 behavior.
+        # migration semantics, not claims that the old run used v5 behavior.
+        for name in (
+            "bottleneck_residual_scale_ema_decay",
+            "bottleneck_eps",
+        ):
+            source_algo_contract.pop(name, None)
         source_algo_contract.update(migration_fields)
         for name in (
             "perception_replay_batch_size",
+            "bottleneck_threshold",
+            "bottleneck_smoothing_window",
+            "bottleneck_min_consecutive",
+            "bottleneck_terminal_exclusion_steps",
+            "failure_phase_lookback_steps",
+            "failure_phase_samples_per_failure",
             "teacher_value_return_semantics",
             "teacher_value_boundary_semantics",
             "teacher_value_reward_group_fingerprint",
@@ -937,7 +956,7 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
     if source_algo_contract != runtime_algo_contract:
         raise ValueError("TVKD resume algorithm config does not match checkpoint")
     if current:
-        _validate_v4_policy_contract(policy_state, cfg)
+        _validate_v5_policy_contract(policy_state, cfg)
     _validate_tvkd_resume_policy_state(
         policy_state,
         source_algo,
@@ -954,6 +973,10 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
     }
     for name, saved_value in backend.items():
         if name in metadata_only or name not in cfg.algo:
+            continue
+        if (legacy or previous or v3) and name in migration_fields:
+            # These fields are the explicit, versioned migration from replay
+            # perception to the PPOVEL live Student rollout contract.
             continue
         current_value = cfg.algo.get(name)
 
