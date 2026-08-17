@@ -389,6 +389,9 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     # explicitly replaces this with the checkpoint's saved cadence.
     sac_alpha_update_cadence: str = "actor"
 
+    # Resolved canonical mixtures. The TVKD CLI may derive Q/Actor values from
+    # explicit total-Teacher and conditional failure-focus overrides before
+    # policy construction; direct construction supplies these fields itself.
     q_uniform_student_fraction: float = 0.35
     q_failure_student_fraction: float = 0.15
     q_uniform_teacher_fraction: float = 0.35
@@ -431,7 +434,8 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     # Q batch and compare against the cached values.  Requires max abs error
     # <= 1e-6.  Production value is 0.0 (disabled).
     teacher_value_cache_validate_fraction: float = 0.0
-    # Deprecated v3 migration input only. Canonical v5 samplers never consult it.
+    # The fresh CLI uses this conditional-within-Student fraction to derive
+    # canonical Q/Actor mixes. Checkpoints still serialize the resolved mix.
     failure_phase_student_fraction: float = 0.3
 
 

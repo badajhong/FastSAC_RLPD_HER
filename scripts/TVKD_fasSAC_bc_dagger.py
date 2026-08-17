@@ -13,10 +13,12 @@ import hashlib
 import json
 import os
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 import hydra
 import torch
+from hydra.core.hydra_config import HydraConfig
+from hydra.core.override_parser.overrides_parser import OverridesParser
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
@@ -561,6 +563,112 @@ _FOUR_WAY_SUFFIXES = (
     "uniform_teacher",
     "failure_teacher",
 )
+_SHARED_FOCUS_MIX_FIELDS = frozenset(
+    {"failure_phase_teacher_fraction", "failure_phase_student_fraction"}
+)
+_LEGACY_MIX_FIELDS_BY_PURPOSE = {
+    "q": frozenset({"q_teacher_replay_ratio", *_SHARED_FOCUS_MIX_FIELDS}),
+    "actor": frozenset(
+        {"teacher_actor_replay_fraction", *_SHARED_FOCUS_MIX_FIELDS}
+    ),
+}
+_CANONICAL_MIX_FIELDS_BY_PURPOSE = {
+    purpose: frozenset(f"{purpose}_{source}_fraction" for source in _FOUR_WAY_SUFFIXES)
+    for purpose in ("q", "actor")
+}
+_ALL_Q_ACTOR_MIX_FIELDS = frozenset().union(
+    *_LEGACY_MIX_FIELDS_BY_PURPOSE.values(),
+    *_CANONICAL_MIX_FIELDS_BY_PURPOSE.values(),
+)
+
+
+def _explicit_algo_override_fields(
+    task_overrides: Iterable[str],
+) -> frozenset[str]:
+    """Return explicit ``algo.*`` field names from Hydra task overrides."""
+    parser = OverridesParser.create()
+    fields: set[str] = set()
+    for raw_override in task_overrides:
+        key = parser.parse_override(str(raw_override)).key_or_group
+        if key.startswith("algo."):
+            fields.add(key.removeprefix("algo."))
+    return frozenset(fields)
+
+
+def _apply_tvkd_cli_replay_mix_overrides(
+    cfg: DictConfig,
+    task_overrides: Iterable[str],
+    *,
+    purposes: Iterable[str] = ("q", "actor"),
+) -> bool:
+    """Resolve fresh-run Q/Actor aliases into the canonical four-way mixes.
+
+    The structured TVKD config always contains canonical fields, so the shared
+    sampler cannot infer whether a user deliberately supplied a legacy-style
+    total/focus override. Hydra's explicit task overrides are therefore the
+    source of intent. For each purpose, a launch may use either the compact
+    total/focus surface or its four canonical fields, never both.
+    """
+    selected_purposes = tuple(dict.fromkeys(str(purpose) for purpose in purposes))
+    if any(purpose not in ("q", "actor") for purpose in selected_purposes):
+        raise ValueError("TVKD replay mix purpose must be 'q' or 'actor'")
+    explicit_fields = _explicit_algo_override_fields(task_overrides)
+    legacy_by_purpose = {
+        purpose: explicit_fields.intersection(fields)
+        for purpose, fields in _LEGACY_MIX_FIELDS_BY_PURPOSE.items()
+        if purpose in selected_purposes
+    }
+    canonical_by_purpose = {
+        purpose: explicit_fields.intersection(fields)
+        for purpose, fields in _CANONICAL_MIX_FIELDS_BY_PURPOSE.items()
+        if purpose in selected_purposes
+    }
+    for purpose in selected_purposes:
+        explicit_legacy = legacy_by_purpose[purpose]
+        explicit_canonical = canonical_by_purpose[purpose]
+        if not (explicit_legacy and explicit_canonical):
+            continue
+        legacy_names = ", ".join(sorted(f"algo.{name}" for name in explicit_legacy))
+        canonical_names = ", ".join(
+            sorted(f"algo.{name}" for name in explicit_canonical)
+        )
+        raise ValueError(
+            f"TVKD CLI {purpose} replay mix cannot combine total/focus "
+            f"aliases ({legacy_names}) with canonical four-way fields "
+            f"({canonical_names}); choose exactly one interface"
+        )
+    if not any(legacy_by_purpose.values()):
+        return False
+
+    teacher_focus = _cli_replay_fraction(
+        "failure_phase_teacher_fraction",
+        cfg.algo.failure_phase_teacher_fraction,
+    )
+    student_focus = _cli_replay_fraction(
+        "failure_phase_student_fraction",
+        cfg.algo.failure_phase_student_fraction,
+    )
+    teacher_fractions = {
+        "q": _cli_replay_fraction(
+            "q_teacher_replay_ratio", cfg.algo.q_teacher_replay_ratio
+        ),
+        "actor": _cli_replay_fraction(
+            "teacher_actor_replay_fraction",
+            cfg.algo.teacher_actor_replay_fraction,
+        ),
+    }
+    with open_dict(cfg.algo):
+        for purpose, explicit_legacy in legacy_by_purpose.items():
+            if not explicit_legacy:
+                continue
+            mix = _legacy_four_way_mix(
+                teacher_fraction=teacher_fractions[purpose],
+                teacher_focus=teacher_focus,
+                student_focus=student_focus,
+            )
+            for source, fraction in mix.items():
+                cfg.algo[f"{purpose}_{source}_fraction"] = fraction
+    return True
 
 
 def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None:
@@ -661,6 +769,17 @@ def _legacy_fraction(name: str, value) -> float:
     return float(value)
 
 
+def _cli_replay_fraction(name: str, value) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0.0 <= float(value) <= 1.0
+    ):
+        raise ValueError(f"TVKD CLI replay mix requires {name} in [0, 1]")
+    return float(value)
+
+
 def _legacy_four_way_mix(
     *, teacher_fraction: float, teacher_focus: float, student_focus: float
 ) -> dict[str, float]:
@@ -674,6 +793,45 @@ def _legacy_four_way_mix(
         "uniform_teacher": teacher_fraction * (1.0 - teacher_focus),
         "failure_teacher": teacher_fraction * teacher_focus,
     }
+
+
+def _saved_v5_alias_mix_purposes(source_algo: Mapping) -> frozenset[str]:
+    """Return purposes whose marker-less v5 mix was derived from aliases."""
+    teacher_focus = _legacy_fraction(
+        "failure_phase_teacher_fraction",
+        source_algo.get("failure_phase_teacher_fraction"),
+    )
+    student_focus = _legacy_fraction(
+        "failure_phase_student_fraction",
+        source_algo.get("failure_phase_student_fraction"),
+    )
+    teacher_fractions = {
+        "q": source_algo.get("q_teacher_replay_ratio"),
+        "actor": source_algo.get("teacher_actor_replay_fraction"),
+    }
+    matching_purposes: set[str] = set()
+    for purpose, teacher_fraction in teacher_fractions.items():
+        derived = _legacy_four_way_mix(
+            teacher_fraction=teacher_fraction,
+            teacher_focus=teacher_focus,
+            student_focus=student_focus,
+        )
+        matches = True
+        for source, expected in derived.items():
+            actual = source_algo.get(f"{purpose}_{source}_fraction")
+            if (
+                isinstance(actual, bool)
+                or not isinstance(actual, (int, float))
+                or not math.isfinite(float(actual))
+                or not math.isclose(
+                    float(actual), expected, rel_tol=0.0, abs_tol=1e-12
+                )
+            ):
+                matches = False
+                break
+        if matches:
+            matching_purposes.add(purpose)
+    return frozenset(matching_purposes)
 
 
 def _install_legacy_v5_replay_contract(
@@ -755,7 +913,12 @@ def _install_legacy_v5_replay_contract(
     }
 
 
-def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
+def _prepare_tvkd_checkpoint(
+    cfg: DictConfig,
+    *,
+    explicit_replay_mix_fields: Iterable[str] = (),
+    task_overrides: Iterable[str] = (),
+) -> dict | None:
     """Validate a model-only TVKD continuation and bottleneck state."""
     requested = cfg.get("fastsac_bc_dagger_checkpoint", None)
     if requested is None:
@@ -793,6 +956,46 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
     v3 = algorithm == V3_TRAINING_ALGORITHM and version == V3_CHECKPOINT_VERSION
     v4 = algorithm == V4_TRAINING_ALGORITHM and version == V4_CHECKPOINT_VERSION
     current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
+    explicitly_changed_mix = frozenset(explicit_replay_mix_fields).intersection(
+        _ALL_Q_ACTOR_MIX_FIELDS
+    )
+    if (legacy or previous or v3) and explicitly_changed_mix:
+        names = ", ".join(
+            sorted(f"algo.{name}" for name in explicitly_changed_mix)
+        )
+        raise ValueError(
+            "TVKD v1-v3 replay mix is owned by the checkpoint migration; "
+            f"remove runtime replay mix overrides: {names}"
+        )
+    source_algo = source_cfg.get("algo")
+    if not isinstance(source_algo, Mapping):
+        raise ValueError("TVKD resume checkpoint lacks saved algo config")
+    alias_mix_purposes = (
+        _saved_v5_alias_mix_purposes(source_algo) if current else frozenset()
+    )
+    if current:
+        _apply_tvkd_cli_replay_mix_overrides(
+            cfg,
+            task_overrides,
+            purposes=alias_mix_purposes,
+        )
+    canonical_authority_alias_fields = frozenset().union(
+        *(
+            fields
+            for purpose, fields in _LEGACY_MIX_FIELDS_BY_PURPOSE.items()
+            if purpose not in alias_mix_purposes
+        )
+    )
+    if current and explicitly_changed_mix.intersection(
+        canonical_authority_alias_fields
+    ):
+        warnings.warn(
+            "This TVKD v5 checkpoint predates CLI alias resolution: its saved "
+            "canonical Q/Actor replay mix remains authoritative, while the "
+            "saved total/focus aliases are compatibility metadata.",
+            UserWarning,
+            stacklevel=2,
+        )
     if v4:
         raise ValueError(
             "TVKD v4 checkpoints cannot resume under the v5 raw-residual "
@@ -882,9 +1085,6 @@ def _prepare_tvkd_checkpoint(cfg: DictConfig) -> dict | None:
             # intentionally behavior-preserving even though fresh v3 runs use
             # the new 0.3 default.
             cfg.algo.failure_phase_student_fraction = 0.0
-    source_algo = source_cfg.get("algo")
-    if not isinstance(source_algo, Mapping):
-        raise ValueError("TVKD resume checkpoint lacks saved algo config")
     if source_algo.get("load_pretrained_perception") is True:
         saved_perception_path = source_algo.get("perception_checkpoint_path")
         if not isinstance(saved_perception_path, str) or not saved_perception_path:
@@ -1086,7 +1286,20 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
 def main(cfg: DictConfig):
     _require_single_process_execution()
     apply_fastsac_dagger_iteration_controls(cfg)
-    resume = _prepare_tvkd_checkpoint(cfg)
+    task_overrides = (
+        HydraConfig.get().overrides.task if HydraConfig.initialized() else ()
+    )
+    explicit_algo_fields = _explicit_algo_override_fields(task_overrides)
+    replay_mix_from_aliases = False
+    if cfg.get("fastsac_bc_dagger_checkpoint", None) is None:
+        replay_mix_from_aliases = _apply_tvkd_cli_replay_mix_overrides(
+            cfg, task_overrides
+        )
+    resume = _prepare_tvkd_checkpoint(
+        cfg,
+        explicit_replay_mix_fields=explicit_algo_fields,
+        task_overrides=task_overrides,
+    )
     if resume is None:
         _prepare_tvkd_fresh_source(cfg)
     validate_tvkd_fastsac_bc_dagger_config(cfg)
@@ -1129,6 +1342,11 @@ def main(cfg: DictConfig):
         f"{replay_mix_summary('perception')}; "
         f"perception_mode={cfg.algo.perception_replay_mode}"
     )
+    if replay_mix_from_aliases:
+        print(
+            "TVKD replay mix source: CLI total/focus aliases were resolved "
+            "into the canonical Q/Actor four-way distributions shown above."
+        )
     return run_training(cfg)
 
 
@@ -1148,6 +1366,7 @@ __all__ = [
     "TeacherValueBottleneckDetector",
     "TVKDDistributionalFastSACTeacherBC",
     "TVKDDistributionalFastSACTeacherBCConfig",
+    "_apply_tvkd_cli_replay_mix_overrides",
     "_prepare_tvkd_checkpoint",
     "_prepare_tvkd_fresh_source",
     "compute_teacher_value_terms",

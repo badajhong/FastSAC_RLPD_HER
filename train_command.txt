@@ -37,6 +37,8 @@ nohup env PYTHONUNBUFFERED=1 \
   > ./logs/fastSAC_bc_dagger_eta1e-2_H2p5_actor_cadence.log 2>&1 < /dev/null &
 
 # TVKD
+# Replay ratios below resolve to Q US/FS/UT/FT=25/25/25/25 and
+# Actor US/FS/UT/FT=50/50/0/0. Perception remains live Student-only.
 nohup env PYTHONUNBUFFERED=1 \
   python scripts/TVKD_fasSAC_bc_dagger.py \
   task=G1/vaic/skateboard_stu \

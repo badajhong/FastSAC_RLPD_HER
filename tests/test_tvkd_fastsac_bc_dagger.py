@@ -73,6 +73,7 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     compute_teacher_value_terms,
 )
 from scripts.TVKD_fasSAC_bc_dagger import (
+    _apply_tvkd_cli_replay_mix_overrides,
     _prepare_tvkd_checkpoint,
     validate_tvkd_fastsac_bc_dagger_config,
 )
@@ -2644,6 +2645,37 @@ def test_v5_checkpoint_rejects_binwise_motion_histogram_mismatch(monkeypatch):
     )
 
 
+def test_legacy_tvkd_resume_rejects_runtime_replay_mix_overrides(tmp_path):
+    checkpoint_path = tmp_path / "legacy_tvkd.pt"
+    torch.save(
+        {
+            "policy": {
+                "training_algorithm": TVKD_V3_TRAINING_ALGORITHM,
+                "checkpoint_version": TVKD_V3_CHECKPOINT_VERSION,
+            },
+            "vecnorm": {},
+            "cfg": {},
+        },
+        checkpoint_path,
+    )
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                f"fastsac_bc_dagger_checkpoint={checkpoint_path}",
+                "fastsac_dagger_iterations=10",
+            ],
+        )
+
+    with pytest.raises(ValueError, match="owned by the checkpoint migration"):
+        _prepare_tvkd_checkpoint(
+            cfg,
+            explicit_replay_mix_fields={"q_teacher_replay_ratio"},
+        )
+
+
 def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     tmp_path,
     monkeypatch,
@@ -2770,6 +2802,140 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     assert cfg._tvkd_model_only_resume is True
     assert cfg._bc_dagger_fresh_source is True
     assert cfg.algo.value_norm is False
+
+    mix_overrides = [
+        "algo.q_teacher_replay_ratio=0.5",
+        "algo.teacher_actor_replay_fraction=0.0",
+        "algo.failure_phase_teacher_fraction=0.5",
+        "algo.failure_phase_student_fraction=0.5",
+    ]
+
+    def save_mix_checkpoint(runtime_cfg, path):
+        tvkd_entry._install_teacher_contract_fingerprints(runtime_cfg)
+        state = copy.deepcopy(policy_state)
+        state.update(
+            _strict_v5_policy_metadata(
+                runtime_cfg.algo,
+                vecnorm_fingerprint="vecnorm",
+                histogram_state=histogram_state,
+            )
+        )
+        state["dagger_backend_config"] = _strict_v5_backend_config(runtime_cfg.algo)
+        torch.save(
+            {
+                "policy": state,
+                "vecnorm": {},
+                "cfg": OmegaConf.create(
+                    OmegaConf.to_container(runtime_cfg, resolve=False)
+                ),
+            },
+            path,
+        )
+
+    def compose_mix_resume(path, replay_overrides=mix_overrides):
+        with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+            return compose(
+                config_name="TVKD_fasSAC_bc_dagger",
+                overrides=[
+                    "task=G1/vaic/skateboard_stu",
+                    f"fastsac_bc_dagger_checkpoint={path}",
+                    "fastsac_dagger_iterations=100",
+                    *replay_overrides,
+                ],
+                return_hydra_config=True,
+            )
+
+    derived_path = tmp_path / "checkpoint_tvkd_v5_derived_alias_mix.pt"
+    derived_cfg = compose_mix_resume(derived_path)
+    assert _apply_tvkd_cli_replay_mix_overrides(
+        derived_cfg, derived_cfg.hydra.overrides.task
+    )
+    save_mix_checkpoint(derived_cfg, derived_path)
+    derived_runtime = compose_mix_resume(derived_path)
+    derived_fields = tvkd_entry._explicit_algo_override_fields(
+        derived_runtime.hydra.overrides.task
+    )
+    derived_result = _prepare_tvkd_checkpoint(
+        derived_runtime,
+        explicit_replay_mix_fields=derived_fields,
+        task_overrides=derived_runtime.hydra.overrides.task,
+    )
+    assert derived_result["path"] == str(derived_path.resolve())
+    assert tuple(
+        float(derived_runtime.algo[f"actor_{source}_fraction"])
+        for source in REPLAY_SOURCE_ORDER
+    ) == pytest.approx((0.5, 0.5, 0.0, 0.0))
+
+    mixed_interfaces = (
+        (
+            "q_alias_actor_canonical",
+            [
+                "algo.q_teacher_replay_ratio=0.2",
+                "algo.actor_uniform_student_fraction=0.2",
+                "algo.actor_failure_student_fraction=0.3",
+                "algo.actor_uniform_teacher_fraction=0.4",
+                "algo.actor_failure_teacher_fraction=0.1",
+            ],
+            (0.56, 0.24, 0.14, 0.06),
+            (0.2, 0.3, 0.4, 0.1),
+        ),
+        (
+            "q_canonical_actor_alias",
+            [
+                "algo.q_uniform_student_fraction=0.4",
+                "algo.q_failure_student_fraction=0.1",
+                "algo.q_uniform_teacher_fraction=0.3",
+                "algo.q_failure_teacher_fraction=0.2",
+                "algo.teacher_actor_replay_fraction=0.2",
+            ],
+            (0.4, 0.1, 0.3, 0.2),
+            (0.56, 0.24, 0.14, 0.06),
+        ),
+    )
+    for name, overrides, expected_q, expected_actor in mixed_interfaces:
+        mixed_path = tmp_path / f"checkpoint_tvkd_v5_{name}.pt"
+        mixed_cfg = compose_mix_resume(mixed_path, overrides)
+        assert _apply_tvkd_cli_replay_mix_overrides(
+            mixed_cfg, mixed_cfg.hydra.overrides.task
+        )
+        save_mix_checkpoint(mixed_cfg, mixed_path)
+        mixed_runtime = compose_mix_resume(mixed_path, overrides)
+        mixed_fields = tvkd_entry._explicit_algo_override_fields(
+            mixed_runtime.hydra.overrides.task
+        )
+        mixed_result = _prepare_tvkd_checkpoint(
+            mixed_runtime,
+            explicit_replay_mix_fields=mixed_fields,
+            task_overrides=mixed_runtime.hydra.overrides.task,
+        )
+        assert mixed_result["path"] == str(mixed_path.resolve())
+        assert tuple(
+            float(mixed_runtime.algo[f"q_{source}_fraction"])
+            for source in REPLAY_SOURCE_ORDER
+        ) == pytest.approx(expected_q)
+        assert tuple(
+            float(mixed_runtime.algo[f"actor_{source}_fraction"])
+            for source in REPLAY_SOURCE_ORDER
+        ) == pytest.approx(expected_actor)
+
+    pre_resolution_path = tmp_path / "checkpoint_tvkd_v5_old_alias_metadata.pt"
+    pre_resolution_cfg = compose_mix_resume(pre_resolution_path)
+    save_mix_checkpoint(pre_resolution_cfg, pre_resolution_path)
+    pre_resolution_runtime = compose_mix_resume(pre_resolution_path)
+    pre_resolution_fields = tvkd_entry._explicit_algo_override_fields(
+        pre_resolution_runtime.hydra.overrides.task
+    )
+    with pytest.warns(UserWarning, match="predates CLI alias resolution"):
+        pre_resolution_result = _prepare_tvkd_checkpoint(
+            pre_resolution_runtime,
+            explicit_replay_mix_fields=pre_resolution_fields,
+            task_overrides=pre_resolution_runtime.hydra.overrides.task,
+        )
+    assert pre_resolution_result["path"] == str(pre_resolution_path.resolve())
+    assert tuple(
+        float(pre_resolution_runtime.algo[f"actor_{source}_fraction"])
+        for source in REPLAY_SOURCE_ORDER
+    ) == pytest.approx((0.35, 0.15, 0.35, 0.15))
 
     mismatched_path = tmp_path / "checkpoint_tvkd_v4_binwise_mismatch.pt"
     mismatched_policy = copy.deepcopy(policy_state)
@@ -3466,7 +3632,12 @@ def test_tvkd_hydra_config_inherits_source_mix_defaults_and_new_controls():
                 "checkpoint_path=/tmp/fresh_ppo.pt",
                 "fastsac_dagger_iterations=10",
             ],
+            return_hydra_config=True,
         )
+
+    assert not _apply_tvkd_cli_replay_mix_overrides(
+        cfg, cfg.hydra.overrides.task
+    )
 
     assert cfg.algo.name == "tvkd_fastsac_bc_dagger"
     assert cfg.algo.sac_alpha_update_cadence == "actor"
@@ -3540,7 +3711,15 @@ def test_tvkd_hydra_resolves_independent_q_and_actor_four_way_mixes():
         "algo.actor_failure_teacher_fraction=0.10",
     ]
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
-        cfg = compose(config_name="TVKD_fasSAC_bc_dagger", overrides=overrides)
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=overrides,
+            return_hydra_config=True,
+        )
+
+    assert not _apply_tvkd_cli_replay_mix_overrides(
+        cfg, cfg.hydra.overrides.task
+    )
 
     expected = {
         "q": (0.40, 0.10, 0.30, 0.20),
@@ -3558,6 +3737,269 @@ def test_tvkd_hydra_resolves_independent_q_and_actor_four_way_mixes():
         float(cfg.algo[f"perception_{source}_fraction"])
         for source in REPLAY_SOURCE_ORDER
     ) == pytest.approx((1.0, 0.0, 0.0, 0.0))
+
+
+def test_tvkd_hydra_legacy_cli_mix_translates_current_command():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    overrides = [
+        "task=G1/vaic/skateboard_stu",
+        "checkpoint_path=/tmp/fresh_ppo.pt",
+        "fastsac_dagger_iterations=14000",
+        "algo.q_teacher_replay_ratio=0.5",
+        "algo.teacher_actor_replay_fraction=0.0",
+        "algo.teacher_perception_replay_fraction=0.0",
+        "algo.failure_phase_teacher_fraction=0.5",
+        "algo.failure_phase_student_fraction=0.5",
+    ]
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=overrides,
+            return_hydra_config=True,
+        )
+
+    assert _apply_tvkd_cli_replay_mix_overrides(
+        cfg, cfg.hydra.overrides.task
+    )
+    expected = {
+        "q": (0.25, 0.25, 0.25, 0.25),
+        "actor": (0.5, 0.5, 0.0, 0.0),
+        "perception": (1.0, 0.0, 0.0, 0.0),
+    }
+    for purpose, values in expected.items():
+        assert tuple(
+            float(cfg.algo[f"{purpose}_{source}_fraction"])
+            for source in REPLAY_SOURCE_ORDER
+        ) == pytest.approx(values)
+
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = cfg.algo
+    assert policy._replay_source_counts("q", 512) == {
+        "uniform_student": 128,
+        "failure_student": 128,
+        "uniform_teacher": 128,
+        "failure_teacher": 128,
+    }
+    assert policy._replay_source_counts("actor", 4096) == {
+        "uniform_student": 2048,
+        "failure_student": 2048,
+        "uniform_teacher": 0,
+        "failure_teacher": 0,
+    }
+
+
+def test_tvkd_main_resolves_cli_mix_before_training(monkeypatch):
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                "algo.q_teacher_replay_ratio=0.5",
+                "algo.teacher_actor_replay_fraction=0.0",
+                "algo.failure_phase_teacher_fraction=0.5",
+                "algo.failure_phase_student_fraction=0.5",
+            ],
+            return_hydra_config=True,
+        )
+
+    monkeypatch.setattr(
+        tvkd_entry,
+        "HydraConfig",
+        SimpleNamespace(initialized=lambda: True, get=lambda: cfg.hydra),
+    )
+    monkeypatch.setattr(tvkd_entry, "_require_single_process_execution", lambda: None)
+    monkeypatch.setattr(
+        tvkd_entry, "apply_fastsac_dagger_iteration_controls", lambda runtime: None
+    )
+    monkeypatch.setattr(tvkd_entry, "_prepare_tvkd_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tvkd_entry, "_prepare_tvkd_fresh_source", lambda runtime: None)
+    monkeypatch.setattr(
+        tvkd_entry, "validate_tvkd_fastsac_bc_dagger_config", lambda runtime: None
+    )
+    monkeypatch.setattr(
+        tvkd_entry,
+        "fastsac_dagger_rollout_schedule",
+        lambda runtime: {
+            "prefill_target_rows": 1,
+            "main_rollouts": 10,
+            "frames_per_rollout": 1,
+        },
+    )
+    captured = {}
+
+    def capture(runtime):
+        captured.update(
+            {
+                purpose: tuple(
+                    float(runtime.algo[f"{purpose}_{source}_fraction"])
+                    for source in REPLAY_SOURCE_ORDER
+                )
+                for purpose in ("q", "actor", "perception")
+            }
+        )
+        return "trained"
+
+    monkeypatch.setattr(tvkd_entry, "run_training", capture)
+
+    assert tvkd_entry.main.__wrapped__(cfg) == "trained"
+    assert captured["q"] == pytest.approx((0.25, 0.25, 0.25, 0.25))
+    assert captured["actor"] == pytest.approx((0.5, 0.5, 0.0, 0.0))
+    assert captured["perception"] == pytest.approx((1.0, 0.0, 0.0, 0.0))
+
+
+@pytest.mark.parametrize(
+    ("override", "derived_purpose", "derived", "unchanged_purpose"),
+    (
+        (
+            "algo.q_teacher_replay_ratio=0.2",
+            "q",
+            (0.56, 0.24, 0.14, 0.06),
+            "actor",
+        ),
+        (
+            "algo.teacher_actor_replay_fraction=0.0",
+            "actor",
+            (0.7, 0.3, 0.0, 0.0),
+            "q",
+        ),
+    ),
+)
+def test_tvkd_hydra_total_teacher_aliases_control_q_and_actor_independently(
+    override,
+    derived_purpose,
+    derived,
+    unchanged_purpose,
+):
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                override,
+            ],
+            return_hydra_config=True,
+        )
+
+    assert _apply_tvkd_cli_replay_mix_overrides(
+        cfg, cfg.hydra.overrides.task
+    )
+    assert tuple(
+        float(cfg.algo[f"{derived_purpose}_{source}_fraction"])
+        for source in REPLAY_SOURCE_ORDER
+    ) == pytest.approx(derived)
+    assert tuple(
+        float(cfg.algo[f"{unchanged_purpose}_{source}_fraction"])
+        for source in REPLAY_SOURCE_ORDER
+    ) == pytest.approx((0.35, 0.15, 0.35, 0.15))
+
+
+def test_tvkd_current_resume_reapplies_the_same_alias_resolution():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    mix_overrides = [
+        "algo.q_teacher_replay_ratio=0.5",
+        "algo.teacher_actor_replay_fraction=0.0",
+        "algo.failure_phase_teacher_fraction=0.5",
+        "algo.failure_phase_student_fraction=0.5",
+    ]
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        fresh = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                *mix_overrides,
+            ],
+            return_hydra_config=True,
+        )
+        resumed = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "fastsac_bc_dagger_checkpoint=/tmp/tvkd.pt",
+                "fastsac_dagger_iterations=10",
+                *mix_overrides,
+            ],
+            return_hydra_config=True,
+        )
+
+    for cfg in (fresh, resumed):
+        assert _apply_tvkd_cli_replay_mix_overrides(
+            cfg, cfg.hydra.overrides.task
+        )
+    assert OmegaConf.to_container(fresh.algo, resolve=True) == OmegaConf.to_container(
+        resumed.algo, resolve=True
+    )
+
+
+def test_tvkd_fresh_alias_validation_does_not_report_a_legacy_checkpoint():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                "algo.q_teacher_replay_ratio=-0.1",
+            ],
+            return_hydra_config=True,
+        )
+
+    with pytest.raises(ValueError, match=r"CLI replay mix.*q_teacher.*\[0, 1\]"):
+        _apply_tvkd_cli_replay_mix_overrides(
+            cfg, cfg.hydra.overrides.task
+        )
+
+
+@pytest.mark.parametrize(
+    ("legacy_override", "canonical_override"),
+    (
+        (
+            "algo.q_teacher_replay_ratio=0.5",
+            "algo.q_uniform_student_fraction=0.35",
+        ),
+        (
+            "algo.teacher_actor_replay_fraction=0.0",
+            "algo.actor_failure_student_fraction=0.15",
+        ),
+        (
+            "algo.failure_phase_student_fraction=0.5",
+            "algo.actor_uniform_teacher_fraction=0.35",
+        ),
+    ),
+)
+def test_tvkd_hydra_rejects_mixed_alias_and_canonical_mix_overrides(
+    legacy_override,
+    canonical_override,
+):
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                legacy_override,
+                canonical_override,
+            ],
+            return_hydra_config=True,
+        )
+
+    with pytest.raises(ValueError, match="cannot combine.*canonical"):
+        _apply_tvkd_cli_replay_mix_overrides(
+            cfg, cfg.hydra.overrides.task
+        )
 
 
 @pytest.mark.parametrize("fraction", (0.0, 0.1, 0.5, 1.0))
@@ -3595,13 +4037,28 @@ def test_tvkd_fresh_configurable_teacher_sources_survive_hydra_run_chdir(
                 f"algo.q_teacher_replay_ratio={fraction}",
                 "fastsac_dagger_iterations=14000",
             ],
+            return_hydra_config=True,
         )
 
     monkeypatch.chdir(launch_dir)
+    assert _apply_tvkd_cli_replay_mix_overrides(
+        cfg, cfg.hydra.overrides.task
+    )
     validate_tvkd_fastsac_bc_dagger_config(cfg)
     assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(fraction)
     assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.0)
     assert cfg.algo.q_teacher_replay_ratio == pytest.approx(fraction)
+    expected = (
+        0.7 * (1.0 - fraction),
+        0.3 * (1.0 - fraction),
+        0.7 * fraction,
+        0.3 * fraction,
+    )
+    for purpose in ("q", "actor"):
+        assert tuple(
+            float(cfg.algo[f"{purpose}_{source}_fraction"])
+            for source in REPLAY_SOURCE_ORDER
+        ) == pytest.approx(expected)
 
     canonical_checkpoint_path = checkpoint_path.resolve()
     assert Path(cfg.algo.perception_checkpoint_path) == canonical_checkpoint_path

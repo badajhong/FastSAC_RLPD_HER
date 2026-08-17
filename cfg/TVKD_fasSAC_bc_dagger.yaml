@@ -21,9 +21,13 @@ algo:
   # cadence as a legacy compatibility contract.
   sac_alpha_update_cadence: actor
 
-  # Canonical Q/Actor four-way replay mixtures. Each replay objective owns an
-  # independent distribution whose four entries sum to exactly one. Focused
-  # shortages backfill only into the uniform source of the same provenance.
+  # Resolved Q/Actor four-way replay mixtures. Each replay objective owns an
+  # independent distribution whose four entries sum to exactly one. On a
+  # fresh CLI launch, explicitly overriding q_teacher_replay_ratio,
+  # teacher_actor_replay_fraction, or either failure-phase fraction derives
+  # these values. Alternatively, override the canonical fields directly; do
+  # not mix the two interfaces. Focused shortages backfill only into the
+  # uniform source of the same provenance.
   q_uniform_student_fraction: 0.35
   q_failure_student_fraction: 0.15
   q_uniform_teacher_fraction: 0.35
