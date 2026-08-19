@@ -91,15 +91,21 @@ def test_probe_terms_expose_literal_and_runtime_boundary_difference():
         potential_clip=None,
     )
 
+    # Rows: ordinary, physical terminal, command completion, pure time limit.
+    # The shared c_t is [1, 0, 0, 1], and every surviving row bootstraps
+    # V_T(s_next) rather than its own value.
     assert terms["literal_delta"].tolist() == pytest.approx([3.0] * 4)
+    assert terms["boundary_teacher_v"].tolist() == pytest.approx(
+        [12.0, 0.0, 0.0, 12.0]
+    )
     assert terms["teacher_continuation"].tolist() == pytest.approx(
-        [10.8, 0.0, 9.0, 9.0]
+        [10.8, 0.0, 0.0, 10.8]
     )
     assert terms["production_delta"].tolist() == pytest.approx(
-        [1.8, -9.0, 0.0, 0.0]
+        [1.8, -9.0, -9.0, 1.8]
     )
     assert terms["shaped_reward"].tolist() == pytest.approx(
-        [1.2, -1.5, 0.75, 0.75]
+        [1.2, -1.5, -1.5, 1.2]
     )
 
 

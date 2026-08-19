@@ -145,7 +145,9 @@ def compute_probe_terms(
 
     from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
         TEACHER_VALUE_BOUNDARY_SEMANTICS,
+        compute_continuation_coefficient,
         compute_teacher_value_continuation,
+        replay_truncation_mask,
     )
 
     teacher_v = torch.as_tensor(teacher_v).detach().float().reshape(-1)
@@ -210,24 +212,30 @@ def compute_probe_terms(
         if not torch.isfinite(value).all():
             raise RuntimeError(f"{name} contains NaN/Inf")
 
+    # The probe reads stored boundary causes, so it rebuilds the replay
+    # ``truncations`` field and then the one shared continuation coefficient
+    # exactly as production does.
+    continuation = compute_continuation_coefficient(
+        dones=terminated | command_finished | time_limit,
+        truncations=replay_truncation_mask(
+            terminated=terminated,
+            command_finished=command_finished,
+            time_limit=time_limit,
+        ),
+        discounts=replay_discount,
+    )
     teacher_continuation = compute_teacher_value_continuation(
-        teacher_v=teacher_v,
         teacher_v_next=teacher_v_next,
-        terminated=terminated,
-        command_finished=command_finished,
-        time_limit=time_limit,
-        replay_discount=replay_discount,
+        continuation=continuation,
         gamma=float(gamma),
         semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
     )
+    # The boundary value actually consumed: V_T(s_{t+1}) wherever the
+    # continuation survives, and nothing at all on a cut row.
     boundary_teacher_v = torch.where(
-        terminated,
+        continuation != 0.0,
+        teacher_v_next,
         torch.zeros_like(teacher_v),
-        torch.where(
-            command_finished | time_limit,
-            teacher_v,
-            teacher_v_next,
-        ),
     )
 
     fixed_v = teacher_v
@@ -239,12 +247,8 @@ def compute_probe_terms(
         fixed_v = fixed_v.clamp(-clip, clip)
         fixed_v_next = fixed_v_next.clamp(-clip, clip)
     fixed_continuation = compute_teacher_value_continuation(
-        teacher_v=fixed_v,
         teacher_v_next=fixed_v_next,
-        terminated=terminated,
-        command_finished=command_finished,
-        time_limit=time_limit,
-        replay_discount=replay_discount,
+        continuation=continuation,
         gamma=float(gamma),
         semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
     )

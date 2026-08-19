@@ -1,0 +1,24 @@
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
+python scripts/eval.py \
+--config-path=/home/hcc/research/VAIC/outputs/2026-08-18/18-10-02-G1CartGeneralTracking-tvkd_fastsac_bc_dagger/wandb/latest-run/files \
+--config-name=cfg \
+checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-18/18-10-02-G1CartGeneralTracking-tvkd_fastsac_bc_dagger/wandb/latest-run/files/checkpoint_15800.pt \
+seed=0 \
+eval_render=false
+
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
+python scripts/eval_multiple.py \
+--config-path=/home/hcc/research/VAIC/outputs/2026-08-18/18-10-02-G1CartGeneralTracking-tvkd_fastsac_bc_dagger/wandb/latest-run/files \
+--config-name=cfg \
+checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-18/18-10-02-G1CartGeneralTracking-tvkd_fastsac_bc_dagger/wandb/latest-run/files\
+seed=0 \
+eval_render=false
+
+
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
+python scripts/eval_multiple.py \
+--config-path=/home/hcc/research/VAIC/VAIC_stu/car_general_stu/car_general_stu/ \
+--config-name=cfg \
+checkpoint_path=/home/hcc/research/VAIC/VAIC_stu/car_general_stu/car_general_stu/checkpoint_15000.pt \
+seed=0 \
+eval_render=false

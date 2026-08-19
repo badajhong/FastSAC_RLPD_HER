@@ -160,11 +160,12 @@ cython_debug/
 #.idea/
 
 # hydra and wandb
-outputs/
-outputs_play/
-outputs_probe/
-diagnostics/
-notes/
+outputs/*
+outputs_play/*
+outputs_probe/*
+diagnostics/*
+notes/*
+teachers/*
 wandb/
 artifacts/
 

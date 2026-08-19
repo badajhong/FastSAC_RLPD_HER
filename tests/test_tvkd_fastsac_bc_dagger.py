@@ -71,8 +71,11 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     TRAINING_ALGORITHM as TVKD_TRAINING_ALGORITHM,
     TVKDDistributionalFastSACTeacherBC,
     TVKDDistributionalFastSACTeacherBCConfig,
+    compute_continuation_coefficient,
     compute_teacher_value_continuation,
     compute_teacher_value_terms,
+    continuation_bootstrap_mask,
+    replay_truncation_mask,
 )
 from scripts.TVKD_fasSAC_bc_dagger import (
     _apply_tvkd_cli_replay_mix_overrides,
@@ -691,10 +694,7 @@ def test_teacher_value_terms_clip_potential_before_difference_and_keep_raw_td():
         current,
         next_observation,
         reward,
-        terminated=torch.tensor([False, True, False]),
-        command_finished=torch.zeros(3, dtype=torch.bool),
-        time_limit=torch.zeros(3, dtype=torch.bool),
-        replay_discount=discount,
+        continuation=discount * torch.tensor([1.0, 0.0, 1.0]),
         gamma=1.0,
         tvkd_lambda=0.25,
         potential_clip=5.0,
@@ -727,10 +727,7 @@ def test_unclipped_teacher_terms_reuse_one_identical_continuation(monkeypatch):
         "teacher_critic_obs": torch.tensor([[2.0], [3.0]]),
         "next_teacher_critic_obs": torch.tensor([[4.0], [5.0]]),
         "raw_reward": torch.tensor([1.0, 2.0]),
-        "terminated": torch.tensor([False, True]),
-        "command_finished": torch.zeros(2, dtype=torch.bool),
-        "time_limit": torch.zeros(2, dtype=torch.bool),
-        "replay_discount": torch.ones(2),
+        "continuation": torch.tensor([1.0, 0.0]),
         "gamma": 0.99,
         "tvkd_lambda": 0.25,
     }
@@ -750,49 +747,61 @@ def test_tvkd_lambda_zero_keeps_raw_reward_exactly():
         torch.tensor([[2.0], [3.0]]),
         torch.tensor([[8.0], [9.0]]),
         torch.tensor([1.5, -2.0]),
-        terminated=torch.tensor([False, True]),
-        command_finished=torch.zeros(2, dtype=torch.bool),
-        time_limit=torch.zeros(2, dtype=torch.bool),
-        replay_discount=torch.ones(2),
+        continuation=torch.tensor([1.0, 0.0]),
         gamma=0.99,
         tvkd_lambda=0.0,
     )
     assert torch.equal(terms.shaped_reward, torch.tensor([1.5, -2.0]))
 
 
-def test_teacher_value_boundary_contract_uses_self_bootstrap_and_variable_discount():
-    current = torch.tensor([13.0, 10.0, 8.0, 5.0])
-    following = torch.tensor([999.0, 20.0, 16.0, 10.0])
+def test_teacher_value_boundary_contract_bootstraps_next_state_under_shared_c_t():
+    # Rows: command completion, pure time limit, physical terminal, ordinary.
+    terminated = torch.tensor([False, False, True, False])
+    # Physical termination wins even when a boundary cause coincides.
+    command_finished = torch.tensor([True, False, True, False])
+    time_limit = torch.tensor([False, True, False, False])
+    done = terminated | command_finished | time_limit
+    truncations = replay_truncation_mask(
+        terminated=terminated,
+        command_finished=command_finished,
+        time_limit=time_limit,
+    )
+    assert torch.equal(truncations, torch.tensor([False, True, False, False]))
+    assert torch.equal(
+        continuation_bootstrap_mask(dones=done, truncations=truncations),
+        torch.tensor([False, True, False, True]),
+    )
+
     discount = torch.tensor([1.0, 0.75, 0.4, 0.5])
+    c_t = compute_continuation_coefficient(
+        dones=done, truncations=truncations, discounts=discount
+    )
+    assert torch.equal(c_t, torch.tensor([0.0, 0.75, 0.0, 0.5]))
+
+    # A cut row's next value is never read, so a sentinel or NaN there is inert.
+    following = torch.tensor([float("nan"), 20.0, 999.0, 10.0])
     continuation = compute_teacher_value_continuation(
-        teacher_v=current,
         teacher_v_next=following,
-        terminated=torch.tensor([False, False, True, False]),
-        # Physical termination wins even when a boundary cause coincides.
-        command_finished=torch.tensor([True, False, True, False]),
-        time_limit=torch.tensor([False, True, False, False]),
-        replay_discount=discount,
+        continuation=c_t,
         gamma=0.99,
     )
     assert torch.allclose(
         continuation,
-        torch.tensor([0.99 * 13.0, 0.99 * 0.75 * 10.0, 0.0, 0.99 * 0.5 * 10.0]),
+        torch.tensor([0.0, 0.99 * 0.75 * 20.0, 0.0, 0.99 * 0.5 * 10.0]),
     )
 
+    # Command completion cuts: the residual reduces to r_t - V_T(s_t).
     terms = compute_teacher_value_terms(
         lambda observation: observation[:, 0],
         torch.tensor([[13.0]]),
         torch.tensor([[999.0]]),
         torch.tensor([0.16]),
-        terminated=torch.tensor([False]),
-        command_finished=torch.tensor([True]),
-        time_limit=torch.tensor([False]),
-        replay_discount=torch.tensor([1.0]),
+        continuation=torch.zeros(1),
         gamma=0.99,
         tvkd_lambda=0.25,
     )
-    assert terms.teacher_td_residual.item() == pytest.approx(0.03, abs=1e-6)
-    assert terms.shaped_reward.item() == pytest.approx(0.1275, abs=1e-6)
+    assert terms.teacher_td_residual.item() == pytest.approx(-12.84, abs=1e-4)
+    assert terms.shaped_reward.item() == pytest.approx(0.16 - 0.25 * 13.0, abs=1e-4)
 
 
 def test_cache_validation_consumes_prepared_normalized_observations_once():
@@ -828,10 +837,7 @@ def test_cache_validation_consumes_prepared_normalized_observations_once():
     }
 
     prepared = policy._prepare_dagger_learning_batch(raw)
-    boundary = torch.zeros(2, dtype=torch.bool)
-    terms = policy._teacher_value_terms_from_batch(
-        prepared, boundary, boundary, boundary
-    )
+    terms = policy._teacher_value_terms_from_batch(prepared, torch.ones(2))
 
     assert torch.equal(prepared["critic_observations"], torch.tensor([[11.0], [12.0]]))
     assert torch.equal(
@@ -855,9 +861,20 @@ def test_cache_validation_checks_only_semantically_consumed_next_values():
         tvkd_potential_clip=None,
     )
     policy.get_frozen_teacher_value = lambda value: value[:, 0]
+    # Rows: ordinary, physical terminal, command completion, pure time limit.
     terminated = torch.tensor([False, True, False, False])
     command_finished = torch.tensor([False, False, True, False])
     time_limit = torch.tensor([False, False, False, True])
+    continuation = compute_continuation_coefficient(
+        dones=terminated | command_finished | time_limit,
+        truncations=replay_truncation_mask(
+            terminated=terminated,
+            command_finished=command_finished,
+            time_limit=time_limit,
+        ),
+        discounts=torch.ones(4),
+    )
+    assert torch.equal(continuation, torch.tensor([1.0, 0.0, 0.0, 1.0]))
     batch = {
         "critic_observations": torch.tensor([[1.0], [2.0], [3.0], [4.0]]),
         "next_critic_observations": torch.tensor(
@@ -866,30 +883,36 @@ def test_cache_validation_checks_only_semantically_consumed_next_values():
         "rewards": torch.zeros(4),
         "discounts": torch.ones(4),
         REPLAY_TEACHER_V_CURRENT_KEY: torch.tensor([1.0, 2.0, 3.0, 4.0]),
-        # Boundary rows intentionally carry the production zero sentinel.
-        REPLAY_TEACHER_V_NEXT_KEY: torch.tensor([11.0, 0.0, 0.0, 0.0]),
+        # Only the cut rows carry the production zero sentinel; a pure time
+        # limit bootstraps, so it stores its real pre-reset next value.
+        REPLAY_TEACHER_V_NEXT_KEY: torch.tensor([11.0, 0.0, 0.0, 14.0]),
     }
 
-    terms = policy._teacher_value_terms_from_batch(
-        batch, terminated, command_finished, time_limit
-    )
-    assert torch.equal(terms.teacher_v_next, torch.tensor([11.0, 0.0, 0.0, 0.0]))
+    terms = policy._teacher_value_terms_from_batch(batch, continuation)
+    assert torch.equal(terms.teacher_v_next, torch.tensor([11.0, 0.0, 0.0, 14.0]))
 
     corrupt_next = dict(batch)
-    corrupt_next[REPLAY_TEACHER_V_NEXT_KEY] = torch.tensor([10.0, 0.0, 0.0, 0.0])
+    corrupt_next[REPLAY_TEACHER_V_NEXT_KEY] = torch.tensor([10.0, 0.0, 0.0, 14.0])
     with pytest.raises(RuntimeError, match="max_err_v_next"):
-        policy._teacher_value_terms_from_batch(
-            corrupt_next, terminated, command_finished, time_limit
-        )
+        policy._teacher_value_terms_from_batch(corrupt_next, continuation)
+
+    # The truncation row is consumed now, so its cache is validated too.
+    corrupt_timeout = dict(batch)
+    corrupt_timeout[REPLAY_TEACHER_V_NEXT_KEY] = torch.tensor([11.0, 0.0, 0.0, 1.0])
+    with pytest.raises(RuntimeError, match="max_err_v_next"):
+        policy._teacher_value_terms_from_batch(corrupt_timeout, continuation)
+
+    # Cut rows still skip validation: their sentinel is never consumed.
+    sentinel_only = dict(batch)
+    sentinel_only[REPLAY_TEACHER_V_NEXT_KEY] = torch.tensor([11.0, 99.0, 99.0, 14.0])
+    policy._teacher_value_terms_from_batch(sentinel_only, continuation)
 
     corrupt_current = dict(batch)
     corrupt_current[REPLAY_TEACHER_V_CURRENT_KEY] = torch.tensor(
         [1.0, 20.0, 3.0, 4.0]
     )
     with pytest.raises(RuntimeError, match="max_err_v"):
-        policy._teacher_value_terms_from_batch(
-            corrupt_current, terminated, command_finished, time_limit
-        )
+        policy._teacher_value_terms_from_batch(corrupt_current, continuation)
 
 
 @pytest.mark.parametrize("fraction", [-0.1, 1.1, float("nan"), float("inf")])
@@ -988,9 +1011,11 @@ def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward
 
     residual = policy._student_teacher_td_residual_grid(rollout, student)
 
+    # env 1 step 2 is a pure timeout: it bootstraps from the captured
+    # pre-reset final state (40.0), not from its own value.
     assert torch.allclose(
         residual,
-        torch.tensor([[1.8, 2.7, 0.0], [0.0, 12.0, 3.0]]),
+        torch.tensor([[1.8, 2.7, 0.0], [0.0, 12.0, 12.0]]),
     )
     assert len(normalization_calls) == 1
     assert normalization_calls[0][1:] == (
@@ -1042,6 +1067,7 @@ def _old_loop_teacher_residual_reference(
     replay_discount = rollout["next", "discount"].reshape(num_envs, num_steps)
     truncation = time_limit & ~command_finished & ~terminated
     q_bootstrap = truncation | ~done
+    continuation_grid = replay_discount * q_bootstrap.float()
 
     state_rows = []
     state_ids = []
@@ -1049,10 +1075,7 @@ def _old_loop_teacher_residual_reference(
     next_state_ids = []
     reward_rows = []
     q_bootstrap_rows = []
-    terminated_rows = []
-    command_finished_rows = []
-    time_limit_rows = []
-    replay_discount_rows = []
+    continuation_rows = []
     flat_positions = []
     env_state_base = torch.arange(num_envs) * (num_steps + 1)
     timeout_next_id_by_transition = torch.full(
@@ -1093,10 +1116,7 @@ def _old_loop_teacher_residual_reference(
         mask = student[:, step]
         reward_rows.append(reward[:, step][mask])
         q_bootstrap_rows.append(q_bootstrap[:, step][mask])
-        terminated_rows.append(terminated[:, step][mask])
-        command_finished_rows.append(command_finished[:, step][mask])
-        time_limit_rows.append(time_limit[:, step][mask])
-        replay_discount_rows.append(replay_discount[:, step][mask])
+        continuation_rows.append(continuation_grid[:, step][mask])
         env_indices = mask.nonzero(as_tuple=False).squeeze(-1)
         current_state_ids.append(env_state_base[env_indices] + step)
         flat_position = env_indices * num_steps + step
@@ -1135,12 +1155,8 @@ def _old_loop_teacher_residual_reference(
             0, next_positions
         )
     continuation = compute_teacher_value_continuation(
-        teacher_v=teacher_v,
         teacher_v_next=teacher_v_next,
-        terminated=torch.cat(terminated_rows),
-        command_finished=torch.cat(command_finished_rows),
-        time_limit=torch.cat(time_limit_rows),
-        replay_discount=torch.cat(replay_discount_rows),
+        continuation=torch.cat(continuation_rows),
         gamma=gamma,
     )
     transition_residual = torch.cat(reward_rows).float() + continuation - teacher_v
@@ -2205,9 +2221,9 @@ def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
     raw_reward_before = batch["rewards"].clone()
 
     projected, metrics, _ = policy._distributional_fastsac_target(batch)
-    # SAC Q bootstraps ordinary/timeout rows, while the frozen source PPO value
-    # self-bootstraps its timeout row. Potential=[4-2, -3, 6-6].
-    expected_shaped = torch.tensor([1.5, 0.25, 1.0])
+    # Shaping and the Q bootstrap share one c_t = [1, 0, 1], so the timeout row
+    # bootstraps V_T(s_next) in both. Potential=[4-2, 0-3, 8-6].
+    expected_shaped = torch.tensor([1.5, 0.25, 1.5])
     expected, _, _ = _project_c51_probabilities(
         second,
         expected_shaped,
@@ -2216,11 +2232,94 @@ def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
         policy.qnet_target.support,
     )
     assert torch.allclose(projected, expected)
-    assert metrics["tvkd_shaped_reward_mean"].item() == pytest.approx(11.0 / 12.0)
-    assert metrics["tvkd_potential_delta_mean"].item() == pytest.approx(-1.0 / 3.0)
+    assert metrics["tvkd_shaped_reward_mean"].item() == pytest.approx(13.0 / 12.0)
+    assert metrics["tvkd_potential_delta_mean"].item() == pytest.approx(1.0 / 3.0)
     assert torch.equal(batch["rewards"], raw_reward_before)
     assert projected.requires_grad is False
     assert projected.grad_fn is None
+
+
+def test_shaping_and_q_bootstrap_read_one_continuation_coefficient():
+    """The shaped reward and the C51 bootstrap must scale by the same c_t.
+
+    The two used to be derived independently and disagreed at command
+    completion.  A soft ``discount`` below one exercises the full coefficient,
+    not just its boundary mask.
+    """
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    gamma = 0.9
+    policy.cfg = SimpleNamespace(
+        use_tvkd_value_shaping=True,
+        tvkd_lambda=0.5,
+        tvkd_potential_clip=None,
+        gamma=gamma,
+    )
+    first = torch.tensor([[0.05, 0.15, 0.80]] * 4)
+    second = torch.tensor([[0.80, 0.15, 0.05]] * 4)
+    policy.qnet_target = _TableTwin(first, second).requires_grad_(False)
+    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.2)))
+    policy.sac_action_rng = torch.Generator().manual_seed(19)
+    policy._actor_dist_from_flat = lambda observations: _FixedDist(
+        observations.shape[0]
+    )
+    policy._normalized_action_log_prob = lambda value: value
+    policy._q_action_input = lambda action: action
+    policy.get_frozen_teacher_value = lambda observation: observation[:, 0]
+
+    # Rows: ordinary (soft discount), physical terminal, command completion,
+    # pure time limit (soft discount).
+    terminated = torch.tensor([False, True, False, False])
+    command_finished = torch.tensor([False, False, True, False])
+    time_limit = torch.tensor([False, False, False, True])
+    discounts = torch.tensor([0.4, 1.0, 1.0, 0.5])
+    teacher_v = torch.tensor([2.0, 3.0, 6.0, 7.0])
+    # Cut rows carry the production zero sentinel for the unused next value.
+    teacher_v_next = torch.tensor([4.0, 0.0, 0.0, 9.0])
+    batch = {
+        "observations": torch.zeros(4, 1),
+        "next_observations": torch.zeros(4, 1),
+        "critic_observations": teacher_v.unsqueeze(-1),
+        "next_critic_observations": teacher_v_next.unsqueeze(-1),
+        "rewards": torch.ones(4),
+        "dones": terminated | command_finished | time_limit,
+        "truncations": replay_truncation_mask(
+            terminated=terminated,
+            command_finished=command_finished,
+            time_limit=time_limit,
+        ),
+        "discounts": discounts,
+        REPLAY_TERMINATED_KEY: terminated,
+        REPLAY_COMMAND_FINISHED_KEY: command_finished,
+        REPLAY_TIME_LIMIT_KEY: time_limit,
+        REPLAY_TEACHER_V_CURRENT_KEY: teacher_v,
+        REPLAY_TEACHER_V_NEXT_KEY: teacher_v_next,
+    }
+
+    c_t = compute_continuation_coefficient(
+        dones=batch["dones"],
+        truncations=batch["truncations"],
+        discounts=discounts,
+    )
+    assert torch.equal(c_t, torch.tensor([0.4, 0.0, 0.0, 0.5]))
+
+    projected, metrics, _ = policy._distributional_fastsac_target(batch)
+    expected_potential = gamma * c_t * teacher_v_next - teacher_v
+    expected_shaped = torch.ones(4) + 0.5 * expected_potential
+    # The very same c_t drives the bootstrap of the target distribution.
+    expected, _, _ = _project_c51_probabilities(
+        second,
+        expected_shaped,
+        c_t,
+        torch.full((4,), gamma),
+        policy.qnet_target.support,
+    )
+    assert torch.allclose(projected, expected)
+    assert metrics["tvkd_potential_delta_mean"].item() == pytest.approx(
+        expected_potential.mean().item(), abs=1e-6
+    )
 
 
 def test_short_terminal_only_episode_creates_no_failure_curriculum():

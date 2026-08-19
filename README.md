@@ -46,6 +46,8 @@ cd ..
 cd FastSAC_RLPD_HER
 pip install -e .
 ```
+# nohup for ELU
+export OMNI_KIT_ACCEPT_EULA=YES
 
 ## Verify Your Data
 Visualize motions in Isaac Sim with `task.command.replay_motion=true`:

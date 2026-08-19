@@ -37,6 +37,7 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_TEACHER_ACTION_VALID_KEY,
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
+    REPLAY_ACTOR_OBSERVATIONS_KEY,
     _PERCEPTION_REPLAY_FIELDS,
 )
 
@@ -183,12 +184,33 @@ def _collect_one_rollout(env, policy, *, teacher_probability: float, seed: int):
         }
 
 
+def _actor_probe_fields(policy) -> tuple[str, ...]:
+    """Mirror the production Actor sampler's source-specific field set.
+
+    ``online_student_rollout`` carries collection-time Actor observations and
+    never materializes the raw recurrent perception windows, so the probe must
+    request the same fields ``_sample_dagger_actor_batch`` does or the batch
+    cannot be prepared.
+    """
+    return (
+        "critic_observations",
+        DAGGER_REPLAY_TEACHER_ACTIONS,
+        DAGGER_TEACHER_ACTION_VALID_KEY,
+        *(
+            (REPLAY_ACTOR_OBSERVATIONS_KEY,)
+            if policy._student_collection_actor_cache_enabled()
+            else _PERCEPTION_REPLAY_FIELDS
+        ),
+    )
+
+
 def _select_rows(
     transitions: dict[str, torch.Tensor],
     count: int,
     *,
     require_student: bool,
     seed: int,
+    actor_fields: tuple[str, ...],
 ) -> dict[str, torch.Tensor]:
     valid = transitions[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
     student = transitions[DAGGER_IS_STUDENT_ACTION_KEY].reshape(-1).bool()
@@ -206,12 +228,6 @@ def _select_rows(
         torch.randperm(indices.numel(), device=indices.device, generator=generator)[
             : int(count)
         ],
-    )
-    actor_fields = (
-        "critic_observations",
-        DAGGER_REPLAY_TEACHER_ACTIONS,
-        DAGGER_TEACHER_ACTION_VALID_KEY,
-        *_PERCEPTION_REPLAY_FIELDS,
     )
     return {
         key: transitions[key].index_select(0, selected)
@@ -282,12 +298,14 @@ def _collect_probe_batch(env, policy, cfg: DictConfig):
         }
 
     source_count = batch_size // 2 if mode == "balanced" else batch_size
+    actor_fields = _actor_probe_fields(policy)
     student = (
         _select_rows(
             collected["student"],
             source_count,
             require_student=True,
             seed=seed + 200_001,
+            actor_fields=actor_fields,
         )
         if "student" in collected
         else None
@@ -298,6 +316,7 @@ def _collect_probe_batch(env, policy, cfg: DictConfig):
             source_count,
             require_student=False,
             seed=seed + 200_002,
+            actor_fields=actor_fields,
         )
         if "teacher" in collected
         else None

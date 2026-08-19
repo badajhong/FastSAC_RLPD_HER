@@ -95,7 +95,7 @@ TEACHER_VALUE_RETURN_SEMANTICS = (
     "source_ppo_gae_gamma_replay_discount_terminated_mask_v1"
 )
 TEACHER_VALUE_BOUNDARY_SEMANTICS = (
-    "source_ppo_physical_zero_nonphysical_done_self_bootstrap_v1"
+    "shared_continuation_coefficient_next_state_bootstrap_v2"
 )
 ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_sac_plus_fixed_joint_valid_teacher_label_bc_v2"
@@ -756,25 +756,94 @@ class TeacherValueTerms:
 
 
 @torch.no_grad()
-def compute_teacher_value_continuation(
+def continuation_bootstrap_mask(
     *,
-    teacher_v: torch.Tensor,
-    teacher_v_next: torch.Tensor,
+    dones: torch.Tensor,
+    truncations: torch.Tensor,
+) -> torch.Tensor:
+    """Return the rows whose boundary continues into ``s_{t+1}``.
+
+    This is the single truth table TVKD is allowed to hold about boundaries:
+    ordinary transitions and pure time-limit truncations continue, while
+    physical termination and command completion cut.  Everything that needs a
+    boundary decision -- the frozen-Teacher potential, the soft-Bellman
+    bootstrap, and the state gathering that feeds them -- derives from here, so
+    the shaping and bootstrap masks cannot drift apart.
+    """
+    done = torch.as_tensor(dones).detach().reshape(-1).bool()
+    truncated = (
+        torch.as_tensor(truncations)
+        .detach()
+        .to(device=done.device)
+        .reshape(-1)
+        .bool()
+    )
+    if truncated.shape != done.shape:
+        raise ValueError("Continuation mask tensors must have identical shape")
+    return truncated | ~done
+
+
+@torch.no_grad()
+def replay_truncation_mask(
+    *,
     terminated: torch.Tensor,
     command_finished: torch.Tensor,
     time_limit: torch.Tensor,
-    replay_discount: torch.Tensor | float,
+) -> torch.Tensor:
+    """Rebuild the replay ``truncations`` field from explicit boundary causes.
+
+    Mirrors ``_vaic_truncation_mask``: only a pure episode time limit truncates,
+    because command completion and physical termination each end the return.
+    Used to cross-check the stored field, and by offline diagnostics that read
+    the boundary causes rather than the field itself.
+    """
+    return time_limit & ~command_finished & ~terminated
+
+
+@torch.no_grad()
+def compute_continuation_coefficient(
+    *,
+    dones: torch.Tensor,
+    truncations: torch.Tensor,
+    discounts: torch.Tensor | float,
+) -> torch.Tensor:
+    """Return ``c_t``, the one continuation coefficient shared by both users.
+
+    ``gamma * c_t`` multiplies the frozen-Teacher boundary value in the shaping
+    term and the target Q value in the soft-Bellman bootstrap.  Both must read
+    this same tensor: two independently derived coefficients silently disagree
+    at command completion, and a shaping term whose continuation factor differs
+    from the bootstrap's is no longer potential-based.
+    """
+    mask = continuation_bootstrap_mask(dones=dones, truncations=truncations)
+    discount = torch.as_tensor(discounts, device=mask.device, dtype=torch.float32)
+    if discount.ndim == 0:
+        discount = discount.expand_as(mask)
+    else:
+        discount = discount.reshape(-1)
+    if discount.shape != mask.shape:
+        raise ValueError("Continuation coefficient tensors must have identical shape")
+    if not bool(torch.isfinite(discount).all()):
+        raise RuntimeError("Replay discount contains NaN/Inf")
+    return (discount * mask.to(discount)).detach()
+
+
+@torch.no_grad()
+def compute_teacher_value_continuation(
+    *,
+    teacher_v_next: torch.Tensor,
+    continuation: torch.Tensor,
     gamma: float,
     semantics: str = TEACHER_VALUE_BOUNDARY_SEMANTICS,
 ) -> torch.Tensor:
-    """Return source-PPO-compatible discounted frozen-value continuation.
+    """Return the discounted frozen-Teacher boundary term ``gamma * c_t * B_t``.
 
-    The frozen PPO Teacher was trained with the current value copied into every
-    done row and with only ``terminated`` masking its one-step value term.  Its
-    exact boundary contract is therefore different from SAC's: physical
-    termination contributes zero, while a non-physical command completion or
-    time-limit boundary self-bootstraps from ``V_T(s_t)``.  Ordinary rows use
-    ``V_T(s_{t+1})``.  Physical termination wins when reset causes coincide.
+    The boundary value ``B_t`` is ``V_T(s_{t+1})`` on every row; there is no
+    self-bootstrap case.  Replay substitutes the real pre-reset final
+    observation on truncation rows, so ``teacher_v_next`` is already the correct
+    next-state value there rather than a post-reset one.  Cut rows are selected
+    away instead of multiplied by zero, so a stored sentinel or a non-finite
+    next value can never reach the arithmetic.
     """
     if semantics != TEACHER_VALUE_BOUNDARY_SEMANTICS:
         raise ValueError(
@@ -784,59 +853,25 @@ def compute_teacher_value_continuation(
     if gamma < 0.0:
         raise ValueError("teacher value gamma must be non-negative")
 
-    current = torch.as_tensor(teacher_v).detach().float().reshape(-1)
+    coefficient = torch.as_tensor(continuation).detach().float().reshape(-1)
     following = (
         torch.as_tensor(teacher_v_next)
         .detach()
-        .to(device=current.device, dtype=torch.float32)
+        .to(device=coefficient.device, dtype=torch.float32)
         .reshape(-1)
     )
-    physical = (
-        torch.as_tensor(terminated)
-        .detach()
-        .to(device=current.device, dtype=torch.bool)
-        .reshape(-1)
-    )
-    command = (
-        torch.as_tensor(command_finished)
-        .detach()
-        .to(device=current.device, dtype=torch.bool)
-        .reshape(-1)
-    )
-    timeout = (
-        torch.as_tensor(time_limit)
-        .detach()
-        .to(device=current.device, dtype=torch.bool)
-        .reshape(-1)
-    )
-    discount = torch.as_tensor(
-        replay_discount, device=current.device, dtype=torch.float32
-    )
-    if discount.ndim == 0:
-        discount = discount.expand_as(current)
-    else:
-        discount = discount.reshape(-1)
-    values = (current, following, physical, command, timeout, discount)
-    if any(value.shape != current.shape for value in values[1:]):
+    if following.shape != coefficient.shape:
         raise ValueError("Teacher continuation tensors must have identical shape")
-    finite_inputs = (
-        torch.isfinite(current).all()
-        & torch.isfinite(following).all()
-        & torch.isfinite(discount).all()
-    )
-    if not bool(finite_inputs):
+    if not bool(torch.isfinite(coefficient).all()):
+        raise RuntimeError("Teacher continuation coefficient contains NaN/Inf")
+    bootstrapping = coefficient != 0.0
+    following = torch.where(bootstrapping, following, torch.zeros_like(following))
+    if not bool(torch.isfinite(following).all()):
         raise RuntimeError("Teacher continuation contains NaN/Inf")
-
-    nonphysical_self_bootstrap = ~physical & (command | timeout)
-    continuation_value = torch.where(
-        physical,
-        torch.zeros_like(current),
-        torch.where(nonphysical_self_bootstrap, current, following),
-    )
-    continuation = gamma * discount * continuation_value
-    if not torch.isfinite(continuation).all():
+    continuation_term = gamma * coefficient * following
+    if not torch.isfinite(continuation_term).all():
         raise RuntimeError("Discounted Teacher continuation contains NaN/Inf")
-    return continuation.detach()
+    return continuation_term.detach()
 
 
 @torch.no_grad()
@@ -846,16 +881,13 @@ def compute_teacher_value_terms(
     next_teacher_critic_obs: torch.Tensor,
     raw_reward: torch.Tensor,
     *,
-    terminated: torch.Tensor,
-    command_finished: torch.Tensor,
-    time_limit: torch.Tensor,
-    replay_discount: torch.Tensor | float,
+    continuation: torch.Tensor,
     gamma: float,
     semantics: str = TEACHER_VALUE_BOUNDARY_SEMANTICS,
     tvkd_lambda: float,
     potential_clip: float | None = None,
 ) -> TeacherValueTerms:
-    """Compute source-PPO-compatible shaping and raw-reward TD residual."""
+    """Compute the frozen-Teacher shaping and raw-reward TD residual."""
     raw_reward = raw_reward.detach().float().reshape(-1)
     if not torch.isfinite(raw_reward).all():
         raise RuntimeError("TVKD raw reward contains NaN/Inf")
@@ -875,34 +907,22 @@ def compute_teacher_value_terms(
         # The shaped and raw residuals use identical values, so one checked
         # continuation is exactly the same tensor as the former duplicate call.
         raw_continuation = compute_teacher_value_continuation(
-            teacher_v=teacher_v,
             teacher_v_next=teacher_v_next,
-            terminated=terminated,
-            command_finished=command_finished,
-            time_limit=time_limit,
-            replay_discount=replay_discount,
+            continuation=continuation,
             gamma=gamma,
             semantics=semantics,
         )
         fixed_continuation = raw_continuation
     else:
         fixed_continuation = compute_teacher_value_continuation(
-            teacher_v=fixed_v,
             teacher_v_next=fixed_v_next,
-            terminated=terminated,
-            command_finished=command_finished,
-            time_limit=time_limit,
-            replay_discount=replay_discount,
+            continuation=continuation,
             gamma=gamma,
             semantics=semantics,
         )
         raw_continuation = compute_teacher_value_continuation(
-            teacher_v=teacher_v,
             teacher_v_next=teacher_v_next,
-            terminated=terminated,
-            command_finished=command_finished,
-            time_limit=time_limit,
-            replay_discount=replay_discount,
+            continuation=continuation,
             gamma=gamma,
             semantics=semantics,
         )
@@ -1000,10 +1020,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
         All rows in a successful Teacher episode are non-terminated ordinary
         transitions except the last row which has ``command_finished=True``.
-        For intermediate rows the continuation uses ``teacher_v_next``
-        (following state); for the final row it uses ``teacher_v_current``
-        (self-bootstrap), so ``teacher_v_next`` of the last row is irrelevant
-        numerically but stored for schema uniformity.
+        Command completion cuts the continuation, so the last row's ``c_t`` is
+        zero and its ``teacher_v_next`` is numerically irrelevant; it is stored
+        anyway for schema uniformity.
         """
         if not self._needs_teacher_value_cache():
             return episode
@@ -1036,9 +1055,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
     def _teacher_value_terms_from_batch(
         self,
         batch: dict[str, torch.Tensor],
-        terminated: torch.Tensor,
-        command_finished: torch.Tensor,
-        time_limit: torch.Tensor,
+        continuation: torch.Tensor,
     ) -> "TeacherValueTerms":
         """Compute TVKD value terms, using the replay cache when available.
 
@@ -1071,10 +1088,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 batch["critic_observations"],
                 batch["next_critic_observations"],
                 batch["rewards"],
-                terminated=terminated,
-                command_finished=command_finished,
-                time_limit=time_limit,
-                replay_discount=batch["discounts"],
+                continuation=continuation,
                 gamma=float(self.cfg.gamma),
                 semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
                 tvkd_lambda=float(self.cfg.tvkd_lambda),
@@ -1101,13 +1115,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             cached_v = teacher_v.index_select(0, validate_indices)
             max_err_v = (live_v - cached_v).abs().max().item()
 
-            # Boundary continuation deliberately ignores V(next): physical
-            # termination contributes zero, while command completion and pure
-            # timeout self-bootstrap from V(current). Student replay therefore
-            # stores a zero sentinel for those unused next-value entries.
-            ordinary = ~(terminated | command_finished | time_limit)
+            # Cut rows (physical termination and command completion) never
+            # read V(next), so Student replay stores a zero sentinel there.
+            # Validate only the rows the continuation coefficient keeps.
+            bootstrapping = continuation != 0.0
             next_validate_indices = validate_indices[
-                ordinary.index_select(0, validate_indices)
+                bootstrapping.index_select(0, validate_indices)
             ]
             if next_validate_indices.numel():
                 next_obs_validate = batch["next_critic_observations"].index_select(
@@ -1143,34 +1156,22 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
         if potential_clip is None:
             raw_continuation = compute_teacher_value_continuation(
-                teacher_v=teacher_v,
                 teacher_v_next=teacher_v_next,
-                terminated=terminated,
-                command_finished=command_finished,
-                time_limit=time_limit,
-                replay_discount=batch["discounts"],
+                continuation=continuation,
                 gamma=float(self.cfg.gamma),
                 semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
             )
             fixed_continuation = raw_continuation
         else:
             fixed_continuation = compute_teacher_value_continuation(
-                teacher_v=fixed_v,
                 teacher_v_next=fixed_v_next,
-                terminated=terminated,
-                command_finished=command_finished,
-                time_limit=time_limit,
-                replay_discount=batch["discounts"],
+                continuation=continuation,
                 gamma=float(self.cfg.gamma),
                 semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
             )
             raw_continuation = compute_teacher_value_continuation(
-                teacher_v=teacher_v,
                 teacher_v_next=teacher_v_next,
-                terminated=terminated,
-                command_finished=command_finished,
-                time_limit=time_limit,
-                replay_discount=batch["discounts"],
+                continuation=continuation,
                 gamma=float(self.cfg.gamma),
                 semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
             )
@@ -1256,18 +1257,28 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         known_boundary = terminated | command_finished | time_limit
         if bool((done ^ known_boundary).any()):
             raise RuntimeError("TVKD replay contains an unknown boundary cause")
-        expected_q_truncation = time_limit & ~command_finished & ~terminated
+        expected_q_truncation = replay_truncation_mask(
+            terminated=terminated,
+            command_finished=command_finished,
+            time_limit=time_limit,
+        )
         if not torch.equal(batch["truncations"].bool(), expected_q_truncation):
             raise RuntimeError(
                 "TVKD replay Q truncation disagrees with explicit boundary metadata"
             )
-        bootstrap = (batch["truncations"].bool() | ~done).float()
-        effective_discount = float(self.cfg.gamma) * batch["discounts"]
-        terms = self._teacher_value_terms_from_batch(
-            batch, terminated, command_finished, time_limit
+        # One continuation coefficient with two consumers: the frozen-Teacher
+        # potential term inside the shaped reward, and the soft-Bellman
+        # bootstrap of the C51 target below.  Both read this same tensor.
+        continuation = compute_continuation_coefficient(
+            dones=done,
+            truncations=batch["truncations"],
+            discounts=batch["discounts"],
         )
+        gamma = float(self.cfg.gamma)
+        gamma_row = torch.full_like(continuation, gamma)
+        terms = self._teacher_value_terms_from_batch(batch, continuation)
         alpha = self.log_alpha.exp()
-        entropy_tax = effective_discount * bootstrap * alpha * next_log_prob
+        entropy_tax = gamma * continuation * alpha * next_log_prob
         soft_reward = terms.shaped_reward.to(entropy_tax) - entropy_tax
         if not torch.isfinite(soft_reward).all():
             raise RuntimeError("TVKD soft C51 reward contains NaN/Inf")
@@ -1282,8 +1293,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             projected, left_fraction, right_fraction = _project_c51_probabilities(
                 head_probability,
                 soft_reward,
-                bootstrap,
-                effective_discount,
+                continuation,
+                gamma_row,
                 self.qnet_target.support,
             )
             projected_heads.append(projected)
@@ -1489,7 +1500,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
         replay_discount = rollout["next", "discount"].reshape(num_envs, num_steps)
         truncation = _vaic_truncation_mask(rollout).reshape(num_envs, num_steps)
-        q_bootstrap = truncation | ~done
+        q_bootstrap = continuation_bootstrap_mask(
+            dones=done, truncations=truncation
+        ).reshape(num_envs, num_steps)
         state_rows = []
         state_ids = []
         # A timeout's real next observation is captured immediately before the
@@ -1627,13 +1640,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             looked_up_next,
             torch.zeros_like(looked_up_next),
         )
+        transition_continuation = compute_continuation_coefficient(
+            dones=done[transition_envs, transition_steps],
+            truncations=transition_truncation,
+            discounts=replay_discount[transition_envs, transition_steps],
+        )
         teacher_continuation = compute_teacher_value_continuation(
-            teacher_v=teacher_v,
             teacher_v_next=teacher_v_next,
-            terminated=terminated[transition_envs, transition_steps],
-            command_finished=command_finished[transition_envs, transition_steps],
-            time_limit=time_limit[transition_envs, transition_steps],
-            replay_discount=replay_discount[transition_envs, transition_steps],
+            continuation=transition_continuation,
             gamma=float(self.cfg.gamma),
             semantics=TEACHER_VALUE_BOUNDARY_SEMANTICS,
         )
@@ -3726,7 +3740,10 @@ __all__ = [
     "TeacherValueTerms",
     "TVKDDistributionalFastSACTeacherBC",
     "TVKDDistributionalFastSACTeacherBCConfig",
+    "compute_continuation_coefficient",
     "compute_teacher_value_continuation",
     "compute_teacher_value_terms",
+    "continuation_bootstrap_mask",
+    "replay_truncation_mask",
     "_validate_tvkd_algorithm_config",
 ]
