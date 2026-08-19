@@ -1658,6 +1658,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._teacher_episode_device_raw_fields = None
         self._teacher_episode_device_raw_lineage = None
         self._teacher_prefill_successful_episodes = 0
+        # Per-motion commit counts.  Failure Teacher matching is same-motion,
+        # so a motion whose successful prefill is starved silently weakens its
+        # own curriculum; the total alone cannot show that.
+        self._teacher_prefill_successful_by_motion: dict[int, int] = {}
         self._teacher_prefill_failed_episodes = 0
         self._teacher_prefill_timeout_episodes = 0
         self._teacher_prefill_incomplete_episodes = 0
@@ -2829,10 +2833,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     rows = self.q_teacher_replay.extend(episode)
             else:
                 rows = 0
+            # Capture before clear(): the emptied list would otherwise read as
+            # "no episode" and silence the per-motion counter entirely.
+            committed_episode = episode if chunks else None
             chunks.clear()
             if raw_chunks is not None:
                 raw_chunks.clear()
             self._teacher_prefill_successful_episodes += 1
+            self._count_prefill_success_motion(committed_episode)
             return rows
 
         for env_index in event_env.unique(sorted=True).tolist():
@@ -3210,6 +3218,37 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         replay_indices = indices.to(replay.device)
         result = replay.data[key].index_select(0, replay_indices).reshape(-1).bool()
         return result if result.device == indices.device else result.to(indices.device)
+
+    def _count_prefill_success_motion(self, episode) -> None:
+        """Record which motion a committed successful prefill episode used."""
+        if episode is None or REPLAY_MOTION_ID_KEY not in episode:
+            return
+        motion_id = episode[REPLAY_MOTION_ID_KEY]
+        if not torch.is_tensor(motion_id) or motion_id.numel() == 0:
+            return
+        unique_ids = motion_id.reshape(-1).long().unique()
+        if unique_ids.numel() != 1:
+            raise RuntimeError(
+                "a successful Teacher prefill episode spans multiple motions"
+            )
+        key = int(unique_ids.item())
+        counts = self._teacher_prefill_successful_by_motion
+        counts[key] = counts.get(key, 0) + 1
+
+    def _prefill_success_motion_metrics(self) -> dict[str, float]:
+        """Expose per-motion prefill commits plus their imbalance ratio."""
+        counts = getattr(self, "_teacher_prefill_successful_by_motion", None)
+        if not counts:
+            return {}
+        metrics = {
+            f"td3/prefill_successful_episodes_motion_{motion}": float(value)
+            for motion, value in sorted(counts.items())
+        }
+        values = [float(value) for value in counts.values()]
+        metrics["td3/prefill_motion_imbalance_ratio"] = max(values) / max(
+            min(values), 1.0
+        )
+        return metrics
 
     def _teacher_phase_match_pool(
         self,
@@ -6689,6 +6728,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "td3/prefill_successful_episodes": (
                     self._teacher_prefill_successful_episodes
                 ),
+                **self._prefill_success_motion_metrics(),
                 "td3/prefill_failed_episodes": self._teacher_prefill_failed_episodes,
                 "td3/prefill_timeout_episodes": (
                     self._teacher_prefill_timeout_episodes
@@ -6959,6 +6999,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "td3/prefill_successful_episodes": (
                 self._teacher_prefill_successful_episodes
             ),
+            **self._prefill_success_motion_metrics(),
             "td3/prefill_failed_episodes": self._teacher_prefill_failed_episodes,
             "td3/prefill_timeout_episodes": self._teacher_prefill_timeout_episodes,
             "td3/prefill_incomplete_episodes": (
@@ -7375,6 +7416,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self._last_teacher_perception_warmup_metrics = {}
             self._teacher_prefill_pending = None
             self._teacher_prefill_successful_episodes = 0
+            self._teacher_prefill_successful_by_motion = {}
             self._teacher_prefill_failed_episodes = 0
             self._teacher_prefill_timeout_episodes = 0
             self._teacher_prefill_incomplete_episodes = 0

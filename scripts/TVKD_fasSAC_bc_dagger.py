@@ -726,6 +726,9 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         ),
         "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
         "bottleneck_fallback_mode": str(cfg.algo.bottleneck_fallback_mode),
+        "bottleneck_selection_mode": str(
+            getattr(cfg.algo, "bottleneck_selection_mode", "first")
+        ),
         "teacher_value_return_semantics": str(cfg.algo.teacher_value_return_semantics),
         "teacher_value_boundary_semantics": str(
             cfg.algo.teacher_value_boundary_semantics
@@ -757,10 +760,13 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
                 ),
             }
         )
+    # Checkpoints written before the selection knob carry no such key; their
+    # behavior was exactly the earliest-crossing rule that "first" reproduces.
+    q_metadata_defaults = {"bottleneck_selection_mode": "first"}
     for name, expected in exact.items():
         if not isinstance(expected, str) or not expected:
             raise ValueError(f"TVKD runtime lacks required metadata {name!r}")
-        if policy_state.get(name) != expected:
+        if policy_state.get(name, q_metadata_defaults.get(name)) != expected:
             raise ValueError(f"TVKD {label} metadata mismatch at {name!r}")
     q_backend = policy_state.get("q_backend_config")
     if not isinstance(q_backend, Mapping):
@@ -770,9 +776,13 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
         "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
         "bottleneck_fallback_mode": str(cfg.algo.bottleneck_fallback_mode),
+        "bottleneck_selection_mode": str(
+            getattr(cfg.algo, "bottleneck_selection_mode", "first")
+        ),
     }
     for name, expected in expected_q_metadata.items():
-        if q_backend.get(name) != expected:
+        observed = q_backend.get(name, q_metadata_defaults.get(name))
+        if observed != expected:
             raise ValueError(
                 f"TVKD {label} Q backend metadata mismatch at {name!r}"
             )
@@ -934,6 +944,9 @@ def _install_legacy_v5_replay_contract(
                 cfg.algo[f"{purpose}_{source}_fraction"] = fraction
         cfg.algo.perception_replay_mode = "online_student_rollout"
         cfg.algo.bottleneck_fallback_mode = "none"
+        # Checkpoints predating the selection knob used the earliest
+        # qualifying onset, which is exactly what "first" reproduces.
+        cfg.algo.bottleneck_selection_mode = "first"
         cfg.algo.bottleneck_include_unsuccessful_timeouts = False
         cfg.algo.max_teacher_phase_match_distance = None
         cfg.algo.sac_alpha_update_cadence = cadence
@@ -952,6 +965,7 @@ def _install_legacy_v5_replay_contract(
         "teacher_perception_warmup_steps": 0,
         "perception_replay_mode": "online_student_rollout",
         "bottleneck_fallback_mode": "none",
+        "bottleneck_selection_mode": "first",
         "bottleneck_include_unsuccessful_timeouts": False,
         "max_teacher_phase_match_distance": None,
         "sac_alpha_update_cadence": cadence,

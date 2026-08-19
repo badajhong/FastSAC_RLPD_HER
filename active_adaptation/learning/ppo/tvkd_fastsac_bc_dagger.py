@@ -100,6 +100,7 @@ TEACHER_VALUE_BOUNDARY_SEMANTICS = (
 ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_sac_plus_fixed_joint_valid_teacher_label_bc_v2"
 )
+BOTTLENECK_SELECTION_MODES = ("first", "last", "deepest")
 BOTTLENECK_LOCATION_SEMANTICS = (
     "frozen_teacher_raw_td_full_causal_mean_sustained_student_replay_valid_v2"
 )
@@ -327,6 +328,12 @@ def _validate_tvkd_algorithm_config(cfg) -> None:
     include_timeouts = getattr(cfg, "bottleneck_include_unsuccessful_timeouts", False)
     if not isinstance(include_timeouts, bool):
         raise ValueError("bottleneck_include_unsuccessful_timeouts must be boolean")
+    selection_mode = str(getattr(cfg, "bottleneck_selection_mode", "first"))
+    if selection_mode not in BOTTLENECK_SELECTION_MODES:
+        raise ValueError(
+            "bottleneck_selection_mode must be one of "
+            f"{sorted(BOTTLENECK_SELECTION_MODES)}"
+        )
     fallback_mode = str(getattr(cfg, "bottleneck_fallback_mode", "none"))
     if fallback_mode not in {"none", "value_argmin"}:
         raise ValueError("bottleneck_fallback_mode must be 'none' or 'value_argmin'")
@@ -437,6 +444,10 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     bottleneck_min_consecutive: int = 3
     bottleneck_terminal_exclusion_steps: int = 5
     bottleneck_fallback_mode: str = "none"
+    # Which qualifying onset becomes the prevention anchor. ``first`` keeps the
+    # historical earliest-crossing rule; ``last``/``deepest`` move the window
+    # toward the failure, which is what a recovery curriculum actually wants.
+    bottleneck_selection_mode: str = "first"
     bottleneck_include_unsuccessful_timeouts: bool = False
     # TVKD interprets this inherited interval as strictly before t_onset.
     failure_phase_lookback_steps: int = 10
@@ -578,6 +589,7 @@ class TeacherValueBottleneckDetector:
         smoothing_window: int,
         min_consecutive: int,
         terminal_exclusion_steps: int,
+        selection_mode: str = "first",
     ) -> None:
         self.threshold = _finite_scalar("threshold", threshold, positive=True)
         for name, value in (
@@ -592,9 +604,15 @@ class TeacherValueBottleneckDetector:
             or terminal_exclusion_steps < 0
         ):
             raise ValueError("terminal_exclusion_steps must be non-negative")
+        if selection_mode not in BOTTLENECK_SELECTION_MODES:
+            raise ValueError(
+                "bottleneck_selection_mode must be one of "
+                f"{sorted(BOTTLENECK_SELECTION_MODES)}"
+            )
         self.smoothing_window = int(smoothing_window)
         self.min_consecutive = int(min_consecutive)
         self.terminal_exclusion_steps = int(terminal_exclusion_steps)
+        self.selection_mode = str(selection_mode)
         self.last_diagnostics = self._empty_diagnostics()
 
     @staticmethod
@@ -683,22 +701,40 @@ class TeacherValueBottleneckDetector:
             "no_candidate": candidate_count == 0,
         }
 
-        selected_index: int | None = None
-        run_start = -1
+        # Every t whose K-window lies entirely below the threshold.  ``first``
+        # stops at the earliest one and is the historical behavior; the other
+        # modes need the complete set, so they keep scanning.
+        onsets: list[int] = []
         run_length = 0
         for index in range(size):
             below = bool(candidate[index] and smoothed[index] < -self.threshold)
-            if below:
-                if run_length == 0:
-                    run_start = index
-                run_length += 1
-                if run_length >= self.min_consecutive:
-                    selected_index = run_start
-                    diagnostics["threshold_detected"] = True
-                    break
-            else:
-                run_start = -1
+            if not below:
                 run_length = 0
+                continue
+            run_length += 1
+            if run_length >= self.min_consecutive:
+                onsets.append(index - self.min_consecutive + 1)
+                if self.selection_mode == "first":
+                    break
+
+        selected_index: int | None = None
+        if onsets:
+            diagnostics["threshold_detected"] = True
+            if self.selection_mode == "first":
+                selected_index = onsets[0]
+            elif self.selection_mode == "last":
+                selected_index = onsets[-1]
+            else:
+                # ``deepest``: the onset whose own smoothed residual is lowest.
+                # Ties resolve to the latest such onset, because among equally
+                # deep candidates the later one leaves less already-doomed
+                # trajectory inside the prevention window.
+                best = None
+                for onset in onsets:
+                    value = float(smoothed[onset].item())
+                    if best is None or value <= best[0]:
+                        best = (value, onset)
+                selected_index = best[1]
 
         used_fallback = False
         if selected_index is None:
@@ -974,6 +1010,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             smoothing_window=int(cfg.bottleneck_smoothing_window),
             min_consecutive=int(cfg.bottleneck_min_consecutive),
             terminal_exclusion_steps=int(cfg.bottleneck_terminal_exclusion_steps),
+            selection_mode=str(getattr(cfg, "bottleneck_selection_mode", "first")),
         )
         self._bottleneck_episode_histories: list[dict[str, list]] | None = None
         self._reset_student_replay_episode_tracking()
@@ -1408,6 +1445,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self._bottleneck_teacher_transitions_inserted = 0
         self._bottleneck_phase_match_distance_sum = 0.0
         self._bottleneck_phase_match_distance_count = 0
+        # Onset quality diagnostics.  Without the distance from the onset to
+        # the physical terminal there is no way to tell a genuine failure
+        # precursor from an early false positive.
+        self._bottleneck_onset_to_terminal_sum = 0.0
+        self._bottleneck_failed_episode_length_sum = 0.0
         self._bottleneck_next_student_episode_id = 0
         self._student_focus_rows_marked = 0
         self._student_focus_rows_missing = 0
@@ -2039,6 +2081,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         episode_id = self._bottleneck_next_student_episode_id
         self._bottleneck_next_student_episode_id += 1
         self._bottleneck_failed_student_episode_count += 1
+        episode_length = len(history["phase"])
+        self._bottleneck_failed_episode_length_sum += float(episode_length)
         residual = torch.tensor(history["teacher_td_residual"], dtype=torch.float32)
         source = torch.tensor(history["source_id"], dtype=torch.long)
         phase = torch.tensor(history["phase"], dtype=torch.float32)
@@ -2069,6 +2113,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
         if result.threshold_detected:
             self._bottleneck_detected_count += 1
+            # The dispatched history ends on its own physical terminal, so the
+            # last index is tau.  A small distance means the onset sits just
+            # before the failure; a large one means it fired early.
+            self._bottleneck_onset_to_terminal_sum += float(
+                (episode_length - 1) - int(result.index)
+            )
             precursor_indices = self._student_bottleneck_anchor_indices(
                 history, result.index
             )
@@ -2574,7 +2624,15 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
     def _bottleneck_metrics(self) -> dict[str, float]:
         selected = max(self._bottleneck_selected_count, 1)
         match_count = max(self._bottleneck_phase_match_distance_count, 1)
+        detected = max(self._bottleneck_detected_count, 1)
+        failed_episodes = max(self._bottleneck_failed_student_episode_count, 1)
         return {
+            "onset_to_terminal_distance_mean": (
+                self._bottleneck_onset_to_terminal_sum / detected
+            ),
+            "failed_episode_length_mean": (
+                self._bottleneck_failed_episode_length_sum / failed_episodes
+            ),
             "unsuccessful_episode_count": float(
                 self._bottleneck_unsuccessful_episode_count
             ),
@@ -2731,6 +2789,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     "bottleneck_min_consecutive",
                     "bottleneck_terminal_exclusion_steps",
                     "bottleneck_fallback_mode",
+                    "bottleneck_selection_mode",
                     "bottleneck_include_unsuccessful_timeouts",
                     "max_teacher_phase_match_distance",
                     "perception_replay_mode",
@@ -2790,6 +2849,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
                 "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                 "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+                "bottleneck_selection_mode": str(
+                    getattr(self.cfg, "bottleneck_selection_mode", "first")
+                ),
             }
         )
         return metadata
@@ -2987,6 +3049,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             "phase_match_distance_sum": float(
                 self._bottleneck_phase_match_distance_sum
             ),
+            "onset_to_terminal_sum": float(self._bottleneck_onset_to_terminal_sum),
+            "failed_episode_length_sum": float(
+                self._bottleneck_failed_episode_length_sum
+            ),
             "last_metadata": copy.deepcopy(self._last_bottleneck_metadata),
             "last_value_argmin_metadata": copy.deepcopy(
                 self._last_value_argmin_metadata
@@ -3050,6 +3116,15 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         ):
             if floats[name] < 0.0:
                 raise ValueError(f"TVKD bottleneck replay {name} is negative")
+        # Added after the first v6 checkpoints shipped, so a missing key is a
+        # legitimate older checkpoint rather than corruption.
+        optional_floats = {
+            name: _finite_scalar(f"bottleneck replay {name}", state.get(name, 0.0))
+            for name in ("onset_to_terminal_sum", "failed_episode_length_sum")
+        }
+        for name, value in optional_floats.items():
+            if value < 0.0:
+                raise ValueError(f"TVKD bottleneck replay {name} is negative")
         metadata = state.get("last_metadata", {})
         if not isinstance(metadata, Mapping):
             raise ValueError("TVKD bottleneck replay metadata is invalid")
@@ -3094,6 +3169,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         ]
         self._failure_phase_student_uniform_fallback_rows = integers[
             "student_focus_uniform_fallback_rows"
+        ]
+        self._bottleneck_onset_to_terminal_sum = optional_floats[
+            "onset_to_terminal_sum"
+        ]
+        self._bottleneck_failed_episode_length_sum = optional_floats[
+            "failed_episode_length_sum"
         ]
         self._bottleneck_selected_step_sum = floats["selected_step_sum"]
         self._bottleneck_selected_phase_sum = floats["selected_phase_sum"]
@@ -3156,6 +3237,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
                     "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                     "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+                    "bottleneck_selection_mode": str(
+                        getattr(self.cfg, "bottleneck_selection_mode", "first")
+                    ),
                 },
                 "replay_mix_state": replay_mix_state,
                 "perception_replay_mode": str(self.cfg.perception_replay_mode),
@@ -3170,6 +3254,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 ),
                 "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                 "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+                "bottleneck_selection_mode": str(
+                    getattr(self.cfg, "bottleneck_selection_mode", "first")
+                ),
                 "teacher_value_return_semantics": str(
                     self.cfg.teacher_value_return_semantics
                 ),
@@ -3316,6 +3403,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 ),
                 "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                 "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+                "bottleneck_selection_mode": str(
+                    getattr(self.cfg, "bottleneck_selection_mode", "first")
+                ),
                 "teacher_value_return_semantics": str(
                     self.cfg.teacher_value_return_semantics
                 ),
@@ -3360,10 +3450,13 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "runtime replay task fingerprint",
                 exact_metadata["replay_task_fingerprint"],
             )
+            # Checkpoints written before the selection knob carry no such key;
+            # their behavior was exactly what "first" reproduces.
+            metadata_defaults = {"bottleneck_selection_mode": "first"}
             for name, expected in exact_metadata.items():
                 if not isinstance(expected, str) or not expected:
                     raise ValueError(f"TVKD runtime lacks required metadata {name!r}")
-                if state.get(name) != expected:
+                if state.get(name, metadata_defaults.get(name)) != expected:
                     raise ValueError(f"TVKD resume metadata mismatch at {name!r}")
             q_backend = state.get("q_backend_config")
             if not isinstance(q_backend, Mapping):
@@ -3375,9 +3468,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
                 "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                 "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
+                "bottleneck_selection_mode": str(
+                    getattr(self.cfg, "bottleneck_selection_mode", "first")
+                ),
             }
             for name, expected in expected_q_metadata.items():
-                if q_backend.get(name) != expected:
+                if q_backend.get(name, metadata_defaults.get(name)) != expected:
                     raise ValueError(
                         f"TVKD resume Q backend metadata mismatch at {name!r}"
                     )
@@ -3711,6 +3807,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 __all__ = [
     "ACTOR_BACKEND",
     "BOTTLENECK_LOCATION_SEMANTICS",
+    "BOTTLENECK_SELECTION_MODES",
     "CHECKPOINT_VERSION",
     "FRESH_RING_RESUME_SEMANTICS",
     "LEGACY_ADAPTIVE_BC_CONFIG_FIELDS",

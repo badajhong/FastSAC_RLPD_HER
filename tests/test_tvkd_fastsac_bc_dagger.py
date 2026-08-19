@@ -754,6 +754,161 @@ def test_tvkd_lambda_zero_keeps_raw_reward_exactly():
     assert torch.equal(terms.shaped_reward, torch.tensor([1.5, -2.0]))
 
 
+def test_bottleneck_selection_mode_picks_first_last_or_deepest_onset():
+    """A recovery curriculum wants the latest/deepest onset, not the earliest.
+
+    The residual dips three separate times.  ``first`` keeps the historical
+    earliest-crossing rule, ``last`` takes the dip closest to the failure, and
+    ``deepest`` takes the lowest one wherever it sits.
+    """
+    # Windows are 1-wide so the smoothed series equals the residual series.
+    residual = torch.tensor(
+        [
+            -0.30, -0.30, -0.30,   # onset 0 (early, shallow)
+            0.50,
+            -0.90, -0.90, -0.90,   # onset 4 (deepest)
+            0.50,
+            -0.40, -0.40, -0.40,   # onset 8 (latest)
+            0.50, 0.50, 0.50, 0.50, 0.50,
+        ]
+    )
+    size = residual.numel()
+    common = dict(
+        source_id=torch.full((size,), SOURCE_STUDENT, dtype=torch.long),
+        reference_phase=torch.linspace(0.0, 0.9, size),
+        true_terminal=torch.zeros(size, dtype=torch.bool),
+        timeout=torch.zeros(size, dtype=torch.bool),
+        replay_valid=torch.ones(size, dtype=torch.bool),
+    )
+    common["true_terminal"][-1] = True
+
+    expected = {"first": 0, "last": 8, "deepest": 4}
+    for mode, index in expected.items():
+        detector = _detector(
+            threshold=0.05,
+            smoothing_window=1,
+            min_consecutive=3,
+            terminal_exclusion_steps=1,
+            selection_mode=mode,
+        )
+        result = detector.detect(residual, **common)
+        assert result is not None, mode
+        assert result.threshold_detected is True
+        assert result.index == index, mode
+        assert result.confirmation_index == index + 2
+
+    with pytest.raises(ValueError, match="bottleneck_selection_mode"):
+        _detector(selection_mode="earliest")
+
+
+def test_bottleneck_selection_mode_deepest_prefers_the_later_tie():
+    """Equally deep onsets resolve toward the failure, not away from it."""
+    residual = torch.tensor(
+        [-0.60, -0.60, -0.60, 0.50, -0.60, -0.60, -0.60, 0.50, 0.50, 0.50]
+    )
+    size = residual.numel()
+    true_terminal = torch.zeros(size, dtype=torch.bool)
+    true_terminal[-1] = True
+    detector = _detector(
+        threshold=0.05,
+        smoothing_window=1,
+        min_consecutive=3,
+        terminal_exclusion_steps=1,
+        selection_mode="deepest",
+    )
+    result = detector.detect(
+        residual,
+        source_id=torch.full((size,), SOURCE_STUDENT, dtype=torch.long),
+        reference_phase=torch.linspace(0.0, 0.9, size),
+        true_terminal=true_terminal,
+        timeout=torch.zeros(size, dtype=torch.bool),
+        replay_valid=torch.ones(size, dtype=torch.bool),
+    )
+    assert result is not None
+    assert result.index == 4
+
+
+def test_onset_to_terminal_diagnostics_round_trip_and_tolerate_legacy_state():
+    """The onset-quality sums must persist, and older checkpoints must load.
+
+    Without the onset-to-terminal distance there is no way to tell a genuine
+    failure precursor from an early false positive, so the sums are part of the
+    resumable state.  They shipped after the first v6 checkpoints, so a state
+    dict lacking them is an older checkpoint rather than corruption.
+    """
+
+    def fresh():
+        policy = TVKDDistributionalFastSACTeacherBC.__new__(
+            TVKDDistributionalFastSACTeacherBC
+        )
+        nn.Module.__init__(policy)
+        policy.teacher_value_bottleneck_detector = _detector()
+        policy._reset_bottleneck_statistics()
+        return policy
+
+    saved = fresh()
+    assert saved._bottleneck_onset_to_terminal_sum == 0.0
+    assert saved._bottleneck_failed_episode_length_sum == 0.0
+    saved._bottleneck_detected_count = 4
+    saved._bottleneck_failed_student_episode_count = 5
+    saved._bottleneck_onset_to_terminal_sum = 34.0
+    saved._bottleneck_failed_episode_length_sum = 210.0
+    state = saved._bottleneck_replay_checkpoint_state()
+    assert state["onset_to_terminal_sum"] == pytest.approx(34.0)
+    assert state["failed_episode_length_sum"] == pytest.approx(210.0)
+
+    restored = fresh()
+    restored._load_bottleneck_replay_checkpoint_state(state)
+    assert restored._bottleneck_onset_to_terminal_sum == pytest.approx(34.0)
+    assert restored._bottleneck_failed_episode_length_sum == pytest.approx(210.0)
+
+    legacy_state = dict(state)
+    legacy_state.pop("onset_to_terminal_sum")
+    legacy_state.pop("failed_episode_length_sum")
+    legacy = fresh()
+    legacy._load_bottleneck_replay_checkpoint_state(legacy_state)
+    assert legacy._bottleneck_onset_to_terminal_sum == 0.0
+    assert legacy._bottleneck_failed_episode_length_sum == 0.0
+
+    negative_state = dict(state)
+    negative_state["onset_to_terminal_sum"] = -1.0
+    with pytest.raises(ValueError, match="onset_to_terminal_sum"):
+        fresh()._load_bottleneck_replay_checkpoint_state(negative_state)
+
+
+def test_prefill_success_motion_counter_tracks_motions_and_imbalance():
+    """Failure Teacher matching is same-motion, so per-motion commits matter."""
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    policy._teacher_prefill_successful_by_motion = {}
+
+    # A cleared chunk list must not silence the counter: the caller captures
+    # the episode before clear(), so None only means "nothing was committed".
+    policy._count_prefill_success_motion(None)
+    assert policy._prefill_success_motion_metrics() == {}
+
+    def episode(motion_id, rows=3):
+        return {
+            REPLAY_MOTION_ID_KEY: torch.full((rows,), motion_id, dtype=torch.long)
+        }
+
+    for motion_id in (0, 0, 0, 1, 2, 2):
+        policy._count_prefill_success_motion(episode(motion_id))
+    assert policy._teacher_prefill_successful_by_motion == {0: 3, 1: 1, 2: 2}
+
+    metrics = policy._prefill_success_motion_metrics()
+    assert metrics["td3/prefill_successful_episodes_motion_0"] == 3.0
+    assert metrics["td3/prefill_successful_episodes_motion_1"] == 1.0
+    assert metrics["td3/prefill_successful_episodes_motion_2"] == 2.0
+    assert metrics["td3/prefill_motion_imbalance_ratio"] == pytest.approx(3.0)
+
+    # An episode is one motion by construction; a mixed one is a real defect.
+    mixed = {REPLAY_MOTION_ID_KEY: torch.tensor([0, 1], dtype=torch.long)}
+    with pytest.raises(RuntimeError, match="spans multiple motions"):
+        policy._count_prefill_success_motion(mixed)
+
+
 def test_teacher_value_boundary_contract_bootstraps_next_state_under_shared_c_t():
     # Rows: command completion, pure time limit, physical terminal, ordinary.
     terminated = torch.tensor([False, False, True, False])
