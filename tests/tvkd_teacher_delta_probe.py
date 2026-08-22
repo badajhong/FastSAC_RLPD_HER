@@ -964,6 +964,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Fresh train-phase PPO checkpoint used by TVKD prefill.",
     )
     parser.add_argument(
+        "--staged-checkpoint",
+        action="store_true",
+        help=(
+            "Load a same-stage TVKD/FastSAC checkpoint using its adjacent "
+            "saved cfg.yaml. This is a read-only Student-policy diagnostic, "
+            "not a fresh-Teacher prefill probe."
+        ),
+    )
+    parser.add_argument(
+        "--rollout-source",
+        choices=("teacher", "student"),
+        default="teacher",
+        help=(
+            "Executed policy source. Student uses the deterministic eval actor; "
+            "teacher preserves the original forced-prefill diagnostic."
+        ),
+    )
+    parser.add_argument(
         "--task",
         default="G1/vaic/skateboard_stu",
         help="Hydra task selection (default: G1/vaic/skateboard_stu).",
@@ -1057,6 +1075,45 @@ def build_config(args: argparse.Namespace):
     checkpoint = args.checkpoint.expanduser().resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(f"PPO Teacher checkpoint does not exist: {checkpoint}")
+    if bool(args.staged_checkpoint):
+        if str(args.rollout_source) != "student":
+            raise ValueError("--staged-checkpoint requires --rollout-source student")
+        saved_config = checkpoint.parent / "cfg.yaml"
+        if not saved_config.is_file():
+            raise FileNotFoundError(
+                "staged checkpoint requires its adjacent saved cfg.yaml: "
+                f"{saved_config}"
+            )
+        # A staged checkpoint is intentionally rejected by the fresh-source
+        # preparation path below.  Its own resolved config is the only safe
+        # architecture/action-contract source for a read-only model load.
+        # Older staged runs predate some current diagnostic-only config fields.
+        # Start from today's schema, then let the run's resolved config win for
+        # every field it actually recorded.
+        config_dir = REPO_ROOT / "cfg"
+        with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+            current_defaults = compose(
+                config_name="TVKD_fasSAC_bc_dagger",
+                overrides=[f"task={args.task}"],
+            )
+        current_defaults = OmegaConf.create(
+            OmegaConf.to_container(current_defaults, resolve=False)
+        )
+        cfg = OmegaConf.merge(current_defaults, OmegaConf.load(saved_config))
+        OmegaConf.set_struct(cfg, False)
+        with open_dict(cfg):
+            cfg.checkpoint_path = str(checkpoint)
+            cfg.seed = int(args.seed)
+            cfg.headless = True
+            cfg.eval_render = False
+            cfg.task.num_envs = int(args.num_envs)
+            cfg.wandb.mode = "disabled"
+            cfg.app.headless = True
+            cfg.app.enable_cameras = False
+            if not bool(args.random_start):
+                cfg.task.command.reset_range = [0, 1]
+        OmegaConf.resolve(cfg)
+        return cfg
     overrides = [
         f"task={args.task}",
         "fastsac_dagger_iterations=1",
@@ -1669,7 +1726,8 @@ def collect_trajectories(
         DAGGER_TEACHER_ACTION_VALID_KEY,
     )
 
-    if not (
+    source = str(args.rollout_source)
+    if source == "teacher" and not (
         hasattr(policy, "is_teacher_prefill_active")
         and policy.is_teacher_prefill_active()
     ):
@@ -1680,7 +1738,7 @@ def collect_trajectories(
     policy.teacher_value_wrapper.freeze()
     env.train()
     env.set_seed(int(args.seed))
-    rollout_policy = policy.get_rollout_policy("train")
+    rollout_policy = policy.get_rollout_policy("train" if source == "teacher" else "eval")
     carry = env.reset()
     _validate_phase_zero_reset(policy, random_start=bool(args.random_start))
     scene_state_before = None if scene_codec is None else scene_codec.snapshot()
@@ -1690,7 +1748,9 @@ def collect_trajectories(
         num_envs,
         num_success=int(args.num_success),
         num_failure=int(args.num_failure),
-        require_pure_teacher=not bool(args.allow_student_fallback),
+        require_pure_teacher=(
+            source == "teacher" and not bool(args.allow_student_fallback)
+        ),
     )
     gamma = float(cfg.algo.gamma)
     tvkd_lambda = float(cfg.algo.tvkd_lambda)
@@ -1738,16 +1798,27 @@ def collect_trajectories(
             )
 
             acted = rollout_policy(carry)
-            teacher_valid = _scalar_per_env(
-                acted[DAGGER_TEACHER_ACTION_VALID_KEY],
-                num_envs,
-                boolean=True,
-            )
-            student_fallback = _scalar_per_env(
-                acted[DAGGER_IS_STUDENT_ACTION_KEY],
-                num_envs,
-                boolean=True,
-            )
+            if source == "teacher":
+                teacher_valid = _scalar_per_env(
+                    acted[DAGGER_TEACHER_ACTION_VALID_KEY],
+                    num_envs,
+                    boolean=True,
+                )
+                student_fallback = _scalar_per_env(
+                    acted[DAGGER_IS_STUDENT_ACTION_KEY],
+                    num_envs,
+                    boolean=True,
+                )
+            else:
+                teacher_valid = torch.zeros(
+                    num_envs, dtype=torch.bool, device=carry.device
+                )
+                # CSV's historical field name is retained for compatibility;
+                # in Student mode it denotes an intentionally executed Student
+                # action, not an invalid-Teacher fallback.
+                student_fallback = torch.ones(
+                    num_envs, dtype=torch.bool, device=carry.device
+                )
             if scene_codec is None:
                 transition, carry = env.step_and_maybe_reset(acted)
                 scene_state_after = None

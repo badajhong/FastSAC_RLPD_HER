@@ -23,7 +23,7 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_REPLAY_TEACHER_ACTIONS,
     DAGGER_TEACHER_ACTION_VALID_KEY,
 )
-from active_adaptation.learning.ppo.ppo_vel import PPOVEL
+from active_adaptation.learning.ppo.ppo_vel import DEPTH_KEY, PPOVEL, PRIV_PRED_KEY
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     DistributionalTD3TeacherBC,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
@@ -34,6 +34,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     PERCEPTION_VEL_COMMAND_RAW_KEY,
     REFERENCE_PHASE_KEY,
     REPLAY_COMMAND_FINISHED_KEY,
+    REPLAY_PERCEPTION_EMA_GENERATION_KEY,
     REPLAY_MOTION_ID_KEY,
     REPLAY_SAMPLE_PROVENANCE_KEY,
     REPLAY_SOURCE_ORDER,
@@ -41,6 +42,8 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     REPLAY_TIME_LIMIT_KEY,
     STUDENT_REPLAY_EPISODE_ID_KEY,
     STUDENT_REPLAY_EPISODE_STEP_KEY,
+    STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY,
+    _StudentPerceptionDriftEpisode,
     _TD3DeviceReplay,
     _PREFILL_ENV_INDEX_KEY,
     _PREFILL_STEP_INDEX_KEY,
@@ -826,6 +829,150 @@ def test_bottleneck_selection_mode_deepest_prefers_the_later_tie():
     )
     assert result is not None
     assert result.index == 4
+
+
+def test_student_collection_cache_ema_age_metrics_exclude_teacher_rows():
+    """Only collection-time Student Actor features have representation age."""
+    policy = DistributionalFastSACTeacherBC.__new__(
+        DistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy._perception_ema_generation = 11
+
+    metrics = policy._student_replay_ema_age_metrics(
+        {
+            REPLAY_PERCEPTION_EMA_GENERATION_KEY: torch.tensor([8, 2, 10, 11]),
+            DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor([True, False, True, True]),
+        }
+    )
+    # Teacher row generation=2 is intentionally ignored: its Actor cache is
+    # rebuilt at the current EMA rather than read from collection-time replay.
+    assert metrics["available"] == 1.0
+    assert metrics["student_rows"] == 3.0
+    assert metrics["mean"] == pytest.approx(4.0 / 3.0)
+    assert metrics["max"] == 3.0
+    assert metrics["stale_fraction"] == pytest.approx(2.0 / 3.0)
+
+    assert policy._student_replay_ema_age_metrics({}) == {
+        "available": 0.0,
+        "student_rows": 0.0,
+        "mean": 0.0,
+        "p95": 0.0,
+        "max": 0.0,
+        "stale_fraction": 0.0,
+    }
+    with pytest.raises(RuntimeError, match="future EMA generation"):
+        policy._student_replay_ema_age_metrics(
+            {
+                REPLAY_PERCEPTION_EMA_GENERATION_KEY: torch.tensor([12]),
+                DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor([True]),
+            }
+        )
+
+
+def test_student_drift_probe_commits_only_reset_complete_episode():
+    policy = DistributionalFastSACTeacherBC.__new__(
+        DistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        perception_replay_mode="online_student_rollout",
+        perception_staleness_probe_num_envs=2,
+        perception_staleness_probe_max_episodes=4,
+    )
+    policy._q_actor_dim = 3
+    policy._perception_ema_generation = 7
+    policy._student_perception_drift_pending = None
+    policy._student_perception_drift_episodes = []
+    policy._student_perception_drift_completed = 0
+    policy._student_perception_drift_discarded_incomplete = 0
+
+    def raw_values(_self, td):
+        return {
+            DEPTH_KEY: td["raw_depth"],
+            PERCEPTION_POLICY_RAW_KEY: td["raw_policy"],
+            PERCEPTION_VEL_COMMAND_RAW_KEY: td["raw_vel"],
+            PERCEPTION_IS_INIT_KEY: td["is_init"],
+        }
+
+    policy._student_perception_drift_raw_values = MethodType(raw_values, policy)
+    rollout = TensorDict(
+        {
+            "raw_depth": torch.arange(8).reshape(2, 4, 1).to(torch.uint8),
+            "raw_policy": torch.arange(8).reshape(2, 4, 1).float(),
+            "raw_vel": torch.ones(2, 4, 1),
+            "is_init": torch.tensor(
+                [[[True], [False], [False], [False]], [[False]] * 4]
+            ),
+            "next": TensorDict(
+                {
+                    "done": torch.tensor(
+                        [[[False], [False], [False], [True]], [[False]] * 4]
+                    )
+                },
+                batch_size=(2, 4),
+            ),
+            DAGGER_IS_STUDENT_ACTION_KEY: torch.ones(2, 4, 1, dtype=torch.bool),
+            STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY: torch.arange(24)
+            .reshape(2, 4, 3)
+            .float(),
+        },
+        batch_size=(2, 4),
+    )
+    policy._capture_student_perception_drift_rollout(rollout)
+
+    assert policy._student_perception_drift_completed == 1
+    assert len(policy._student_perception_drift_episodes) == 1
+    episode = policy._student_perception_drift_episodes[0]
+    assert episode.collection_actor.shape == (4, 3)
+    assert episode.collection_ema_generation.tolist() == [7, 7, 7, 7]
+    assert episode.eligible_student_rows.tolist() == [False, True, True, True]
+    assert policy._student_perception_drift_pending[1] is None
+
+
+def test_reset_exact_student_drift_metrics_measure_features_and_action_effect():
+    policy = DistributionalFastSACTeacherBC.__new__(
+        DistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        perception_replay_mode="online_student_rollout",
+        perception_staleness_probe_num_envs=1,
+        perception_staleness_probe_max_generation_age=8,
+        perception_staleness_probe_interval=1,
+    )
+    policy._q_actor_dim = 2
+    policy.device = torch.device("cpu")
+    policy.q_actor_keys = (PRIV_PRED_KEY,)
+    policy._q_actor_widths = (2,)
+    policy._perception_ema_generation = 3
+    policy._fastsac_q_action_scale = torch.ones(2)
+    old = torch.tensor([[1.0, 2.0], [2.0, 1.0], [1.0, 1.0]])
+    episode = _StudentPerceptionDriftEpisode(
+        raw_fields={},
+        collection_actor=old,
+        collection_ema_generation=torch.tensor([1, 2, 3]),
+        eligible_student_rows=torch.tensor([True, True, False]),
+    )
+    policy._student_perception_drift_episodes = [episode]
+    policy._reencode_student_perception_drift_episode = MethodType(
+        lambda _self, _episode: old + 1.0,
+        policy,
+    )
+    policy._actor_dist_from_flat = MethodType(
+        lambda _self, value: SimpleNamespace(mean=value),
+        policy,
+    )
+
+    metrics = policy._student_perception_drift_metrics()
+    assert metrics["enabled"] == 1.0
+    assert metrics["available"] == 1.0
+    assert metrics["episodes"] == 1.0
+    assert metrics["rows"] == 2.0
+    assert metrics["ema_age_mean"] == pytest.approx(1.5)
+    assert metrics["actor_feature_mse"] == pytest.approx(1.0)
+    assert metrics["perception_latent_mse"] == pytest.approx(1.0)
+    assert metrics["action_normalized_rmse"] == pytest.approx(1.0)
 
 
 def test_onset_to_terminal_diagnostics_round_trip_and_tolerate_legacy_state():

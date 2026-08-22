@@ -11,13 +11,13 @@ app:
   headless: ${..headless}
   enable_cameras: ${oc.select:..task.enable_cameras,${..eval_render}}
 
-total_frames: 800_000_000
+total_frames: 4_800_000_000
 # total_frames: 500_000_000
 # total_frames: 300_000_000
 # total_frames: 150_000_000
 # total_frames: 100_000_000
 eval_render: false
-save_interval: 300
+save_interval: 600
 seed: 0
 checkpoint_path: null
 # Optional explicit teacher H5 used with checkpoint_path. This top-level alias
@@ -50,7 +50,7 @@ wallclock_profile:
 wandb:
   name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
   job_type: train
-  project: haic
+  project: vaic
   mode: online # set to 'disabled' when debugging locally
   tags: []
   # Teacher replay files are commonly 20+ GiB. Keep them local unless an

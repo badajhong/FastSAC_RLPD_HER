@@ -3351,6 +3351,25 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             expected_backend = self._checkpoint_config()
             if v5:
                 expected_backend["method"] = V5_TRAINING_ALGORITHM
+            # These knobs are measurement-only and were added after the first
+            # v6 checkpoints.  They do not affect policy, critic, replay, or
+            # optimizer semantics, so an older checkpoint may safely inherit
+            # the current config's diagnostic defaults.
+            legacy_optional_diagnostic_keys = frozenset(
+                {
+                    "perception_staleness_probe_num_envs",
+                    "perception_staleness_probe_max_episodes",
+                    "perception_staleness_probe_max_generation_age",
+                    "perception_staleness_probe_interval",
+                }
+            )
+            missing_optional = set(expected_backend).difference(backend) & (
+                legacy_optional_diagnostic_keys
+            )
+            if missing_optional:
+                backend = dict(backend)
+                for name in missing_optional:
+                    backend[name] = expected_backend[name]
             if set(backend) != set(expected_backend):
                 missing = sorted(set(expected_backend).difference(backend))
                 unexpected = sorted(set(backend).difference(expected_backend))

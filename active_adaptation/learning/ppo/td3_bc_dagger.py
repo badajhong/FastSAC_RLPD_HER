@@ -144,6 +144,11 @@ PERCEPTION_VEL_COMMAND_RAW_KEY = "perception_vel_command_raw"
 PERCEPTION_IS_INIT_KEY = "perception_is_init"
 REPLAY_ACTOR_OBSERVATIONS_KEY = "replay_actor_observations"
 REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY = "replay_next_actor_observations"
+# The EMA generation that produced a Student collection Actor cache.  This is
+# provenance only: it must never be used to reconstruct a recurrent state.
+# Teacher rows are re-encoded lazily at the current generation, so the
+# staleness metrics deliberately exclude them.
+REPLAY_PERCEPTION_EMA_GENERATION_KEY = "replay_perception_ema_generation"
 # Transitional internal aliases keep the Student collection patch isolated;
 # Teacher episode replay can populate the same generic schema directly.
 STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY = REPLAY_ACTOR_OBSERVATIONS_KEY
@@ -266,6 +271,16 @@ _PERCEPTION_REPLAY_FIELDS = (
     PERCEPTION_IS_INIT_KEY,
 )
 
+# Drift diagnostics keep the actual pre-VecNorm depth.  Reusing the replay's
+# uint8 codec would measure quantization error together with EMA drift and
+# make a same-generation comparison non-zero for the wrong reason.
+_STUDENT_DRIFT_RAW_FIELDS = (
+    DEPTH_KEY,
+    PERCEPTION_POLICY_RAW_KEY,
+    PERCEPTION_VEL_COMMAND_RAW_KEY,
+    PERCEPTION_IS_INIT_KEY,
+)
+
 _Q_REPLAY_FIELDS = (
     "critic_observations",
     "actions",
@@ -275,6 +290,7 @@ _Q_REPLAY_FIELDS = (
     "discounts",
     "next_critic_observations",
     REFERENCE_PHASE_KEY,
+    REPLAY_PERCEPTION_EMA_GENERATION_KEY,
     *_PERCEPTION_REPLAY_FIELDS,
 )
 
@@ -288,6 +304,16 @@ _V4_REPLAY_CONTEXT_FIELDS = (
     REPLAY_TIME_LIMIT_KEY,
     REPLAY_MOTION_ID_KEY,
 )
+
+
+@dataclass
+class _StudentPerceptionDriftEpisode:
+    """Small diagnostic-only complete episode captured from the live Student."""
+
+    raw_fields: dict[str, torch.Tensor]
+    collection_actor: torch.Tensor
+    collection_ema_generation: torch.Tensor
+    eligible_student_rows: torch.Tensor
 
 
 def _failure_lookback_offsets(
@@ -1242,6 +1268,14 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     # explicitly configured TD3/checkpoint-compatibility paths.
     perception_replay_mode: str = "legacy_online_student"
     perception_replay_batch_size: int = 128
+    # Optional reset-exact diagnostic for collection-cache representation
+    # drift.  Zero disables every raw journal allocation/transfer.  Enabled
+    # probes retain only a few complete Student episodes and never feed their
+    # re-encoded values back into optimization.
+    perception_staleness_probe_num_envs: int = 0
+    perception_staleness_probe_max_episodes: int = 8
+    perception_staleness_probe_max_generation_age: int = 8
+    perception_staleness_probe_interval: int = 1
     # Teacher-replay-only supervised updates performed exactly once after the
     # successful-only prefill ring reaches capacity and before Student control
     # begins. Zero keeps the old no-warm-up behavior.
@@ -1657,6 +1691,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._teacher_ring_cache_lineage: TeacherActorCacheLineage | None = None
         self._teacher_episode_device_raw_fields = None
         self._teacher_episode_device_raw_lineage = None
+        self._student_perception_drift_pending: list[dict | None] | None = None
+        self._student_perception_drift_episodes: list[
+            _StudentPerceptionDriftEpisode
+        ] = []
+        self._student_perception_drift_completed = 0
+        self._student_perception_drift_discarded_incomplete = 0
         self._teacher_prefill_successful_episodes = 0
         # Per-motion commit counts.  Failure Teacher matching is same-motion,
         # so a motion whose successful prefill is starved silently weakens its
@@ -1828,6 +1868,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
         for name in positive_integers:
             value = getattr(cfg, name)
+            if isinstance(value, bool) or int(value) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        probe_num_envs = getattr(cfg, "perception_staleness_probe_num_envs", 0)
+        if isinstance(probe_num_envs, bool) or int(probe_num_envs) < 0:
+            raise ValueError(
+                "perception_staleness_probe_num_envs must be a non-negative integer"
+            )
+        for name in (
+            "perception_staleness_probe_max_episodes",
+            "perception_staleness_probe_max_generation_age",
+            "perception_staleness_probe_interval",
+        ):
+            value = getattr(cfg, name, 1)
             if isinstance(value, bool) or int(value) < 1:
                 raise ValueError(f"{name} must be a positive integer")
         perception_replay_mode = str(
@@ -2371,6 +2424,404 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._perception_ema_generation += 1
         self._teacher_actor_cache.invalidate()
         self._teacher_ring_cache_lineage = None
+
+    def _student_replay_ema_age_metrics(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> dict[str, float]:
+        """Measure, but never alter, collection-cache representation age.
+
+        In collection-exact FastSAC replay, a Student Actor input is exact for
+        the EMA generation at collection.  The generation gap to the current
+        EMA bounds how far its representation *may* have drifted.  It is not a
+        feature-space distance, and therefore does not justify a zero-hidden
+        reconstruction.  Teacher rows are intentionally omitted because their
+        Actor cache is rebuilt from a complete episode at the current EMA.
+        """
+        zeros = {
+            "available": 0.0,
+            "student_rows": 0.0,
+            "mean": 0.0,
+            "p95": 0.0,
+            "max": 0.0,
+            "stale_fraction": 0.0,
+        }
+        generation = batch.get(REPLAY_PERCEPTION_EMA_GENERATION_KEY, None)
+        is_teacher = batch.get(REPLAY_SAMPLE_IS_TEACHER_KEY, None)
+        is_student = batch.get(DAGGER_IS_STUDENT_ACTION_KEY, None)
+        source = is_teacher if is_teacher is not None else is_student
+        if generation is None or source is None:
+            # Compatibility for a deliberately fresh-only replay or focused
+            # unit-test batches which predate the provenance field.
+            return zeros
+        if not torch.is_tensor(generation) or not torch.is_tensor(source):
+            raise TypeError("replay EMA provenance fields must be tensors")
+        generation = generation.reshape(-1).long()
+        student = (~source if is_teacher is not None else source).reshape(-1).bool()
+        if generation.shape != student.shape:
+            raise ValueError("replay EMA provenance fields are misaligned")
+        generation = generation[student]
+        if generation.numel() == 0:
+            return zeros
+        current = int(getattr(self, "_perception_ema_generation", 0))
+        age = current - generation
+        if bool((age < 0).any()):
+            raise RuntimeError("Student replay row has a future EMA generation")
+        age = age.float()
+        return {
+            "available": 1.0,
+            "student_rows": float(age.numel()),
+            "mean": age.mean().item(),
+            "p95": torch.quantile(age, 0.95).item(),
+            "max": age.max().item(),
+            "stale_fraction": (age > 0).float().mean().item(),
+        }
+
+    @staticmethod
+    def _empty_student_perception_drift_metrics() -> dict[str, float]:
+        return {
+            "enabled": 0.0,
+            "available": 0.0,
+            "episodes": 0.0,
+            "rows": 0.0,
+            "ema_age_mean": 0.0,
+            "ema_age_p95": 0.0,
+            "ema_age_max": 0.0,
+            "actor_feature_mse": 0.0,
+            "actor_feature_relative_rmse": 0.0,
+            "actor_feature_cosine_distance": 0.0,
+            "perception_latent_mse": 0.0,
+            "perception_latent_relative_rmse": 0.0,
+            "perception_latent_cosine_distance": 0.0,
+            "action_normalized_rmse": 0.0,
+        }
+
+    def _student_perception_drift_probe_enabled(self) -> bool:
+        return bool(
+            self._student_collection_actor_cache_enabled()
+            and int(getattr(self.cfg, "perception_staleness_probe_num_envs", 0)) > 0
+        )
+
+    @torch.no_grad()
+    def _student_perception_drift_raw_values(
+        self, td: TensorDict
+    ) -> dict[str, torch.Tensor]:
+        self._register_replay_object_geo(td)
+        return {
+            DEPTH_KEY: self._replay_source(td, DEPTH_KEY).detach(),
+            PERCEPTION_POLICY_RAW_KEY: self._replay_source(td, OBS_KEY).detach(),
+            PERCEPTION_VEL_COMMAND_RAW_KEY: self._replay_source(
+                td, VEL_CMD_KEY
+            ).detach(),
+            PERCEPTION_IS_INIT_KEY: td["is_init"].detach().bool(),
+        }
+
+    @torch.no_grad()
+    def _capture_student_perception_drift_rollout(self, rollout: TensorDict) -> None:
+        """Journal a few complete raw episodes without affecting replay.
+
+        The journal starts only at a real ``is_init`` row and keeps every raw
+        state needed to reconstruct recurrent context.  It is intentionally
+        small, CPU-resident, fresh-only, and diagnostic-only.
+        """
+        if not self._student_perception_drift_probe_enabled():
+            return
+        if len(rollout.batch_size) != 2:
+            raise ValueError("Student drift probe requires an [env,time] rollout")
+        num_envs, num_steps = (int(value) for value in rollout.batch_size)
+        probe_envs = min(
+            num_envs,
+            int(self.cfg.perception_staleness_probe_num_envs),
+        )
+        actor = rollout.get(STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY, None)
+        if actor is None or actor.shape != (num_envs, num_steps, self._q_actor_dim):
+            raise RuntimeError(
+                "Student drift probe requires the collection-exact Actor cache"
+            )
+        student = rollout.get(DAGGER_IS_STUDENT_ACTION_KEY, None)
+        if student is None:
+            raise RuntimeError("Student drift probe requires rollout source labels")
+
+        raw = self._student_perception_drift_raw_values(rollout)
+        raw_cpu = {
+            key: value[:probe_envs].detach().to(device="cpu").contiguous()
+            for key, value in raw.items()
+        }
+        actor_cpu = actor[:probe_envs].detach().to(device="cpu").contiguous()
+        done_cpu = (
+            rollout[DONE_KEY][:probe_envs]
+            .reshape(probe_envs, num_steps, -1)
+            .bool()
+            .any(dim=-1)
+            .cpu()
+        )
+        init_cpu = (
+            rollout["is_init"][:probe_envs]
+            .reshape(probe_envs, num_steps, -1)
+            .bool()
+            .any(dim=-1)
+            .cpu()
+        )
+        student_cpu = (
+            student[:probe_envs]
+            .reshape(probe_envs, num_steps, -1)
+            .bool()
+            .any(dim=-1)
+            .cpu()
+        )
+
+        pending = self._student_perception_drift_pending
+        if pending is None or len(pending) != probe_envs:
+            pending = [None for _ in range(probe_envs)]
+        generation = int(getattr(self, "_perception_ema_generation", 0))
+
+        def _new_pending() -> dict:
+            return {
+                "raw": {key: [] for key in _STUDENT_DRIFT_RAW_FIELDS},
+                "actor": [],
+                "generation": [],
+                "eligible": [],
+            }
+
+        for env_index in range(probe_envs):
+            for step in range(num_steps):
+                if bool(init_cpu[env_index, step]):
+                    if pending[env_index] is not None:
+                        self._student_perception_drift_discarded_incomplete += 1
+                    pending[env_index] = _new_pending()
+                entry = pending[env_index]
+                if entry is None:
+                    continue
+                for key in _STUDENT_DRIFT_RAW_FIELDS:
+                    entry["raw"][key].append(raw_cpu[key][env_index, step].clone())
+                entry["actor"].append(actor_cpu[env_index, step].clone())
+                entry["generation"].append(generation)
+                entry["eligible"].append(
+                    bool(student_cpu[env_index, step])
+                    and not bool(init_cpu[env_index, step])
+                )
+                if not bool(done_cpu[env_index, step]):
+                    continue
+
+                raw_episode = {
+                    key: torch.stack(values, dim=0).contiguous()
+                    for key, values in entry["raw"].items()
+                }
+                length = int(next(iter(raw_episode.values())).shape[0])
+                starts_at_reset = bool(
+                    raw_episode[PERCEPTION_IS_INIT_KEY]
+                    .reshape(length, -1)
+                    .bool()
+                    .any(dim=-1)[0]
+                )
+                if not starts_at_reset:
+                    raise RuntimeError("Student drift episode does not start at reset")
+                self._student_perception_drift_episodes.append(
+                    _StudentPerceptionDriftEpisode(
+                        raw_fields=raw_episode,
+                        collection_actor=torch.stack(
+                            entry["actor"], dim=0
+                        ).float().contiguous(),
+                        collection_ema_generation=torch.tensor(
+                            entry["generation"], dtype=torch.long
+                        ),
+                        eligible_student_rows=torch.tensor(
+                            entry["eligible"], dtype=torch.bool
+                        ),
+                    )
+                )
+                maximum = int(self.cfg.perception_staleness_probe_max_episodes)
+                self._student_perception_drift_episodes = (
+                    self._student_perception_drift_episodes[-maximum:]
+                )
+                self._student_perception_drift_completed += 1
+                pending[env_index] = None
+        self._student_perception_drift_pending = pending
+
+    @torch.no_grad()
+    def _reencode_student_perception_drift_episode(
+        self, episode: _StudentPerceptionDriftEpisode
+    ) -> torch.Tensor:
+        """Re-encode one complete episode from its true reset at current EMA."""
+        if self._replay_object_geo is None:
+            raise RuntimeError("Student drift probe lacks object geometry")
+        length = int(episode.collection_actor.shape[0])
+        if length < 1 or episode.collection_actor.shape != (
+            length,
+            self._q_actor_dim,
+        ):
+            raise ValueError("Student drift episode Actor cache is misaligned")
+        if any(int(value.shape[0]) != length for value in episode.raw_fields.values()):
+            raise ValueError("Student drift episode raw fields are misaligned")
+
+        snapshot = self._vecnorm_snapshot()
+        geometry = self._replay_object_geo.to(self.device)
+        depth_state = torch.zeros(1, self.depth_feature_dim, device=self.device)
+        adapt_state = torch.zeros(1, int(self.cfg.latent_dim), device=self.device)
+        encoded: list[torch.Tensor] = []
+        chunk_size = max(1, int(self.cfg.train_every))
+
+        with set_recurrent_mode(True):
+            for start in range(0, length, chunk_size):
+                stop = min(start + chunk_size, length)
+                sequence_length = stop - start
+                depth_raw = episode.raw_fields[DEPTH_KEY][start:stop].to(
+                    self.device
+                ).unsqueeze(0)
+                policy_raw = episode.raw_fields[PERCEPTION_POLICY_RAW_KEY][
+                    start:stop
+                ].to(self.device).unsqueeze(0)
+                vel_raw = episode.raw_fields[PERCEPTION_VEL_COMMAND_RAW_KEY][
+                    start:stop
+                ].to(self.device).unsqueeze(0)
+                depth = self._normalize_replay_value(
+                    DEPTH_KEY, depth_raw, snapshot
+                )
+                policy = self._normalize_replay_value(OBS_KEY, policy_raw, snapshot)
+                vel = self._normalize_replay_value(VEL_CMD_KEY, vel_raw, snapshot)
+                td = TensorDict(
+                    {
+                        DEPTH_KEY: depth,
+                        OBS_KEY: policy,
+                        VEL_CMD_KEY: vel,
+                        OBJECT_GEO_KEY: geometry.to(dtype=policy.dtype)
+                        .view(1, 1, -1)
+                        .expand(1, sequence_length, -1),
+                        "is_init": episode.raw_fields[PERCEPTION_IS_INIT_KEY][
+                            start:stop
+                        ].to(self.device).unsqueeze(0),
+                        "depth_hx": depth_state.unsqueeze(1).expand(
+                            1, sequence_length, -1
+                        ),
+                        "adapt_hx": adapt_state.unsqueeze(1).expand(
+                            1, sequence_length, -1
+                        ),
+                    },
+                    batch_size=(1, sequence_length),
+                    device=self.device,
+                )
+                if hasattr(self, "temporal_depth_gru_ema"):
+                    self.temporal_depth_gru_ema(td)
+                    depth_state = td["next", "depth_hx"][:, -1]
+                else:
+                    td["_depth_feature"] = torch.zeros(
+                        1,
+                        sequence_length,
+                        self.depth_feature_dim,
+                        device=self.device,
+                        dtype=policy.dtype,
+                    )
+                if bool(self.cfg.use_object_adapt):
+                    self.object_adapt_ema(td)
+                    self.object_pred_transform(td)
+                self.adapt_ema(td)
+                adapt_state = td["next", "adapt_hx"][:, -1]
+                actor = torch.cat([td[key] for key in self.q_actor_keys], dim=-1)
+                if actor.shape != (1, sequence_length, self._q_actor_dim):
+                    raise RuntimeError("Student drift re-encode has invalid shape")
+                encoded.append(actor.squeeze(0).float())
+        result = torch.cat(encoded, dim=0).contiguous()
+        if not bool(torch.isfinite(result).all()):
+            raise RuntimeError("Student drift re-encode contains NaN/Inf")
+        return result
+
+    @torch.no_grad()
+    def _student_perception_drift_metrics(self) -> dict[str, float]:
+        """Compare collection features with reset-exact current-EMA features."""
+        result = self._empty_student_perception_drift_metrics()
+        if not self._student_perception_drift_probe_enabled():
+            return result
+        result["enabled"] = 1.0
+        current = int(getattr(self, "_perception_ema_generation", 0))
+        interval = int(self.cfg.perception_staleness_probe_interval)
+        if current % interval:
+            return result
+        maximum_age = int(self.cfg.perception_staleness_probe_max_generation_age)
+        retained = []
+        old_values = []
+        new_values = []
+        ages = []
+        used_episodes = 0
+        for episode in self._student_perception_drift_episodes:
+            row_age = current - episode.collection_ema_generation
+            if bool((row_age < 0).any()):
+                raise RuntimeError("Student drift journal has a future EMA generation")
+            live = row_age <= maximum_age
+            if not bool(live.any()):
+                continue
+            retained.append(episode)
+            selected = live & episode.eligible_student_rows
+            if not bool(selected.any()):
+                continue
+            current_actor = self._reencode_student_perception_drift_episode(episode)
+            selected_device = selected.to(self.device)
+            old_values.append(
+                episode.collection_actor[selected].to(self.device)
+            )
+            new_values.append(current_actor[selected_device])
+            ages.append(row_age[selected].to(self.device))
+            used_episodes += 1
+        self._student_perception_drift_episodes = retained
+        if not old_values:
+            return result
+
+        old = torch.cat(old_values, dim=0).float()
+        new = torch.cat(new_values, dim=0).float()
+        age = torch.cat(ages, dim=0).float()
+        difference = new - old
+        mse = difference.square().mean()
+        reference_rms = old.square().mean().sqrt().clamp_min(1e-8)
+        cosine_distance = 1.0 - F.cosine_similarity(old, new, dim=-1).mean()
+
+        latent_start = 0
+        latent_slice = None
+        for key, width in zip(self.q_actor_keys, self._q_actor_widths):
+            if key == PRIV_PRED_KEY:
+                latent_slice = slice(latent_start, latent_start + int(width))
+                break
+            latent_start += int(width)
+        if latent_slice is None:
+            raise RuntimeError("Student drift probe cannot locate perception latent")
+        old_latent = old[:, latent_slice]
+        new_latent = new[:, latent_slice]
+        latent_difference = new_latent - old_latent
+        latent_mse = latent_difference.square().mean()
+        latent_reference_rms = old_latent.square().mean().sqrt().clamp_min(1e-8)
+        latent_cosine_distance = 1.0 - F.cosine_similarity(
+            old_latent, new_latent, dim=-1
+        ).mean()
+
+        old_action = self._actor_dist_from_flat(old).mean
+        new_action = self._actor_dist_from_flat(new).mean
+        action_difference = new_action - old_action
+        action_scale = getattr(self, "_fastsac_q_action_scale", None)
+        if torch.is_tensor(action_scale):
+            action_difference = action_difference / action_scale.to(action_difference)
+
+        result.update(
+            {
+                "available": 1.0,
+                "episodes": float(used_episodes),
+                "rows": float(age.numel()),
+                "ema_age_mean": age.mean().item(),
+                "ema_age_p95": torch.quantile(age, 0.95).item(),
+                "ema_age_max": age.max().item(),
+                "actor_feature_mse": mse.item(),
+                "actor_feature_relative_rmse": (mse.sqrt() / reference_rms).item(),
+                "actor_feature_cosine_distance": cosine_distance.item(),
+                "perception_latent_mse": latent_mse.item(),
+                "perception_latent_relative_rmse": (
+                    latent_mse.sqrt() / latent_reference_rms
+                ).item(),
+                "perception_latent_cosine_distance": (
+                    latent_cosine_distance.item()
+                ),
+                "action_normalized_rmse": action_difference.square()
+                .mean()
+                .sqrt()
+                .item(),
+            }
+        )
+        return result
 
     @torch.no_grad()
     def _collection_actor_observations(self, td: TensorDict) -> torch.Tensor:
@@ -4779,6 +5230,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 .reshape(int(n))
                 .bool(),
                 REPLAY_MOTION_ID_KEY: motion_id.reshape(int(n)).long(),
+                REPLAY_PERCEPTION_EMA_GENERATION_KEY: torch.full(
+                    (int(n),),
+                    int(getattr(self, "_perception_ema_generation", 0)),
+                    dtype=torch.long,
+                    device=current.device,
+                ),
                 _PREFILL_ENV_INDEX_KEY: torch.arange(
                     int(n), device=current.device, dtype=torch.long
                 ),
@@ -5345,6 +5802,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "teacher_perception_batch_size",
             "perception_replay_mode",
             "perception_replay_batch_size",
+            "perception_staleness_probe_num_envs",
+            "perception_staleness_probe_max_episodes",
+            "perception_staleness_probe_max_generation_age",
+            "perception_staleness_probe_interval",
             "teacher_perception_warmup_steps",
             "perception_depth_codec",
             "load_pretrained_perception",
@@ -5381,6 +5842,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         ):
             self._ensure_teacher_actor_cache_current()
         q_fields = self._q_replay_storage_fields()
+        generation_replays = []
+        if teacher_count:
+            generation_replays.append(self.q_teacher_replay)
+        if student_count:
+            generation_replays.append(self.dagger_replay)
+        # Replays are deliberately fresh-only, but compact legacy/unit seams
+        # may not carry the optional measurement provenance.  Sampling must
+        # retain its old schema in that case; metrics simply report unavailable.
+        if any(
+            REPLAY_PERCEPTION_EMA_GENERATION_KEY not in replay.data
+            for replay in generation_replays
+        ):
+            q_fields = tuple(
+                key
+                for key in q_fields
+                if key != REPLAY_PERCEPTION_EMA_GENERATION_KEY
+            )
         if not self._has_canonical_replay_mix():
             # Legacy unit/checkpoint seams may predate explicit boundary fields.
             if teacher_count and student_count:
@@ -5521,6 +5999,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "critic_observations",
             DAGGER_REPLAY_TEACHER_ACTIONS,
             DAGGER_TEACHER_ACTION_VALID_KEY,
+            REPLAY_PERCEPTION_EMA_GENERATION_KEY,
             *(
                 (REPLAY_ACTOR_OBSERVATIONS_KEY,)
                 if collection_cache_enabled
@@ -5537,6 +6016,20 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         focused_teacher_count = requested_counts["failure_teacher"]
         main_count = requested_counts["uniform_student"] + focused_student_count
         teacher_count = requested_counts["uniform_teacher"] + focused_teacher_count
+        generation_replays = []
+        if teacher_count:
+            generation_replays.append(self.q_teacher_replay)
+        if main_count:
+            generation_replays.append(self.dagger_replay)
+        if any(
+            REPLAY_PERCEPTION_EMA_GENERATION_KEY not in replay.data
+            for replay in generation_replays
+        ):
+            main_fields = tuple(
+                key
+                for key in main_fields
+                if key != REPLAY_PERCEPTION_EMA_GENERATION_KEY
+            )
         if (
             teacher_count
             and self._teacher_episode_cache_enabled()
@@ -5630,6 +6123,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         teacher_fields = (
             "critic_observations",
             "actions",
+            *(
+                (REPLAY_PERCEPTION_EMA_GENERATION_KEY,)
+                if REPLAY_PERCEPTION_EMA_GENERATION_KEY in main_fields
+                else ()
+            ),
             *(() if collection_cache_enabled else _PERCEPTION_REPLAY_FIELDS),
         )
         if teacher_indices is None:
@@ -6587,6 +7085,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             and TERM_KEY in rollout.keys(True, True)
         ):
             failure_anchors_added = self._update_failure_phase_histogram(rollout)
+            self._capture_student_perception_drift_rollout(rollout)
         transition_chunks = tuple(self._dagger_transition_chunks(rollout))
         appended = 0
         teacher_rows_appended = 0
@@ -6792,6 +7291,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         critic_metrics: list[dict[str, torch.Tensor]] = []
         actor_metrics: list[dict[str, torch.Tensor]] = []
+        q_staleness_metrics: list[dict[str, float]] = []
+        actor_staleness_metrics: list[dict[str, float]] = []
         student_q_rows = self.dagger_replay.valid_count(DAGGER_IS_STUDENT_ACTION_KEY)
         learning_starts = int(self.cfg.td3_learning_starts)
         q_counts = self._replay_source_counts("q", int(self.cfg.q_batch_size))
@@ -6847,6 +7348,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     None if sample_plans is None else sample_plans[update_index]
                 )
                 q_batch = self._sample_balanced_q_batch(sample_plan)
+                q_staleness_metrics.append(
+                    self._student_replay_ema_age_metrics(q_batch)
+                )
                 q_batch = self._prepare_dagger_learning_batch(q_batch)
                 critic_metrics.append(self._critic_update(q_batch))
                 if self.critic_update_count % int(self.cfg.policy_delay) == 0:
@@ -6864,21 +7368,25 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         and actor_teacher_indices is None
                     ):
                         raise RuntimeError("delayed Actor replay plan is missing")
+                    actor_batch = self._sample_actor_batch(
+                        actor_indices,
+                        actor_teacher_indices,
+                        (
+                            None
+                            if sample_plan is None
+                            else sample_plan.actor_teacher_focused
+                        ),
+                        (
+                            None
+                            if sample_plan is None
+                            else sample_plan.actor_student_focused
+                        ),
+                    )
+                    actor_staleness_metrics.append(
+                        self._student_replay_ema_age_metrics(actor_batch)
+                    )
                     delayed = self._maybe_delayed_actor_and_targets(
-                        self._sample_actor_batch(
-                            actor_indices,
-                            actor_teacher_indices,
-                            (
-                                None
-                                if sample_plan is None
-                                else sample_plan.actor_teacher_focused
-                            ),
-                            (
-                                None
-                                if sample_plan is None
-                                else sample_plan.actor_student_focused
-                            ),
-                        )
+                        actor_batch
                     )
                     if delayed is None:
                         raise RuntimeError("scheduled delayed Actor update was skipped")
@@ -6935,6 +7443,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "adapt/grad_norm": 0.0,
                 "adapt/depth_grad_norm": 0.0,
             }
+        exact_staleness = self._student_perception_drift_metrics()
         self.num_updates += 1
         self.dagger_rollout_count += 1
         self.dagger_environment_steps += int(self.cfg.train_every)
@@ -6973,6 +7482,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
         critic = self._mean_metric_dict(critic_metrics, critic_keys)
         actor = self._mean_metric_dict(actor_metrics, actor_keys)
+        staleness_keys = (
+            "available",
+            "student_rows",
+            "mean",
+            "p95",
+            "max",
+            "stale_fraction",
+        )
+        q_staleness = self._mean_metric_dict(q_staleness_metrics, staleness_keys)
+        actor_staleness = self._mean_metric_dict(
+            actor_staleness_metrics, staleness_keys
+        )
 
         def rollout_fraction(key):
             value = rollout.get(key, None)
@@ -7108,6 +7629,33 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "dagger/beta_teacher_fraction": rollout_fraction(DAGGER_BETA_TEACHER_KEY),
         }
         info.update(adapt_info)
+        info.update(
+            {
+                f"replay/staleness/q_student_ema_generation_age_{key}": value
+                for key, value in q_staleness.items()
+            }
+        )
+        info.update(
+            {
+                f"replay/staleness/actor_student_ema_generation_age_{key}": value
+                for key, value in actor_staleness.items()
+            }
+        )
+        info["replay/staleness/current_ema_generation"] = float(
+            getattr(self, "_perception_ema_generation", 0)
+        )
+        info.update(
+            {
+                f"replay/staleness/exact_{key}": value
+                for key, value in exact_staleness.items()
+            }
+        )
+        info["replay/staleness/exact_completed_episodes_total"] = float(
+            self._student_perception_drift_completed
+        )
+        info["replay/staleness/exact_discarded_incomplete_total"] = float(
+            self._student_perception_drift_discarded_incomplete
+        )
         for purpose in ("q", "actor", "perception"):
             info.update(
                 {

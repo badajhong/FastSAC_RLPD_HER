@@ -71,12 +71,13 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.tvkd_lambda=1.0 \
   algo.tvkd_potential_clip=null \
   algo.use_teacher_value_bottleneck_replay=true \
+  algo.bottleneck_selection_mode=deepest \
   algo.bottleneck_threshold=0.05 \
   algo.bottleneck_smoothing_window=5 \
   algo.bottleneck_min_consecutive=3 \
   algo.bottleneck_terminal_exclusion_steps=5 \
   algo.failure_phase_lookback_steps=25 \
-  algo.failure_phase_samples_per_failure=10 \
+  algo.failure_phase_samples_per_failure=25 \
   algo.bottleneck_include_unsuccessful_timeouts=false \
   task.num_envs=512 \
   save_interval=100 \
@@ -208,3 +209,9 @@ python scripts/train.py \
   total_frames=57344000 \
   save_interval=100 \
   seed=0
+
+nohup env PYTHONUNBUFFERED=1 \
+  python scripts/train.py \
+  algo=ppo_vel_train \
+  task=G1/vaic/skateboard_general_tracking_tea \
+  > ./logs/skateboard_general_tracking_tea.log 2>&1 < /dev/null &
