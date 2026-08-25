@@ -4,9 +4,10 @@ This backend deliberately reuses the Teacher-only
 prefill, DAgger source selection, timeout handling, and twin-C51 topology from
 ``td3_bc_dagger``.  The learning rule itself is SAC:
 
-* Student collection and Actor updates use a reparameterized bounded Gaussian
-  whose standard deviation is expressed in nominal joint coordinates;
-* exact Teacher BC is applied only to the bounded noise-free mean;
+* Student collection and Actor updates use either the historical bounded
+  Gaussian in nominal joint coordinates or an opt-in PPOVEL-compatible raw
+  physical-action Gaussian;
+* exact Teacher BC is applied only to the distribution's noise-free mean;
 * the soft Bellman target contains the next-policy entropy term;
 * both online critics learn from the complete target-C51 head with the lower
   expected return; and
@@ -95,6 +96,12 @@ TRAINING_ALGORITHM = "distributional_fastsac_teacher_bc_v1"
 CHECKPOINT_VERSION = 5
 PREVIOUS_CHECKPOINT_VERSION = 4
 ACTOR_BACKEND = "ppo_vel_smooth_bounded_normalized_std_tanh_fastsac_bc_v2"
+PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND = (
+    "ppo_vel_raw_physical_joint_std_gaussian_fastsac_bc_v1"
+)
+NORMALIZED_TANH_ACTION_DISTRIBUTION = "normalized_tanh"
+PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION = "ppo_physical_gaussian"
+FASTSAC_ACTION_PROJECTION_KEY = "fastsac_action_projection"
 _LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION = 3
 _LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND = (
     "ppo_vel_normalized_std_tanh_bounded_fastsac_bc_v1"
@@ -110,9 +117,16 @@ ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_normalized_std_bounded_alpha_logpi_minus_online_twin_min_plus_"
     "joint_normalized_raw_teacher_mean_bc_v1"
 )
+PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS = (
+    "reparameterized_ppo_physical_joint_std_gaussian_alpha_logpi_minus_online_"
+    "twin_min_plus_joint_normalized_raw_teacher_mean_bc_v1"
+)
 ENTROPY_SEMANTICS = (
     "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
     "auto_temperature_delayed_actor_cadence_v3"
+)
+PPO_PHYSICAL_GAUSSIAN_ENTROPY_SEMANTICS = (
+    "fixed_temperature_ppo_physical_joint_std_gaussian_log_probability_v1"
 )
 FASTSAC_TEACHER_PREFILL_SEMANTICS = (
     "forced_valid_teacher_successful_episode_commit_until_replay_capacity_"
@@ -122,6 +136,57 @@ _CRITIC_CADENCE_ENTROPY_SEMANTICS = (
     "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
     "auto_temperature_v2"
 )
+
+
+def _fastsac_action_distribution(cfg) -> str:
+    """Return the explicit policy-distribution mode, defaulting legacy configs."""
+    return str(
+        getattr(cfg, "sac_action_distribution", NORMALIZED_TANH_ACTION_DISTRIBUTION)
+    )
+
+
+def _fastsac_actor_backend(cfg) -> str:
+    if _fastsac_action_distribution(cfg) == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
+        return PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
+    return ACTOR_BACKEND
+
+
+class FastSACPhysicalNormal:
+    """Generator-aware diagonal Normal in PPOVEL physical-action coordinates.
+
+    PPOVEL uses ``Independent(Normal(loc, scale), 1)`` without a tanh
+    transform.  This compact wrapper preserves that distribution while also
+    accepting FastSAC's private ``torch.Generator`` streams.
+    """
+
+    def __init__(self, loc: torch.Tensor, scale: torch.Tensor):
+        self.loc = loc
+        self.scale = torch.clamp_min(scale, 1.0e-6).expand_as(loc)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return self.loc
+
+    def log_prob_for_action(self, action: torch.Tensor) -> torch.Tensor:
+        standardized = (action - self.loc) / self.scale
+        per_coordinate = (
+            -0.5 * standardized.square()
+            - self.scale.log()
+            - 0.5 * math.log(2.0 * math.pi)
+        )
+        return per_coordinate.sum(dim=-1)
+
+    def rsample_with_log_prob(
+        self, *, generator: torch.Generator | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        noise = torch.randn(
+            self.loc.shape,
+            dtype=self.loc.dtype,
+            device=self.loc.device,
+            generator=generator,
+        )
+        action = self.loc + self.scale * noise
+        return action, self.log_prob_for_action(action)
 
 
 def _validate_fastsac_entropy_target_controls(
@@ -224,6 +289,10 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     eta_sac: float = 1e-4
     lambda_bc: float = 1.0
     sac_actor_lr: float = 3e-4
+    # ``normalized_tanh`` preserves the historical FastSAC policy.  The
+    # opt-in ``ppo_physical_gaussian`` mode uses PPOVEL's raw physical-action
+    # mean and its directly learned per-joint Actor.actor_std parameter.
+    sac_action_distribution: str = NORMALIZED_TANH_ACTION_DISTRIBUTION
     sac_initial_action_std: float = 0.1
     sac_log_std_min: float = -10.0
     sac_log_std_max: float = -2.0
@@ -382,10 +451,16 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         if not torch.isfinite(sampled_student_action).all():
             raise RuntimeError("FastSAC sampled a non-finite raw action")
 
+        projected_student_action = owner._project_execution_action(
+            sampled_student_action
+        )
+        student_projection = (~choose_teacher) & (
+            projected_student_action != sampled_student_action
+        ).any(dim=-1)
         issued_action = torch.where(
             choose_teacher.unsqueeze(-1),
             bounded_teacher_action,
-            sampled_student_action,
+            projected_student_action,
         )
         issued_action = owner._project_execution_action(issued_action)
         sample_q_deviation = owner._q_action_input(sampled_student_action) - (
@@ -411,6 +486,7 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         td[TD3_NOISE_FREE_STUDENT_ACTION_KEY] = mean_student_action
         td[TD3_EXPLORATORY_STUDENT_ACTION_KEY] = sampled_student_action
         td[TD3_COLLECTOR_NOISE_KEY] = sample_q_deviation
+        td[FASTSAC_ACTION_PROJECTION_KEY] = student_projection
         td[TD3_BETA_KEY] = torch.full_like(discrepancy_rms, float(scheduled_beta))
         motion_ids = getattr(
             getattr(getattr(owner, "env", None), "command_manager", None),
@@ -428,7 +504,7 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
 
 
 class _DeterministicFastSACStudentEvalPolicy(_DeterministicTD3StudentEvalPolicy):
-    """Bounded deterministic Student mean; never samples or computes log-prob."""
+    """Mode-consistent Student mean; never samples or computes log-prob."""
 
 
 class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
@@ -439,28 +515,37 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # SAC owns no target Actor.  The TD3 base initializes this to None; keep
         # that explicit invariant for checkpoint and runtime inspection.
         self.actor_target = None
-        self.actor_backend = ACTOR_BACKEND
+        self.actor_backend = _fastsac_actor_backend(cfg)
 
         self._fastsac_entropy_reference_log_scale_sum = float(
             torch.log(self._fastsac_q_action_scale).sum().item()
         )
-        initial_log_std = torch.log(
-            self._fastsac_q_action_scale.new_full(
-                (self.action_dim,), float(cfg.sac_initial_action_std)
+        physical_gaussian = self._uses_ppo_physical_gaussian()
+        if physical_gaussian:
+            # Registered but inert compatibility state for old checkpoint and
+            # module-tree loaders. PPOVEL's actor_std owns physical variance.
+            initial_log_std = self._fastsac_q_action_scale.new_zeros(
+                (self.action_dim,)
             )
-        )
-        if (initial_log_std <= float(cfg.sac_log_std_min)).any() or (
-            initial_log_std >= float(cfg.sac_log_std_max)
-        ).any():
-            raise ValueError(
-                "sac_initial_action_std must map strictly inside normalized "
-                "log-std bounds"
+            initial_raw_log_std = initial_log_std.clone()
+        else:
+            initial_log_std = torch.log(
+                self._fastsac_q_action_scale.new_full(
+                    (self.action_dim,), float(cfg.sac_initial_action_std)
+                )
             )
-        initial_raw_log_std = self._inverse_smooth_log_std(
-            initial_log_std,
-            float(cfg.sac_log_std_min),
-            float(cfg.sac_log_std_max),
-        )
+            if (initial_log_std <= float(cfg.sac_log_std_min)).any() or (
+                initial_log_std >= float(cfg.sac_log_std_max)
+            ).any():
+                raise ValueError(
+                    "sac_initial_action_std must map strictly inside normalized "
+                    "log-std bounds"
+                )
+            initial_raw_log_std = self._inverse_smooth_log_std(
+                initial_log_std,
+                float(cfg.sac_log_std_min),
+                float(cfg.sac_log_std_max),
+            )
         self.register_buffer(
             "_fastsac_initial_log_std", initial_log_std.detach().clone()
         )
@@ -470,18 +555,40 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
             self.action_dim, initial_raw_log_std, self.device
         )
-        self._freeze_legacy_actor_std()
+        if physical_gaussian:
+            # PPOVEL owns the directly parameterized per-joint std.  The
+            # normalized-tanh adapter remains registered only so historical
+            # source/checkpoint topology stays explicit and loadable.
+            self.bc_dagger_sac_adapter.requires_grad_(False)
+            self._configure_training_actor_std()
+        else:
+            self._freeze_legacy_actor_std()
 
+        actor_std_parameter = (
+            self._ppo_actor_std_parameter() if physical_gaussian else None
+        )
         actor_mean_parameters = tuple(
             parameter
             for parameter in self.actor_adapt.parameters()
-            if parameter.requires_grad
+            if parameter.requires_grad and parameter is not actor_std_parameter
         )
         if not actor_mean_parameters:
             raise RuntimeError("FastSAC Actor has no trainable mean parameters")
-        # The adapter stores the unconstrained pre-tanh log-std coordinate.
-        # Keep that single parameter unregularized so weight decay cannot pull
-        # the effective standard deviation toward the interval midpoint.
+        # The second group owns exactly one variance representation: either the
+        # unconstrained pre-tanh adapter or PPOVEL's direct actor_std vector.
+        # Keep it unregularized so weight decay cannot alter exploration.
+        std_parameters = (
+            (actor_std_parameter,)
+            if physical_gaussian
+            else tuple(self.bc_dagger_sac_adapter.parameters())
+        )
+        if not std_parameters or {
+            id(parameter) for parameter in actor_mean_parameters
+        }.intersection(id(parameter) for parameter in std_parameters):
+            raise RuntimeError(
+                "FastSAC Actor mean and variance optimizer groups must be "
+                "non-empty and disjoint"
+            )
         self.actor_optimizer = torch.optim.AdamW(
             (
                 {
@@ -490,7 +597,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "weight_decay": float(cfg.q_weight_decay),
                 },
                 {
-                    "params": tuple(self.bc_dagger_sac_adapter.parameters()),
+                    "params": std_parameters,
                     "lr": float(cfg.sac_actor_lr),
                     "weight_decay": 0.0,
                 },
@@ -579,18 +686,61 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         for name in exact_zero:
             if float(getattr(cfg, name)) != 0.0:
                 raise ValueError(f"FastSAC requires inherited TD3 field {name}=0")
+        action_distribution = _fastsac_action_distribution(cfg)
+        if action_distribution not in (
+            NORMALIZED_TANH_ACTION_DISTRIBUTION,
+            PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+        ):
+            raise ValueError(
+                "sac_action_distribution must be 'normalized_tanh' or "
+                "'ppo_physical_gaussian'"
+            )
         if not isinstance(cfg.sac_use_autotune, bool):
             raise ValueError("sac_use_autotune must be a boolean")
+        if (
+            action_distribution == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+            and bool(cfg.sac_use_autotune)
+        ):
+            raise ValueError(
+                "ppo_physical_gaussian matches PPOVEL's learned joint std and "
+                "therefore requires sac_use_autotune=false"
+            )
+        if action_distribution == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
+            load_noise_scale = getattr(cfg, "load_noise_scale", None)
+            if (
+                isinstance(load_noise_scale, bool)
+                or not isinstance(load_noise_scale, (int, float))
+                or not math.isfinite(float(load_noise_scale))
+                or float(load_noise_scale) <= 0.0
+            ):
+                raise ValueError(
+                    "ppo_physical_gaussian requires a finite positive "
+                    "load_noise_scale, matching PPOVEL finetune initialization"
+                )
         if str(cfg.sac_alpha_update_cadence) not in ("actor", "critic"):
             raise ValueError("sac_alpha_update_cadence must be 'actor' or 'critic'")
-        _validate_fastsac_entropy_target_controls(
-            cfg.sac_log_std_min,
-            cfg.sac_log_std_max,
-            cfg.sac_target_entropy_ratio,
-        )
+        if action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION:
+            initial_action_std = float(cfg.sac_initial_action_std)
+            if not math.isfinite(initial_action_std) or initial_action_std <= 0.0:
+                raise ValueError("sac_initial_action_std must be finite and positive")
+            _validate_fastsac_entropy_target_controls(
+                cfg.sac_log_std_min,
+                cfg.sac_log_std_max,
+                cfg.sac_target_entropy_ratio,
+            )
+        else:
+            target_ratio = cfg.sac_target_entropy_ratio
+            if (
+                isinstance(target_ratio, bool)
+                or not isinstance(target_ratio, (int, float))
+                or not math.isfinite(float(target_ratio))
+                or float(target_ratio) <= 0.0
+            ):
+                raise ValueError(
+                    "sac_target_entropy_ratio must be finite and positive"
+                )
         for name in (
             "sac_actor_lr",
-            "sac_initial_action_std",
             "sac_alpha_init",
             "sac_alpha_lr",
             "sac_tau",
@@ -638,7 +788,29 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "FastSAC requires q_update_to_data_ratio=1 for row-level Q UTD=1"
             )
 
-    def _freeze_legacy_actor_std(self) -> None:
+    def _uses_ppo_physical_gaussian(self) -> bool:
+        return (
+            _fastsac_action_distribution(self.cfg)
+            == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+        )
+
+    def _actor_learning_semantics(self) -> str:
+        return (
+            PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
+            if self._uses_ppo_physical_gaussian()
+            else ACTOR_LEARNING_SEMANTICS
+        )
+
+    def _entropy_semantics(self) -> str:
+        if self._uses_ppo_physical_gaussian():
+            return PPO_PHYSICAL_GAUSSIAN_ENTROPY_SEMANTICS
+        return (
+            ENTROPY_SEMANTICS
+            if str(self.cfg.sac_alpha_update_cadence) == "actor"
+            else _CRITIC_CADENCE_ENTROPY_SEMANTICS
+        )
+
+    def _ppo_actor_core(self) -> Actor:
         cores = [
             module for module in self.actor_adapt.modules() if isinstance(module, Actor)
         ]
@@ -650,8 +822,65 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         core = cores[0]
         if bool(core.predict_std):
             raise RuntimeError("FastSAC mean transfer requires a separate legacy std")
+        return core
+
+    def _ppo_actor_std_parameter(self) -> nn.Parameter:
+        return self._ppo_actor_core().actor_std
+
+    def _freeze_legacy_actor_std(self) -> None:
+        core = self._ppo_actor_core()
         core.actor_std.requires_grad_(False)
         core.actor_std.grad = None
+
+    def _configure_training_actor_std(self) -> None:
+        """Select PPOVEL std ownership for the configured policy distribution."""
+        if self._uses_ppo_physical_gaussian():
+            core = self._ppo_actor_core()
+            core.actor_std.requires_grad_(True)
+            core.actor_std.grad = None
+            self.bc_dagger_sac_adapter.requires_grad_(False)
+            for parameter in self.bc_dagger_sac_adapter.parameters():
+                parameter.grad = None
+        else:
+            self._freeze_legacy_actor_std()
+            self.bc_dagger_sac_adapter.requires_grad_(True)
+
+    @staticmethod
+    def _actor_std_from_module_state(
+        module_state: Mapping, *, context: str
+    ) -> torch.Tensor:
+        candidates = [
+            value
+            for key, value in module_state.items()
+            if str(key).endswith("actor_std") and torch.is_tensor(value)
+        ]
+        if len(candidates) != 1:
+            raise ValueError(
+                f"{context} must contain exactly one PPOVEL actor_std tensor"
+            )
+        actor_std = candidates[0].detach().reshape(-1)
+        if (
+            actor_std.numel() == 0
+            or not torch.is_floating_point(actor_std)
+            or not torch.isfinite(actor_std).all()
+        ):
+            raise ValueError(f"{context} contains an invalid PPOVEL actor_std")
+        return actor_std
+
+    def _restore_checkpoint_physical_actor_std(
+        self, module_state: Mapping, *, context: str
+    ) -> None:
+        """Undo PPOVEL's fresh-finetune 0.5 reset for FastSAC resume only."""
+        if not self._uses_ppo_physical_gaussian():
+            return
+        actor_std = self._actor_std_from_module_state(module_state, context=context)
+        parameter = self._ppo_actor_std_parameter()
+        if actor_std.shape != parameter.shape:
+            raise ValueError(
+                f"{context} actor_std shape {tuple(actor_std.shape)} does not match "
+                f"runtime action shape {tuple(parameter.shape)}"
+            )
+        parameter.data.copy_(actor_std.to(parameter))
 
     @staticmethod
     def _inverse_smooth_log_std(
@@ -689,6 +918,18 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         return log_std_min + 0.5 * (log_std_max - log_std_min) * (
             torch.tanh(raw_log_std) + 1.0
         )
+
+    def _policy_log_std(self) -> torch.Tensor:
+        """Return the effective std coordinate used by the current policy."""
+        if self._uses_ppo_physical_gaussian():
+            return self._ppo_actor_std_parameter().clamp_min(1.0e-6).log()
+        return self._bounded_log_std()
+
+    def _policy_raw_log_std(self) -> torch.Tensor:
+        if self._uses_ppo_physical_gaussian():
+            # PPOVEL parameterizes std directly; there is no latent/raw map.
+            return self._policy_log_std()
+        return self.bc_dagger_sac_adapter.log_std
 
     def _legacy_effective_log_std_to_raw(
         self,
@@ -730,10 +971,18 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         inward = 4.0 * torch.finfo(normalized.dtype).eps
         return torch.atanh(normalized.clamp(-1.0 + inward, 1.0 - inward))
 
-    def _sac_dist_from_mean(self, mean: torch.Tensor) -> FastSACTanhNormal:
-        """Build a bounded policy with std in nominal Q-action coordinates."""
+    def _sac_dist_from_mean(
+        self, mean: torch.Tensor
+    ) -> FastSACTanhNormal | FastSACPhysicalNormal:
+        """Build the configured stochastic policy from a physical-action mean."""
         if not torch.isfinite(mean).all():
             raise RuntimeError("FastSAC Actor proposal contains non-finite raw actions")
+        if self._uses_ppo_physical_gaussian():
+            # This is the same direct per-joint scale parameter and unbounded
+            # physical Normal used by PPOVEL.  The shared execution projection
+            # remains only as a far-tail finite-safety guard.
+            action_std = self._ppo_actor_std_parameter().clamp_min(1.0e-6)
+            return FastSACPhysicalNormal(mean, action_std.expand_as(mean))
         log_std = self._bounded_log_std()
         actor_center = self._fastsac_actor_action_center.to(mean)
         actor_scale = self._fastsac_actor_action_scale.to(mean)
@@ -759,12 +1008,29 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         legacy_dist = DistributionalTD3TeacherBC._actor_dist_from_flat(self, actor_obs)
         return legacy_dist.mean
 
-    def _actor_dist_from_flat(self, actor_obs: torch.Tensor) -> FastSACTanhNormal:
+    def _actor_dist_from_flat(
+        self, actor_obs: torch.Tensor
+    ) -> FastSACTanhNormal | FastSACPhysicalNormal:
         return self._sac_dist_from_mean(self._actor_mean_from_flat(actor_obs))
 
     def _normalized_action_log_prob(self, raw_log_prob: torch.Tensor):
         """Convert raw-action density to joint-normalized-coordinate density."""
+        if self._uses_ppo_physical_gaussian():
+            # PPOVEL scores the raw physical-action Normal directly. Autotune
+            # is forbidden in this mode, so no target-entropy coordinate
+            # conversion is required or silently implied.
+            return raw_log_prob
         return raw_log_prob + float(self._fastsac_entropy_reference_log_scale_sum)
+
+    @torch.no_grad()
+    def _student_mean_action(self, td: TensorDict) -> torch.Tensor:
+        """Use the distribution-consistent deterministic Student action."""
+        if not self._uses_ppo_physical_gaussian():
+            return DistributionalTD3TeacherBC._student_mean_action(self, td)
+        raw_mean = self._student_raw_action_proposal(td)
+        if not torch.isfinite(raw_mean).all():
+            raise RuntimeError("FastSAC evaluation Actor produced non-finite actions")
+        return self._project_execution_action(raw_mean)
 
     def get_rollout_policy(self, mode="train"):
         if mode == "train":
@@ -1092,10 +1358,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_entropy": -normalized_log_prob.detach().mean(),
             "actor_sample_action_abs_mean": sampled_action.detach().abs().mean(),
             "actor_mean_action_abs_mean": dist.mean.detach().abs().mean(),
-            "actor_log_std_mean": self._bounded_log_std().detach().mean(),
-            "actor_raw_log_std_mean": (
-                self.bc_dagger_sac_adapter.log_std.detach().mean()
-            ),
+            "actor_log_std_mean": self._policy_log_std().detach().mean(),
+            "actor_raw_log_std_mean": self._policy_raw_log_std().detach().mean(),
+            "actor_std_min": self._policy_log_std().detach().exp().min(),
+            "actor_std_max": self._policy_log_std().detach().exp().max(),
             "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
             "actor_failure_phase_teacher_fraction": batch.get(
                 FAILURE_PHASE_TEACHER_SOURCE_KEY,
@@ -1128,6 +1394,17 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         """Reuse raw replay/prefill orchestration and publish SAC-native logs."""
         self._fastsac_rollout_critic_metrics: list[dict[str, torch.Tensor]] = []
         self._fastsac_rollout_actor_metrics: list[dict[str, torch.Tensor]] = []
+        action_projection_fraction = 0.0
+        if (
+            FASTSAC_ACTION_PROJECTION_KEY in tensordict.keys(True, True)
+            and DAGGER_IS_STUDENT_ACTION_KEY in tensordict.keys(True, True)
+        ):
+            projected = tensordict[FASTSAC_ACTION_PROJECTION_KEY].reshape(-1).bool()
+            student = tensordict[DAGGER_IS_STUDENT_ACTION_KEY].reshape(-1).bool()
+            if bool(student.any()):
+                action_projection_fraction = float(
+                    projected[student].float().mean().item()
+                )
         td3_info = DistributionalTD3TeacherBC.train_op(self, tensordict)
 
         replacements = {
@@ -1173,6 +1450,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_mean_action_abs_mean",
             "actor_log_std_mean",
             "actor_raw_log_std_mean",
+            "actor_std_min",
+            "actor_std_max",
         )
         critic = self._mean_metric_dict(
             self._fastsac_rollout_critic_metrics, critic_keys
@@ -1204,6 +1483,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         actor = self._mean_metric_dict(self._fastsac_rollout_actor_metrics, actor_keys)
         info.update({f"fastsac/{key}": value for key, value in critic.items()})
         info.update({f"fastsac/{key}": value for key, value in actor.items()})
+        info["fastsac/action_projection_fraction"] = action_projection_fraction
         info["fastsac/alpha_update_count"] = self.alpha_update_count
         info["fastsac/target_entropy"] = float(self.target_entropy)
         self._last_fastsac_diagnostics = {
@@ -1222,13 +1502,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "actor_q_reduction": "minimum_online_twin_expectations",
                 "actor_target": False,
                 "stochastic_actor": True,
-                "entropy_semantics": (
-                    ENTROPY_SEMANTICS
-                    if alpha_update_cadence == "actor"
-                    else _CRITIC_CADENCE_ENTROPY_SEMANTICS
-                ),
+                "action_distribution": _fastsac_action_distribution(self.cfg),
+                "entropy_semantics": self._entropy_semantics(),
                 "entropy_reference_log_scale_sum": (
-                    self._fastsac_entropy_reference_log_scale_sum
+                    0.0
+                    if self._uses_ppo_physical_gaussian()
+                    else self._fastsac_entropy_reference_log_scale_sum
                 ),
                 "target_entropy": float(self.target_entropy),
                 "temperature_update_cadence": (
@@ -1262,6 +1541,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "eta_sac",
                     "lambda_bc",
                     "sac_actor_lr",
+                    "sac_action_distribution",
+                    "load_noise_scale",
                     "sac_initial_action_std",
                     "sac_log_std_min",
                     "sac_log_std_max",
@@ -1281,7 +1562,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             {
                 "method": TRAINING_ALGORITHM,
                 "actor_output": (
-                    "smooth_tanh_bounded_normalized_std_raw_action_normal"
+                    "raw_physical_joint_std_gaussian_with_finite_safety_projection"
+                    if self._uses_ppo_physical_gaussian()
+                    else "smooth_tanh_bounded_normalized_std_raw_action_normal"
                 ),
                 "bc_loss": "joint_normalized_raw_mean_teacher_smooth_l1",
             }
@@ -1289,18 +1572,16 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         return common
 
     def _fastsac_checkpoint_state(self):
-        alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
         return {
             "training_algorithm": TRAINING_ALGORITHM,
             "checkpoint_version": CHECKPOINT_VERSION,
-            "actor_backend": ACTOR_BACKEND,
-            "critic_learning_semantics": CRITIC_SEMANTICS,
-            "actor_learning_semantics": ACTOR_LEARNING_SEMANTICS,
-            "entropy_semantics": (
-                ENTROPY_SEMANTICS
-                if alpha_update_cadence == "actor"
-                else _CRITIC_CADENCE_ENTROPY_SEMANTICS
+            "actor_backend": getattr(
+                self, "actor_backend", _fastsac_actor_backend(self.cfg)
             ),
+            "critic_learning_semantics": CRITIC_SEMANTICS,
+            "actor_learning_semantics": self._actor_learning_semantics(),
+            "entropy_semantics": self._entropy_semantics(),
+            "action_distribution": _fastsac_action_distribution(self.cfg),
             "actor_adapt": self.actor_adapt.state_dict(),
             "bc_dagger_sac_adapter": self.bc_dagger_sac_adapter.state_dict(),
             "qnet": self.qnet.state_dict(),
@@ -1347,6 +1628,15 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise ValueError("not a distributional FastSAC Teacher-BC checkpoint")
         if int(state.get("checkpoint_version", -1)) != CHECKPOINT_VERSION:
             raise ValueError("distributional FastSAC checkpoint version mismatch")
+        if state.get("actor_backend") != _fastsac_actor_backend(self.cfg):
+            raise ValueError("distributional FastSAC actor backend mismatch")
+        saved_distribution = state.get(
+            "action_distribution", NORMALIZED_TANH_ACTION_DISTRIBUTION
+        )
+        if saved_distribution != _fastsac_action_distribution(self.cfg):
+            raise ValueError(
+                "distributional FastSAC action distribution mismatch"
+            )
         if load_modules:
             for name in (
                 "actor_adapt",
@@ -1355,6 +1645,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "qnet_target",
             ):
                 getattr(self, name).load_state_dict(state[name], strict=True)
+            self._restore_checkpoint_physical_actor_std(
+                state["actor_adapt"], context="FastSAC checkpoint actor_adapt"
+            )
             self.log_alpha.data.copy_(state["log_alpha"].to(self.log_alpha))
         optimizers = state.get("optimizer_resume_state")
         if not isinstance(optimizers, dict):
@@ -1420,10 +1713,19 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         ):
             raise ValueError("distributional FastSAC checkpoint version mismatch")
         expected_actor_backend = (
-            _LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND if legacy_v3 else ACTOR_BACKEND
+            _LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND
+            if legacy_v3
+            else _fastsac_actor_backend(self.cfg)
         )
         if state_dict.get("actor_backend") != expected_actor_backend:
             raise ValueError("distributional FastSAC actor backend mismatch")
+        saved_distribution = state_dict.get(
+            "action_distribution", NORMALIZED_TANH_ACTION_DISTRIBUTION
+        )
+        if saved_distribution != _fastsac_action_distribution(self.cfg):
+            raise ValueError(
+                "distributional FastSAC action distribution mismatch"
+            )
         saved_action_contract = state_dict.get("action_contract")
         if not isinstance(saved_action_contract, Mapping):
             raise ValueError("FastSAC inference checkpoint lacks its action contract")
@@ -1485,6 +1787,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     f"FastSAC inference checkpoint lacks module mapping {name!r}"
                 )
             getattr(self, name).load_state_dict(source, strict=True)
+        self._restore_checkpoint_physical_actor_std(
+            load_state["actor_adapt"], context="FastSAC inference actor_adapt"
+        )
         log_alpha = load_state.get("log_alpha")
         if not torch.is_tensor(log_alpha) or log_alpha.numel() != 1:
             raise ValueError("FastSAC inference checkpoint lacks scalar log_alpha")
@@ -1578,7 +1883,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         padded_source["bc_dagger_sac_adapter"] = self.bc_dagger_sac_adapter.state_dict()
         failed = DistributionalTD3TeacherBC.load_state_dict(self, padded_source, strict)
         self.actor_target = None
-        self._freeze_legacy_actor_std()
         self.bc_dagger_sac_adapter.log_std.data.copy_(self._fastsac_initial_raw_log_std)
         self.log_alpha.data.fill_(math.log(float(self.cfg.sac_alpha_init)))
         self.actor_update_count = 0
@@ -1602,7 +1906,17 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         hard_copy_(self.qnet, self.qnet_target)
         self.qnet_target.requires_grad_(False).eval()
         self.actor_adapt.requires_grad_(True).train()
-        self._freeze_legacy_actor_std()
+        self._configure_training_actor_std()
+        if self._uses_ppo_physical_gaussian():
+            expected_std = float(self.cfg.load_noise_scale)
+            actual_std = self._ppo_actor_std_parameter().detach()
+            if not torch.equal(
+                actual_std, torch.full_like(actual_std, expected_std)
+            ):
+                raise RuntimeError(
+                    "PPOVEL fresh finetune did not initialize every physical "
+                    "actor_std from load_noise_scale"
+                )
         return failed
 
 
@@ -1610,6 +1924,11 @@ __all__ = [
     "ACTION_CONTRACT_SEMANTICS",
     "ACTOR_BACKEND",
     "CHECKPOINT_VERSION",
+    "FASTSAC_ACTION_PROJECTION_KEY",
+    "FastSACPhysicalNormal",
+    "NORMALIZED_TANH_ACTION_DISTRIBUTION",
+    "PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION",
+    "PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND",
     "PREVIOUS_CHECKPOINT_VERSION",
     "TRAINING_ALGORITHM",
     "DistributionalFastSACTeacherBC",

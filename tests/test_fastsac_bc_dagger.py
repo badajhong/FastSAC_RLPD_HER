@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from active_adaptation.learning.ppo.common import ACTION_KEY
+from active_adaptation.learning.ppo.common import ACTION_KEY, Actor
 from active_adaptation.learning.ppo.fastsac_vel import (
     FastSACTanhNormal,
     _BCDaggerSACAdapter,
@@ -41,6 +41,10 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
+    FastSACPhysicalNormal,
+    NORMALIZED_TANH_ACTION_DISTRIBUTION,
+    PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+    PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND,
     PREVIOUS_CHECKPOINT_VERSION,
     TRAINING_ALGORITHM,
     DistributionalFastSACTeacherBC,
@@ -186,12 +190,50 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.eta_td3 == 0.0
     assert cfg.policy_delay == cfg.sac_policy_frequency == 8
     assert cfg.sac_alpha_update_cadence == "actor"
+    assert cfg.sac_action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION
     assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
     assert cfg.perception_replay_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
     assert cfg.teacher_perception_replay_fraction == 0.0
     assert cfg.teacher_perception_warmup_steps == 0
+
+
+def test_physical_gaussian_config_requires_fixed_temperature_and_ppo_load_scale():
+    valid = DistributionalFastSACTeacherBCConfig(
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+        sac_use_autotune=False,
+        load_noise_scale=0.5,
+    )
+    DistributionalFastSACTeacherBC._validate_td3_config(valid)
+
+    with pytest.raises(ValueError, match="requires sac_use_autotune=false"):
+        DistributionalFastSACTeacherBC._validate_td3_config(
+            DistributionalFastSACTeacherBCConfig(
+                sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+                sac_use_autotune=True,
+                load_noise_scale=0.5,
+            )
+        )
+    with pytest.raises(ValueError, match="load_noise_scale"):
+        DistributionalFastSACTeacherBC._validate_td3_config(
+            DistributionalFastSACTeacherBCConfig(
+                sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+                sac_use_autotune=False,
+                load_noise_scale=None,
+            )
+        )
+
+
+def test_ppo_finetune_fresh_load_resets_saved_joint_std_to_load_noise_scale():
+    actor = Actor(2, init_noise_scale=1.0, load_noise_scale=0.5)
+    actor(torch.zeros(1, 3))
+    saved = copy.deepcopy(actor.state_dict())
+    saved["actor_std"] = torch.tensor([0.17, 0.29])
+
+    actor.load_state_dict(saved, strict=True)
+
+    assert torch.equal(actor.actor_std, torch.tensor([0.5, 0.5]))
 
 
 def test_config_allows_explicit_pure_sac_ablation_without_inherited_td3_eta():
@@ -373,6 +415,107 @@ def test_backend_distribution_maps_normalized_std_to_joint_scaled_bounded_policy
     )
     assert torch.allclose(dist.mean, 20.0 * torch.tanh(raw_mean / 20.0))
     assert torch.all(dist.mean >= -20.0) and torch.all(dist.mean <= 20.0)
+
+
+def _install_ppo_physical_std(policy, values=(0.5, 0.5)):
+    policy.actor_adapt = nn.Sequential(
+        Actor(
+            len(values),
+            init_noise_scale=1.0,
+            load_noise_scale=0.5,
+        )
+    )
+    with torch.no_grad():
+        policy._ppo_actor_std_parameter().copy_(torch.tensor(values))
+    policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
+        len(values), torch.zeros(len(values)), "cpu"
+    )
+
+
+def test_ppo_physical_gaussian_matches_independent_normal_without_tanh_or_q_offset():
+    policy = _bare_policy(
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+    )
+    _install_ppo_physical_std(policy, values=(0.2, 0.7))
+    policy._fastsac_entropy_reference_log_scale_sum = math.log(37.0)
+    raw_mean = torch.tensor([[2.0, -3.0], [4.0, 1.0]], requires_grad=True)
+
+    dist = policy._sac_dist_from_mean(raw_mean)
+    assert isinstance(dist, FastSACPhysicalNormal)
+    assert torch.equal(dist.mean, raw_mean)
+    assert torch.allclose(dist.scale, torch.tensor([[0.2, 0.7], [0.2, 0.7]]))
+
+    sample_generator = torch.Generator().manual_seed(91)
+    expected_generator = torch.Generator().manual_seed(91)
+    sample, log_prob = dist.rsample_with_log_prob(generator=sample_generator)
+    expected_noise = torch.randn(raw_mean.shape, generator=expected_generator)
+    expected_sample = raw_mean + dist.scale * expected_noise
+    expected_dist = torch.distributions.Independent(
+        torch.distributions.Normal(raw_mean, dist.scale), 1
+    )
+    assert torch.allclose(sample, expected_sample)
+    assert torch.allclose(log_prob, expected_dist.log_prob(sample))
+    assert torch.equal(policy._normalized_action_log_prob(log_prob), log_prob)
+
+    (sample.sum() - log_prob.mean()).backward()
+    assert raw_mean.grad is not None and torch.isfinite(raw_mean.grad).all()
+    assert policy._ppo_actor_std_parameter().grad is not None
+
+
+def test_physical_mode_owns_trainable_ppo_std_and_freezes_tanh_adapter():
+    physical = _bare_policy(
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+    )
+    _install_ppo_physical_std(physical)
+    physical._configure_training_actor_std()
+    assert physical._ppo_actor_std_parameter().requires_grad
+    assert not any(
+        parameter.requires_grad
+        for parameter in physical.bc_dagger_sac_adapter.parameters()
+    )
+
+    normalized = _bare_policy(
+        sac_action_distribution=NORMALIZED_TANH_ACTION_DISTRIBUTION
+    )
+    _install_ppo_physical_std(normalized)
+    normalized._configure_training_actor_std()
+    assert not normalized._ppo_actor_std_parameter().requires_grad
+    assert all(
+        parameter.requires_grad
+        for parameter in normalized.bc_dagger_sac_adapter.parameters()
+    )
+
+
+def test_physical_checkpoint_restore_preserves_learned_joint_std_after_ppo_reset():
+    policy = _bare_policy(
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+    )
+    _install_ppo_physical_std(policy, values=(0.5, 0.5))
+    saved = {"module.actor_std": torch.tensor([0.17, 0.29])}
+
+    policy._restore_checkpoint_physical_actor_std(
+        saved, context="unit checkpoint actor_adapt"
+    )
+
+    assert torch.equal(
+        policy._ppo_actor_std_parameter(), torch.tensor([0.17, 0.29])
+    )
+
+
+def test_physical_deterministic_eval_uses_raw_mean_before_only_safety_projection():
+    policy = _bare_policy(
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+    )
+    raw_mean = torch.tensor([[2.0, 25.0]])
+    policy._student_raw_action_proposal = lambda td: raw_mean.clone()
+    policy._project_execution_action = lambda action: action.clamp(-20.0, 20.0)
+
+    action = policy._student_mean_action(TensorDict({}, batch_size=[1]))
+
+    assert torch.equal(action, torch.tensor([[2.0, 20.0]]))
+    assert action[0, 0].item() != pytest.approx(
+        20.0 * math.tanh(raw_mean[0, 0].item() / 20.0)
+    )
 
 
 def test_smooth_log_std_stays_bounded_and_keeps_gradient_past_old_hard_cap():
@@ -1158,6 +1301,19 @@ def _checkpoint_policy(seed: int):
         "fingerprint": "sha256:unit-test",
     }
     return policy
+
+
+def test_physical_checkpoint_metadata_names_its_distribution_and_backend():
+    policy = _checkpoint_policy(90)
+    policy.cfg.sac_action_distribution = PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+    policy.actor_backend = PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
+
+    state = policy._fastsac_checkpoint_state()
+
+    assert state["action_distribution"] == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+    assert state["actor_backend"] == PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
+    assert "physical_joint_std_gaussian" in state["actor_learning_semantics"]
+    assert "physical_joint_std_gaussian" in state["entropy_semantics"]
 
 
 def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():

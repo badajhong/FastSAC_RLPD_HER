@@ -48,32 +48,35 @@ def _finite_float(value: torch.Tensor | float) -> float:
 
 
 def _parameter_groups(policy) -> tuple[tuple[torch.nn.Parameter, ...], ...]:
-    """Return the production mean and global-log-std optimizer groups."""
-    adapter_parameters = tuple(policy.bc_dagger_sac_adapter.parameters())
-    adapter_ids = {id(parameter) for parameter in adapter_parameters}
-
+    """Return the production mean and policy-scale optimizer groups."""
     optimizer = getattr(policy, "actor_optimizer", None)
     if optimizer is not None and len(optimizer.param_groups) >= 2:
-        mean_parameters = tuple(
-            parameter
-            for parameter in optimizer.param_groups[0]["params"]
-            if id(parameter) not in adapter_ids
-        )
+        mean_parameters = tuple(optimizer.param_groups[0]["params"])
+        scale_parameters = tuple(optimizer.param_groups[1]["params"])
     else:
+        uses_physical = bool(
+            getattr(policy, "_uses_ppo_physical_gaussian", lambda: False)()
+        )
+        scale_parameters = (
+            (policy._ppo_actor_std_parameter(),)
+            if uses_physical
+            else tuple(policy.bc_dagger_sac_adapter.parameters())
+        )
+        scale_ids = {id(parameter) for parameter in scale_parameters}
         mean_parameters = tuple(
             parameter
             for parameter in policy.actor_adapt.parameters()
-            if id(parameter) not in adapter_ids
+            if id(parameter) not in scale_ids
         )
     if not mean_parameters:
         raise RuntimeError("FastSAC gradient probe found no Actor mean parameters")
-    if not adapter_parameters:
-        raise RuntimeError("FastSAC gradient probe found no log-std parameter")
+    if not scale_parameters:
+        raise RuntimeError("FastSAC gradient probe found no policy-scale parameter")
 
-    all_parameters = mean_parameters + adapter_parameters
+    all_parameters = mean_parameters + scale_parameters
     if len({id(parameter) for parameter in all_parameters}) != len(all_parameters):
         raise RuntimeError("FastSAC Actor diagnostic parameter groups overlap")
-    return mean_parameters, adapter_parameters, all_parameters
+    return mean_parameters, scale_parameters, all_parameters
 
 
 @contextmanager

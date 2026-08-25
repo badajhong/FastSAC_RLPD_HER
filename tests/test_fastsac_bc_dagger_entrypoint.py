@@ -198,6 +198,7 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     assert cfg.algo.dagger_beta_end == pytest.approx(0.0)
     assert cfg.algo.eta_sac == pytest.approx(1.0e-4)
     assert cfg.algo.lambda_bc == pytest.approx(1.0)
+    assert cfg.algo.sac_action_distribution == "normalized_tanh"
     assert cfg.algo.sac_initial_action_std == pytest.approx(0.1)
     assert cfg.algo.action_support_clip == pytest.approx(20.0)
     assert cfg.algo.sac_use_autotune is True
@@ -232,6 +233,32 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
         "beta_zero_rollouts": 3000,
         "safe_zero_rollouts": 0,
     }
+
+
+def test_entrypoint_accepts_ppo_physical_gaussian_only_as_fixed_temperature():
+    cfg = _cfg()
+    cfg.algo.sac_action_distribution = "ppo_physical_gaussian"
+    cfg.algo.sac_use_autotune = False
+    cfg.algo.load_noise_scale = 0.5
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    cfg.algo.sac_use_autotune = True
+    with pytest.raises(ValueError, match="requires algo.sac_use_autotune=false"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize("load_noise_scale", (None, 0.0, -0.5, float("nan")))
+def test_entrypoint_rejects_invalid_ppo_physical_load_noise_scale(
+    load_noise_scale,
+):
+    cfg = _cfg()
+    cfg.algo.sac_action_distribution = "ppo_physical_gaussian"
+    cfg.algo.sac_use_autotune = False
+    cfg.algo.load_noise_scale = load_noise_scale
+
+    with pytest.raises(ValueError, match="load_noise_scale"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
 def test_fastsac_yaml_environment_count_can_be_overridden():

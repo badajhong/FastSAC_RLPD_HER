@@ -7,6 +7,7 @@ import random
 import time
 import wandb
 import logging
+import math
 import os
 import shutil
 import stat
@@ -543,6 +544,56 @@ def _fill_replayless_inference_algo_defaults(
     filled_checkpoint = []
     filled_defaults = []
     with open_dict(cfg.algo):
+        if algorithm in {
+            "distributional_fastsac_teacher_bc_v1",
+            "distributional_tvkd_fastsac_teacher_bc_v1",
+            "distributional_tvkd_fastsac_teacher_bc_v2",
+            "distributional_tvkd_fastsac_teacher_bc_v3",
+            "distributional_tvkd_fastsac_teacher_bc_v4",
+            "distributional_tvkd_fastsac_teacher_bc_v5",
+            "distributional_tvkd_fastsac_teacher_bc_v6",
+        }:
+            # This field changes Actor parameter ownership and the distribution
+            # class, so the checkpoint must select it before construction even
+            # when the eval config already contains today's structured default.
+            saved_distribution = backend.get(
+                "sac_action_distribution", "normalized_tanh"
+            )
+            if saved_distribution not in (
+                "normalized_tanh",
+                "ppo_physical_gaussian",
+            ):
+                raise ValueError(
+                    "FastSAC inference checkpoint has invalid "
+                    "sac_action_distribution metadata"
+                )
+            if cfg.algo.get("sac_action_distribution") != saved_distribution:
+                cfg.algo.sac_action_distribution = saved_distribution
+                filled_checkpoint.append("sac_action_distribution")
+            if saved_distribution == "ppo_physical_gaussian":
+                saved_autotune = backend.get("sac_use_autotune")
+                if saved_autotune is not False:
+                    raise ValueError(
+                        "physical FastSAC inference checkpoint must record "
+                        "sac_use_autotune=false"
+                    )
+                if cfg.algo.get("sac_use_autotune") is not False:
+                    cfg.algo.sac_use_autotune = False
+                    filled_checkpoint.append("sac_use_autotune")
+                saved_load_scale = backend.get("load_noise_scale")
+                if (
+                    isinstance(saved_load_scale, bool)
+                    or not isinstance(saved_load_scale, (int, float))
+                    or not math.isfinite(float(saved_load_scale))
+                    or float(saved_load_scale) <= 0.0
+                ):
+                    raise ValueError(
+                        "physical FastSAC inference checkpoint lacks a valid "
+                        "load_noise_scale"
+                    )
+                if cfg.algo.get("load_noise_scale") != saved_load_scale:
+                    cfg.algo.load_noise_scale = float(saved_load_scale)
+                    filled_checkpoint.append("load_noise_scale")
         if algorithm in {
             "distributional_tvkd_fastsac_teacher_bc_v1",
             "distributional_tvkd_fastsac_teacher_bc_v2",

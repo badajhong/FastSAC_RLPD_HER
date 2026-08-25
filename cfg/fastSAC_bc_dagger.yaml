@@ -137,11 +137,15 @@ algo:
   collector_exploration_noise_clip: 0.0
   td3_learning_starts: 8192
 
-  # Reparameterized bounded Actor. Standard deviation is dimensionless in the
-  # same per-joint nominal coordinates used by Q, BC, and entropy.
+  # Policy distribution. ``normalized_tanh`` is the historical bounded
+  # FastSAC policy. ``ppo_physical_gaussian`` instead uses PPOVEL's raw
+  # physical-action mean and directly learned joint-wise actor_std; it requires
+  # sac_use_autotune=false and initializes every joint from load_noise_scale.
   eta_sac: 1.0e-4
   lambda_bc: 1.0
   sac_actor_lr: 3.0e-4
+  sac_action_distribution: normalized_tanh
+  # The next three fields apply only to normalized_tanh.
   sac_initial_action_std: 0.1
   sac_log_std_min: -10.0
   sac_log_std_max: -2.0

@@ -61,6 +61,9 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     _validate_tvkd_algorithm_config,
     compute_teacher_value_terms,
 )
+from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+    _fastsac_actor_backend,
+)
 from active_adaptation.utils.wandb import parse_checkpoint_path
 
 try:
@@ -1102,7 +1105,7 @@ def _prepare_tvkd_checkpoint(
             UserWarning,
             stacklevel=2,
         )
-    if policy_state.get("actor_backend") != ACTOR_BACKEND:
+    if policy_state.get("actor_backend") != _fastsac_actor_backend(cfg.algo):
         raise ValueError("TVKD resume checkpoint actor backend mismatch")
     required_mappings = [
         "frozen_teacher_state",
@@ -1179,6 +1182,11 @@ def _prepare_tvkd_checkpoint(
         else OmegaConf.create(source_algo),
         resolve=True,
         enum_to_str=True,
+    )
+    # Checkpoints written before the explicit distribution selector all used
+    # the normalized-tanh backend named in their actor_backend sentinel.
+    source_algo_contract.setdefault(
+        "sac_action_distribution", "normalized_tanh"
     )
     # Legacy v1 checkpoints predate this explicit provenance field but already
     # used one alpha update per Critic. v2+ checkpoints must contain it.
@@ -1409,6 +1417,8 @@ def main(cfg: DictConfig):
         f"frames/rollout={schedule['frames_per_rollout']}; "
         f"tvkd_lambda={float(cfg.algo.tvkd_lambda):g}, "
         f"bottleneck={bool(cfg.algo.use_teacher_value_bottleneck_replay)}, "
+        f"action_distribution={cfg.algo.get('sac_action_distribution', 'normalized_tanh')}, "
+        f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence}, "
         f"{replay_mix_summary('q')}; "
         f"{replay_mix_summary('actor')}; "

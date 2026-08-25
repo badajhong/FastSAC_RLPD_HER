@@ -6,10 +6,11 @@ method-specific Hydra surface and rejects incompatible configuration before
 the simulator starts.
 
 The stochastic policy is intentional: Student collection, the soft Bellman
-target, and the SAC Actor objective sample a bounded reparameterized policy.
-Its standard deviation, Teacher BC, and Critic inputs use the same per-joint
-nominal coordinates. Exploration therefore comes from SAC itself; inherited
-TD3 noise knobs are locked to zero.
+target, and the SAC Actor objective sample one explicitly selected
+distribution. The historical normalized tanh policy remains available; an
+opt-in mode reproduces PPOVEL's raw physical-action Gaussian and directly
+learned joint standard deviations. Exploration therefore comes from SAC
+itself; inherited TD3 noise knobs are locked to zero.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     ACTION_CONTRACT_SEMANTICS,
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
+    NORMALIZED_TANH_ACTION_DISTRIBUTION,
+    PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     TRAINING_ALGORITHM,
     _validate_fastsac_entropy_target_controls,
 )
@@ -573,6 +576,19 @@ def _validate_replay_contract(cfg: DictConfig) -> None:
 
 
 def _validate_sac_controls(cfg: DictConfig) -> None:
+    action_distribution = str(
+        cfg.algo.get(
+            "sac_action_distribution", NORMALIZED_TANH_ACTION_DISTRIBUTION
+        )
+    )
+    if action_distribution not in (
+        NORMALIZED_TANH_ACTION_DISTRIBUTION,
+        PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+    ):
+        raise ValueError(
+            "algo.sac_action_distribution must be 'normalized_tanh' or "
+            "'ppo_physical_gaussian'"
+        )
     for name in (
         "eta_sac",
         "lambda_bc",
@@ -589,7 +605,6 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         "q_action_input_gain",
         "q_update_to_data_ratio",
         "sac_actor_lr",
-        "sac_initial_action_std",
         "sac_alpha_init",
         "sac_alpha_lr",
     ):
@@ -597,16 +612,32 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
     if float(cfg.algo.eta_sac) == 0.0 and float(cfg.algo.lambda_bc) == 0.0:
         raise ValueError("eta_sac and lambda_bc cannot both be zero")
 
-    log_std_min = cfg.algo.get("sac_log_std_min", None)
-    log_std_max = cfg.algo.get("sac_log_std_max", None)
-    _validate_fastsac_entropy_target_controls(
-        log_std_min,
-        log_std_max,
-        cfg.algo.get("sac_target_entropy_ratio", None),
-        field_prefix="algo",
-    )
     if cfg.algo.get("sac_use_autotune", None) not in (True, False):
         raise ValueError("algo.sac_use_autotune must be boolean")
+    if action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION:
+        _finite_positive(
+            "algo.sac_initial_action_std",
+            cfg.algo.get("sac_initial_action_std", None),
+        )
+        _validate_fastsac_entropy_target_controls(
+            cfg.algo.get("sac_log_std_min", None),
+            cfg.algo.get("sac_log_std_max", None),
+            cfg.algo.get("sac_target_entropy_ratio", None),
+            field_prefix="algo",
+        )
+    else:
+        if bool(cfg.algo.sac_use_autotune):
+            raise ValueError(
+                "algo.sac_action_distribution=ppo_physical_gaussian requires "
+                "algo.sac_use_autotune=false"
+            )
+        _finite_positive(
+            "algo.load_noise_scale", cfg.algo.get("load_noise_scale", None)
+        )
+        _finite_positive(
+            "algo.sac_target_entropy_ratio",
+            cfg.algo.get("sac_target_entropy_ratio", None),
+        )
     if cfg.algo.get("sac_alpha_update_cadence", None) != "actor":
         raise ValueError(
             "algo.sac_alpha_update_cadence must be 'actor' so temperature "
@@ -825,6 +856,9 @@ def main(cfg: DictConfig):
         f"tau={float(cfg.algo.sac_tau):g}, "
         f"eta_sac={float(cfg.algo.eta_sac):g}, "
         f"lambda_bc={float(cfg.algo.lambda_bc):g}, "
+        "action_distribution="
+        f"{cfg.algo.get('sac_action_distribution', NORMALIZED_TANH_ACTION_DISTRIBUTION)}, "
+        f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "
         f"alpha_init={float(cfg.algo.sac_alpha_init):g}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence} "
         f"(every {int(cfg.algo.sac_policy_frequency)} Critic updates); "

@@ -41,9 +41,11 @@ from .common import CMD_KEY, DONE_KEY, OBS_KEY, OBS_PRIV_KEY, REWARD_KEY, TERM_K
 from .fastsac_bc_dagger import (
     ACTOR_BACKEND,
     CHECKPOINT_VERSION as BASE_FASTSAC_CHECKPOINT_VERSION,
+    NORMALIZED_TANH_ACTION_DISTRIBUTION,
     TRAINING_ALGORITHM as BASE_FASTSAC_TRAINING_ALGORITHM,
     DistributionalFastSACTeacherBC,
     DistributionalFastSACTeacherBCConfig,
+    _fastsac_actor_backend,
 )
 from .fastsac_vel import _vaic_truncation_mask
 from .ppo_bc_dagger import (
@@ -3351,6 +3353,20 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             expected_backend = self._checkpoint_config()
             if v5:
                 expected_backend["method"] = V5_TRAINING_ALGORITHM
+            if "sac_action_distribution" not in backend:
+                if (
+                    state.get("actor_backend") != ACTOR_BACKEND
+                    or expected_backend.get("sac_action_distribution")
+                    != NORMALIZED_TANH_ACTION_DISTRIBUTION
+                ):
+                    raise ValueError(
+                        f"TVKD {contract_label} checkpoint lacks its physical "
+                        "action-distribution contract"
+                    )
+                backend = dict(backend)
+                backend["sac_action_distribution"] = (
+                    NORMALIZED_TANH_ACTION_DISTRIBUTION
+                )
             # These knobs are measurement-only and were added after the first
             # v6 checkpoints.  They do not affect policy, critic, replay, or
             # optimizer semantics, so an older checkpoint may safely inherit
@@ -3761,7 +3777,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
             self.teacher_value_wrapper.freeze()
             return failed
-        if state_dict.get("actor_backend") != ACTOR_BACKEND:
+        expected_actor_backend = getattr(
+            self, "actor_backend", _fastsac_actor_backend(self.cfg)
+        )
+        if state_dict.get("actor_backend") != expected_actor_backend:
             raise ValueError("TVKD FastSAC resume actor backend mismatch")
         saved_action_contract = state_dict.get("action_contract")
         if not isinstance(saved_action_contract, Mapping):
@@ -3806,11 +3825,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self._teacher_phase_bin_counts = torch.empty(0, dtype=torch.long)
         self._teacher_phase_device_cache.clear()
         self.actor_adapt.requires_grad_(True).train()
-        # ``requires_grad_(True)`` above recursively touches the legacy PPO
-        # variance parameter. FastSAC owns variance exclusively through its
-        # separate SAC adapter, so immediately restore the inherited invariant.
-        self._freeze_legacy_actor_std()
-        self.bc_dagger_sac_adapter.requires_grad_(True).train()
+        # ``requires_grad_(True)`` recursively touches PPOVEL's actor_std.
+        # Restore the mode-specific single variance owner: direct actor_std for
+        # physical Gaussian, SAC adapter for historical normalized tanh.
+        self._configure_training_actor_std()
+        self.bc_dagger_sac_adapter.train()
         self.qnet.requires_grad_(True).train()
         self.qnet_target.requires_grad_(False).eval()
         self._set_perception_trainable(bool(self.cfg.train_perception))

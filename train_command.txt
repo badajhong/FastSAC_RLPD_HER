@@ -37,14 +37,16 @@ nohup env PYTHONUNBUFFERED=1 \
   > ./logs/fastSAC_bc_dagger_eta1e-2_H2p5_actor_cadence.log 2>&1 < /dev/null &
 
 # TVKD
-# Replay ratios below resolve to Q US/FS/UT/FT=25/25/25/25 and
-# Actor US/FS/UT/FT=50/50/0/0. Perception remains live Student-only.
+# Replay ratios below resolve to Q US/FS/UT/FT=50/0/50/0 and
+# Actor US/FS/UT/FT=100/0/0/0. Perception remains live Student-only.
+# Action exploration matches ppo_vel_finetune: raw physical Gaussian,
+# per-joint trainable actor_std, freshly reset to load_noise_scale=0.5.
 nohup env PYTHONUNBUFFERED=1 \
   python scripts/TVKD_fasSAC_bc_dagger.py \
-  task=G1/vaic/cart_general_tracking_stu \
-  checkpoint_path=/home/hcc/research/VAIC/teachers/cart_general/13-13-56-G1CartGeneralTracking-ppo_vel/wandb/latest-run/files/checkpoint_final.pt \
+  task=G1/vaic/skateboard_general_tracking_stu \
+  checkpoint_path=/home/hcc/research/VAIC/teachers/skateboard_general_tracking/wandb/latest-run/files/checkpoint_final.pt \
   algo.load_pretrained_perception=true \
-  algo.perception_checkpoint_path=/home/hcc/research/VAIC/teachers/cart_general/13-13-56-G1CartGeneralTracking-ppo_vel/wandb/latest-run/files/checkpoint_final.pt \
+  algo.perception_checkpoint_path=/home/hcc/research/VAIC/teachers/skateboard_general_tracking/wandb/latest-run/files/checkpoint_final.pt \
   algo.train_perception=true \
   fastsac_dagger_iterations=14000 \
   algo.teacher_prefill_max_rollouts=300 \
@@ -53,42 +55,38 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.teacher_perception_replay_fraction=0.0 \
   algo.teacher_actor_replay_fraction=0.5 \
   algo.q_teacher_replay_ratio=0.5 \
-  algo.failure_phase_teacher_fraction=0.25 \
-  algo.failure_phase_student_fraction=0.25 \
+  algo.failure_phase_teacher_fraction=0.0 \
+  algo.failure_phase_student_fraction=0.0 \
   algo.lambda_bc=1.0 \
   algo.sac_actor_lr=3.0e-4 \
   algo.dagger_bc_lr=3.0e-4 \
   algo.eta_sac=5.0e-3 \
-  algo.sac_initial_action_std=0.02 \
-  algo.sac_log_std_min=-4.0 \
-  algo.sac_log_std_max=-3.8 \
+  algo.sac_action_distribution=ppo_physical_gaussian \
+  algo.load_noise_scale=0.5 \
   algo.sac_use_autotune=false \
   algo.sac_alpha_init=1.0e-5 \
-  algo.sac_alpha_lr=2.0e-5 \
-  algo.sac_alpha_update_cadence=actor \
-  algo.sac_target_entropy_ratio=2.5 \
   algo.use_tvkd_value_shaping=true \
-  algo.tvkd_lambda=1.0 \
+  algo.tvkd_lambda=0.5 \
   algo.tvkd_potential_clip=null \
-  algo.use_teacher_value_bottleneck_replay=true \
+  algo.use_teacher_value_bottleneck_replay=false \
   algo.bottleneck_selection_mode=deepest \
   algo.bottleneck_threshold=0.05 \
   algo.bottleneck_smoothing_window=5 \
   algo.bottleneck_min_consecutive=3 \
   algo.bottleneck_terminal_exclusion_steps=5 \
-  algo.failure_phase_lookback_steps=25 \
-  algo.failure_phase_samples_per_failure=25 \
+  algo.failure_phase_lookback_steps=30 \
+  algo.failure_phase_samples_per_failure=30 \
   algo.bottleneck_include_unsuccessful_timeouts=false \
   task.num_envs=512 \
   save_interval=100 \
   algo.q_update_to_data_ratio=1.0 \
   algo.q_batch_size=512 \
-  algo.dagger_batch_size=8192 \
+  algo.dagger_batch_size=4096 \
   algo.q_teacher_buffer_capacity=131072 \
   algo.dagger_buffer_capacity=131072 \
-  algo.sac_policy_frequency=8 \
-  algo.policy_delay=8 \
-  > ./logs/TVKD_fasSAC_bc_dagger.log 2>&1 < /dev/null &
+  algo.sac_policy_frequency=2 \
+  algo.policy_delay=2 \
+  > ./logs/skateboard_general_tracking_stu_TVKD_fasSAC_bc_dagger_ppo_physical.log 2>&1 < /dev/null &
 
 # DAgger
 nohup python scripts/bc_dagger.py \
@@ -215,3 +213,11 @@ nohup env PYTHONUNBUFFERED=1 \
   algo=ppo_vel_train \
   task=G1/vaic/skateboard_general_tracking_tea \
   > ./logs/skateboard_general_tracking_tea.log 2>&1 < /dev/null &
+
+nohup env PYTHONUNBUFFERED=1 \
+  python scripts/train.py \
+  algo=ppo_vel_finetune \
+  task=G1/vaic/skateboard_general_tracking_stu \
+  checkpoint_path=/home/hcc/research/VAIC/teachers/skateboard_general_tracking/wandb/latest-run/files/checkpoint_final.pt\
+  total_frames=400000000 \
+  > ./logs/skateboard_general_tracking_stu.log 2>&1 < /dev/null &

@@ -106,6 +106,13 @@ class FixedStdFastSACStudentPolicy(nn.Module):
             raise ValueError(
                 "checkpoint std and a fixed normalized std are mutually exclusive"
             )
+        if self.normalized_std is not None and bool(
+            getattr(owner, "_uses_ppo_physical_gaussian", lambda: False)()
+        ):
+            raise ValueError(
+                "fixed normalized tanh std conditions are incompatible with a "
+                "ppo_physical_gaussian checkpoint; use checkpoint_std"
+            )
         if self.normalized_std is not None:
             if not math.isfinite(self.normalized_std) or self.normalized_std <= 0.0:
                 raise ValueError("normalized_std must be finite and positive")
@@ -127,7 +134,9 @@ class FixedStdFastSACStudentPolicy(nn.Module):
         raw_mean = owner._student_raw_action_proposal(td)
         if not torch.isfinite(raw_mean).all():
             raise RuntimeError("FastSAC evaluation Actor produced a non-finite mean")
-        mean_action = owner._bounded_actor_mean(raw_mean)
+        mean_action = owner._project_execution_action(
+            owner._sac_dist_from_mean(raw_mean).mean
+        )
         if self.normalized_std is None and not self.use_checkpoint_std:
             action = mean_action
         else:
@@ -352,15 +361,24 @@ def _install_checkpoint_vecnorm(env, vecnorm, state: dict[str, Any]) -> None:
 
 
 def _checkpoint_metadata(agent, policy_state: dict[str, Any]) -> dict[str, Any]:
-    learned_std = agent._bounded_log_std().detach().exp().cpu()
+    learned_std = agent._policy_log_std().detach().exp().cpu()
+    action_distribution = str(
+        getattr(agent.cfg, "sac_action_distribution", "normalized_tanh")
+    )
     log_alpha = policy_state.get("log_alpha")
     alpha = None
     if torch.is_tensor(log_alpha) and log_alpha.numel() == 1:
         alpha = float(log_alpha.detach().float().exp().item())
     return {
-        "learned_normalized_action_std_mean": float(learned_std.mean()),
-        "learned_normalized_action_std_min": float(learned_std.min()),
-        "learned_normalized_action_std_max": float(learned_std.max()),
+        "action_distribution": action_distribution,
+        "learned_action_std_units": (
+            "physical_action"
+            if action_distribution == "ppo_physical_gaussian"
+            else "normalized_q_action"
+        ),
+        "learned_action_std_mean": float(learned_std.mean()),
+        "learned_action_std_min": float(learned_std.min()),
+        "learned_action_std_max": float(learned_std.max()),
         "alpha": alpha,
         "actor_update_count": int(policy_state.get("actor_update_count", -1)),
         "critic_update_count": int(policy_state.get("critic_update_count", -1)),

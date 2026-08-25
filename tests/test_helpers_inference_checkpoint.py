@@ -155,6 +155,45 @@ def test_legacy_fastsac_inference_config_uses_checkpoint_then_defaults():
     assert "actor_output" not in cfg.algo
 
 
+def test_physical_fastsac_checkpoint_overrides_structured_tanh_inference_default():
+    cfg = OmegaConf.create(
+        {"algo": {"sac_action_distribution": "normalized_tanh"}}
+    )
+    policy_state = {
+        "training_algorithm": "distributional_fastsac_teacher_bc_v1",
+        "dagger_backend_config": {
+            "sac_action_distribution": "ppo_physical_gaussian",
+            "sac_use_autotune": False,
+            "load_noise_scale": 0.5,
+        },
+    }
+
+    filled = helpers._fill_replayless_inference_algo_defaults(
+        cfg, policy_state, inference_only=True
+    )
+
+    assert cfg.algo.sac_action_distribution == "ppo_physical_gaussian"
+    assert cfg.algo.sac_use_autotune is False
+    assert cfg.algo.load_noise_scale == pytest.approx(0.5)
+    assert "sac_action_distribution" in filled["checkpoint"]
+
+
+def test_old_fastsac_checkpoint_without_distribution_defaults_to_normalized_tanh():
+    cfg = OmegaConf.create(
+        {"algo": {"sac_action_distribution": "ppo_physical_gaussian"}}
+    )
+    policy_state = {
+        "training_algorithm": "distributional_fastsac_teacher_bc_v1",
+        "dagger_backend_config": {},
+    }
+
+    helpers._fill_replayless_inference_algo_defaults(
+        cfg, policy_state, inference_only=True
+    )
+
+    assert cfg.algo.sac_action_distribution == "normalized_tanh"
+
+
 def test_legacy_td3_inference_config_preserves_none_and_false_values():
     cfg = OmegaConf.create(
         {
