@@ -6,3 +6,19 @@ python scripts/play.py \
 python scripts/convert_holosoma_motion.py \
   /home/hcc/research/HOI/train_r1/rl/largebox/sub3_largebox_003.npz \
   data/motion/r1/largebox/sub3_largebox_003
+
+python scripts/convert_holosoma_motion.py \
+  /home/hcc/research/HOI/train_r1/rl/whitechair/sub4_whitechair_029.npz \
+  data/motion/r1/whitechair/sub4_whitechair_029
+
+python scripts/convert_holosoma_motion.py \
+  /home/hcc/research/HOI/train_r1/rl/smalltable/sub17_smalltable_010.npz \
+  data/motion/r1/smalltable/sub17_smalltable_010
+
+python scripts/convert_holosoma_motion.py \
+  /home/hcc/research/HOI/train_r1/rl/suitcase/sub5_suitcase_000.npz \
+  data/motion/r1/suitcase/sub5_suitcase_000
+
+python scripts/convert_holosoma_motion.py \
+  /home/hcc/research/HOI/train_r1/rl/plasticbox/sub5_plasticbox_030.npz \
+  data/motion/r1/plasticbox/sub5_plasticbox_030

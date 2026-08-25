@@ -147,9 +147,12 @@ algo:
   sac_action_distribution: normalized_tanh
   # Physical Gaussian only: replay Q/entropy/BC update the mean but never std.
   # A separate SGD step (one per delayed Actor step) contracts direct PPOVEL
-  # actor_std from load_noise_scale toward this prior and projects to bounds.
+  # actor_std from load_noise_scale toward the scalar fallback below, or toward
+  # an exact joint-name mapping when prior_by_joint is configured. Named values
+  # prevent a same-length prior from being assigned in the wrong action order.
   sac_physical_std_lr: 1.0e-5
   sac_physical_std_prior: 0.3
+  sac_physical_std_prior_by_joint: {}
   sac_physical_std_min: 0.05
   sac_physical_std_max: 0.5
   # The next three fields apply only to normalized_tanh.

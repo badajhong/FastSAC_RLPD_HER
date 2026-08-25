@@ -3377,6 +3377,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 for name in (
                     "sac_physical_std_lr",
                     "sac_physical_std_prior",
+                    "sac_physical_std_prior_by_joint",
                     "sac_physical_std_min",
                     "sac_physical_std_max",
                 ):
@@ -3410,6 +3411,13 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             missing_optional = set(expected_backend).difference(backend) & (
                 legacy_optional_diagnostic_keys
             )
+            if (
+                current
+                and backend.get("sac_physical_std_prior_by_joint") is None
+                and not expected_backend.get("sac_physical_std_prior_by_joint")
+            ):
+                backend = dict(backend)
+                backend["sac_physical_std_prior_by_joint"] = {}
             if missing_optional:
                 backend = dict(backend)
                 for name in missing_optional:

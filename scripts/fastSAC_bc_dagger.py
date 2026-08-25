@@ -32,6 +32,7 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     TRAINING_ALGORITHM,
     _validate_fastsac_entropy_target_controls,
+    _validate_fastsac_physical_std_prior_by_joint,
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
@@ -658,6 +659,12 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
             raise ValueError(
                 "algo.sac_physical_std_prior must lie inside the std bounds"
             )
+        _validate_fastsac_physical_std_prior_by_joint(
+            cfg.algo.get("sac_physical_std_prior_by_joint", None),
+            std_min,
+            std_max,
+            field_prefix="algo",
+        )
         if not std_min <= load_noise_scale <= std_max:
             raise ValueError(
                 "algo.load_noise_scale must lie inside the physical std bounds"

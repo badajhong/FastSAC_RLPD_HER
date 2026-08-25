@@ -597,6 +597,41 @@ def _fill_replayless_inference_algo_defaults(
                 if cfg.algo.get("load_noise_scale") != saved_load_scale:
                     cfg.algo.load_noise_scale = float(saved_load_scale)
                     filled_checkpoint.append("load_noise_scale")
+                # The structured inference config already contains an empty
+                # named-prior map, so the generic missing-field completion
+                # below would otherwise hide a saved PPOVEL joint profile.
+                # Copy every recorded physical-std control explicitly. This
+                # keeps checkpoint provenance exact even though deterministic
+                # evaluation uses only the restored mean action.
+                for name in (
+                    "sac_physical_std_lr",
+                    "sac_physical_std_prior",
+                    "sac_physical_std_prior_by_joint",
+                    "sac_physical_std_min",
+                    "sac_physical_std_max",
+                ):
+                    if name not in backend:
+                        continue
+                    saved_value = copy.deepcopy(backend[name])
+                    if name == "sac_physical_std_prior_by_joint":
+                        if saved_value is None:
+                            saved_value = {}
+                        elif not isinstance(saved_value, Mapping):
+                            raise ValueError(
+                                "physical FastSAC inference checkpoint has invalid "
+                                "sac_physical_std_prior_by_joint metadata"
+                            )
+                        else:
+                            saved_value = dict(saved_value)
+                    current_value = cfg.algo.get(name)
+                    current_container = (
+                        dict(current_value)
+                        if isinstance(current_value, Mapping)
+                        else current_value
+                    )
+                    if current_container != saved_value:
+                        cfg.algo[name] = saved_value
+                        filled_checkpoint.append(name)
         if algorithm in {
             "distributional_tvkd_fastsac_teacher_bc_v1",
             "distributional_tvkd_fastsac_teacher_bc_v2",

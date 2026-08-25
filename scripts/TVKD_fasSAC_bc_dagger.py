@@ -1215,6 +1215,11 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault(
         "sac_action_distribution", "normalized_tanh"
     )
+    # Early v7 checkpoints predate the optional named prior. Their physical
+    # std behavior is exactly the scalar fallback represented by an empty map.
+    source_algo_contract.setdefault("sac_physical_std_prior_by_joint", {})
+    if source_algo_contract["sac_physical_std_prior_by_joint"] is None:
+        source_algo_contract["sac_physical_std_prior_by_joint"] = {}
     # Legacy v1 checkpoints predate this explicit provenance field but already
     # used one alpha update per Critic. v2+ checkpoints must contain it.
     if legacy:
@@ -1228,6 +1233,7 @@ def _prepare_tvkd_checkpoint(
         for name in (
             "sac_physical_std_lr",
             "sac_physical_std_prior",
+            "sac_physical_std_prior_by_joint",
             "sac_physical_std_min",
             "sac_physical_std_max",
         ):

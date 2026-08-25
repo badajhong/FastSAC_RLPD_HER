@@ -39,8 +39,10 @@ nohup env PYTHONUNBUFFERED=1 \
 # TVKD
 # Replay ratios below resolve to Q US/FS/UT/FT=50/0/50/0 and
 # Actor US/FS/UT/FT=100/0/0/0. Perception remains live Student-only.
-# Action exploration matches ppo_vel_finetune: raw physical Gaussian,
-# per-joint actor_std reset to 0.5, then replay-detached SGD prior control.
+# Action exploration follows ppo_vel_finetune: raw physical Gaussian and a
+# fresh 0.5 actor_std. The named target is actor_adapt.actor_std from the same
+# task's checkpoint_13800.pt (sha256 70ca09fa4efc30a3ae5b888d7587b632937845f097cd1e45987f7d49679dfc49).
+# With 16 std steps/rollout, 2.4e-5 best fits that PPOVEL run through 14k.
 nohup env PYTHONUNBUFFERED=1 \
   python scripts/TVKD_fasSAC_bc_dagger.py \
   task=G1/vaic/skateboard_general_tracking_stu \
@@ -63,8 +65,9 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.eta_sac=5.0e-3 \
   algo.sac_action_distribution=ppo_physical_gaussian \
   algo.load_noise_scale=0.5 \
-  algo.sac_physical_std_lr=1.0e-5 \
-  algo.sac_physical_std_prior=0.3 \
+  algo.sac_physical_std_lr=2.4e-5 \
+  algo.sac_physical_std_prior=0.24 \
+  '+algo.sac_physical_std_prior_by_joint={left_hip_pitch_joint:0.226045936,right_hip_pitch_joint:0.210184395,waist_yaw_joint:0.167723149,left_hip_roll_joint:0.170180768,right_hip_roll_joint:0.166876256,waist_roll_joint:0.259335428,left_hip_yaw_joint:0.156493351,right_hip_yaw_joint:0.169216678,waist_pitch_joint:0.262056023,left_knee_joint:0.194541767,right_knee_joint:0.187954128,left_shoulder_pitch_joint:0.289068580,right_shoulder_pitch_joint:0.300275773,left_ankle_pitch_joint:0.235239163,right_ankle_pitch_joint:0.225991189,left_shoulder_roll_joint:0.293521732,right_shoulder_roll_joint:0.307227701,left_ankle_roll_joint:0.222927645,right_ankle_roll_joint:0.232772201,left_shoulder_yaw_joint:0.255685657,right_shoulder_yaw_joint:0.271756440,left_elbow_joint:0.292680502,right_elbow_joint:0.268915445}' \
   algo.sac_physical_std_min=0.05 \
   algo.sac_physical_std_max=0.5 \
   algo.sac_use_autotune=false \

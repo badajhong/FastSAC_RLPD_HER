@@ -27,7 +27,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -151,6 +151,49 @@ def _fastsac_actor_backend(cfg) -> str:
     if _fastsac_action_distribution(cfg) == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
         return PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
     return ACTOR_BACKEND
+
+
+def _validate_fastsac_physical_std_prior_by_joint(
+    prior_by_joint,
+    std_min: float,
+    std_max: float,
+    *,
+    field_prefix: str = "",
+) -> dict[str, float] | None:
+    """Validate and normalize an optional named physical-std prior.
+
+    A name-keyed mapping is intentional: a bare vector can have the right
+    length while silently assigning PPOVEL noise to the wrong joints. Runtime
+    construction additionally checks this mapping against the action
+    manager's exact joint-name contract before ordering it into a tensor.
+    """
+    if prior_by_joint is None:
+        return None
+    prefix = f"{field_prefix}." if field_prefix else ""
+    field = f"{prefix}sac_physical_std_prior_by_joint"
+    if not isinstance(prior_by_joint, Mapping):
+        raise ValueError(f"{field} must be a joint-name mapping")
+    if not prior_by_joint:
+        return None
+
+    normalized: dict[str, float] = {}
+    for joint_name, value in prior_by_joint.items():
+        if not isinstance(joint_name, str) or not joint_name:
+            raise ValueError(f"{field} keys must be non-empty joint names")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+        ):
+            raise ValueError(f"{field}.{joint_name} must be finite and positive")
+        std = float(value)
+        if not float(std_min) <= std <= float(std_max):
+            raise ValueError(
+                f"{field}.{joint_name} must lie inside the physical std bounds"
+            )
+        normalized[joint_name] = std
+    return normalized
 
 
 class FastSACPhysicalNormal:
@@ -301,6 +344,10 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # a conservative prior while hard bounds prevent another variance runaway.
     sac_physical_std_lr: float = 1e-5
     sac_physical_std_prior: float = 0.3
+    # When present, this named mapping overrides the scalar prior. Joint names
+    # are checked exactly against env.action_manager.joint_names so a valid-
+    # length PPOVEL vector cannot be silently applied in the wrong order.
+    sac_physical_std_prior_by_joint: dict[str, float] = field(default_factory=dict)
     sac_physical_std_min: float = 0.05
     sac_physical_std_max: float = 0.5
     sac_initial_action_std: float = 0.1
@@ -632,6 +679,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         if physical_gaussian:
             self._project_physical_actor_std_()
+            # Fail before rollout collection if a named PPOVEL profile does
+            # not exactly cover this environment's physical-action contract.
+            self._physical_actor_std_prior()
         self.log_alpha = nn.Parameter(
             torch.tensor(
                 math.log(float(cfg.sac_alpha_init)),
@@ -774,6 +824,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 raise ValueError(
                     "sac_physical_std_prior must lie inside the physical std bounds"
                 )
+            _validate_fastsac_physical_std_prior_by_joint(
+                getattr(cfg, "sac_physical_std_prior_by_joint", None),
+                std_min,
+                std_max,
+            )
             if not std_min <= float(load_noise_scale) <= std_max:
                 raise ValueError(
                     "load_noise_scale must lie inside the physical std bounds"
@@ -987,6 +1042,38 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             float(getattr(self.cfg, "sac_physical_std_max", 0.5)),
         )
 
+    def _physical_actor_std_prior(self) -> torch.Tensor:
+        """Resolve a scalar or named PPOVEL prior in runtime action order."""
+        parameter = self._ppo_actor_std_parameter()
+        prior_by_joint = _validate_fastsac_physical_std_prior_by_joint(
+            getattr(self.cfg, "sac_physical_std_prior_by_joint", None),
+            *self._physical_std_bounds(),
+        )
+        if prior_by_joint is None:
+            return parameter.new_full(
+                parameter.shape, float(self.cfg.sac_physical_std_prior)
+            )
+
+        joint_names = tuple(str(name) for name in self.joint_names)
+        if len(joint_names) != parameter.numel() or len(set(joint_names)) != len(
+            joint_names
+        ):
+            raise ValueError(
+                "runtime physical-action joint names do not uniquely match actor_std"
+            )
+        configured = set(prior_by_joint)
+        runtime = set(joint_names)
+        if configured != runtime:
+            missing = sorted(runtime.difference(configured))
+            unexpected = sorted(configured.difference(runtime))
+            raise ValueError(
+                "sac_physical_std_prior_by_joint does not match the runtime action "
+                f"contract: missing={missing}, unexpected={unexpected}"
+            )
+        return parameter.new_tensor(
+            [prior_by_joint[name] for name in joint_names]
+        ).reshape_as(parameter)
+
     def _bounded_physical_actor_std(self, *, detach: bool = False) -> torch.Tensor:
         """Read PPOVEL's direct std through the FastSAC safety envelope."""
         std_min, std_max = self._physical_std_bounds()
@@ -1020,9 +1107,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         optimizer.zero_grad(set_to_none=True)
         pre_projection = self._project_physical_actor_std_()
         before = parameter.detach().clone()
-        prior = parameter.new_full(
-            parameter.shape, float(self.cfg.sac_physical_std_prior)
-        )
+        prior = self._physical_actor_std_prior()
         per_joint_prior_loss = 0.5 * (parameter - prior).square()
         prior_objective = per_joint_prior_loss.sum()
         prior_objective.backward()
@@ -1047,6 +1132,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_std_at_min_fraction": (after <= std_min).float().mean(),
             "actor_std_at_max_fraction": (after >= std_max).float().mean(),
             "actor_std_prior": prior.detach().mean(),
+            "actor_std_prior_min": prior.detach().min(),
+            "actor_std_prior_max": prior.detach().max(),
             "actor_std_lr": after.new_tensor(
                 float(self.cfg.sac_physical_std_lr)
             ),
@@ -1615,6 +1702,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "actor_std_at_min_fraction",
                 "actor_std_at_max_fraction",
                 "actor_std_prior",
+                "actor_std_prior_min",
+                "actor_std_prior_max",
                 "actor_std_lr",
             )
         critic = self._mean_metric_dict(
@@ -1652,6 +1741,14 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         info["fastsac/actor_std_update_count"] = int(
             getattr(self, "actor_std_update_count", 0)
         )
+        if self._uses_ppo_physical_gaussian():
+            current_std = self._bounded_physical_actor_std(detach=True)
+            prior = self._physical_actor_std_prior().detach()
+            for joint_name, std, target in zip(
+                self.joint_names, current_std, prior, strict=True
+            ):
+                info[f"fastsac/actor_std/{joint_name}"] = float(std.item())
+                info[f"fastsac/actor_std_prior/{joint_name}"] = float(target.item())
         info["fastsac/target_entropy"] = float(self.target_entropy)
         self._last_fastsac_diagnostics = {
             key: float(value)
@@ -1690,13 +1787,31 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             }
         )
         if self._uses_ppo_physical_gaussian():
+            prior = self._physical_actor_std_prior().detach()
             metadata.update(
                 {
                     "physical_std_update_semantics": (
                         "replay_detached_separate_sgd_l2_prior_then_hard_projection_v1"
                     ),
                     "physical_std_lr": float(self.cfg.sac_physical_std_lr),
-                    "physical_std_prior": float(self.cfg.sac_physical_std_prior),
+                    "physical_std_prior": float(prior.mean().item()),
+                    "physical_std_prior_mode": (
+                        "joint_name_mapping"
+                        if bool(
+                            getattr(
+                                self.cfg, "sac_physical_std_prior_by_joint", None
+                            )
+                        )
+                        else "scalar"
+                    ),
+                    "physical_std_prior_by_joint": {
+                        str(name): float(value.item())
+                        for name, value in zip(
+                            self.joint_names, prior, strict=True
+                        )
+                    },
+                    "physical_std_prior_min_value": float(prior.min().item()),
+                    "physical_std_prior_max_value": float(prior.max().item()),
                     "physical_std_min": float(self.cfg.sac_physical_std_min),
                     "physical_std_max": float(self.cfg.sac_physical_std_max),
                 }
@@ -1739,6 +1854,21 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "sac_tau",
                     "sac_max_grad_norm",
                 )
+            }
+        )
+        prior_by_joint = getattr(
+            self.cfg, "sac_physical_std_prior_by_joint", None
+        )
+        # Canonicalize the scalar-fallback spelling in saved contracts.  The
+        # runtime validator accepts both ``null`` and ``{}``, but writing only
+        # ``{}`` prevents resume/inference equality from depending on which
+        # equivalent spelling an older config used.
+        common["sac_physical_std_prior_by_joint"] = (
+            {}
+            if prior_by_joint is None
+            else {
+                str(name): float(value)
+                for name, value in prior_by_joint.items()
             }
         )
         common.update(

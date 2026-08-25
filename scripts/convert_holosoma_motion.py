@@ -271,8 +271,8 @@ def augment_default_pose_transitions(
     reference: dict[str, Any] | None,
     *,
     fps: float,
-    prepend_duration_s: float = 2.0,
-    append_duration_s: float = 2.0,
+    prepend_duration_s: float = 1.0,
+    append_duration_s: float = 1.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Bake Holosoma's per-clip default-pose interpolation into VAIC arrays."""
     if not np.isfinite(fps) or fps <= 0.0:
@@ -415,8 +415,8 @@ def convert_motion(
     *,
     foot_height_threshold: float = 0.015,
     default_pose_reference: Path | None = None,
-    default_pose_prepend_duration_s: float = 2.0,
-    default_pose_append_duration_s: float = 2.0,
+    default_pose_prepend_duration_s: float = 1.0,
+    default_pose_append_duration_s: float = 1.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, object]]:
     """Normalize one Holosoma archive entirely in memory."""
     with np.load(source, allow_pickle=False) as archive:

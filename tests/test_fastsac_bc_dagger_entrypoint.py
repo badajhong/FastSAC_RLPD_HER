@@ -203,6 +203,7 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     assert cfg.algo.eta_sac == pytest.approx(1.0e-4)
     assert cfg.algo.lambda_bc == pytest.approx(1.0)
     assert cfg.algo.sac_action_distribution == "normalized_tanh"
+    assert not cfg.algo.sac_physical_std_prior_by_joint
     assert cfg.algo.sac_initial_action_std == pytest.approx(0.1)
     assert cfg.algo.action_support_clip == pytest.approx(20.0)
     assert cfg.algo.sac_use_autotune is True
@@ -250,6 +251,41 @@ def test_entrypoint_accepts_ppo_physical_gaussian_only_as_fixed_temperature():
     cfg.algo.sac_use_autotune = True
     with pytest.raises(ValueError, match="requires algo.sac_use_autotune=false"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_entrypoint_validates_optional_named_physical_std_prior():
+    cfg = _cfg()
+    cfg.algo.sac_action_distribution = "ppo_physical_gaussian"
+    cfg.algo.sac_use_autotune = False
+    cfg.algo.load_noise_scale = 0.5
+    cfg.algo.sac_physical_std_prior_by_joint = {
+        "left_hip_joint": 0.17,
+        "right_hip_joint": 0.29,
+    }
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    cfg.algo.sac_physical_std_prior_by_joint.right_hip_joint = 0.7
+    with pytest.raises(ValueError, match="prior_by_joint.*inside"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_named_physical_std_prior_composes_from_hydra_cli_mapping():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="fastSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "+algo.sac_physical_std_prior_by_joint="
+                "{hip_joint:0.17,knee_joint:0.29}",
+            ],
+        )
+
+    assert dict(cfg.algo.sac_physical_std_prior_by_joint) == {
+        "hip_joint": pytest.approx(0.17),
+        "knee_joint": pytest.approx(0.29),
+    }
 
 
 @pytest.mark.parametrize("load_noise_scale", (None, 0.0, -0.5, float("nan")))

@@ -3043,6 +3043,28 @@ def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
     )
     assert translated[0][1] is False
 
+    early_v7_state = copy.deepcopy(state)
+    early_v7_state["dagger_backend_config"].pop(
+        "sac_physical_std_prior_by_joint"
+    )
+    policy._load_fastsac_checkpoint_state(early_v7_state, load_modules=False)
+    assert len(translated) == 2
+    assert translated[-1][0]["checkpoint_version"] == (
+        tvkd_module.BASE_FASTSAC_CHECKPOINT_VERSION
+    )
+
+    null_prior_v7_state = copy.deepcopy(state)
+    null_prior_v7_state["dagger_backend_config"][
+        "sac_physical_std_prior_by_joint"
+    ] = None
+    policy._load_fastsac_checkpoint_state(
+        null_prior_v7_state, load_modules=False
+    )
+    assert len(translated) == 3
+    assert translated[-1][0]["checkpoint_version"] == (
+        tvkd_module.BASE_FASTSAC_CHECKPOINT_VERSION
+    )
+
     v5_state = copy.deepcopy(state)
     v5_state["training_algorithm"] = TVKD_V5_TRAINING_ALGORITHM
     v5_state["checkpoint_version"] = TVKD_V5_CHECKPOINT_VERSION
@@ -3057,6 +3079,7 @@ def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
     for name in (
         "sac_physical_std_lr",
         "sac_physical_std_prior",
+        "sac_physical_std_prior_by_joint",
         "sac_physical_std_min",
         "sac_physical_std_max",
     ):
@@ -3065,7 +3088,7 @@ def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
     v5_state.pop("teacher_episode_sidecar_semantics")
     with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v7"):
         policy._load_fastsac_checkpoint_state(v5_state, load_modules=False)
-    assert len(translated) == 2
+    assert len(translated) == 4
     assert translated[-1][0]["checkpoint_version"] == (
         tvkd_module.BASE_FASTSAC_CHECKPOINT_VERSION
     )

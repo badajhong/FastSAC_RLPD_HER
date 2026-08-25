@@ -193,6 +193,7 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.sac_action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION
     assert cfg.sac_physical_std_lr == pytest.approx(1.0e-5)
     assert cfg.sac_physical_std_prior == pytest.approx(0.3)
+    assert cfg.sac_physical_std_prior_by_joint == {}
     assert cfg.sac_physical_std_min == pytest.approx(0.05)
     assert cfg.sac_physical_std_max == pytest.approx(0.5)
     assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
@@ -235,6 +236,24 @@ def test_physical_gaussian_config_requires_fixed_temperature_and_ppo_load_scale(
                 sac_use_autotune=False,
                 load_noise_scale=0.5,
                 sac_physical_std_prior=0.7,
+            )
+        )
+
+    DistributionalFastSACTeacherBC._validate_td3_config(
+        DistributionalFastSACTeacherBCConfig(
+            sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+            sac_use_autotune=False,
+            load_noise_scale=0.5,
+            sac_physical_std_prior_by_joint={"left_joint": 0.17},
+        )
+    )
+    with pytest.raises(ValueError, match="prior_by_joint.*inside"):
+        DistributionalFastSACTeacherBC._validate_td3_config(
+            DistributionalFastSACTeacherBCConfig(
+                sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+                sac_use_autotune=False,
+                load_noise_scale=0.5,
+                sac_physical_std_prior_by_joint={"left_joint": 0.7},
             )
         )
 
@@ -836,6 +855,39 @@ def test_physical_std_prior_step_is_exact_and_action_dimension_invariant():
     assert one_joint.actor_std_update_count == many_joints.actor_std_update_count == 1
     assert one_joint._ppo_actor_std_parameter().grad is None
     assert many_joints._ppo_actor_std_parameter().grad is None
+
+
+def test_physical_std_named_prior_uses_runtime_joint_order_exactly():
+    policy = _tiny_physical_policy(action_dim=3)
+    policy.joint_names = ["hip_joint", "knee_joint", "ankle_joint"]
+    policy.cfg.sac_physical_std_prior_by_joint = {
+        "ankle_joint": 0.12,
+        "hip_joint": 0.28,
+        "knee_joint": 0.21,
+    }
+
+    metrics = policy._physical_actor_std_update()
+    expected_prior = torch.tensor([0.28, 0.21, 0.12])
+    expected_std = 0.5 - 1.0e-5 * (0.5 - expected_prior)
+
+    assert torch.allclose(policy._ppo_actor_std_parameter(), expected_std)
+    assert metrics["actor_std_prior"].item() == pytest.approx(
+        expected_prior.mean().item()
+    )
+    assert metrics["actor_std_prior_min"].item() == pytest.approx(0.12)
+    assert metrics["actor_std_prior_max"].item() == pytest.approx(0.28)
+
+
+def test_physical_std_named_prior_rejects_action_contract_mismatch():
+    policy = _tiny_physical_policy(action_dim=2)
+    policy.joint_names = ["hip_joint", "knee_joint"]
+    policy.cfg.sac_physical_std_prior_by_joint = {
+        "hip_joint": 0.28,
+        "ankle_joint": 0.12,
+    }
+
+    with pytest.raises(ValueError, match="missing=.*knee_joint.*unexpected=.*ankle"):
+        policy._physical_actor_std_prior()
 
 
 def test_physical_actor_update_keeps_std_independent_of_replay_q():
