@@ -151,8 +151,14 @@ algo:
   # against abrupt changes without imposing a fixed target or checkpoint prior.
   sac_physical_std_lr: 1.0e-5
   sac_physical_std_max_kl: 0.01
+  # ``uniform_physical`` applies the scalar interval below exactly as before.
+  # ``q_normalized`` additionally intersects it with q_action_scale times the
+  # normalized interval, giving each joint a comparable dimensionless envelope.
+  sac_physical_std_bound_mode: uniform_physical
   sac_physical_std_min: 0.05
   sac_physical_std_max: 0.5
+  sac_physical_std_normalized_min: 0.02
+  sac_physical_std_normalized_max: 0.11
   # The next three fields apply only to normalized_tanh.
   sac_initial_action_std: 0.1
   sac_log_std_min: -10.0

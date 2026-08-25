@@ -22,3 +22,23 @@ python scripts/convert_holosoma_motion.py \
 python scripts/convert_holosoma_motion.py \
   /home/hcc/research/HOI/train_r1/rl/plasticbox/sub5_plasticbox_030.npz \
   data/motion/r1/plasticbox/sub5_plasticbox_030
+
+python scripts/play.py \
+  algo=ppo_vel_train \
+  task=R1/TEACH/sub4_whitechair_029 \
+  task.command.replay_motion=true
+
+python scripts/play.py \
+  algo=ppo_vel_train \
+  task=R1/TEACH/sub17_smalltable_010 \
+  task.command.replay_motion=true
+
+python scripts/play.py \
+  algo=ppo_vel_train \
+  task=R1/TEACH/sub5_suitcase_000 \
+  task.command.replay_motion=true
+
+python scripts/play.py \
+  algo=ppo_vel_train \
+  task=R1/TEACH/sub5_plasticbox_030 \
+  task.command.replay_motion=true

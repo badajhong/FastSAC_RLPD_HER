@@ -1,4 +1,4 @@
-"""R1 robot and large-box assets used by the R1 motion-tracking tasks.
+"""R1 robot and interaction-object assets used by R1 tracking tasks.
 
 The heavy USD layers stay in the neighboring HOI checkout.  Set
 ``VAIC_HOI_ROOT`` when that checkout is located somewhere other than the
@@ -24,6 +24,22 @@ R1_USD_PATH = os.path.join(
 R1_LARGEBOX_USD_PATH = os.path.join(
     HOI_ROOT,
     "train_r1/objects/largebox/converted_rank0/largebox.usd",
+)
+R1_WHITECHAIR_USD_PATH = os.path.join(
+    HOI_ROOT,
+    "train_r1/objects/whitechair/converted_rank0/whitechair.usd",
+)
+R1_SMALLTABLE_USD_PATH = os.path.join(
+    HOI_ROOT,
+    "train_r1/objects/smalltable/converted_rank0/smalltable.usd",
+)
+R1_SUITCASE_USD_PATH = os.path.join(
+    HOI_ROOT,
+    "train_r1/objects/suitcase/converted_rank0/suitcase.usd",
+)
+R1_PLASTICBOX_USD_PATH = os.path.join(
+    HOI_ROOT,
+    "train_r1/objects/plasticbox/converted_rank0/plasticbox.usd",
 )
 
 
@@ -127,20 +143,28 @@ R1_26DOF_CFG = ArticulationCfg(
 )
 
 
-R1_LARGEBOX_CFG = RigidObjectCfg(
-    prim_path="{ENV_REGEX_NS}/largebox_link",
-    spawn=sim_utils.UsdFileCfg(
-        usd_path=R1_LARGEBOX_USD_PATH,
-        activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,
-            retain_accelerations=False,
-            linear_damping=0.01,
-            angular_damping=0.01,
-            max_linear_velocity=1000.0,
-            max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
+def _r1_object_cfg(usd_path: str, scene_name: str) -> RigidObjectCfg:
+    """Create the common Holosoma rigid-object configuration."""
+    return RigidObjectCfg(
+        prim_path=f"{{ENV_REGEX_NS}}/{scene_name}",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=usd_path,
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+                retain_accelerations=False,
+                linear_damping=0.01,
+                angular_damping=0.01,
+                max_linear_velocity=1000.0,
+                max_angular_velocity=1000.0,
+                max_depenetration_velocity=1.0,
+            ),
         ),
-    ),
-)
+    )
 
+
+R1_LARGEBOX_CFG = _r1_object_cfg(R1_LARGEBOX_USD_PATH, "largebox_link")
+R1_WHITECHAIR_CFG = _r1_object_cfg(R1_WHITECHAIR_USD_PATH, "whitechair_link")
+R1_SMALLTABLE_CFG = _r1_object_cfg(R1_SMALLTABLE_USD_PATH, "smalltable_link")
+R1_SUITCASE_CFG = _r1_object_cfg(R1_SUITCASE_USD_PATH, "suitcase_link")
+R1_PLASTICBOX_CFG = _r1_object_cfg(R1_PLASTICBOX_USD_PATH, "plasticbox_link")

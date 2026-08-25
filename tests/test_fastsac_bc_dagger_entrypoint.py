@@ -205,6 +205,9 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     assert cfg.algo.sac_action_distribution == "normalized_tanh"
     assert cfg.algo.sac_physical_std_lr == pytest.approx(1.0e-5)
     assert cfg.algo.sac_physical_std_max_kl == pytest.approx(0.01)
+    assert cfg.algo.sac_physical_std_bound_mode == "uniform_physical"
+    assert cfg.algo.sac_physical_std_normalized_min == pytest.approx(0.02)
+    assert cfg.algo.sac_physical_std_normalized_max == pytest.approx(0.11)
     assert cfg.algo.sac_initial_action_std == pytest.approx(0.1)
     assert cfg.algo.action_support_clip == pytest.approx(20.0)
     assert cfg.algo.sac_use_autotune is True
@@ -266,6 +269,31 @@ def test_physical_std_kl_cap_composes_from_hydra_cli():
         )
 
     assert cfg.algo.sac_physical_std_max_kl == pytest.approx(0.02)
+
+
+def test_q_normalized_physical_std_envelope_composes_and_validates_from_cli():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="fastSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "fastsac_dagger_iterations=3000",
+                "algo.sac_action_distribution=ppo_physical_gaussian",
+                "algo.load_noise_scale=0.15",
+                "algo.sac_physical_std_bound_mode=q_normalized",
+                "algo.sac_physical_std_min=0.05",
+                "algo.sac_physical_std_max=0.2",
+                "algo.sac_physical_std_normalized_min=0.02",
+                "algo.sac_physical_std_normalized_max=0.11",
+                "algo.sac_target_entropy_ratio=1.6",
+            ],
+        )
+
+    sac_entry._validate_sac_controls(cfg)
+    assert cfg.algo.sac_physical_std_bound_mode == "q_normalized"
+    assert cfg.algo.sac_physical_std_max == pytest.approx(0.2)
+    assert cfg.algo.sac_target_entropy_ratio == pytest.approx(1.6)
 
 
 @pytest.mark.parametrize("load_noise_scale", (None, 0.0, -0.5, float("nan")))

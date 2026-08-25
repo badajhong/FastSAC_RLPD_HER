@@ -103,6 +103,11 @@ PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND = (
 )
 NORMALIZED_TANH_ACTION_DISTRIBUTION = "normalized_tanh"
 PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION = "ppo_physical_gaussian"
+UNIFORM_PHYSICAL_STD_BOUND_MODE = "uniform_physical"
+Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE = "q_normalized"
+PHYSICAL_STD_BOUND_MODES = frozenset(
+    (UNIFORM_PHYSICAL_STD_BOUND_MODE, Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE)
+)
 FASTSAC_ACTION_PROJECTION_KEY = "fastsac_action_projection"
 _LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION = 3
 _LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND = (
@@ -123,6 +128,12 @@ PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_ppo_physical_joint_std_gaussian_alpha_logpi_minus_online_"
     "twin_min_with_mean_only_joint_normalized_teacher_bc_separate_low_lr_std_"
     "adam_rollout_scale_kl_cap_and_hard_bounds_v3"
+)
+Q_NORMALIZED_PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS = (
+    "reparameterized_ppo_physical_joint_std_gaussian_alpha_logpi_minus_online_"
+    "twin_min_with_mean_only_joint_normalized_teacher_bc_separate_low_lr_std_"
+    "adam_rollout_scale_kl_cap_and_jointwise_q_normalized_absolute_intersection_"
+    "bounds_v1"
 )
 ENTROPY_SEMANTICS = (
     "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
@@ -304,8 +315,16 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # destination or checkpoint-derived prior.
     sac_physical_std_lr: float = 1e-5
     sac_physical_std_max_kl: float = 0.01
+    # ``uniform_physical`` reproduces the historical scalar interval exactly.
+    # ``q_normalized`` intersects that absolute interval with per-joint bounds
+    # expressed in the Critic's dimensionless nominal-action coordinates.  It
+    # prevents one raw std from meaning radically different exploration on
+    # small- and large-range joints without replacing SAC's Q+entropy gradient.
+    sac_physical_std_bound_mode: str = UNIFORM_PHYSICAL_STD_BOUND_MODE
     sac_physical_std_min: float = 0.05
     sac_physical_std_max: float = 0.5
+    sac_physical_std_normalized_min: float = 0.02
+    sac_physical_std_normalized_max: float = 0.11
     sac_initial_action_std: float = 0.1
     sac_log_std_min: float = -10.0
     sac_log_std_max: float = -2.0
@@ -779,6 +798,52 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 raise ValueError(
                     "load_noise_scale must lie inside the physical std bounds"
                 )
+            bound_mode = str(
+                getattr(
+                    cfg,
+                    "sac_physical_std_bound_mode",
+                    UNIFORM_PHYSICAL_STD_BOUND_MODE,
+                )
+            )
+            if bound_mode not in PHYSICAL_STD_BOUND_MODES:
+                raise ValueError(
+                    "sac_physical_std_bound_mode must be 'uniform_physical' "
+                    "or 'q_normalized'"
+                )
+            normalized_std_controls = {
+                name: getattr(cfg, name, default)
+                for name, default in (
+                    ("sac_physical_std_normalized_min", 0.02),
+                    ("sac_physical_std_normalized_max", 0.11),
+                )
+            }
+            for name, value in normalized_std_controls.items():
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) <= 0.0
+                ):
+                    raise ValueError(f"{name} must be finite and positive")
+            if not (
+                float(normalized_std_controls["sac_physical_std_normalized_min"])
+                < float(normalized_std_controls["sac_physical_std_normalized_max"])
+            ):
+                raise ValueError(
+                    "sac_physical_std_normalized_min must be smaller than "
+                    "sac_physical_std_normalized_max"
+                )
+        elif str(
+            getattr(
+                cfg,
+                "sac_physical_std_bound_mode",
+                UNIFORM_PHYSICAL_STD_BOUND_MODE,
+            )
+        ) != UNIFORM_PHYSICAL_STD_BOUND_MODE:
+            raise ValueError(
+                "q-normalized physical std bounds require "
+                "sac_action_distribution='ppo_physical_gaussian'"
+            )
         if str(cfg.sac_alpha_update_cadence) not in ("actor", "critic"):
             raise ValueError("sac_alpha_update_cadence must be 'actor' or 'critic'")
         if action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION:
@@ -857,11 +922,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
 
     def _actor_learning_semantics(self) -> str:
-        return (
-            PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
-            if self._uses_ppo_physical_gaussian()
-            else ACTOR_LEARNING_SEMANTICS
-        )
+        if not self._uses_ppo_physical_gaussian():
+            return ACTOR_LEARNING_SEMANTICS
+        if self._physical_std_bound_mode() == Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE:
+            return Q_NORMALIZED_PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
+        return PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
 
     def _entropy_semantics(self) -> str:
         if self._uses_ppo_physical_gaussian():
@@ -981,17 +1046,70 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             torch.tanh(raw_log_std) + 1.0
         )
 
-    def _physical_std_bounds(self) -> tuple[float, float]:
-        """Return the validated raw physical-action std interval."""
-        return (
-            float(getattr(self.cfg, "sac_physical_std_min", 0.05)),
-            float(getattr(self.cfg, "sac_physical_std_max", 0.5)),
+    def _physical_std_bound_mode(self) -> str:
+        return str(
+            getattr(
+                self.cfg,
+                "sac_physical_std_bound_mode",
+                UNIFORM_PHYSICAL_STD_BOUND_MODE,
+            )
         )
+
+    def _physical_std_bounds(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return joint-wise raw std bounds for the selected coordinate mode."""
+        cached = getattr(self, "_fastsac_physical_std_bounds_cache", None)
+        if cached is not None:
+            return cached
+
+        q_scale = getattr(self, "_fastsac_q_action_scale", None)
+        if not torch.is_tensor(q_scale):
+            q_scale = self._ppo_actor_std_parameter().detach()
+        q_scale = q_scale.detach()
+        if not torch.isfinite(q_scale).all() or not bool((q_scale > 0.0).all()):
+            raise ValueError("physical FastSAC q-action scale is invalid")
+        absolute_min = float(getattr(self.cfg, "sac_physical_std_min", 0.05))
+        absolute_max = float(getattr(self.cfg, "sac_physical_std_max", 0.5))
+        lower = q_scale.new_full(q_scale.shape, absolute_min)
+        upper = q_scale.new_full(q_scale.shape, absolute_max)
+        mode = self._physical_std_bound_mode()
+        if mode == Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE:
+            normalized_min = float(
+                getattr(self.cfg, "sac_physical_std_normalized_min", 0.02)
+            )
+            normalized_max = float(
+                getattr(self.cfg, "sac_physical_std_normalized_max", 0.11)
+            )
+            lower = torch.maximum(lower, q_scale * normalized_min)
+            upper = torch.minimum(upper, q_scale * normalized_max)
+        elif mode != UNIFORM_PHYSICAL_STD_BOUND_MODE:
+            raise ValueError(f"unsupported physical std bound mode {mode!r}")
+
+        if not torch.isfinite(lower).all() or not torch.isfinite(upper).all():
+            raise ValueError("physical FastSAC std bounds contain NaN/Inf")
+        invalid = lower >= upper
+        if bool(invalid.any()):
+            indices = invalid.nonzero(as_tuple=False).reshape(-1).cpu().tolist()
+            raise ValueError(
+                "physical FastSAC std bounds are empty for joint indices "
+                f"{indices}; widen the absolute or q-normalized interval"
+            )
+        self._fastsac_physical_std_bounds_cache = (
+            lower.detach(),
+            upper.detach(),
+        )
+        return self._fastsac_physical_std_bounds_cache
+
+    def _clamp_physical_actor_std(self, std: torch.Tensor) -> torch.Tensor:
+        lower, upper = self._physical_std_bounds()
+        if std.shape != lower.shape:
+            raise ValueError(
+                "physical FastSAC q-action scale and actor_std shapes differ"
+            )
+        return torch.maximum(torch.minimum(std, upper.to(std)), lower.to(std))
 
     def _bounded_physical_actor_std(self, *, detach: bool = False) -> torch.Tensor:
         """Read PPOVEL's direct std through the FastSAC safety envelope."""
-        std_min, std_max = self._physical_std_bounds()
-        std = self._ppo_actor_std_parameter().clamp(std_min, std_max)
+        std = self._clamp_physical_actor_std(self._ppo_actor_std_parameter())
         return std.detach() if detach else std
 
     @torch.no_grad()
@@ -1000,9 +1118,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         parameter = self._ppo_actor_std_parameter()
         if not torch.isfinite(parameter).all():
             raise RuntimeError("FastSAC physical actor_std contains NaN/Inf")
-        std_min, std_max = self._physical_std_bounds()
         before = parameter.detach().clone()
-        parameter.clamp_(std_min, std_max)
+        parameter.copy_(self._clamp_physical_actor_std(parameter))
         return (parameter != before).float().mean()
 
     def _physical_normalized_entropy_bounds(self) -> tuple[float, float]:
@@ -1015,12 +1132,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise ValueError("physical FastSAC entropy reference scale is invalid")
         std_min, std_max = self._physical_std_bounds()
         offset = 0.5 * math.log(2.0 * math.pi * math.e)
-        minimum = (
-            q_scale.new_tensor(offset + math.log(std_min)) - q_scale.log()
-        ).sum()
-        maximum = (
-            q_scale.new_tensor(offset + math.log(std_max)) - q_scale.log()
-        ).sum()
+        minimum = (q_scale.new_tensor(offset) + std_min.log() - q_scale.log()).sum()
+        maximum = (q_scale.new_tensor(offset) + std_max.log() - q_scale.log()).sum()
         bounds = (float(minimum.item()), float(maximum.item()))
         self._fastsac_physical_entropy_bounds = bounds
         return bounds
@@ -1062,9 +1175,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         ).to(parameter)
         if reference.shape != parameter.shape or not torch.isfinite(reference).all():
             raise RuntimeError("FastSAC physical std rollout reference is invalid")
-        std_min, std_max = self._physical_std_bounds()
-        reference = reference.clamp(std_min, std_max)
-        candidate = parameter.detach().clamp(std_min, std_max)
+        reference = self._clamp_physical_actor_std(reference)
+        candidate = self._clamp_physical_actor_std(parameter.detach())
         maximum_kl = float(self.cfg.sac_physical_std_max_kl)
         candidate_kl = self._physical_scale_kl(reference, candidate)
         if float(candidate_kl.item()) <= maximum_kl:
@@ -1085,7 +1197,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             else:
                 high = fraction
         capped = torch.exp(log_reference + low * (log_candidate - log_reference))
-        parameter.copy_(capped.clamp(std_min, std_max))
+        parameter.copy_(self._clamp_physical_actor_std(capped))
         capped_kl = self._physical_scale_kl(reference, parameter.detach())
         return capped_kl, capped_kl.new_ones(())
 
@@ -1746,11 +1858,47 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         if self._uses_ppo_physical_gaussian():
             current_std = self._bounded_physical_actor_std(detach=True)
+            q_scale = self._fastsac_q_action_scale.detach().to(current_std)
+            normalized_std = current_std / q_scale
+            lower, upper = self._physical_std_bounds()
             current_std_values = current_std.float().cpu().tolist()
             for joint_name, std in zip(
                 self.joint_names, current_std_values, strict=True
             ):
                 info[f"fastsac/actor_std/{joint_name}"] = float(std)
+            info["fastsac/actor_std_physical_mean"] = float(
+                current_std.float().mean().item()
+            )
+            info["fastsac/actor_std_physical_geometric_mean"] = float(
+                current_std.float().log().mean().exp().item()
+            )
+            info["fastsac/actor_std_q_normalized_l2"] = float(
+                torch.linalg.vector_norm(normalized_std.float()).item()
+            )
+            info["fastsac/actor_std_q_normalized_rms"] = float(
+                normalized_std.float().square().mean().sqrt().item()
+            )
+            info["fastsac/actor_std_q_normalized_geometric_mean"] = float(
+                normalized_std.float().log().mean().exp().item()
+            )
+            info["fastsac/actor_std_q_normalized_min"] = float(
+                normalized_std.float().min().item()
+            )
+            info["fastsac/actor_std_q_normalized_max"] = float(
+                normalized_std.float().max().item()
+            )
+            info["fastsac/physical_std_lower_bound_min"] = float(
+                lower.float().min().item()
+            )
+            info["fastsac/physical_std_lower_bound_max"] = float(
+                lower.float().max().item()
+            )
+            info["fastsac/physical_std_upper_bound_min"] = float(
+                upper.float().min().item()
+            )
+            info["fastsac/physical_std_upper_bound_max"] = float(
+                upper.float().max().item()
+            )
             entropy_min, entropy_max = self._physical_normalized_entropy_bounds()
             info["fastsac/physical_entropy_bound_min"] = entropy_min
             info["fastsac/physical_entropy_bound_max"] = entropy_max
@@ -1791,18 +1939,28 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         if self._uses_ppo_physical_gaussian():
             entropy_min, entropy_max = self._physical_normalized_entropy_bounds()
+            lower, upper = self._physical_std_bounds()
             metadata.update(
                 {
                     "physical_std_update_semantics": (
                         "sac_q_entropy_gradient_separate_low_lr_adam_rollout_scale_"
-                        "kl_cap_then_hard_projection_v2"
+                        "kl_cap_then_configured_jointwise_hard_projection_v3"
                     ),
                     "physical_std_lr": float(self.cfg.sac_physical_std_lr),
                     "physical_std_max_kl": float(
                         self.cfg.sac_physical_std_max_kl
                     ),
+                    "physical_std_bound_mode": self._physical_std_bound_mode(),
                     "physical_std_min": float(self.cfg.sac_physical_std_min),
                     "physical_std_max": float(self.cfg.sac_physical_std_max),
+                    "physical_std_normalized_min": float(
+                        getattr(self.cfg, "sac_physical_std_normalized_min", 0.02)
+                    ),
+                    "physical_std_normalized_max": float(
+                        getattr(self.cfg, "sac_physical_std_normalized_max", 0.11)
+                    ),
+                    "physical_std_resolved_lower": lower.detach().cpu().tolist(),
+                    "physical_std_resolved_upper": upper.detach().cpu().tolist(),
                     "physical_entropy_bound_min": entropy_min,
                     "physical_entropy_bound_max": entropy_max,
                 }
@@ -1829,8 +1987,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "sac_action_distribution",
                     "sac_physical_std_lr",
                     "sac_physical_std_max_kl",
+                    "sac_physical_std_bound_mode",
                     "sac_physical_std_min",
                     "sac_physical_std_max",
+                    "sac_physical_std_normalized_min",
+                    "sac_physical_std_normalized_max",
                     "load_noise_scale",
                     "sac_initial_action_std",
                     "sac_log_std_min",
@@ -2235,6 +2396,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "PPOVEL fresh finetune did not initialize every physical "
                     "actor_std from load_noise_scale"
                 )
+            # In q-normalized mode the scalar PPO-compatible reset is only the
+            # fresh source value.  Resolve it through the joint-wise envelope
+            # before the first Student rollout; same-stage resume never enters
+            # this source-loading branch and therefore restores its saved std.
+            self._project_physical_actor_std_()
         return failed
 
 
@@ -2245,8 +2411,11 @@ __all__ = [
     "FASTSAC_ACTION_PROJECTION_KEY",
     "FastSACPhysicalNormal",
     "NORMALIZED_TANH_ACTION_DISTRIBUTION",
+    "PHYSICAL_STD_BOUND_MODES",
     "PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION",
     "PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND",
+    "Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE",
+    "UNIFORM_PHYSICAL_STD_BOUND_MODE",
     "PREVIOUS_CHECKPOINT_VERSION",
     "TRAINING_ALGORITHM",
     "DistributionalFastSACTeacherBC",

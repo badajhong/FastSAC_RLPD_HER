@@ -2752,12 +2752,19 @@ def test_tvkd_v8_actor_semantics_follow_selected_action_distribution():
     physical = TVKDDistributionalFastSACTeacherBCConfig(
         sac_action_distribution="ppo_physical_gaussian"
     )
+    q_normalized = TVKDDistributionalFastSACTeacherBCConfig(
+        sac_action_distribution="ppo_physical_gaussian",
+        sac_physical_std_bound_mode="q_normalized",
+    )
 
     assert tvkd_module._tvkd_actor_learning_semantics(normalized) == (
         tvkd_module.NORMALIZED_ACTOR_LEARNING_SEMANTICS
     )
     assert tvkd_module._tvkd_actor_learning_semantics(physical) == (
         tvkd_module.ACTOR_LEARNING_SEMANTICS
+    )
+    assert tvkd_module._tvkd_actor_learning_semantics(q_normalized) == (
+        tvkd_module.Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS
     )
 
 

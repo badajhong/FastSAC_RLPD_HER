@@ -271,8 +271,8 @@ def augment_default_pose_transitions(
     reference: dict[str, Any] | None,
     *,
     fps: float,
-    prepend_duration_s: float = 1.0,
-    append_duration_s: float = 1.0,
+    prepend_duration_s: float = 2.0,
+    append_duration_s: float = 2.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Bake Holosoma's per-clip default-pose interpolation into VAIC arrays."""
     if not np.isfinite(fps) or fps <= 0.0:
@@ -415,8 +415,8 @@ def convert_motion(
     *,
     foot_height_threshold: float = 0.015,
     default_pose_reference: Path | None = None,
-    default_pose_prepend_duration_s: float = 1.0,
-    default_pose_append_duration_s: float = 1.0,
+    default_pose_prepend_duration_s: float = 2.0,
+    default_pose_append_duration_s: float = 2.0,
 ) -> tuple[dict[str, np.ndarray], dict[str, object]]:
     """Normalize one Holosoma archive entirely in memory."""
     with np.load(source, allow_pickle=False) as archive:
@@ -478,9 +478,18 @@ def convert_motion(
             f"{source_contact.shape} vs {len(source_contact_names)}"
         )
 
-    # Holosoma's virtual hand markers are fixed +0.1 m along each wrist-roll
-    # link.  Use those labels but place them in VAIC's wrist-roll contact slots.
+    # Preserve direct ankle/object contacts for motions such as plastic-box
+    # pushing. These slots can be selected as contact EEFs by the task config.
     body_contact = np.zeros((frame_count, len(VAIC_CONTACT_BODY_NAMES)), dtype=bool)
+    for side, destination in (("left", 0), ("right", 1)):
+        source_name = f"{side}_ankle_roll_link"
+        if source_name in source_contact_names:
+            body_contact[:, destination] = source_contact[
+                :, source_contact_names.index(source_name)
+            ]
+
+    # Holosoma's virtual hand markers are fixed +0.1 m along each wrist-roll
+    # link. Use those labels but place them in VAIC's wrist-roll contact slots.
     for side, destination in (("left", 2), ("right", 5)):
         candidates = [f"{side}_hand_contact_link", f"{side}_wrist_roll_link"]
         source_name = next(
@@ -570,9 +579,82 @@ def write_motion(
 
 def _default_object_points(source: Path) -> Path:
     # .../train_r1/rl/<object>/<clip>.npz -> .../train_r1/objects/<object>/sample_points.npy
-    if len(source.parents) < 3:
+    if len(source.parents) < 4:
         raise ValueError(f"cannot infer object-points path from {source}")
-    return source.parents[2] / "objects" / source.parent.name / "sample_points.npy"
+    object_name = source.parent.name
+    primary = source.parents[2] / "objects" / object_name / "sample_points.npy"
+
+    # Some copied train_r1 clouds are stale. Suitcase, for example, has source
+    # contact indices up to 595 but its copied cloud contains only 340 points.
+    # Prefer the canonical retargeting cloud when the source index range or
+    # recorded target coordinates reject the nearby copy.
+    required_point_count = 0
+    source_indices: np.ndarray | None = None
+    source_target_points: np.ndarray | None = None
+    source_target_valid: np.ndarray | None = None
+    with np.load(source, allow_pickle=False) as archive:
+        if "contact_object_target_indices" in archive:
+            source_indices = np.asarray(archive["contact_object_target_indices"])
+            valid_indices = source_indices[source_indices >= 0]
+            if valid_indices.size:
+                required_point_count = int(valid_indices.max()) + 1
+        if "contact_object_target_points_obj" in archive:
+            source_target_points = np.asarray(
+                archive["contact_object_target_points_obj"]
+            )
+        if "contact_object_target_valid" in archive:
+            source_target_valid = np.asarray(
+                archive["contact_object_target_valid"], dtype=bool
+            )
+
+    def is_compatible(candidate: Path) -> bool:
+        if not candidate.is_file():
+            return False
+        points = np.asarray(np.load(candidate, allow_pickle=False))
+        if points.ndim != 2 or points.shape[1] != 3:
+            return False
+        if points.shape[0] < required_point_count:
+            return False
+        if source_indices is None or source_target_points is None:
+            return True
+        if source_target_points.shape != (*source_indices.shape, 3):
+            return False
+
+        valid = source_indices >= 0
+        if source_target_valid is not None:
+            expected_valid_shape = source_indices.shape[:-1]
+            if source_target_valid.shape != expected_valid_shape:
+                return False
+            valid &= source_target_valid[..., None]
+        if not valid.any():
+            return True
+        return bool(
+            np.allclose(
+                points[source_indices[valid]],
+                source_target_points[valid],
+                rtol=1.0e-5,
+                atol=1.0e-6,
+            )
+        )
+
+    if is_compatible(primary):
+        return primary
+
+    hoi_root = source.parents[3]
+    canonical = (
+        hoi_root
+        / "src/holosoma_retargeting/holosoma_retargeting/models/objects"
+        / object_name
+        / "sample_points.npy"
+    )
+    if is_compatible(canonical):
+        return canonical
+
+    raise FileNotFoundError(
+        "could not infer an object point cloud compatible with source contact "
+        "indices/target coordinates "
+        f"(need at least {required_point_count} points); pass --object-points"
+    )
 
 
 def main() -> None:

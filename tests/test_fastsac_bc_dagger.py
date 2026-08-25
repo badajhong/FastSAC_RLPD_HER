@@ -43,10 +43,12 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     CHECKPOINT_VERSION,
     FastSACPhysicalNormal,
     NORMALIZED_TANH_ACTION_DISTRIBUTION,
+    Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND,
     PREVIOUS_CHECKPOINT_VERSION,
     TRAINING_ALGORITHM,
+    UNIFORM_PHYSICAL_STD_BOUND_MODE,
     DistributionalFastSACTeacherBC,
     DistributionalFastSACTeacherBCConfig,
     _DeterministicFastSACStudentEvalPolicy,
@@ -203,8 +205,11 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.sac_action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION
     assert cfg.sac_physical_std_lr == pytest.approx(1.0e-5)
     assert cfg.sac_physical_std_max_kl == pytest.approx(0.01)
+    assert cfg.sac_physical_std_bound_mode == UNIFORM_PHYSICAL_STD_BOUND_MODE
     assert cfg.sac_physical_std_min == pytest.approx(0.05)
     assert cfg.sac_physical_std_max == pytest.approx(0.5)
+    assert cfg.sac_physical_std_normalized_min == pytest.approx(0.02)
+    assert cfg.sac_physical_std_normalized_max == pytest.approx(0.11)
     assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
@@ -247,6 +252,46 @@ def test_physical_gaussian_config_allows_autotune_and_requires_ppo_load_scale():
                 load_noise_scale=0.5,
                 sac_physical_std_min=0.5,
                 sac_physical_std_max=0.5,
+            )
+        )
+
+
+def test_q_normalized_physical_std_config_is_opt_in_and_strictly_validated():
+    valid = DistributionalFastSACTeacherBCConfig(
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+        sac_physical_std_bound_mode=Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
+        sac_physical_std_normalized_min=0.02,
+        sac_physical_std_normalized_max=0.11,
+        load_noise_scale=0.15,
+        sac_physical_std_min=0.05,
+        sac_physical_std_max=0.2,
+    )
+
+    DistributionalFastSACTeacherBC._validate_td3_config(valid)
+
+    with pytest.raises(ValueError, match="sac_physical_std_bound_mode"):
+        DistributionalFastSACTeacherBC._validate_td3_config(
+            DistributionalFastSACTeacherBCConfig(
+                sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+                sac_physical_std_bound_mode="teacher_vector",
+                load_noise_scale=0.15,
+            )
+        )
+    with pytest.raises(ValueError, match="normalized_min must be smaller"):
+        DistributionalFastSACTeacherBC._validate_td3_config(
+            DistributionalFastSACTeacherBCConfig(
+                sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+                sac_physical_std_bound_mode=Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
+                sac_physical_std_normalized_min=0.11,
+                sac_physical_std_normalized_max=0.11,
+                load_noise_scale=0.15,
+            )
+        )
+    with pytest.raises(ValueError, match="require.*ppo_physical_gaussian"):
+        DistributionalFastSACTeacherBC._validate_td3_config(
+            DistributionalFastSACTeacherBCConfig(
+                sac_action_distribution=NORMALIZED_TANH_ACTION_DISTRIBUTION,
+                sac_physical_std_bound_mode=Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
             )
         )
 
@@ -860,6 +905,94 @@ def _apply_physical_std_gradient(policy, value: float):
     return policy._physical_actor_std_update(before)
 
 
+def test_q_normalized_physical_std_bounds_intersect_absolute_envelope_per_joint():
+    policy = _tiny_physical_policy(action_dim=3)
+    policy.cfg.sac_physical_std_bound_mode = Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE
+    policy.cfg.sac_physical_std_min = 0.05
+    policy.cfg.sac_physical_std_max = 0.2
+    policy.cfg.sac_physical_std_normalized_min = 0.02
+    policy.cfg.sac_physical_std_normalized_max = 0.11
+    policy._fastsac_q_action_scale = torch.tensor([0.5355, 1.063636, 5.890499])
+
+    lower, upper = policy._physical_std_bounds()
+
+    assert torch.allclose(lower, torch.tensor([0.05, 0.05, 0.11780998]))
+    assert torch.allclose(upper, torch.tensor([0.058905, 0.11699996, 0.2]))
+    with torch.no_grad():
+        policy._ppo_actor_std_parameter().copy_(torch.tensor([0.01, 0.15, 0.9]))
+    projected = policy._project_physical_actor_std_()
+    assert projected.item() == pytest.approx(1.0)
+    assert torch.allclose(
+        policy._ppo_actor_std_parameter(),
+        torch.tensor([0.05, 0.11699996, 0.2]),
+    )
+
+
+def test_q_normalized_physical_std_rejects_empty_joint_intersection():
+    policy = _tiny_physical_policy()
+    policy.cfg.sac_physical_std_bound_mode = Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE
+    policy.cfg.sac_physical_std_min = 0.05
+    policy.cfg.sac_physical_std_max = 0.2
+    policy.cfg.sac_physical_std_normalized_min = 0.02
+    policy.cfg.sac_physical_std_normalized_max = 0.11
+    policy._fastsac_q_action_scale = torch.tensor([0.1])
+
+    with pytest.raises(ValueError, match="empty for joint indices"):
+        policy._physical_std_bounds()
+
+
+def test_g1_q_normalized_envelope_has_intended_exploration_and_entropy_margin():
+    q_scale = torch.tensor(
+        [
+            4.426772,
+            4.426772,
+            4.284,
+            4.488042,
+            4.488042,
+            1.063636,
+            4.512436,
+            4.512436,
+            1.063636,
+            3.8148,
+            3.8148,
+            5.890499,
+            5.890499,
+            1.428003,
+            1.428003,
+            3.926966,
+            3.926966,
+            0.5355,
+            0.5355,
+            5.355,
+            5.355,
+            3.213,
+            3.213,
+        ]
+    )
+    policy = _tiny_physical_policy(action_dim=q_scale.numel())
+    policy.cfg.sac_physical_std_bound_mode = Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE
+    policy.cfg.sac_physical_std_min = 0.05
+    policy.cfg.sac_physical_std_max = 0.2
+    policy.cfg.sac_physical_std_normalized_min = 0.02
+    policy.cfg.sac_physical_std_normalized_max = 0.11
+    policy._fastsac_q_action_scale = q_scale
+    policy.target_entropy = -1.6 * q_scale.numel()
+    with torch.no_grad():
+        policy._ppo_actor_std_parameter().fill_(0.15)
+
+    policy._project_physical_actor_std_()
+    projected_std = policy._bounded_physical_actor_std(detach=True)
+    normalized_l2 = torch.linalg.vector_norm(projected_std / q_scale)
+    entropy_min, entropy_max = policy._physical_normalized_entropy_bounds()
+
+    assert normalized_l2.item() == pytest.approx(0.30277, rel=2.0e-5)
+    assert torch.linalg.vector_norm(policy._physical_std_bounds()[1] / q_scale).item() == (
+        pytest.approx(0.33210, rel=2.0e-5)
+    )
+    assert entropy_min < policy.target_entropy < entropy_max
+    policy._validate_physical_entropy_target_reachable()
+
+
 def _tiny_physical_batch(action_dim: int = 1):
     return {
         "observations": torch.tensor([[1.0], [2.0], [-1.0]]),
@@ -991,6 +1124,12 @@ def test_physical_rollout_applies_cumulative_kl_once_after_all_replay_updates(
     assert torch.all(final_std < 0.5)
     assert info["fastsac/actor_std/joint_0"] == pytest.approx(final_std[0].item())
     assert info["fastsac/actor_std/joint_1"] == pytest.approx(final_std[1].item())
+    assert info["fastsac/actor_std_physical_geometric_mean"] == pytest.approx(
+        final_std.log().mean().exp().item()
+    )
+    assert info["fastsac/actor_std_q_normalized_l2"] == pytest.approx(
+        torch.linalg.vector_norm(final_std).item()
+    )
 
 
 def test_physical_std_projection_and_nonfinite_failure_are_explicit():

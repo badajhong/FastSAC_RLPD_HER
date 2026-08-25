@@ -144,6 +144,102 @@ def test_preserves_wxyz_quaternions(tmp_path):
     assert motion["body_quat_w"].shape[1] == len(body_names) - 1
 
 
+def test_preserves_direct_ankle_object_contacts(tmp_path):
+    source = tmp_path / "clip.npz"
+    _synthetic_archive(source)
+    with np.load(source) as archive:
+        payload = {key: archive[key] for key in archive.files}
+    payload["contact_object_names"] = np.asarray(
+        [
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+            "left_hand_contact_link",
+            "right_hand_contact_link",
+        ]
+    )
+    payload["contact_object_label"] = np.asarray(
+        [
+            [True, False, False, False],
+            [False, True, True, False],
+            [False, False, False, True],
+            [False, False, True, True],
+        ],
+        dtype=bool,
+    )
+    np.savez(source, **payload)
+    point_path = tmp_path / "sample_points.npy"
+    np.save(point_path, np.zeros((340, 3)))
+
+    motion, _ = CONVERTER.convert_motion(
+        source,
+        point_path,
+        default_pose_prepend_duration_s=0.0,
+        default_pose_append_duration_s=0.0,
+    )
+
+    np.testing.assert_array_equal(
+        motion["body_contact"][:, 0], [True, False, False, False]
+    )
+    np.testing.assert_array_equal(
+        motion["body_contact"][:, 1], [False, True, False, False]
+    )
+    np.testing.assert_array_equal(
+        motion["body_contact"][:, 2], [False, True, False, True]
+    )
+    np.testing.assert_array_equal(
+        motion["body_contact"][:, 5], [False, False, True, True]
+    )
+    assert motion["object_contact"].all()
+
+
+def test_object_point_inference_rejects_stale_nearby_cloud(tmp_path):
+    hoi_root = tmp_path / "HOI"
+    source = hoi_root / "train_r1/rl/suitcase/clip.npz"
+    source.parent.mkdir(parents=True)
+    np.savez(source, contact_object_target_indices=np.asarray([0, 595]))
+
+    nearby = hoi_root / "train_r1/objects/suitcase/sample_points.npy"
+    nearby.parent.mkdir(parents=True)
+    np.save(nearby, np.zeros((340, 3)))
+    canonical = (
+        hoi_root
+        / "src/holosoma_retargeting/holosoma_retargeting/models/objects"
+        / "suitcase/sample_points.npy"
+    )
+    canonical.parent.mkdir(parents=True)
+    np.save(canonical, np.zeros((596, 3)))
+
+    assert CONVERTER._default_object_points(source) == canonical
+
+
+def test_object_point_inference_rejects_misordered_nearby_cloud(tmp_path):
+    hoi_root = tmp_path / "HOI"
+    source = hoi_root / "train_r1/rl/suitcase/clip.npz"
+    source.parent.mkdir(parents=True)
+    expected_points = np.asarray([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
+    np.savez(
+        source,
+        contact_object_target_indices=np.asarray([[[0, 2]]]),
+        contact_object_target_points_obj=np.asarray(
+            [[[[1.0, 0.0, 0.0], [3.0, 0.0, 0.0]]]]
+        ),
+        contact_object_target_valid=np.asarray([[True]]),
+    )
+
+    nearby = hoi_root / "train_r1/objects/suitcase/sample_points.npy"
+    nearby.parent.mkdir(parents=True)
+    np.save(nearby, expected_points[::-1])
+    canonical = (
+        hoi_root
+        / "src/holosoma_retargeting/holosoma_retargeting/models/objects"
+        / "suitcase/sample_points.npy"
+    )
+    canonical.parent.mkdir(parents=True)
+    np.save(canonical, expected_points)
+
+    assert CONVERTER._default_object_points(source) == canonical
+
+
 def test_bakes_holosoma_default_pose_boundaries_without_duplicate_frames(tmp_path):
     source = tmp_path / "clip.npz"
     joint_names, body_names = _synthetic_archive(source)

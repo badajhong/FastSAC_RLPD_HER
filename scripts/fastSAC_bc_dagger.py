@@ -29,7 +29,9 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
     NORMALIZED_TANH_ACTION_DISTRIBUTION,
+    PHYSICAL_STD_BOUND_MODES,
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+    UNIFORM_PHYSICAL_STD_BOUND_MODE,
     TRAINING_ALGORITHM,
     _validate_fastsac_entropy_target_controls,
 )
@@ -615,6 +617,16 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
     if cfg.algo.get("sac_use_autotune", None) not in (True, False):
         raise ValueError("algo.sac_use_autotune must be boolean")
     if action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION:
+        if str(
+            cfg.algo.get(
+                "sac_physical_std_bound_mode",
+                UNIFORM_PHYSICAL_STD_BOUND_MODE,
+            )
+        ) != UNIFORM_PHYSICAL_STD_BOUND_MODE:
+            raise ValueError(
+                "algo.sac_physical_std_bound_mode=q_normalized requires "
+                "algo.sac_action_distribution=ppo_physical_gaussian"
+            )
         _finite_positive(
             "algo.sac_initial_action_std",
             cfg.algo.get("sac_initial_action_std", None),
@@ -651,6 +663,30 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         if not std_min <= load_noise_scale <= std_max:
             raise ValueError(
                 "algo.load_noise_scale must lie inside the physical std bounds"
+            )
+        bound_mode = str(
+            cfg.algo.get(
+                "sac_physical_std_bound_mode",
+                UNIFORM_PHYSICAL_STD_BOUND_MODE,
+            )
+        )
+        if bound_mode not in PHYSICAL_STD_BOUND_MODES:
+            raise ValueError(
+                "algo.sac_physical_std_bound_mode must be 'uniform_physical' "
+                "or 'q_normalized'"
+            )
+        normalized_min = cfg.algo.get("sac_physical_std_normalized_min", 0.02)
+        normalized_max = cfg.algo.get("sac_physical_std_normalized_max", 0.11)
+        _finite_positive(
+            "algo.sac_physical_std_normalized_min", normalized_min
+        )
+        _finite_positive(
+            "algo.sac_physical_std_normalized_max", normalized_max
+        )
+        if not float(normalized_min) < float(normalized_max):
+            raise ValueError(
+                "algo.sac_physical_std_normalized_min must be smaller than "
+                "algo.sac_physical_std_normalized_max"
             )
     if cfg.algo.get("sac_alpha_update_cadence", None) != "actor":
         raise ValueError(

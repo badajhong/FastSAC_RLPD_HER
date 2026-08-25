@@ -22,7 +22,6 @@ from hydra.core.override_parser.overrides_parser import OverridesParser
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
-    ACTOR_BACKEND,
     BOTTLENECK_LOCATION_SEMANTICS,
     CHECKPOINT_VERSION,
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
@@ -1241,6 +1240,16 @@ def _prepare_tvkd_checkpoint(
     runtime_algo_contract = OmegaConf.to_container(
         cfg.algo, resolve=True, enum_to_str=True
     )
+    # Older checkpoints predate the joint-aware envelope and therefore used
+    # the exact scalar physical interval.  Use fixed historical defaults here,
+    # not runtime values, so an old std optimizer cannot be resumed silently
+    # under q-normalized projection semantics.
+    for name, value in (
+        ("sac_physical_std_bound_mode", "uniform_physical"),
+        ("sac_physical_std_normalized_min", 0.02),
+        ("sac_physical_std_normalized_max", 0.11),
+    ):
+        source_algo_contract.setdefault(name, value)
     if v5:
         # TVKD v5 was normalized-tanh only; the v8 physical-std controls are
         # inert for that distribution and can safely take today's defaults.

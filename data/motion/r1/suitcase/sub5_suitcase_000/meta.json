@@ -86,7 +86,7 @@
     "format": "holosoma_to_vaic_v2",
     "quaternion_order": "wxyz",
     "foot_height_threshold": 0.015,
-    "object_points_source": "/home/hcc/research/HOI/train_r1/objects/suitcase/sample_points.npy",
+    "object_points_source": "/home/hcc/research/HOI/src/holosoma_retargeting/holosoma_retargeting/models/objects/suitcase/sample_points.npy",
     "object_points_selection": "linspace_128",
     "default_pose_transition": {
       "semantics": "holosoma_wbt_default_pose",

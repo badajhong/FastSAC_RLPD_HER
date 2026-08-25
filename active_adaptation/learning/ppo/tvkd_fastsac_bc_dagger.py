@@ -44,6 +44,7 @@ from .fastsac_bc_dagger import (
     CHECKPOINT_VERSION as BASE_FASTSAC_CHECKPOINT_VERSION,
     NORMALIZED_TANH_ACTION_DISTRIBUTION,
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+    Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
     TRAINING_ALGORITHM as BASE_FASTSAC_TRAINING_ALGORITHM,
     DistributionalFastSACTeacherBC,
     DistributionalFastSACTeacherBCConfig,
@@ -111,6 +112,12 @@ ACTOR_LEARNING_SEMANTICS = (
     "twin_min_plus_fixed_joint_valid_teacher_label_mean_bc_with_separate_low_lr_"
     "std_adam_rollout_scale_kl_cap_and_hard_bounds_v4"
 )
+Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS = (
+    "reparameterized_ppo_physical_joint_std_gaussian_alpha_logpi_minus_online_"
+    "twin_min_plus_fixed_joint_valid_teacher_label_mean_bc_with_separate_low_lr_"
+    "std_adam_rollout_scale_kl_cap_and_jointwise_q_normalized_absolute_"
+    "intersection_bounds_v1"
+)
 NORMALIZED_ACTOR_LEARNING_SEMANTICS = BASE_NORMALIZED_ACTOR_LEARNING_SEMANTICS
 V5_ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_sac_plus_fixed_joint_valid_teacher_label_bc_v2"
@@ -122,6 +129,10 @@ def _tvkd_actor_learning_semantics(config) -> str:
     if distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION:
         return NORMALIZED_ACTOR_LEARNING_SEMANTICS
     if distribution == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
+        if str(
+            getattr(config, "sac_physical_std_bound_mode", "uniform_physical")
+        ) == Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE:
+            return Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS
         return ACTOR_LEARNING_SEMANTICS
     raise ValueError(f"unsupported FastSAC action distribution {distribution!r}")
 
@@ -3423,6 +3434,23 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 backend["sac_action_distribution"] = (
                     NORMALIZED_TANH_ACTION_DISTRIBUTION
                 )
+            # Checkpoints written before the joint-aware envelope used the
+            # scalar physical interval.  Install that exact historical contract
+            # rather than inheriting runtime values: an old optimizer may resume
+            # only into the equivalent uniform mode, never silently into the new
+            # q-normalized feasible set.
+            legacy_physical_bound_defaults = {
+                "sac_physical_std_bound_mode": "uniform_physical",
+                "sac_physical_std_normalized_min": 0.02,
+                "sac_physical_std_normalized_max": 0.11,
+            }
+            missing_physical_bound_fields = set(
+                legacy_physical_bound_defaults
+            ).difference(backend)
+            if missing_physical_bound_fields:
+                backend = dict(backend)
+                for name in missing_physical_bound_fields:
+                    backend[name] = legacy_physical_bound_defaults[name]
             # These knobs are measurement-only and were added after the first
             # v6 checkpoints.  They do not affect policy, critic, replay, or
             # optimizer semantics, so an older checkpoint may safely inherit
@@ -3930,6 +3958,7 @@ __all__ = [
     "LEGACY_CHECKPOINT_VERSION",
     "LEGACY_TRAINING_ALGORITHM",
     "NORMALIZED_ACTOR_LEARNING_SEMANTICS",
+    "Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS",
     "PREVIOUS_CHECKPOINT_VERSION",
     "PREVIOUS_TRAINING_ALGORITHM",
     "REPLAY_RESUME_SEMANTICS",

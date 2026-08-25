@@ -19,8 +19,12 @@ OBJECTS = {
     "wheelchair": WHEELCHAIR_CFG,
     "stairslope": STAIRSLOPE_CFG,
     # The scene key intentionally matches the object body name embedded in the
-    # R1 motion archive.  The rigid body inside the USD is named ``baseLink``.
+    # R1 motion archive. The rigid body inside each USD may have another name.
     "largebox_link": R1_LARGEBOX_CFG,
+    "whitechair_link": R1_WHITECHAIR_CFG,
+    "smalltable_link": R1_SMALLTABLE_CFG,
+    "suitcase_link": R1_SUITCASE_CFG,
+    "plasticbox_link": R1_PLASTICBOX_CFG,
 }
 
 

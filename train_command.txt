@@ -39,13 +39,13 @@ nohup env PYTHONUNBUFFERED=1 \
 # TVKD
 # Replay ratios below resolve to Q US/FS/UT/FT=50/0/50/0 and
 # Actor US/FS/UT/FT=100/0/0/0. Perception remains live Student-only.
-# Action exploration follows ppo_vel_finetune's representation and fresh
-# joint-wise actor_std=0.5 initialization. Unlike PPO, the original SAC
-# alpha*logpi-Q objective controls every std direction. The separate std Adam
-# uses 2e-4 for faster initial contraction, while hard bounds and a rollout-old
-# scale KL cap guard individual updates. Entropy ratio 1.4 targets geometric
-# std ~=0.175 (the source PPOVEL checkpoint is ~=0.180), and the slower alpha
-# LR damps the collapse/rebound loop. There is no per-joint std target/prior.
+# Action exploration keeps PPOVEL's physical Gaussian and SAC's original
+# alpha*logpi-Q std gradient. The q-normalized envelope is derived automatically
+# from the task action contract; it is not a Teacher-checkpoint std prior.
+# For this G1 contract, fresh load_noise_scale=0.15 projects to normalized std
+# L2 ~=0.303 (expected sampled Q-deviation norm ~=0.296, above the earlier
+# run's observed ~=0.281). The envelope limits std L2 to <=~0.332 and physical
+# std to <=0.2. Ratio 1.6 stays near initialization without pinning the cap.
 nohup env PYTHONUNBUFFERED=1 \
   python scripts/TVKD_fasSAC_bc_dagger.py \
   task=G1/vaic/skateboard_general_tracking_stu \
@@ -67,16 +67,19 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.dagger_bc_lr=3.0e-4 \
   algo.eta_sac=5.0e-3 \
   algo.sac_action_distribution=ppo_physical_gaussian \
-  algo.load_noise_scale=0.5 \
-  algo.sac_physical_std_lr=2.0e-4 \
-  algo.sac_physical_std_max_kl=0.01 \
+  algo.load_noise_scale=0.15 \
+  algo.sac_physical_std_lr=1.0e-5 \
+  algo.sac_physical_std_max_kl=0.005 \
+  algo.sac_physical_std_bound_mode=q_normalized \
   algo.sac_physical_std_min=0.05 \
-  algo.sac_physical_std_max=0.5 \
+  algo.sac_physical_std_max=0.20 \
+  algo.sac_physical_std_normalized_min=0.02 \
+  algo.sac_physical_std_normalized_max=0.11 \
   algo.sac_use_autotune=true \
-  algo.sac_alpha_init=1.0e-4 \
-  algo.sac_alpha_lr=1.0e-4 \
+  algo.sac_alpha_init=2.0e-5 \
+  algo.sac_alpha_lr=2.0e-5 \
   algo.sac_alpha_update_cadence=actor \
-  algo.sac_target_entropy_ratio=1.4 \
+  algo.sac_target_entropy_ratio=1.2 \
   algo.use_tvkd_value_shaping=true \
   algo.tvkd_lambda=0.5 \
   algo.tvkd_potential_clip=null \
@@ -98,7 +101,7 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.dagger_buffer_capacity=131072 \
   algo.sac_policy_frequency=2 \
   algo.policy_delay=2 \
-  > ./logs/skateboard_general_tracking_stu_TVKD_fasSAC_bc_dagger_sac.log 2>&1 < /dev/null &
+  > ./logs/skateboard_general_tracking_stu_TVKD_fasSAC_bc_dagger_qnorm_explore.log 2>&1 < /dev/null &
 
 # DAgger
 nohup python scripts/bc_dagger.py \
