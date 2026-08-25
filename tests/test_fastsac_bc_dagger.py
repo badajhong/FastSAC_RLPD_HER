@@ -639,11 +639,14 @@ def test_physical_autotune_ratio_one_target_is_reachable_for_g1_action_scales():
     policy._fastsac_q_action_scale = q_scale
     policy.target_entropy = _fastsac_target_entropy(-q_scale, q_scale, 1.0)
 
-    entropy_min, entropy_max = policy._physical_normalized_entropy_bounds()
+    entropy_bounds = policy._physical_normalized_entropy_bounds()
+    entropy_min, entropy_max = entropy_bounds
     policy._validate_physical_entropy_target_reachable()
 
     assert policy.target_entropy == pytest.approx(-23.0)
     assert entropy_min < policy.target_entropy < entropy_max
+    assert policy._fastsac_physical_entropy_bounds is entropy_bounds
+    assert policy._physical_normalized_entropy_bounds() is entropy_bounds
     # The equivalent uniform physical std lies comfortably within the guard.
     target_uniform_std = math.exp(
         (
@@ -852,10 +855,9 @@ def _tiny_physical_policy(*, q_slope: float = 1.0, action_dim: int = 1):
 def _apply_physical_std_gradient(policy, value: float):
     parameter = policy._ppo_actor_std_parameter()
     policy.actor_std_optimizer.zero_grad(set_to_none=True)
-    pre_projection = policy._project_physical_actor_std_()
     before = parameter.detach().clone()
     parameter.grad = torch.full_like(parameter, float(value))
-    return policy._physical_actor_std_update(before, pre_projection)
+    return policy._physical_actor_std_update(before)
 
 
 def _tiny_physical_batch(action_dim: int = 1):
@@ -941,7 +943,54 @@ def test_physical_actor_update_applies_ordinary_sac_gradient_to_direct_std():
     assert policy._ppo_actor_std_parameter().grad is None
     assert metrics["actor_std_sac_grad_norm"].item() > 0.0
     assert metrics["actor_std_step_abs_mean"].item() > 0.0
-    assert metrics["actor_std_rollout_scale_kl"].item() <= 0.01 + 1.0e-7
+    assert "actor_std_rollout_scale_kl" not in metrics
+    assert "actor_std_kl_cap_fraction" not in metrics
+    assert torch.all(policy._ppo_actor_std_parameter() >= 0.05)
+    assert torch.all(policy._ppo_actor_std_parameter() <= 0.5)
+
+
+def test_physical_rollout_applies_cumulative_kl_once_after_all_replay_updates(
+    monkeypatch,
+):
+    policy = _tiny_physical_policy(action_dim=2)
+    policy.joint_names = ("joint_0", "joint_1")
+    policy.target_entropy = -2.0
+    policy.alpha_update_count = 0
+    cap_calls = 0
+    original_cap = policy._cap_physical_actor_std_rollout_kl_
+
+    def counted_cap(owner, fallback_reference):
+        nonlocal cap_calls
+        cap_calls += 1
+        return original_cap(fallback_reference)
+
+    policy._cap_physical_actor_std_rollout_kl_ = MethodType(counted_cap, policy)
+
+    def replay_updates(owner, tensordict):
+        del tensordict
+        # Model multiple replay steps by presenting their final in-bound std.
+        # The rollout-old trust guard must run only after this method returns.
+        with torch.no_grad():
+            owner._ppo_actor_std_parameter().fill_(0.1)
+        assert cap_calls == 0
+        return {}
+
+    monkeypatch.setattr(DistributionalTD3TeacherBC, "train_op", replay_updates)
+
+    info = DistributionalFastSACTeacherBC.train_op(
+        policy, TensorDict({}, batch_size=[])
+    )
+
+    assert cap_calls == 1
+    assert info["fastsac/actor_std_kl_cap_fraction"] == pytest.approx(1.0)
+    assert info["fastsac/actor_std_rollout_scale_kl"] == pytest.approx(
+        0.01, abs=1.0e-6
+    )
+    final_std = policy._ppo_actor_std_parameter().detach()
+    assert torch.all(final_std > 0.1)
+    assert torch.all(final_std < 0.5)
+    assert info["fastsac/actor_std/joint_0"] == pytest.approx(final_std[0].item())
+    assert info["fastsac/actor_std/joint_1"] == pytest.approx(final_std[1].item())
 
 
 def test_physical_std_projection_and_nonfinite_failure_are_explicit():
@@ -1244,6 +1293,15 @@ def _rollout_owner(*, prefill: bool, beta: float = 0.5):
 
 def test_main_rollout_keeps_teacher_rows_exact_and_samples_only_student_behavior():
     owner, raw_mean, teacher = _rollout_owner(prefill=False, beta=0.5)
+    projection_calls = 0
+    project_execution_action = owner._project_execution_action
+
+    def counted_projection(action):
+        nonlocal projection_calls
+        projection_calls += 1
+        return project_execution_action(action)
+
+    owner._project_execution_action = counted_projection
     policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
     td = TensorDict(
         {"is_init": torch.zeros(raw_mean.shape[0], dtype=torch.bool)},
@@ -1258,6 +1316,9 @@ def test_main_rollout_keeps_teacher_rows_exact_and_samples_only_student_behavior
     assert student.any() and (~student).any()
     assert torch.equal(result[DAGGER_TEACHER_ACTION_KEY], teacher)
     assert result[DAGGER_TEACHER_ACTION_VALID_KEY].all()
+    # Teacher and Student are each projected once. Their elementwise selection
+    # is already inside the same support and must not be projected a third time.
+    assert projection_calls == 2
     assert torch.equal(result[ACTION_KEY][~student], teacher[~student])
     assert torch.equal(result[TD3_NOISE_FREE_STUDENT_ACTION_KEY], raw_mean)
     assert not torch.equal(

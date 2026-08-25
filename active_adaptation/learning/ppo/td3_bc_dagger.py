@@ -149,6 +149,14 @@ REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY = "replay_next_actor_observations"
 # Teacher rows are re-encoded lazily at the current generation, so the
 # staleness metrics deliberately exclude them.
 REPLAY_PERCEPTION_EMA_GENERATION_KEY = "replay_perception_ema_generation"
+_STUDENT_REPLAY_EMA_AGE_METRIC_KEYS = (
+    "available",
+    "student_rows",
+    "mean",
+    "p95",
+    "max",
+    "stale_fraction",
+)
 # Transitional internal aliases keep the Student collection patch isolated;
 # Teacher episode replay can populate the same generic schema directly.
 STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY = REPLAY_ACTOR_OBSERVATIONS_KEY
@@ -2425,10 +2433,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._teacher_actor_cache.invalidate()
         self._teacher_ring_cache_lineage = None
 
-    def _student_replay_ema_age_metrics(
+    def _student_replay_ema_ages(
         self, batch: Mapping[str, torch.Tensor]
-    ) -> dict[str, float]:
-        """Measure, but never alter, collection-cache representation age.
+    ) -> torch.Tensor | None:
+        """Return Student collection-cache ages without reducing diagnostics.
 
         In collection-exact FastSAC replay, a Student Actor input is exact for
         the EMA generation at collection.  The generation gap to the current
@@ -2436,15 +2444,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         feature-space distance, and therefore does not justify a zero-hidden
         reconstruction.  Teacher rows are intentionally omitted because their
         Actor cache is rebuilt from a complete episode at the current EMA.
+
+        Future-generation validation deliberately remains on every sampled
+        batch and before its learning update.  The diagnostic reductions are
+        deferred so they do not introduce several device synchronizations per
+        Q/Actor sample.
         """
-        zeros = {
-            "available": 0.0,
-            "student_rows": 0.0,
-            "mean": 0.0,
-            "p95": 0.0,
-            "max": 0.0,
-            "stale_fraction": 0.0,
-        }
         generation = batch.get(REPLAY_PERCEPTION_EMA_GENERATION_KEY, None)
         is_teacher = batch.get(REPLAY_SAMPLE_IS_TEACHER_KEY, None)
         is_student = batch.get(DAGGER_IS_STUDENT_ACTION_KEY, None)
@@ -2452,7 +2457,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         if generation is None or source is None:
             # Compatibility for a deliberately fresh-only replay or focused
             # unit-test batches which predate the provenance field.
-            return zeros
+            return None
         if not torch.is_tensor(generation) or not torch.is_tensor(source):
             raise TypeError("replay EMA provenance fields must be tensors")
         generation = generation.reshape(-1).long()
@@ -2461,20 +2466,78 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError("replay EMA provenance fields are misaligned")
         generation = generation[student]
         if generation.numel() == 0:
-            return zeros
+            return None
         current = int(getattr(self, "_perception_ema_generation", 0))
         age = current - generation
         if bool((age < 0).any()):
             raise RuntimeError("Student replay row has a future EMA generation")
-        age = age.float()
-        return {
-            "available": 1.0,
-            "student_rows": float(age.numel()),
-            "mean": age.mean().item(),
-            "p95": torch.quantile(age, 0.95).item(),
-            "max": age.max().item(),
-            "stale_fraction": (age > 0).float().mean().item(),
-        }
+        return age.detach().float()
+
+    def _aggregate_student_replay_ema_ages(
+        self, age_batches: list[torch.Tensor | None]
+    ) -> torch.Tensor:
+        """Reproduce the historical mean-of-batch age metrics on-device.
+
+        Missing provenance and teacher-only batches remain zero-valued samples
+        in the rollout average.  A padded matrix permits one quantile reduction
+        for all non-empty samples, including unusually different Student row
+        counts.  The caller performs the sole host extraction for both Q and
+        Actor diagnostics after their respective tensors are complete.
+        """
+        first_age = next((age for age in age_batches if age is not None), None)
+        device = (
+            first_age.device
+            if first_age is not None
+            else getattr(self, "device", torch.device("cpu"))
+        )
+        result = torch.zeros(
+            len(_STUDENT_REPLAY_EMA_AGE_METRIC_KEYS),
+            dtype=torch.float32,
+            device=device,
+        )
+        if not age_batches or first_age is None:
+            return result
+
+        available_ages = [age for age in age_batches if age is not None]
+        if any(age.device != first_age.device for age in available_ages):
+            raise ValueError("replay EMA age samples must share a device")
+        row_counts = torch.as_tensor(
+            [age.numel() for age in available_ages],
+            dtype=torch.float32,
+            device=first_age.device,
+        )
+        max_rows = max(age.numel() for age in available_ages)
+        padded = first_age.new_full(
+            (len(available_ages), max_rows), float("nan")
+        )
+        for row, age in enumerate(available_ages):
+            padded[row, : age.numel()] = age.reshape(-1)
+
+        denominator = float(len(age_batches))
+        per_batch_mean = torch.nanmean(padded, dim=1)
+        per_batch_p95 = torch.nanquantile(padded, 0.95, dim=1)
+        per_batch_max = padded.nan_to_num(nan=-torch.inf).max(dim=1).values
+        per_batch_stale_fraction = (padded > 0).sum(dim=1) / row_counts
+        return torch.stack(
+            (
+                padded.new_tensor(len(available_ages) / denominator),
+                row_counts.sum() / denominator,
+                per_batch_mean.sum() / denominator,
+                per_batch_p95.sum() / denominator,
+                per_batch_max.sum() / denominator,
+                per_batch_stale_fraction.sum() / denominator,
+            )
+        )
+
+    def _student_replay_ema_age_metrics(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> dict[str, float]:
+        """Compatibility wrapper for one-batch diagnostic callers/tests."""
+        metrics = self._aggregate_student_replay_ema_ages(
+            [self._student_replay_ema_ages(batch)]
+        )
+        values = metrics.detach().cpu().tolist()
+        return dict(zip(_STUDENT_REPLAY_EMA_AGE_METRIC_KEYS, values))
 
     @staticmethod
     def _empty_student_perception_drift_metrics() -> dict[str, float]:
@@ -7291,8 +7354,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         critic_metrics: list[dict[str, torch.Tensor]] = []
         actor_metrics: list[dict[str, torch.Tensor]] = []
-        q_staleness_metrics: list[dict[str, float]] = []
-        actor_staleness_metrics: list[dict[str, float]] = []
+        q_staleness_age_batches: list[torch.Tensor | None] = []
+        actor_staleness_age_batches: list[torch.Tensor | None] = []
         student_q_rows = self.dagger_replay.valid_count(DAGGER_IS_STUDENT_ACTION_KEY)
         learning_starts = int(self.cfg.td3_learning_starts)
         q_counts = self._replay_source_counts("q", int(self.cfg.q_batch_size))
@@ -7348,8 +7411,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     None if sample_plans is None else sample_plans[update_index]
                 )
                 q_batch = self._sample_balanced_q_batch(sample_plan)
-                q_staleness_metrics.append(
-                    self._student_replay_ema_age_metrics(q_batch)
+                q_staleness_age_batches.append(
+                    self._student_replay_ema_ages(q_batch)
                 )
                 q_batch = self._prepare_dagger_learning_batch(q_batch)
                 critic_metrics.append(self._critic_update(q_batch))
@@ -7382,8 +7445,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                             else sample_plan.actor_student_focused
                         ),
                     )
-                    actor_staleness_metrics.append(
-                        self._student_replay_ema_age_metrics(actor_batch)
+                    actor_staleness_age_batches.append(
+                        self._student_replay_ema_ages(actor_batch)
                     )
                     delayed = self._maybe_delayed_actor_and_targets(
                         actor_batch
@@ -7482,17 +7545,30 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
         critic = self._mean_metric_dict(critic_metrics, critic_keys)
         actor = self._mean_metric_dict(actor_metrics, actor_keys)
-        staleness_keys = (
-            "available",
-            "student_rows",
-            "mean",
-            "p95",
-            "max",
-            "stale_fraction",
+        q_staleness_tensor = self._aggregate_student_replay_ema_ages(
+            q_staleness_age_batches
         )
-        q_staleness = self._mean_metric_dict(q_staleness_metrics, staleness_keys)
-        actor_staleness = self._mean_metric_dict(
-            actor_staleness_metrics, staleness_keys
+        actor_staleness_tensor = self._aggregate_student_replay_ema_ages(
+            actor_staleness_age_batches
+        )
+        staleness_values = (
+            torch.cat((q_staleness_tensor, actor_staleness_tensor))
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        metric_count = len(_STUDENT_REPLAY_EMA_AGE_METRIC_KEYS)
+        q_staleness = dict(
+            zip(
+                _STUDENT_REPLAY_EMA_AGE_METRIC_KEYS,
+                staleness_values[:metric_count],
+            )
+        )
+        actor_staleness = dict(
+            zip(
+                _STUDENT_REPLAY_EMA_AGE_METRIC_KEYS,
+                staleness_values[metric_count:],
+            )
         )
 
         def rollout_fraction(key):

@@ -53,6 +53,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     REFERENCE_PHASE_KEY,
     REPLAY_INTRINSIC_FOCUSED_KEY,
     REPLAY_MOTION_ID_KEY,
+    REPLAY_PERCEPTION_EMA_GENERATION_KEY,
     REPLAY_SAMPLE_IS_TEACHER_KEY,
     REPLAY_SAMPLE_PHYSICAL_INDEX_KEY,
     REPLAY_SAMPLE_PROVENANCE_KEY,
@@ -197,6 +198,85 @@ def test_shared_replay_schema_carries_reference_phase_but_no_failure_copy():
     assert FAILURE_PHASE_TEACHER_SOURCE_KEY == "failure_phase_teacher_source"
     assert REFERENCE_PHASE_KEY in _Q_REPLAY_FIELDS
     assert all("pre_failure" not in field for field in _Q_REPLAY_FIELDS)
+
+
+def test_student_replay_age_rollup_preserves_mean_of_batch_metrics(monkeypatch):
+    policy = _bare_policy()
+    policy._perception_ema_generation = 10
+    batches = [
+        {
+            REPLAY_PERCEPTION_EMA_GENERATION_KEY: torch.tensor([6, 2, 9, 10]),
+            REPLAY_SAMPLE_IS_TEACHER_KEY: torch.tensor(
+                [False, True, False, False]
+            ),
+        },
+        {},
+        {
+            REPLAY_PERCEPTION_EMA_GENERATION_KEY: torch.tensor([10, 8]),
+            DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor([True, True]),
+        },
+    ]
+    keys = (
+        "available",
+        "student_rows",
+        "mean",
+        "p95",
+        "max",
+        "stale_fraction",
+    )
+
+    def historical_metrics(age):
+        if age is None:
+            return {key: 0.0 for key in keys}
+        return {
+            "available": 1.0,
+            "student_rows": float(age.numel()),
+            "mean": age.mean().item(),
+            "p95": torch.quantile(age, 0.95).item(),
+            "max": age.max().item(),
+            "stale_fraction": (age > 0).float().mean().item(),
+        }
+
+    # This is the exact former per-sample reduction, including a missing-
+    # provenance batch which historically contributed one all-zero sample.
+    historical = [
+        historical_metrics(torch.tensor([4.0, 1.0, 0.0])),
+        historical_metrics(None),
+        historical_metrics(torch.tensor([0.0, 2.0])),
+    ]
+    expected = {
+        key: sum(metrics[key] for metrics in historical) / len(historical)
+        for key in keys
+    }
+
+    quantile_calls = 0
+    nanquantile = torch.nanquantile
+
+    def counted_nanquantile(*args, **kwargs):
+        nonlocal quantile_calls
+        quantile_calls += 1
+        return nanquantile(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "nanquantile", counted_nanquantile)
+    age_batches = [policy._student_replay_ema_ages(batch) for batch in batches]
+    aggregate = policy._aggregate_student_replay_ema_ages(age_batches)
+    actual = dict(zip(keys, aggregate.tolist()))
+
+    assert quantile_calls == 1
+    assert actual == pytest.approx(expected)
+
+
+def test_student_replay_age_hot_path_still_rejects_future_generation():
+    policy = _bare_policy()
+    policy._perception_ema_generation = 10
+
+    with pytest.raises(RuntimeError, match="future EMA generation"):
+        policy._student_replay_ema_ages(
+            {
+                REPLAY_PERCEPTION_EMA_GENERATION_KEY: torch.tensor([11]),
+                DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor([True]),
+            }
+        )
 
 
 def _failure_rollout() -> TensorDict:

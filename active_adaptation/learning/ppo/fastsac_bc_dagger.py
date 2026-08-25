@@ -475,7 +475,9 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
             bounded_teacher_action,
             projected_student_action,
         )
-        issued_action = owner._project_execution_action(issued_action)
+        # Both branches have already passed through the authoritative execution
+        # projection. Selecting between them cannot leave that finite support,
+        # so projecting the combined tensor again only repeats the same kernels.
         sample_q_deviation = owner._q_action_input(sampled_student_action) - (
             owner._q_action_input(mean_student_action)
         )
@@ -655,8 +657,15 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             self._fastsac_q_action_center + self._fastsac_q_action_scale,
             float(cfg.sac_target_entropy_ratio),
         )
-        if physical_gaussian and bool(cfg.sac_use_autotune):
-            self._validate_physical_entropy_target_reachable()
+        if physical_gaussian:
+            # These bounds depend only on the immutable action contract and
+            # configured std interval. Materialize their host scalars once;
+            # rollout diagnostics and checkpoint metadata reuse the cache.
+            self._fastsac_physical_entropy_bounds = (
+                self._physical_normalized_entropy_bounds()
+            )
+            if bool(cfg.sac_use_autotune):
+                self._validate_physical_entropy_target_reachable()
         generator_device = torch.device(device)
         self.sac_action_rng = torch.Generator(device=generator_device).manual_seed(
             int(cfg.q_seed) + 1
@@ -998,6 +1007,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
 
     def _physical_normalized_entropy_bounds(self) -> tuple[float, float]:
         """Return total Normal entropy bounds in nominal joint coordinates."""
+        cached = getattr(self, "_fastsac_physical_entropy_bounds", None)
+        if cached is not None:
+            return cached
         q_scale = self._fastsac_q_action_scale.detach().float()
         if not torch.isfinite(q_scale).all() or not bool((q_scale > 0.0).all()):
             raise ValueError("physical FastSAC entropy reference scale is invalid")
@@ -1009,7 +1021,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         maximum = (
             q_scale.new_tensor(offset + math.log(std_max)) - q_scale.log()
         ).sum()
-        return float(minimum.item()), float(maximum.item())
+        bounds = (float(minimum.item()), float(maximum.item()))
+        self._fastsac_physical_entropy_bounds = bounds
+        return bounds
 
     def _validate_physical_entropy_target_reachable(self) -> None:
         """Fail if autotune would continuously press against a std boundary."""
@@ -1078,9 +1092,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
     def _physical_actor_std_update(
         self,
         before: torch.Tensor,
-        pre_projection: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Apply the SAC-populated direct-std gradient with PPO-like guards."""
+        """Apply the SAC-populated direct-std gradient and hard bounds."""
         if not self._uses_ppo_physical_gaussian():
             raise RuntimeError("physical std update requested for normalized_tanh")
         optimizer = getattr(self, "actor_std_optimizer", None)
@@ -1100,7 +1113,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise RuntimeError("FastSAC physical actor_std gradient norm is NaN/Inf")
         optimizer.step()
         post_projection = self._project_physical_actor_std_()
-        scale_kl, kl_capped = self._cap_physical_actor_std_rollout_kl_(before)
         after = parameter.detach().clone()
         optimizer.zero_grad(set_to_none=True)
         self.actor_std_update_count = (
@@ -1110,11 +1122,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         return {
             "actor_std_sac_grad_norm": torch.as_tensor(std_grad).detach(),
             "actor_std_step_abs_mean": (after - before).abs().mean(),
-            "actor_std_projection_fraction": torch.maximum(
-                pre_projection, post_projection
-            ).detach(),
-            "actor_std_rollout_scale_kl": scale_kl.detach(),
-            "actor_std_kl_cap_fraction": kl_capped.detach(),
+            "actor_std_projection_fraction": post_projection.detach(),
             "actor_std_at_min_fraction": (after <= std_min).float().mean(),
             "actor_std_at_max_fraction": (after >= std_max).float().mean(),
             "actor_std_lr": after.new_tensor(
@@ -1475,14 +1483,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
     def _actor_update(self, batch: dict[str, torch.Tensor]):
         """One mean-only BC step plus the ordinary reparameterized SAC step."""
         raw_prediction = self._actor_mean_from_flat(batch["observations"])
-        if not torch.isfinite(raw_prediction).all():
-            raise RuntimeError("FastSAC Actor mean contains non-finite raw actions")
         physical_gaussian = self._uses_ppo_physical_gaussian()
         std_before = None
-        std_pre_projection = None
         if physical_gaussian:
             self.actor_std_optimizer.zero_grad(set_to_none=True)
-            std_pre_projection = self._project_physical_actor_std_()
             std_before = self._ppo_actor_std_parameter().detach().clone()
         dist = self._sac_dist_from_mean(raw_prediction)
         prediction_action = dist.mean
@@ -1543,11 +1547,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise RuntimeError("Critic parameters accumulated Actor-step gradients")
         self.actor_optimizer.step()
         if physical_gaussian:
-            if std_before is None or std_pre_projection is None:
-                raise RuntimeError("physical std update snapshots were not captured")
-            std_metrics = self._physical_actor_std_update(
-                std_before, std_pre_projection
-            )
+            if std_before is None:
+                raise RuntimeError("physical std update snapshot was not captured")
+            std_metrics = self._physical_actor_std_update(std_before)
         else:
             std_metrics = {}
         self.actor_update_count = int(getattr(self, "actor_update_count", 0)) + 1
@@ -1634,6 +1636,21 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     projected[student].float().mean().item()
                 )
         td3_info = DistributionalTD3TeacherBC.train_op(self, tensordict)
+        physical_rollout_std_metrics = {}
+        if self._uses_ppo_physical_gaussian():
+            # Replay optimization has finished and no environment action can be
+            # issued until this method returns. Enforce the cumulative old-scale
+            # trust guard once on the policy that will collect the next rollout;
+            # hard physical bounds were retained after every std Adam step.
+            rollout_scale_kl, rollout_kl_capped = (
+                self._cap_physical_actor_std_rollout_kl_(
+                    self._physical_std_rollout_reference
+                )
+            )
+            physical_rollout_std_metrics = {
+                "actor_std_rollout_scale_kl": float(rollout_scale_kl.item()),
+                "actor_std_kl_cap_fraction": float(rollout_kl_capped.item()),
+            }
 
         replacements = {
             "method_distributional_td3_teacher_bc_v1": (
@@ -1687,8 +1704,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "actor_std_sac_grad_norm",
                 "actor_std_step_abs_mean",
                 "actor_std_projection_fraction",
-                "actor_std_rollout_scale_kl",
-                "actor_std_kl_cap_fraction",
                 "actor_std_at_min_fraction",
                 "actor_std_at_max_fraction",
                 "actor_std_lr",
@@ -1721,6 +1736,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # rather than the within-rollout mean of stale and updated values.
         critic["alpha"] = self.log_alpha.detach().exp().item()
         actor = self._mean_metric_dict(self._fastsac_rollout_actor_metrics, actor_keys)
+        actor.update(physical_rollout_std_metrics)
         info.update({f"fastsac/{key}": value for key, value in critic.items()})
         info.update({f"fastsac/{key}": value for key, value in actor.items()})
         info["fastsac/action_projection_fraction"] = action_projection_fraction
@@ -1730,8 +1746,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         if self._uses_ppo_physical_gaussian():
             current_std = self._bounded_physical_actor_std(detach=True)
-            for joint_name, std in zip(self.joint_names, current_std, strict=True):
-                info[f"fastsac/actor_std/{joint_name}"] = float(std.item())
+            current_std_values = current_std.float().cpu().tolist()
+            for joint_name, std in zip(
+                self.joint_names, current_std_values, strict=True
+            ):
+                info[f"fastsac/actor_std/{joint_name}"] = float(std)
             entropy_min, entropy_max = self._physical_normalized_entropy_bounds()
             info["fastsac/physical_entropy_bound_min"] = entropy_min
             info["fastsac/physical_entropy_bound_max"] = entropy_max
