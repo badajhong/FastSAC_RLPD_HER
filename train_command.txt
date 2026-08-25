@@ -40,7 +40,7 @@ nohup env PYTHONUNBUFFERED=1 \
 # Replay ratios below resolve to Q US/FS/UT/FT=50/0/50/0 and
 # Actor US/FS/UT/FT=100/0/0/0. Perception remains live Student-only.
 # Action exploration matches ppo_vel_finetune: raw physical Gaussian,
-# per-joint trainable actor_std, freshly reset to load_noise_scale=0.5.
+# per-joint actor_std reset to 0.5, then replay-detached SGD prior control.
 nohup env PYTHONUNBUFFERED=1 \
   python scripts/TVKD_fasSAC_bc_dagger.py \
   task=G1/vaic/skateboard_general_tracking_stu \
@@ -63,6 +63,10 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.eta_sac=5.0e-3 \
   algo.sac_action_distribution=ppo_physical_gaussian \
   algo.load_noise_scale=0.5 \
+  algo.sac_physical_std_lr=1.0e-5 \
+  algo.sac_physical_std_prior=0.3 \
+  algo.sac_physical_std_min=0.05 \
+  algo.sac_physical_std_max=0.5 \
   algo.sac_use_autotune=false \
   algo.sac_alpha_init=1.0e-5 \
   algo.use_tvkd_value_shaping=true \

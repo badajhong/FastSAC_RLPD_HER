@@ -49,14 +49,26 @@ def _finite_float(value: torch.Tensor | float) -> float:
 
 def _parameter_groups(policy) -> tuple[tuple[torch.nn.Parameter, ...], ...]:
     """Return the production mean and policy-scale optimizer groups."""
+    uses_physical = bool(
+        getattr(policy, "_uses_ppo_physical_gaussian", lambda: False)()
+    )
     optimizer = getattr(policy, "actor_optimizer", None)
-    if optimizer is not None and len(optimizer.param_groups) >= 2:
+    std_optimizer = getattr(policy, "actor_std_optimizer", None)
+    if uses_physical and optimizer is not None and std_optimizer is not None:
+        mean_parameters = tuple(
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        )
+        scale_parameters = tuple(
+            parameter
+            for group in std_optimizer.param_groups
+            for parameter in group["params"]
+        )
+    elif optimizer is not None and len(optimizer.param_groups) >= 2:
         mean_parameters = tuple(optimizer.param_groups[0]["params"])
         scale_parameters = tuple(optimizer.param_groups[1]["params"])
     else:
-        uses_physical = bool(
-            getattr(policy, "_uses_ppo_physical_gaussian", lambda: False)()
-        )
         scale_parameters = (
             (policy._ppo_actor_std_parameter(),)
             if uses_physical
@@ -336,7 +348,12 @@ def diagnose_fastsac_actor_gradients(
         raw_prediction = policy._actor_mean_from_flat(observations)
         if not torch.isfinite(raw_prediction).all():
             raise RuntimeError("FastSAC gradient probe Actor mean is non-finite")
-        distribution = policy._sac_dist_from_mean(raw_prediction)
+        uses_physical = bool(
+            getattr(policy, "_uses_ppo_physical_gaussian", lambda: False)()
+        )
+        distribution = policy._sac_dist_from_mean(
+            raw_prediction, detach_physical_std=uses_physical
+        )
         mean_action = distribution.mean
         sampled_action, raw_log_prob = distribution.rsample_with_log_prob(
             generator=generator

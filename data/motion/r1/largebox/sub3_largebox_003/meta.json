@@ -83,10 +83,27 @@
   "fps": 50.0,
   "source": "/home/hcc/research/HOI/train_r1/rl/largebox/sub3_largebox_003.npz",
   "conversion": {
-    "format": "holosoma_to_vaic_v1",
+    "format": "holosoma_to_vaic_v2",
     "quaternion_order": "wxyz",
     "foot_height_threshold": 0.015,
     "object_points_source": "/home/hcc/research/HOI/train_r1/objects/largebox/sample_points.npy",
-    "object_points_selection": "linspace_128"
+    "object_points_selection": "linspace_128",
+    "default_pose_transition": {
+      "semantics": "holosoma_wbt_default_pose",
+      "prepend_duration_s": 2.0,
+      "append_duration_s": 2.0,
+      "prepend_frames": 100,
+      "append_frames": 100,
+      "original_frames": 325,
+      "output_frames": 525,
+      "real_motion_range": [
+        100,
+        425
+      ],
+      "object_behavior": "hold_boundary_state",
+      "object_contact_behavior": "false_during_synthetic_transitions",
+      "feet_contact_behavior": "recomputed_from_augmented_body_positions",
+      "reference": "/home/hcc/research/VAIC/active_adaptation/assets/r1_default_pose.npz"
+    }
   }
 }

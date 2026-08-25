@@ -66,6 +66,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     V4_TRAINING_ALGORITHM as TVKD_V4_TRAINING_ALGORITHM,
     V5_CHECKPOINT_VERSION as TVKD_V5_CHECKPOINT_VERSION,
     V5_TRAINING_ALGORITHM as TVKD_V5_TRAINING_ALGORITHM,
+    V6_CHECKPOINT_VERSION as TVKD_V6_CHECKPOINT_VERSION,
+    V6_TRAINING_ALGORITHM as TVKD_V6_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
@@ -2703,6 +2705,7 @@ def test_unsuccessful_episode_without_threshold_crossing_creates_no_focus():
         TVKD_V3_TRAINING_ALGORITHM,
         TVKD_V4_TRAINING_ALGORITHM,
         TVKD_V5_TRAINING_ALGORITHM,
+        TVKD_V6_TRAINING_ALGORITHM,
         TVKD_TRAINING_ALGORITHM,
     ),
 )
@@ -2720,9 +2723,13 @@ def test_tvkd_inference_forces_checkpoint_value_norm_before_construction(algorit
     assert "value_norm" in result["checkpoint"]
 
 
-def test_tvkd_v6_version_identity_preserves_v5_for_safe_migration():
-    assert TVKD_TRAINING_ALGORITHM == "distributional_tvkd_fastsac_teacher_bc_v6"
-    assert TVKD_CHECKPOINT_VERSION == 6
+def test_tvkd_v7_version_identity_preserves_v6_for_inference():
+    assert TVKD_TRAINING_ALGORITHM == "distributional_tvkd_fastsac_teacher_bc_v7"
+    assert TVKD_CHECKPOINT_VERSION == 7
+    assert TVKD_V6_TRAINING_ALGORITHM == (
+        "distributional_tvkd_fastsac_teacher_bc_v6"
+    )
+    assert TVKD_V6_CHECKPOINT_VERSION == 6
     assert TVKD_V5_TRAINING_ALGORITHM == (
         "distributional_tvkd_fastsac_teacher_bc_v5"
     )
@@ -2748,10 +2755,31 @@ def test_tvkd_v4_training_resume_is_rejected_under_v5_sampler():
         )
 
 
+def test_tvkd_v6_training_resume_is_rejected_but_kept_for_inference():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+
+    with pytest.raises(ValueError, match="v6 training resume is incompatible"):
+        policy._load_fastsac_checkpoint_state(
+            {
+                "training_algorithm": TVKD_V6_TRAINING_ALGORITHM,
+                "checkpoint_version": TVKD_V6_CHECKPOINT_VERSION,
+            },
+            load_modules=False,
+        )
+
+
 @pytest.mark.parametrize(
-    "algorithm", (TVKD_V5_TRAINING_ALGORITHM, TVKD_TRAINING_ALGORITHM)
+    "algorithm",
+    (
+        TVKD_V5_TRAINING_ALGORITHM,
+        TVKD_V6_TRAINING_ALGORITHM,
+        TVKD_TRAINING_ALGORITHM,
+    ),
 )
-def test_tvkd_v5_v6_inference_uses_the_replayless_model_only_loader(algorithm):
+def test_tvkd_v5_v6_v7_inference_uses_the_replayless_model_only_loader(algorithm):
     calls = []
 
     class _InferencePolicy:
@@ -2850,7 +2878,7 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
     assert not any(key.startswith("bc_scheduler/") for key in info)
 
 
-def test_tvkd_v6_checkpoint_saves_state_and_accepts_safe_v5_migration(
+def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
     monkeypatch,
 ):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
@@ -3023,9 +3051,19 @@ def test_tvkd_v6_checkpoint_saves_state_and_accepts_safe_v5_migration(
     )
     v5_state["replay_resume_semantics"] = tvkd_module.V5_REPLAY_RESUME_SEMANTICS
     v5_state["dagger_backend_config"]["method"] = TVKD_V5_TRAINING_ALGORITHM
+    v5_state["actor_learning_semantics"] = (
+        tvkd_module.V5_ACTOR_LEARNING_SEMANTICS
+    )
+    for name in (
+        "sac_physical_std_lr",
+        "sac_physical_std_prior",
+        "sac_physical_std_min",
+        "sac_physical_std_max",
+    ):
+        v5_state["dagger_backend_config"].pop(name, None)
     v5_state.pop("actor_replay_observation_semantics")
     v5_state.pop("teacher_episode_sidecar_semantics")
-    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v6"):
+    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v7"):
         policy._load_fastsac_checkpoint_state(v5_state, load_modules=False)
     assert len(translated) == 2
     assert translated[-1][0]["checkpoint_version"] == (
@@ -3256,6 +3294,9 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     v5_policy_state["dagger_backend_config"]["method"] = (
         TVKD_V5_TRAINING_ALGORITHM
     )
+    v5_policy_state["actor_learning_semantics"] = (
+        tvkd_module.V5_ACTOR_LEARNING_SEMANTICS
+    )
     v5_policy_state.pop("actor_replay_observation_semantics")
     v5_policy_state.pop("teacher_episode_sidecar_semantics")
     v5_checkpoint_path = checkpoint_path.with_name("checkpoint_v5.pt")
@@ -3276,7 +3317,7 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
                 f"fastsac_bc_dagger_checkpoint={v5_checkpoint_path}",
             ],
         )
-    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v6"):
+    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v7"):
         v5_result = _prepare_tvkd_checkpoint(v5_cfg)
     assert v5_result == {
         "path": str(v5_checkpoint_path.resolve()),

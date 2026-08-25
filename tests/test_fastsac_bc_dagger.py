@@ -191,6 +191,10 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.policy_delay == cfg.sac_policy_frequency == 8
     assert cfg.sac_alpha_update_cadence == "actor"
     assert cfg.sac_action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION
+    assert cfg.sac_physical_std_lr == pytest.approx(1.0e-5)
+    assert cfg.sac_physical_std_prior == pytest.approx(0.3)
+    assert cfg.sac_physical_std_min == pytest.approx(0.05)
+    assert cfg.sac_physical_std_max == pytest.approx(0.5)
     assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
@@ -221,6 +225,16 @@ def test_physical_gaussian_config_requires_fixed_temperature_and_ppo_load_scale(
                 sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
                 sac_use_autotune=False,
                 load_noise_scale=None,
+            )
+        )
+
+    with pytest.raises(ValueError, match="prior must lie inside"):
+        DistributionalFastSACTeacherBC._validate_td3_config(
+            DistributionalFastSACTeacherBCConfig(
+                sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+                sac_use_autotune=False,
+                load_noise_scale=0.5,
+                sac_physical_std_prior=0.7,
             )
         )
 
@@ -443,7 +457,9 @@ def test_ppo_physical_gaussian_matches_independent_normal_without_tanh_or_q_offs
     dist = policy._sac_dist_from_mean(raw_mean)
     assert isinstance(dist, FastSACPhysicalNormal)
     assert torch.equal(dist.mean, raw_mean)
-    assert torch.allclose(dist.scale, torch.tensor([[0.2, 0.7], [0.2, 0.7]]))
+    # The physical Normal remains unsquashed, but its direct PPOVEL std is now
+    # defensively bounded before sampling.
+    assert torch.allclose(dist.scale, torch.tensor([[0.2, 0.5], [0.2, 0.5]]))
 
     sample_generator = torch.Generator().manual_seed(91)
     expected_generator = torch.Generator().manual_seed(91)
@@ -696,6 +712,189 @@ def _install_tiny_stochastic_actor(policy, *, actor_weight=0.25, log_std=-1.0):
         policy.bc_dagger_sac_adapter.parameters()
     )
     return policy
+
+
+class _TinyPhysicalActor(nn.Module):
+    """Small mean module that still owns the production PPOVEL Actor core."""
+
+    def __init__(self, action_dim: int, *, mean_weight: float, std: float):
+        super().__init__()
+        self.mean_weight = nn.Parameter(
+            torch.full((1, action_dim), float(mean_weight))
+        )
+        self.actor_core = Actor(
+            action_dim,
+            init_noise_scale=float(std),
+            load_noise_scale=0.5,
+        )
+        # Materialize the compatibility LazyLinear parameters. The test mean
+        # intentionally bypasses them, but production parameter ownership does
+        # not special-case this harness.
+        self.actor_core(torch.zeros(1, 1))
+
+    def forward(self, observations):
+        return observations @ self.mean_weight
+
+
+def _tiny_physical_policy(*, q_slope: float = 1.0, action_dim: int = 1):
+    policy = _bare_policy(
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+        sac_physical_std_lr=1.0e-5,
+        sac_physical_std_prior=0.3,
+        sac_physical_std_min=0.05,
+        sac_physical_std_max=0.5,
+        eta_sac=0.7,
+        lambda_bc=1.3,
+        dagger_actor_huber_delta=0.4,
+        sac_max_grad_norm=1.0,
+        q_action_input_gain=1.0,
+    )
+    policy.actor_adapt = _TinyPhysicalActor(
+        action_dim, mean_weight=0.25, std=0.5
+    )
+    policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
+        action_dim, torch.zeros(action_dim), "cpu"
+    ).requires_grad_(False)
+    policy._fastsac_q_action_center = torch.zeros(action_dim)
+    policy._fastsac_q_action_scale = torch.ones(action_dim)
+    policy._fastsac_action_low = torch.full((action_dim,), -20.0)
+    policy._fastsac_action_high = torch.full((action_dim,), 20.0)
+    policy._fastsac_actor_action_center = torch.zeros(action_dim)
+    policy._fastsac_actor_action_scale = torch.full((action_dim,), 20.0)
+    policy._fastsac_entropy_reference_log_scale_sum = 0.0
+    policy.cfg.action_support_clip = 20.0
+    actor_std = policy._ppo_actor_std_parameter()
+    mean_parameters = tuple(
+        parameter
+        for parameter in policy.actor_adapt.parameters()
+        if parameter is not actor_std
+    )
+    policy.actor_optimizer = _CountingSGD(mean_parameters, lr=0.05)
+    policy.actor_std_optimizer = _CountingSGD(
+        (actor_std,), lr=policy.cfg.sac_physical_std_lr
+    )
+    policy.qnet = _ActionSensitiveTwinC51(
+        first_slope=float(q_slope), second_slope=-2.0 * float(q_slope)
+    )
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
+    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.4)))
+    policy.sac_action_rng = torch.Generator().manual_seed(313)
+    policy.actor_update_count = 0
+    policy.actor_std_update_count = 0
+    return policy
+
+
+def _tiny_physical_batch(action_dim: int = 1):
+    return {
+        "observations": torch.tensor([[1.0], [2.0], [-1.0]]),
+        "critic_observations": torch.ones(3, 1),
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.tensor(
+            [[0.5], [-0.2], [0.1]]
+        ).expand(-1, action_dim),
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.tensor([True, True, False]),
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([True, False, True]),
+    }
+
+
+def test_physical_actor_mean_and_std_optimizers_are_disjoint_with_separate_lrs():
+    policy = _tiny_physical_policy()
+    mean_parameters = {
+        id(parameter)
+        for group in policy.actor_optimizer.param_groups
+        for parameter in group["params"]
+    }
+    std_parameters = {
+        id(parameter)
+        for group in policy.actor_std_optimizer.param_groups
+        for parameter in group["params"]
+    }
+
+    assert not mean_parameters.intersection(std_parameters)
+    assert std_parameters == {id(policy._ppo_actor_std_parameter())}
+    assert policy.actor_optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+    assert policy.actor_std_optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
+
+
+def test_physical_std_prior_step_is_exact_and_action_dimension_invariant():
+    one_joint = _tiny_physical_policy(action_dim=1)
+    many_joints = _tiny_physical_policy(action_dim=23)
+
+    one_metrics = one_joint._physical_actor_std_update()
+    many_metrics = many_joints._physical_actor_std_update()
+    expected = 0.5 - 1.0e-5 * (0.5 - 0.3)
+
+    assert one_joint._ppo_actor_std_parameter().item() == pytest.approx(expected)
+    assert torch.allclose(
+        many_joints._ppo_actor_std_parameter(),
+        torch.full((23,), expected),
+    )
+    assert many_joints._ppo_actor_std_parameter()[0].item() == pytest.approx(
+        one_joint._ppo_actor_std_parameter().item()
+    )
+    assert one_metrics["actor_std_prior_loss"].item() == pytest.approx(0.02)
+    assert many_metrics["actor_std_prior_loss"].item() == pytest.approx(0.02)
+    assert one_joint.actor_std_update_count == many_joints.actor_std_update_count == 1
+    assert one_joint._ppo_actor_std_parameter().grad is None
+    assert many_joints._ppo_actor_std_parameter().grad is None
+
+
+def test_physical_actor_update_keeps_std_independent_of_replay_q():
+    ordinary_q = _tiny_physical_policy(q_slope=1.0)
+    extreme_q = _tiny_physical_policy(q_slope=1.0e6)
+    ordinary_mean_before = ordinary_q.actor_adapt.mean_weight.detach().clone()
+    extreme_mean_before = extreme_q.actor_adapt.mean_weight.detach().clone()
+
+    ordinary_metrics = ordinary_q._actor_update(_tiny_physical_batch())
+    extreme_metrics = extreme_q._actor_update(_tiny_physical_batch())
+
+    assert torch.equal(
+        ordinary_q._ppo_actor_std_parameter(),
+        extreme_q._ppo_actor_std_parameter(),
+    )
+    assert ordinary_q._ppo_actor_std_parameter().grad is None
+    assert extreme_q._ppo_actor_std_parameter().grad is None
+    assert ordinary_q.actor_std_optimizer.step_calls == 1
+    assert extreme_q.actor_std_optimizer.step_calls == 1
+    assert ordinary_metrics["actor_std_step_abs_mean"].item() == pytest.approx(
+        extreme_metrics["actor_std_step_abs_mean"].item()
+    )
+    assert not torch.equal(
+        ordinary_q.actor_adapt.mean_weight - ordinary_mean_before,
+        extreme_q.actor_adapt.mean_weight - extreme_mean_before,
+    )
+
+
+def test_physical_gradient_probe_reports_replay_detached_std():
+    policy = _tiny_physical_policy()
+
+    result = diagnose_fastsac_actor_gradients(
+        policy,
+        _tiny_physical_batch(),
+        sample_seed=313,
+        source_gradients=False,
+    )
+
+    std_group = result["gradients"]["all"]["groups"]["global_log_std"]
+    assert std_group["unweighted_norms"]["bc"] == 0.0
+    assert std_group["unweighted_norms"]["q"] == 0.0
+    assert std_group["unweighted_norms"]["entropy"] == 0.0
+    assert std_group["unweighted_norms"]["sac"] == 0.0
+
+
+def test_physical_std_projection_and_nonfinite_failure_are_explicit():
+    policy = _tiny_physical_policy(action_dim=2)
+    with torch.no_grad():
+        policy._ppo_actor_std_parameter().copy_(torch.tensor([0.9, 0.01]))
+
+    metrics = policy._physical_actor_std_update()
+
+    std = policy._ppo_actor_std_parameter().detach()
+    assert torch.all((std >= 0.05) & (std <= 0.5))
+    assert metrics["actor_std_projection_fraction"].item() == pytest.approx(1.0)
+    with torch.no_grad():
+        policy._ppo_actor_std_parameter()[0] = torch.nan
+    with pytest.raises(RuntimeError, match="NaN/Inf"):
+        policy._physical_actor_std_update()
 
 
 def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
@@ -1303,6 +1502,27 @@ def _checkpoint_policy(seed: int):
     return policy
 
 
+def _physical_checkpoint_policy(seed: int):
+    policy = _checkpoint_policy(seed)
+    policy.cfg.sac_action_distribution = PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+    policy.cfg.sac_physical_std_lr = 1.0e-5
+    policy.cfg.sac_physical_std_prior = 0.3
+    policy.cfg.sac_physical_std_min = 0.05
+    policy.cfg.sac_physical_std_max = 0.5
+    policy.actor_backend = PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
+    policy.actor_adapt = _TinyPhysicalActor(1, mean_weight=0.25, std=0.5)
+    actor_std = policy._ppo_actor_std_parameter()
+    mean_parameters = tuple(
+        parameter
+        for parameter in policy.actor_adapt.parameters()
+        if parameter is not actor_std
+    )
+    policy.actor_optimizer = torch.optim.Adam(mean_parameters, lr=3.0e-3)
+    policy.actor_std_optimizer = torch.optim.SGD((actor_std,), lr=1.0e-5)
+    policy.actor_std_update_count = 0
+    return policy
+
+
 def test_physical_checkpoint_metadata_names_its_distribution_and_backend():
     policy = _checkpoint_policy(90)
     policy.cfg.sac_action_distribution = PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
@@ -1314,6 +1534,45 @@ def test_physical_checkpoint_metadata_names_its_distribution_and_backend():
     assert state["actor_backend"] == PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
     assert "physical_joint_std_gaussian" in state["actor_learning_semantics"]
     assert "physical_joint_std_gaussian" in state["entropy_semantics"]
+
+
+def test_physical_checkpoint_round_trips_separate_std_optimizer_and_next_step():
+    source = _physical_checkpoint_policy(95)
+    mean_parameters = tuple(
+        parameter
+        for group in source.actor_optimizer.param_groups
+        for parameter in group["params"]
+    )
+    _optimizer_step(mean_parameters, source.actor_optimizer)
+    source._physical_actor_std_update()
+    source._physical_actor_std_update()
+    state = copy.deepcopy(source._fastsac_checkpoint_state())
+
+    assert isinstance(
+        state["optimizer_resume_state"]["actor_std_optimizer"], dict
+    )
+    assert state["actor_std_update_count"] == 2
+
+    restored = _physical_checkpoint_policy(195)
+    restored._load_fastsac_checkpoint_state(state)
+
+    assert torch.equal(
+        restored._ppo_actor_std_parameter(), source._ppo_actor_std_parameter()
+    )
+    assert restored.actor_std_update_count == 2
+    _assert_nested_equal(
+        restored.actor_optimizer.state_dict(), source.actor_optimizer.state_dict()
+    )
+    _assert_nested_equal(
+        restored.actor_std_optimizer.state_dict(),
+        source.actor_std_optimizer.state_dict(),
+    )
+    source._physical_actor_std_update()
+    restored._physical_actor_std_update()
+    assert torch.equal(
+        restored._ppo_actor_std_parameter(), source._ppo_actor_std_parameter()
+    )
+    assert restored.actor_std_update_count == source.actor_std_update_count == 3
 
 
 def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
@@ -1418,6 +1677,7 @@ def _install_tiny_fastsac_inference_perception_stack(policy, seed: int) -> None:
     (
         (False, CHECKPOINT_VERSION),
         (False, PREVIOUS_CHECKPOINT_VERSION),
+        (False, 4),
         (True, 3),
     ),
 )

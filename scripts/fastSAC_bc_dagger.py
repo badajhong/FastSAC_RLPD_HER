@@ -605,6 +605,7 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         "q_action_input_gain",
         "q_update_to_data_ratio",
         "sac_actor_lr",
+        "sac_physical_std_lr",
         "sac_alpha_init",
         "sac_alpha_lr",
     ):
@@ -638,6 +639,29 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
             "algo.sac_target_entropy_ratio",
             cfg.algo.get("sac_target_entropy_ratio", None),
         )
+        for name in (
+            "sac_physical_std_prior",
+            "sac_physical_std_min",
+            "sac_physical_std_max",
+        ):
+            _finite_positive(f"algo.{name}", cfg.algo.get(name, None))
+        std_min = float(cfg.algo.sac_physical_std_min)
+        std_max = float(cfg.algo.sac_physical_std_max)
+        std_prior = float(cfg.algo.sac_physical_std_prior)
+        load_noise_scale = float(cfg.algo.load_noise_scale)
+        if not std_min < std_max:
+            raise ValueError(
+                "algo.sac_physical_std_min must be smaller than "
+                "algo.sac_physical_std_max"
+            )
+        if not std_min <= std_prior <= std_max:
+            raise ValueError(
+                "algo.sac_physical_std_prior must lie inside the std bounds"
+            )
+        if not std_min <= load_noise_scale <= std_max:
+            raise ValueError(
+                "algo.load_noise_scale must lie inside the physical std bounds"
+            )
     if cfg.algo.get("sac_alpha_update_cadence", None) != "actor":
         raise ValueError(
             "algo.sac_alpha_update_cadence must be 'actor' so temperature "
