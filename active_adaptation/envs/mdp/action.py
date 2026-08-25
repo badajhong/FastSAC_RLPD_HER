@@ -45,6 +45,14 @@ class JointPosition(ActionManager):
         **kwargs,
     ):
         super().__init__(env)
+        # A child Hydra task can set an inherited robot-specific pattern to
+        # null in order to remove it (for example, R1 has no waist-pitch DOF).
+        if isinstance(action_scaling, dict) or hasattr(action_scaling, "items"):
+            action_scaling = {
+                pattern: scale
+                for pattern, scale in dict(action_scaling).items()
+                if scale is not None
+            }
         self.joint_ids, self.joint_names, self.action_scaling = (
             string_utils.resolve_matching_names_values(
                 dict(action_scaling), self.asset.joint_names

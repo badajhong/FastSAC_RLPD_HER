@@ -1,0 +1,6 @@
+python scripts/play.py \
+    algo=ppo_vel_train \
+    task=R1/TEACH/sub3_largebox_003 \
+    task.command.replay_motion=true
+
+/home/hcc/research/HOI/train_r1/rl/largebox/sub3_largebox_003.npz

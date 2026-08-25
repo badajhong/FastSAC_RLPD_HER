@@ -2,12 +2,14 @@ import os
 
 from .objects import *
 from .g1 import *
+from .r1 import *
 
 
 ASSET_PATH = os.path.dirname(__file__)
 
 ROBOTS = {
     "g1": G1_CYLINDER_CFG,
+    "r1": R1_26DOF_CFG,
 }
 
 OBJECTS = {
@@ -16,6 +18,9 @@ OBJECTS = {
     "cart": CART_CFG,
     "wheelchair": WHEELCHAIR_CFG,
     "stairslope": STAIRSLOPE_CFG,
+    # The scene key intentionally matches the object body name embedded in the
+    # R1 motion archive.  The rigid body inside the USD is named ``baseLink``.
+    "largebox_link": R1_LARGEBOX_CFG,
 }
 
 
@@ -36,4 +41,3 @@ def get_asset_meta(asset: Articulation):
     for actuator_name, actuator in asset.actuators.items():
         meta["actuators"][actuator_name] = actuator.cfg.to_dict()
     return meta
-
