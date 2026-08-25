@@ -163,7 +163,7 @@ def test_physical_fastsac_checkpoint_overrides_structured_tanh_inference_default
         "training_algorithm": "distributional_fastsac_teacher_bc_v1",
         "dagger_backend_config": {
             "sac_action_distribution": "ppo_physical_gaussian",
-            "sac_use_autotune": False,
+            "sac_use_autotune": True,
             "load_noise_scale": 0.5,
         },
     }
@@ -173,18 +173,18 @@ def test_physical_fastsac_checkpoint_overrides_structured_tanh_inference_default
     )
 
     assert cfg.algo.sac_action_distribution == "ppo_physical_gaussian"
-    assert cfg.algo.sac_use_autotune is False
+    assert cfg.algo.sac_use_autotune is True
     assert cfg.algo.load_noise_scale == pytest.approx(0.5)
     assert "sac_action_distribution" in filled["checkpoint"]
 
 
-def test_physical_fastsac_inference_restores_named_std_prior_contract():
+def test_physical_fastsac_inference_restores_sac_std_guard_contract():
     cfg = OmegaConf.create(
         {
             "algo": {
                 "sac_action_distribution": "normalized_tanh",
-                "sac_physical_std_prior": 0.3,
-                "sac_physical_std_prior_by_joint": {},
+                "sac_physical_std_lr": 1.0e-5,
+                "sac_physical_std_max_kl": 0.01,
                 "sac_physical_std_min": 0.05,
                 "sac_physical_std_max": 0.5,
             }
@@ -194,13 +194,10 @@ def test_physical_fastsac_inference_restores_named_std_prior_contract():
         "training_algorithm": "distributional_fastsac_teacher_bc_v1",
         "dagger_backend_config": {
             "sac_action_distribution": "ppo_physical_gaussian",
-            "sac_use_autotune": False,
+            "sac_use_autotune": True,
             "load_noise_scale": 0.5,
-            "sac_physical_std_prior": 0.24,
-            "sac_physical_std_prior_by_joint": {
-                "hip_joint": 0.17,
-                "knee_joint": 0.29,
-            },
+            "sac_physical_std_lr": 2.0e-5,
+            "sac_physical_std_max_kl": 0.02,
             "sac_physical_std_min": 0.04,
             "sac_physical_std_max": 0.55,
         },
@@ -210,39 +207,12 @@ def test_physical_fastsac_inference_restores_named_std_prior_contract():
         cfg, policy_state, inference_only=True
     )
 
-    assert dict(cfg.algo.sac_physical_std_prior_by_joint) == pytest.approx(
-        {"hip_joint": 0.17, "knee_joint": 0.29}
-    )
-    assert cfg.algo.sac_physical_std_prior == pytest.approx(0.24)
+    assert cfg.algo.sac_physical_std_lr == pytest.approx(2.0e-5)
+    assert cfg.algo.sac_physical_std_max_kl == pytest.approx(0.02)
     assert cfg.algo.sac_physical_std_min == pytest.approx(0.04)
     assert cfg.algo.sac_physical_std_max == pytest.approx(0.55)
-    assert "sac_physical_std_prior_by_joint" in filled["checkpoint"]
-
-
-def test_physical_fastsac_inference_canonicalizes_null_named_std_prior():
-    cfg = OmegaConf.create(
-        {
-            "algo": {
-                "sac_action_distribution": "normalized_tanh",
-                "sac_physical_std_prior_by_joint": {},
-            }
-        }
-    )
-    policy_state = {
-        "training_algorithm": "distributional_fastsac_teacher_bc_v1",
-        "dagger_backend_config": {
-            "sac_action_distribution": "ppo_physical_gaussian",
-            "sac_use_autotune": False,
-            "load_noise_scale": 0.5,
-            "sac_physical_std_prior_by_joint": None,
-        },
-    }
-
-    helpers._fill_replayless_inference_algo_defaults(
-        cfg, policy_state, inference_only=True
-    )
-
-    assert dict(cfg.algo.sac_physical_std_prior_by_joint) == {}
+    assert "sac_physical_std_lr" in filled["checkpoint"]
+    assert "sac_physical_std_max_kl" in filled["checkpoint"]
 
 
 def test_old_fastsac_checkpoint_without_distribution_defaults_to_normalized_tanh():

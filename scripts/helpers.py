@@ -464,6 +464,7 @@ def _load_policy_checkpoint(
         "distributional_tvkd_fastsac_teacher_bc_v5",
         "distributional_tvkd_fastsac_teacher_bc_v6",
         "distributional_tvkd_fastsac_teacher_bc_v7",
+        "distributional_tvkd_fastsac_teacher_bc_v8",
     }
     if inference_only and algorithm in replayless_inference_algorithms:
         loader = getattr(policy, "load_inference_state_dict", None)
@@ -522,6 +523,7 @@ def _fill_replayless_inference_algo_defaults(
         "distributional_tvkd_fastsac_teacher_bc_v5",
         "distributional_tvkd_fastsac_teacher_bc_v6",
         "distributional_tvkd_fastsac_teacher_bc_v7",
+        "distributional_tvkd_fastsac_teacher_bc_v8",
     }:
         from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
             TVKDDistributionalFastSACTeacherBCConfig,
@@ -555,6 +557,7 @@ def _fill_replayless_inference_algo_defaults(
             "distributional_tvkd_fastsac_teacher_bc_v5",
             "distributional_tvkd_fastsac_teacher_bc_v6",
             "distributional_tvkd_fastsac_teacher_bc_v7",
+            "distributional_tvkd_fastsac_teacher_bc_v8",
         }:
             # This field changes Actor parameter ownership and the distribution
             # class, so the checkpoint must select it before construction even
@@ -575,13 +578,13 @@ def _fill_replayless_inference_algo_defaults(
                 filled_checkpoint.append("sac_action_distribution")
             if saved_distribution == "ppo_physical_gaussian":
                 saved_autotune = backend.get("sac_use_autotune")
-                if saved_autotune is not False:
+                if not isinstance(saved_autotune, bool):
                     raise ValueError(
                         "physical FastSAC inference checkpoint must record "
-                        "sac_use_autotune=false"
+                        "a boolean sac_use_autotune value"
                     )
-                if cfg.algo.get("sac_use_autotune") is not False:
-                    cfg.algo.sac_use_autotune = False
+                if cfg.algo.get("sac_use_autotune") is not saved_autotune:
+                    cfg.algo.sac_use_autotune = saved_autotune
                     filled_checkpoint.append("sac_use_autotune")
                 saved_load_scale = backend.get("load_noise_scale")
                 if (
@@ -597,39 +600,20 @@ def _fill_replayless_inference_algo_defaults(
                 if cfg.algo.get("load_noise_scale") != saved_load_scale:
                     cfg.algo.load_noise_scale = float(saved_load_scale)
                     filled_checkpoint.append("load_noise_scale")
-                # The structured inference config already contains an empty
-                # named-prior map, so the generic missing-field completion
-                # below would otherwise hide a saved PPOVEL joint profile.
                 # Copy every recorded physical-std control explicitly. This
                 # keeps checkpoint provenance exact even though deterministic
                 # evaluation uses only the restored mean action.
                 for name in (
                     "sac_physical_std_lr",
-                    "sac_physical_std_prior",
-                    "sac_physical_std_prior_by_joint",
+                    "sac_physical_std_max_kl",
                     "sac_physical_std_min",
                     "sac_physical_std_max",
                 ):
                     if name not in backend:
                         continue
                     saved_value = copy.deepcopy(backend[name])
-                    if name == "sac_physical_std_prior_by_joint":
-                        if saved_value is None:
-                            saved_value = {}
-                        elif not isinstance(saved_value, Mapping):
-                            raise ValueError(
-                                "physical FastSAC inference checkpoint has invalid "
-                                "sac_physical_std_prior_by_joint metadata"
-                            )
-                        else:
-                            saved_value = dict(saved_value)
                     current_value = cfg.algo.get(name)
-                    current_container = (
-                        dict(current_value)
-                        if isinstance(current_value, Mapping)
-                        else current_value
-                    )
-                    if current_container != saved_value:
+                    if current_value != saved_value:
                         cfg.algo[name] = saved_value
                         filled_checkpoint.append(name)
         if algorithm in {
@@ -640,6 +624,7 @@ def _fill_replayless_inference_algo_defaults(
             "distributional_tvkd_fastsac_teacher_bc_v5",
             "distributional_tvkd_fastsac_teacher_bc_v6",
             "distributional_tvkd_fastsac_teacher_bc_v7",
+            "distributional_tvkd_fastsac_teacher_bc_v8",
         }:
             # ValueNorm changes the module type, so it must be selected from
             # the checkpoint before policy construction even when an eval

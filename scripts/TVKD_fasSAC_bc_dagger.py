@@ -23,7 +23,6 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     ACTOR_BACKEND,
-    ACTOR_LEARNING_SEMANTICS,
     BOTTLENECK_LOCATION_SEMANTICS,
     CHECKPOINT_VERSION,
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
@@ -50,6 +49,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     V5_TRAINING_ALGORITHM,
     V6_CHECKPOINT_VERSION,
     V6_TRAINING_ALGORITHM,
+    V7_CHECKPOINT_VERSION,
+    V7_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
@@ -61,6 +62,7 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     TVKDDistributionalFastSACTeacherBC,
     TVKDDistributionalFastSACTeacherBCConfig,
     _same_verified_histogram_state,
+    _tvkd_actor_learning_semantics,
     _validate_tvkd_algorithm_config,
     compute_teacher_value_terms,
 )
@@ -265,10 +267,15 @@ def _validate_tvkd_resume_policy_state(
     require_student_focus_counters: bool = False,
 ) -> None:
     """Fail before W&B/Isaac startup when continuation state is incomplete."""
-    verified_v5_plus = (
+    checkpoint_pair = (
         policy_state.get("training_algorithm"),
         policy_state.get("checkpoint_version"),
-    ) in {
+    )
+    current_checkpoint = checkpoint_pair == (
+        TRAINING_ALGORITHM,
+        CHECKPOINT_VERSION,
+    )
+    verified_v5_plus = checkpoint_pair in {
         (V5_TRAINING_ALGORITHM, V5_CHECKPOINT_VERSION),
         (TRAINING_ALGORITHM, CHECKPOINT_VERSION),
     }
@@ -332,6 +339,8 @@ def _validate_tvkd_resume_policy_state(
         source_algo.get("sac_action_distribution", "normalized_tanh")
         == "ppo_physical_gaussian"
     )
+    if current_checkpoint and "actor_std_optimizer" not in optimizers:
+        raise ValueError("TVKD resume checkpoint lacks actor_std_optimizer entry")
     actor_std_optimizer = optimizers.get("actor_std_optimizer")
     if physical_gaussian:
         if not isinstance(actor_std_optimizer, Mapping):
@@ -352,7 +361,7 @@ def _validate_tvkd_resume_policy_state(
         if not enabled and value is not None:
             raise ValueError(f"TVKD resume checkpoint has unexpected {name}")
 
-    counters = (
+    counters = [
         "actor_update_count",
         "critic_update_count",
         "alpha_update_count",
@@ -363,7 +372,9 @@ def _validate_tvkd_resume_policy_state(
         "num_updates",
         "sac_actor_update_count",
         "sac_alpha_update_count",
-    )
+    ]
+    if current_checkpoint:
+        counters.append("actor_std_update_count")
     for name in counters:
         value = policy_state.get(name)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -705,7 +716,7 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         policy_state.get("training_algorithm"),
         policy_state.get("checkpoint_version"),
     ) == (V5_TRAINING_ALGORITHM, V5_CHECKPOINT_VERSION)
-    label = "v5" if legacy_v5 else "v7"
+    label = "v5" if legacy_v5 else "v8"
     replay_mix = policy_state.get("replay_mix_state")
     if not isinstance(replay_mix, Mapping):
         raise ValueError(f"TVKD {label} checkpoint lacks replay mix state")
@@ -740,7 +751,7 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         "actor_learning_semantics": (
             V5_ACTOR_LEARNING_SEMANTICS
             if legacy_v5
-            else ACTOR_LEARNING_SEMANTICS
+            else _tvkd_actor_learning_semantics(cfg.algo)
         ),
         "perception_replay_mode": str(cfg.algo.perception_replay_mode),
         "perception_training_semantics": (
@@ -1038,6 +1049,7 @@ def _prepare_tvkd_checkpoint(
     v4 = algorithm == V4_TRAINING_ALGORITHM and version == V4_CHECKPOINT_VERSION
     v5 = algorithm == V5_TRAINING_ALGORITHM and version == V5_CHECKPOINT_VERSION
     v6 = algorithm == V6_TRAINING_ALGORITHM and version == V6_CHECKPOINT_VERSION
+    v7 = algorithm == V7_TRAINING_ALGORITHM and version == V7_CHECKPOINT_VERSION
     current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
     same_scientific_contract = v5 or current
     explicitly_changed_mix = frozenset(explicit_replay_mix_fields).intersection(
@@ -1075,7 +1087,7 @@ def _prepare_tvkd_checkpoint(
     if same_scientific_contract and explicitly_changed_mix.intersection(
         canonical_authority_alias_fields
     ):
-        version_label = "v5" if v5 else "v7"
+        version_label = "v5" if v5 else "v8"
         warnings.warn(
             f"This TVKD {version_label} checkpoint predates CLI alias resolution: "
             "its saved "
@@ -1087,13 +1099,20 @@ def _prepare_tvkd_checkpoint(
     if v4:
         raise ValueError(
             "TVKD v4 checkpoints cannot resume under the verified replay/value "
-            "contract; start v7 from the frozen PPO checkpoint"
+            "contract; start v8 from the frozen PPO checkpoint"
         )
     if v6:
         raise ValueError(
-            "TVKD v6 training resume is incompatible with the v7 physical-std "
-            "optimizer contract; start v7 from the frozen PPO checkpoint. "
+            "TVKD v6 training resume is incompatible with the v8 physical-std "
+            "optimizer contract; start v8 from the frozen PPO checkpoint. "
             "The v6 checkpoint remains available for model-only inference."
+        )
+    if v7:
+        raise ValueError(
+            "TVKD v7 training resume is incompatible with the v8 physical-std "
+            "SAC-gradient, separate-Adam, and rollout-KL contract; start v8 "
+            "from the frozen PPO checkpoint. The v7 checkpoint remains "
+            "available for model-only inference."
         )
     if not (legacy or previous or v3 or v5 or current):
         raise ValueError("fastsac_bc_dagger_checkpoint is not a TVKD checkpoint")
@@ -1125,7 +1144,7 @@ def _prepare_tvkd_checkpoint(
         )
     elif v5:
         warnings.warn(
-            "Migrating a normalized-tanh TVKD v5 checkpoint to v7 with fresh "
+            "Migrating a normalized-tanh TVKD v5 checkpoint to v8 with fresh "
             "replay rings and "
             "fresh Teacher episode/current-EMA cache sidecars; model, optimizer, "
             "RNG, bottleneck, and verified-histogram state are retained.",
@@ -1215,11 +1234,6 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault(
         "sac_action_distribution", "normalized_tanh"
     )
-    # Early v7 checkpoints predate the optional named prior. Their physical
-    # std behavior is exactly the scalar fallback represented by an empty map.
-    source_algo_contract.setdefault("sac_physical_std_prior_by_joint", {})
-    if source_algo_contract["sac_physical_std_prior_by_joint"] is None:
-        source_algo_contract["sac_physical_std_prior_by_joint"] = {}
     # Legacy v1 checkpoints predate this explicit provenance field but already
     # used one alpha update per Critic. v2+ checkpoints must contain it.
     if legacy:
@@ -1228,12 +1242,11 @@ def _prepare_tvkd_checkpoint(
         cfg.algo, resolve=True, enum_to_str=True
     )
     if v5:
-        # TVKD v5 was normalized-tanh only; the v7 physical-std controls are
+        # TVKD v5 was normalized-tanh only; the v8 physical-std controls are
         # inert for that distribution and can safely take today's defaults.
         for name in (
             "sac_physical_std_lr",
-            "sac_physical_std_prior",
-            "sac_physical_std_prior_by_joint",
+            "sac_physical_std_max_kl",
             "sac_physical_std_min",
             "sac_physical_std_max",
         ):

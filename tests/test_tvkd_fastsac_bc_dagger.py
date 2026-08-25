@@ -68,6 +68,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     V5_TRAINING_ALGORITHM as TVKD_V5_TRAINING_ALGORITHM,
     V6_CHECKPOINT_VERSION as TVKD_V6_CHECKPOINT_VERSION,
     V6_TRAINING_ALGORITHM as TVKD_V6_TRAINING_ALGORITHM,
+    V7_CHECKPOINT_VERSION as TVKD_V7_CHECKPOINT_VERSION,
+    V7_TRAINING_ALGORITHM as TVKD_V7_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
@@ -272,7 +274,7 @@ def _strict_v5_policy_metadata(
 ) -> dict:
     return {
         "critic_learning_semantics": tvkd_module.CRITIC_LEARNING_SEMANTICS,
-        "actor_learning_semantics": tvkd_module.ACTOR_LEARNING_SEMANTICS,
+        "actor_learning_semantics": tvkd_module._tvkd_actor_learning_semantics(cfg),
         "replay_mix_state": _checkpoint_replay_mix(cfg),
         "perception_replay_mode": str(cfg.perception_replay_mode),
         "perception_training_semantics": (
@@ -2706,6 +2708,7 @@ def test_unsuccessful_episode_without_threshold_crossing_creates_no_focus():
         TVKD_V4_TRAINING_ALGORITHM,
         TVKD_V5_TRAINING_ALGORITHM,
         TVKD_V6_TRAINING_ALGORITHM,
+        TVKD_V7_TRAINING_ALGORITHM,
         TVKD_TRAINING_ALGORITHM,
     ),
 )
@@ -2723,9 +2726,13 @@ def test_tvkd_inference_forces_checkpoint_value_norm_before_construction(algorit
     assert "value_norm" in result["checkpoint"]
 
 
-def test_tvkd_v7_version_identity_preserves_v6_for_inference():
-    assert TVKD_TRAINING_ALGORITHM == "distributional_tvkd_fastsac_teacher_bc_v7"
-    assert TVKD_CHECKPOINT_VERSION == 7
+def test_tvkd_v8_version_identity_preserves_v7_for_inference():
+    assert TVKD_TRAINING_ALGORITHM == "distributional_tvkd_fastsac_teacher_bc_v8"
+    assert TVKD_CHECKPOINT_VERSION == 8
+    assert TVKD_V7_TRAINING_ALGORITHM == (
+        "distributional_tvkd_fastsac_teacher_bc_v7"
+    )
+    assert TVKD_V7_CHECKPOINT_VERSION == 7
     assert TVKD_V6_TRAINING_ALGORITHM == (
         "distributional_tvkd_fastsac_teacher_bc_v6"
     )
@@ -2738,6 +2745,20 @@ def test_tvkd_v7_version_identity_preserves_v6_for_inference():
     assert TVKD_V4_CHECKPOINT_VERSION == 4
     assert TVKD_V3_TRAINING_ALGORITHM == ("distributional_tvkd_fastsac_teacher_bc_v3")
     assert TVKD_V3_CHECKPOINT_VERSION == 3
+
+
+def test_tvkd_v8_actor_semantics_follow_selected_action_distribution():
+    normalized = TVKDDistributionalFastSACTeacherBCConfig()
+    physical = TVKDDistributionalFastSACTeacherBCConfig(
+        sac_action_distribution="ppo_physical_gaussian"
+    )
+
+    assert tvkd_module._tvkd_actor_learning_semantics(normalized) == (
+        tvkd_module.NORMALIZED_ACTOR_LEARNING_SEMANTICS
+    )
+    assert tvkd_module._tvkd_actor_learning_semantics(physical) == (
+        tvkd_module.ACTOR_LEARNING_SEMANTICS
+    )
 
 
 def test_tvkd_v4_training_resume_is_rejected_under_v5_sampler():
@@ -2771,15 +2792,32 @@ def test_tvkd_v6_training_resume_is_rejected_but_kept_for_inference():
         )
 
 
+def test_tvkd_v7_training_resume_is_rejected_but_kept_for_inference():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+
+    with pytest.raises(ValueError, match="v7 training resume is incompatible"):
+        policy._load_fastsac_checkpoint_state(
+            {
+                "training_algorithm": TVKD_V7_TRAINING_ALGORITHM,
+                "checkpoint_version": TVKD_V7_CHECKPOINT_VERSION,
+            },
+            load_modules=False,
+        )
+
+
 @pytest.mark.parametrize(
     "algorithm",
     (
         TVKD_V5_TRAINING_ALGORITHM,
         TVKD_V6_TRAINING_ALGORITHM,
+        TVKD_V7_TRAINING_ALGORITHM,
         TVKD_TRAINING_ALGORITHM,
     ),
 )
-def test_tvkd_v5_v6_v7_inference_uses_the_replayless_model_only_loader(algorithm):
+def test_tvkd_v5_through_v8_inference_uses_replayless_model_only_loader(algorithm):
     calls = []
 
     class _InferencePolicy:
@@ -2878,7 +2916,7 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
     assert not any(key.startswith("bc_scheduler/") for key in info)
 
 
-def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
+def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
     monkeypatch,
 ):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
@@ -2907,6 +2945,7 @@ def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
     policy.opt_dr_estimator.step()
     policy.num_updates = 17
     policy.actor_update_count = 19
+    policy.actor_std_update_count = 0
     policy.sac_actor_update_count = 19
     policy.alpha_update_count = 23
     policy.sac_alpha_update_count = 23
@@ -2943,7 +2982,8 @@ def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
         "_fastsac_checkpoint_state",
         lambda self: {
             "baseline_state": torch.tensor(1.0),
-            "optimizer_resume_state": {},
+            "optimizer_resume_state": {"actor_std_optimizer": None},
+            "actor_std_update_count": self.actor_std_update_count,
             "dagger_backend_config": _strict_v5_backend_config(self.cfg),
         },
     )
@@ -3043,28 +3083,6 @@ def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
     )
     assert translated[0][1] is False
 
-    early_v7_state = copy.deepcopy(state)
-    early_v7_state["dagger_backend_config"].pop(
-        "sac_physical_std_prior_by_joint"
-    )
-    policy._load_fastsac_checkpoint_state(early_v7_state, load_modules=False)
-    assert len(translated) == 2
-    assert translated[-1][0]["checkpoint_version"] == (
-        tvkd_module.BASE_FASTSAC_CHECKPOINT_VERSION
-    )
-
-    null_prior_v7_state = copy.deepcopy(state)
-    null_prior_v7_state["dagger_backend_config"][
-        "sac_physical_std_prior_by_joint"
-    ] = None
-    policy._load_fastsac_checkpoint_state(
-        null_prior_v7_state, load_modules=False
-    )
-    assert len(translated) == 3
-    assert translated[-1][0]["checkpoint_version"] == (
-        tvkd_module.BASE_FASTSAC_CHECKPOINT_VERSION
-    )
-
     v5_state = copy.deepcopy(state)
     v5_state["training_algorithm"] = TVKD_V5_TRAINING_ALGORITHM
     v5_state["checkpoint_version"] = TVKD_V5_CHECKPOINT_VERSION
@@ -3078,17 +3096,16 @@ def test_tvkd_v7_checkpoint_saves_state_and_accepts_safe_v5_migration(
     )
     for name in (
         "sac_physical_std_lr",
-        "sac_physical_std_prior",
-        "sac_physical_std_prior_by_joint",
+        "sac_physical_std_max_kl",
         "sac_physical_std_min",
         "sac_physical_std_max",
     ):
         v5_state["dagger_backend_config"].pop(name, None)
     v5_state.pop("actor_replay_observation_semantics")
     v5_state.pop("teacher_episode_sidecar_semantics")
-    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v7"):
+    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v8"):
         policy._load_fastsac_checkpoint_state(v5_state, load_modules=False)
-    assert len(translated) == 4
+    assert len(translated) == 2
     assert translated[-1][0]["checkpoint_version"] == (
         tvkd_module.BASE_FASTSAC_CHECKPOINT_VERSION
     )
@@ -3249,6 +3266,7 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
             },
             "optimizer_resume_state": {
                 "actor_optimizer": {},
+                "actor_std_optimizer": None,
                 "critic_optimizer": {},
                 "alpha_optimizer": {},
                 "adapt_optimizer": {},
@@ -3263,6 +3281,7 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
             "vecnorm_fingerprint": "vecnorm",
             "log_alpha": torch.tensor(-2.0),
             "actor_update_count": 1,
+            "actor_std_update_count": 0,
             "critic_update_count": 2,
             "alpha_update_count": 3,
             "q_update_row_credit": 383.0,
@@ -3340,7 +3359,7 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
                 f"fastsac_bc_dagger_checkpoint={v5_checkpoint_path}",
             ],
         )
-    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v7"):
+    with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v8"):
         v5_result = _prepare_tvkd_checkpoint(v5_cfg)
     assert v5_result == {
         "path": str(v5_checkpoint_path.resolve()),
@@ -3969,8 +3988,12 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
         },
         "vecnorm_fingerprint": "same-vecnorm",
         "perception_initialization": {"trainable": False},
-        "optimizer_resume_state": {"dr_estimator_optimizer": None},
+        "optimizer_resume_state": {
+            "actor_std_optimizer": None,
+            "dr_estimator_optimizer": None,
+        },
         "num_updates": 0,
+        "actor_std_update_count": 0,
         "sac_actor_update_count": 0,
         "sac_alpha_update_count": 0,
         "actor": policy.actor.state_dict(),

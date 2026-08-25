@@ -32,7 +32,6 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     TRAINING_ALGORITHM,
     _validate_fastsac_entropy_target_controls,
-    _validate_fastsac_physical_std_prior_by_joint,
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
@@ -606,7 +605,6 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         "q_action_input_gain",
         "q_update_to_data_ratio",
         "sac_actor_lr",
-        "sac_physical_std_lr",
         "sac_alpha_init",
         "sac_alpha_lr",
     ):
@@ -628,11 +626,6 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
             field_prefix="algo",
         )
     else:
-        if bool(cfg.algo.sac_use_autotune):
-            raise ValueError(
-                "algo.sac_action_distribution=ppo_physical_gaussian requires "
-                "algo.sac_use_autotune=false"
-            )
         _finite_positive(
             "algo.load_noise_scale", cfg.algo.get("load_noise_scale", None)
         )
@@ -641,30 +634,20 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
             cfg.algo.get("sac_target_entropy_ratio", None),
         )
         for name in (
-            "sac_physical_std_prior",
+            "sac_physical_std_lr",
+            "sac_physical_std_max_kl",
             "sac_physical_std_min",
             "sac_physical_std_max",
         ):
             _finite_positive(f"algo.{name}", cfg.algo.get(name, None))
         std_min = float(cfg.algo.sac_physical_std_min)
         std_max = float(cfg.algo.sac_physical_std_max)
-        std_prior = float(cfg.algo.sac_physical_std_prior)
         load_noise_scale = float(cfg.algo.load_noise_scale)
         if not std_min < std_max:
             raise ValueError(
                 "algo.sac_physical_std_min must be smaller than "
                 "algo.sac_physical_std_max"
             )
-        if not std_min <= std_prior <= std_max:
-            raise ValueError(
-                "algo.sac_physical_std_prior must lie inside the std bounds"
-            )
-        _validate_fastsac_physical_std_prior_by_joint(
-            cfg.algo.get("sac_physical_std_prior_by_joint", None),
-            std_min,
-            std_max,
-            field_prefix="algo",
-        )
         if not std_min <= load_noise_scale <= std_max:
             raise ValueError(
                 "algo.load_noise_scale must lie inside the physical std bounds"

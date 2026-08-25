@@ -139,20 +139,18 @@ algo:
 
   # Policy distribution. ``normalized_tanh`` is the historical bounded
   # FastSAC policy. ``ppo_physical_gaussian`` instead uses PPOVEL's raw
-  # physical-action mean and directly learned joint-wise actor_std; it requires
-  # sac_use_autotune=false and initializes every joint from load_noise_scale.
+  # physical-action mean and direct joint-wise actor_std, initialized uniformly
+  # from load_noise_scale. Fixed-temperature and autotuned SAC are both valid.
   eta_sac: 1.0e-4
   lambda_bc: 1.0
   sac_actor_lr: 3.0e-4
   sac_action_distribution: normalized_tanh
-  # Physical Gaussian only: replay Q/entropy/BC update the mean but never std.
-  # A separate SGD step (one per delayed Actor step) contracts direct PPOVEL
-  # actor_std from load_noise_scale toward the scalar fallback below, or toward
-  # an exact joint-name mapping when prior_by_joint is configured. Named values
-  # prevent a same-length prior from being assigned in the wrong action order.
+  # Physical Gaussian only: the ordinary SAC alpha*logpi-Q objective controls
+  # actor_std; Teacher BC remains mean-only. A separate small-LR Adam and hard
+  # bounds slow its movement, while the rollout-old std-only KL cap guards
+  # against abrupt changes without imposing a fixed target or checkpoint prior.
   sac_physical_std_lr: 1.0e-5
-  sac_physical_std_prior: 0.3
-  sac_physical_std_prior_by_joint: {}
+  sac_physical_std_max_kl: 0.01
   sac_physical_std_min: 0.05
   sac_physical_std_max: 0.5
   # The next three fields apply only to normalized_tanh.

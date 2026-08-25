@@ -348,12 +348,7 @@ def diagnose_fastsac_actor_gradients(
         raw_prediction = policy._actor_mean_from_flat(observations)
         if not torch.isfinite(raw_prediction).all():
             raise RuntimeError("FastSAC gradient probe Actor mean is non-finite")
-        uses_physical = bool(
-            getattr(policy, "_uses_ppo_physical_gaussian", lambda: False)()
-        )
-        distribution = policy._sac_dist_from_mean(
-            raw_prediction, detach_physical_std=uses_physical
-        )
+        distribution = policy._sac_dist_from_mean(raw_prediction)
         mean_action = distribution.mean
         sampled_action, raw_log_prob = distribution.rsample_with_log_prob(
             generator=generator

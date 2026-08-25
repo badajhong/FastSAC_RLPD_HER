@@ -40,11 +40,14 @@ from tensordict import TensorDict
 from .common import CMD_KEY, DONE_KEY, OBS_KEY, OBS_PRIV_KEY, REWARD_KEY, TERM_KEY
 from .fastsac_bc_dagger import (
     ACTOR_BACKEND,
+    ACTOR_LEARNING_SEMANTICS as BASE_NORMALIZED_ACTOR_LEARNING_SEMANTICS,
     CHECKPOINT_VERSION as BASE_FASTSAC_CHECKPOINT_VERSION,
     NORMALIZED_TANH_ACTION_DISTRIBUTION,
+    PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     TRAINING_ALGORITHM as BASE_FASTSAC_TRAINING_ALGORITHM,
     DistributionalFastSACTeacherBC,
     DistributionalFastSACTeacherBCConfig,
+    _fastsac_action_distribution,
     _fastsac_actor_backend,
 )
 from .fastsac_vel import _vaic_truncation_mask
@@ -73,14 +76,16 @@ from .td3_bc_dagger import (
     _project_c51_probabilities,
 )
 
-TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v7"
+TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v8"
+V7_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v7"
 V6_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v6"
 V5_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v5"
 V4_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v4"
 V3_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v3"
 PREVIOUS_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v2"
 LEGACY_TRAINING_ALGORITHM = "distributional_tvkd_fastsac_teacher_bc_v1"
-CHECKPOINT_VERSION = 7
+CHECKPOINT_VERSION = 8
+V7_CHECKPOINT_VERSION = 7
 V6_CHECKPOINT_VERSION = 6
 V5_CHECKPOINT_VERSION = 5
 V4_CHECKPOINT_VERSION = 4
@@ -102,12 +107,25 @@ TEACHER_VALUE_BOUNDARY_SEMANTICS = (
     "shared_continuation_coefficient_next_state_bootstrap_v2"
 )
 ACTOR_LEARNING_SEMANTICS = (
-    "distribution_specific_fastsac_mean_plus_fixed_joint_valid_teacher_label_bc_"
-    "with_physical_std_replay_detach_and_separate_bounded_prior_optimizer_v3"
+    "reparameterized_ppo_physical_joint_std_gaussian_alpha_logpi_minus_online_"
+    "twin_min_plus_fixed_joint_valid_teacher_label_mean_bc_with_separate_low_lr_"
+    "std_adam_rollout_scale_kl_cap_and_hard_bounds_v4"
 )
+NORMALIZED_ACTOR_LEARNING_SEMANTICS = BASE_NORMALIZED_ACTOR_LEARNING_SEMANTICS
 V5_ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_sac_plus_fixed_joint_valid_teacher_label_bc_v2"
 )
+
+
+def _tvkd_actor_learning_semantics(config) -> str:
+    distribution = _fastsac_action_distribution(config)
+    if distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION:
+        return NORMALIZED_ACTOR_LEARNING_SEMANTICS
+    if distribution == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
+        return ACTOR_LEARNING_SEMANTICS
+    raise ValueError(f"unsupported FastSAC action distribution {distribution!r}")
+
+
 BOTTLENECK_SELECTION_MODES = ("first", "last", "deepest")
 BOTTLENECK_LOCATION_SEMANTICS = (
     "frozen_teacher_raw_td_full_causal_mean_sustained_student_replay_valid_v2"
@@ -2768,7 +2786,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         info["source/actor_bottleneck_student_fraction"] = self._mean_optional_metric(
             actor_metrics, "actor_failure_phase_student_fraction"
         )
-        info["tvkd/method_distributional_tvkd_fastsac_teacher_bc_v7"] = 1.0
+        info["tvkd/method_distributional_tvkd_fastsac_teacher_bc_v8"] = 1.0
         self._last_tvkd_diagnostics = {
             key: float(value)
             for key, value in info.items()
@@ -3239,7 +3257,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "training_algorithm": TRAINING_ALGORITHM,
                 "checkpoint_version": CHECKPOINT_VERSION,
                 "critic_learning_semantics": CRITIC_LEARNING_SEMANTICS,
-                "actor_learning_semantics": ACTOR_LEARNING_SEMANTICS,
+                "actor_learning_semantics": _tvkd_actor_learning_semantics(
+                    self.cfg
+                ),
                 "q_backend_config": {
                     "target_semantics": CRITIC_LEARNING_SEMANTICS,
                     "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
@@ -3324,6 +3344,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         v4 = algorithm == V4_TRAINING_ALGORITHM and version == V4_CHECKPOINT_VERSION
         v5 = algorithm == V5_TRAINING_ALGORITHM and version == V5_CHECKPOINT_VERSION
         v6 = algorithm == V6_TRAINING_ALGORITHM and version == V6_CHECKPOINT_VERSION
+        v7 = algorithm == V7_TRAINING_ALGORITHM and version == V7_CHECKPOINT_VERSION
         current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
         if v4:
             raise ValueError(
@@ -3332,9 +3353,16 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
         if v6:
             raise ValueError(
-                "TVKD v6 training resume is incompatible with the v7 physical-std "
-                "optimizer contract; start v7 from the frozen PPO source. The v6 "
+                "TVKD v6 training resume is incompatible with the v8 physical-std "
+                "optimizer contract; start v8 from the frozen PPO source. The v6 "
                 "checkpoint remains supported for model-only inference."
+            )
+        if v7:
+            raise ValueError(
+                "TVKD v7 training resume is incompatible with the v8 physical-std "
+                "SAC-gradient, separate-Adam, and rollout-KL contract; start v8 "
+                "from the frozen PPO source. The v7 checkpoint remains supported "
+                "for model-only inference."
             )
         if not (legacy or previous or v3 or v5 or current):
             raise ValueError("not a TVKD FastSAC Teacher-BC checkpoint")
@@ -3362,7 +3390,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 student_focus_default=(0.0 if legacy or previous else None),
             )
         if v5 or current:
-            contract_label = "v7" if current else "v5"
+            contract_label = "v8" if current else "v5"
             expected_backend = self._checkpoint_config()
             if v5:
                 if state.get(
@@ -3371,13 +3399,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 ) != NORMALIZED_TANH_ACTION_DISTRIBUTION:
                     raise ValueError(
                         "TVKD v5 physical-Gaussian optimizer state cannot be "
-                        "migrated to the separated v7 std optimizer"
+                        "migrated to the separated v8 std optimizer"
                     )
                 expected_backend["method"] = V5_TRAINING_ALGORITHM
                 for name in (
                     "sac_physical_std_lr",
-                    "sac_physical_std_prior",
-                    "sac_physical_std_prior_by_joint",
+                    "sac_physical_std_max_kl",
                     "sac_physical_std_min",
                     "sac_physical_std_max",
                 ):
@@ -3411,13 +3438,6 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             missing_optional = set(expected_backend).difference(backend) & (
                 legacy_optional_diagnostic_keys
             )
-            if (
-                current
-                and backend.get("sac_physical_std_prior_by_joint") is None
-                and not expected_backend.get("sac_physical_std_prior_by_joint")
-            ):
-                backend = dict(backend)
-                backend["sac_physical_std_prior_by_joint"] = {}
             if missing_optional:
                 backend = dict(backend)
                 for name in missing_optional:
@@ -3470,7 +3490,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "actor_learning_semantics": (
                     V5_ACTOR_LEARNING_SEMANTICS
                     if v5
-                    else ACTOR_LEARNING_SEMANTICS
+                    else _tvkd_actor_learning_semantics(self.cfg)
                 ),
                 "perception_replay_mode": str(self.cfg.perception_replay_mode),
                 "perception_training_semantics": (
@@ -3608,7 +3628,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
         elif v5:
             warnings.warn(
-                "Migrating a normalized-tanh TVKD v5 checkpoint to v7: model, "
+                "Migrating a normalized-tanh TVKD v5 checkpoint to v8: model, "
                 "optimizer, RNG, "
                 "bottleneck, and verified-histogram state are retained; the "
                 "non-serialized replay rings and Teacher episode/current-EMA "
@@ -3646,6 +3666,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         optimizer_state = state.get("optimizer_resume_state")
         if not isinstance(optimizer_state, Mapping):
             raise ValueError("TVKD checkpoint lacks optimizer state")
+        if current and "actor_std_optimizer" not in optimizer_state:
+            raise ValueError("TVKD checkpoint lacks actor_std optimizer entry")
         if "dr_estimator_optimizer" not in optimizer_state:
             raise ValueError("TVKD checkpoint lacks DR-estimator optimizer state")
         dr_optimizer_state = optimizer_state["dr_estimator_optimizer"]
@@ -3657,11 +3679,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         elif dr_optimizer_state is not None:
             raise ValueError("frozen DR estimator checkpoint has an optimizer state")
         resume_counters = {}
-        for name in (
+        counter_names = [
             "num_updates",
             "sac_actor_update_count",
             "sac_alpha_update_count",
-        ):
+        ]
+        if current:
+            counter_names.append("actor_std_update_count")
+        for name in counter_names:
             value = state.get(name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"TVKD checkpoint {name} is invalid")
@@ -3765,6 +3790,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             raise ValueError("TVKD inference checkpoint version is invalid")
         if (algorithm, version) not in {
             (TRAINING_ALGORITHM, CHECKPOINT_VERSION),
+            (V7_TRAINING_ALGORITHM, V7_CHECKPOINT_VERSION),
             (V6_TRAINING_ALGORITHM, V6_CHECKPOINT_VERSION),
             (V5_TRAINING_ALGORITHM, V5_CHECKPOINT_VERSION),
             (V4_TRAINING_ALGORITHM, V4_CHECKPOINT_VERSION),
@@ -3815,6 +3841,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         # non-serialized Teacher episode/current-EMA cache sidecar.
         if state_dict.get("training_algorithm") not in {
             TRAINING_ALGORITHM,
+            V7_TRAINING_ALGORITHM,
             V6_TRAINING_ALGORITHM,
             V5_TRAINING_ALGORITHM,
             V4_TRAINING_ALGORITHM,
@@ -3894,6 +3921,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
 __all__ = [
     "ACTOR_BACKEND",
+    "ACTOR_LEARNING_SEMANTICS",
     "BOTTLENECK_LOCATION_SEMANTICS",
     "BOTTLENECK_SELECTION_MODES",
     "CHECKPOINT_VERSION",
@@ -3901,6 +3929,7 @@ __all__ = [
     "LEGACY_ADAPTIVE_BC_CONFIG_FIELDS",
     "LEGACY_CHECKPOINT_VERSION",
     "LEGACY_TRAINING_ALGORITHM",
+    "NORMALIZED_ACTOR_LEARNING_SEMANTICS",
     "PREVIOUS_CHECKPOINT_VERSION",
     "PREVIOUS_TRAINING_ALGORITHM",
     "REPLAY_RESUME_SEMANTICS",
@@ -3910,6 +3939,8 @@ __all__ = [
     "TEACHER_VALUE_BOUNDARY_SEMANTICS",
     "TEACHER_VALUE_RETURN_SEMANTICS",
     "TRAINING_ALGORITHM",
+    "V7_CHECKPOINT_VERSION",
+    "V7_TRAINING_ALGORITHM",
     "V6_CHECKPOINT_VERSION",
     "V6_TRAINING_ALGORITHM",
     "V5_CHECKPOINT_VERSION",
@@ -3928,6 +3959,7 @@ __all__ = [
     "TeacherValueTerms",
     "TVKDDistributionalFastSACTeacherBC",
     "TVKDDistributionalFastSACTeacherBCConfig",
+    "_tvkd_actor_learning_semantics",
     "compute_continuation_coefficient",
     "compute_teacher_value_continuation",
     "compute_teacher_value_terms",
