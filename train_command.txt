@@ -67,19 +67,19 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.dagger_bc_lr=3.0e-4 \
   algo.eta_sac=5.0e-3 \
   algo.sac_action_distribution=ppo_physical_gaussian \
-  algo.load_noise_scale=0.15 \
-  algo.sac_physical_std_lr=1.0e-5 \
+  algo.load_noise_scale=0.2 \
+  algo.sac_physical_std_lr=5.0e-5 \
   algo.sac_physical_std_max_kl=0.005 \
   algo.sac_physical_std_bound_mode=q_normalized \
   algo.sac_physical_std_min=0.05 \
-  algo.sac_physical_std_max=0.20 \
+  algo.sac_physical_std_max=0.3 \
   algo.sac_physical_std_normalized_min=0.02 \
-  algo.sac_physical_std_normalized_max=0.11 \
+  algo.sac_physical_std_normalized_max=0.12 \
   algo.sac_use_autotune=true \
-  algo.sac_alpha_init=2.0e-5 \
-  algo.sac_alpha_lr=2.0e-5 \
+  algo.sac_alpha_init=1.0e-4 \
+  algo.sac_alpha_lr=5.0e-5 \
   algo.sac_alpha_update_cadence=actor \
-  algo.sac_target_entropy_ratio=1.2 \
+  algo.sac_target_entropy_ratio=1.4 \
   algo.use_tvkd_value_shaping=true \
   algo.tvkd_lambda=0.5 \
   algo.tvkd_potential_clip=null \
@@ -101,7 +101,7 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.dagger_buffer_capacity=131072 \
   algo.sac_policy_frequency=2 \
   algo.policy_delay=2 \
-  > ./logs/skateboard_general_tracking_stu_TVKD_fasSAC_bc_dagger_qnorm_explore.log 2>&1 < /dev/null &
+  > ./logs/skateboard_general_tracking_stu_TVKD_fasSAC_bc_dagger.log 2>&1 < /dev/null &
 
 # DAgger
 nohup python scripts/bc_dagger.py \

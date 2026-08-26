@@ -1,0 +1,711 @@
+task:
+  name: G1SkateboardGeneralTracking
+  viewer:
+    resolution:
+    - 2560
+    - 1440
+    lookat:
+    - 0.5
+    - -2.5
+    - 0.8
+    eye:
+    - 3
+    - 2
+    - 1.0
+    env_spacing: 5.0
+  terrain: plane
+  num_envs: 512
+  buffer_steps: null
+  max_episode_length: 1000
+  sim:
+    step_dt: 0.02
+    isaac_physics_dt: 0.005
+    mujoco_physics_dt: 0.002
+  robot:
+    name: g1
+    robot_type: g1_29dof_rubberhand-feet_box-eef_box-body_capsule
+  action:
+    _target_: active_adaptation.envs.mdp.action.JointPosition
+    action_scaling:
+      .*_hip_yaw_joint: 0.55
+      .*_hip_roll_joint: 0.35
+      .*_hip_pitch_joint: 0.55
+      .*_knee_joint: 0.35
+      .*_ankle_pitch_joint: 0.44
+      .*_ankle_roll_joint: 0.44
+      waist_roll_joint: 0.44
+      waist_pitch_joint: 0.44
+      waist_yaw_joint: 0.55
+      .*_shoulder_pitch_joint: 0.44
+      .*_shoulder_roll_joint: 0.44
+      .*_shoulder_yaw_joint: 0.44
+      .*_elbow_joint: 0.44
+    min_delay: 2
+    max_delay: 6
+    alpha:
+    - 0.8
+    - 1.0
+  command:
+    _target_: active_adaptation.envs.mdp.commands.hdmi.command.RobotObjectTracking
+    data_path:
+    - data/motion/g1/mirobotA/board6
+    - data/motion/g1/mirobotA/board6_mirror
+    tracking_keypoint_names:
+    - .*_hip_(pitch|yaw)_link
+    - .*_knee_link
+    - .*_ankle_roll_link
+    - pelvis
+    - torso_link
+    - .*_shoulder_pitch_link
+    - .*_elbow_link
+    - .*_wrist_yaw_link
+    tracking_joint_names:
+    - waist_.*_joint
+    - .*_hip_.*_joint
+    - .*_knee_joint
+    - .*_ankle_.*_joint
+    - .*_shoulder_.*_joint
+    - .*_elbow_joint
+    root_body_name: pelvis
+    pose_range:
+      x:
+      - -0.05
+      - 0.05
+      'y':
+      - -0.01
+      - 0.01
+      z:
+      - -0.0
+      - 0.0
+      roll:
+      - -0.1
+      - 0.1
+      pitch:
+      - -0.1
+      - 0.1
+      yaw:
+      - -0.2
+      - 0.2
+    velocity_range:
+      x:
+      - -0.2
+      - 0.2
+      'y':
+      - -0.2
+      - 0.2
+      z:
+      - -0.2
+      - 0.2
+      roll:
+      - -0.5
+      - 0.5
+      pitch:
+      - -0.5
+      - 0.5
+      yaw:
+      - -0.5
+      - 0.5
+    init_joint_pos_noise: 0.1
+    init_joint_vel_noise: 0.1
+    future_steps:
+    - 1
+    - 2
+    - 8
+    - 16
+    - 32
+    extra_object_names: []
+    object_asset_name: skateboard
+    object_body_name: board_deck
+    object_pose_range:
+      x:
+      - -0.0
+      - 0.0
+      'y':
+      - -0.0
+      - 0.0
+      z:
+      - -0.0
+      - 0.0
+      roll:
+      - -0.0
+      - 0.0
+      pitch:
+      - -0.0
+      - 0.0
+      yaw:
+      - -0.1
+      - 0.1
+    contact_target_pos_offset:
+    - - 0.12
+      - -0.025
+      - 0.02
+    - - -0.15
+      - -0.025
+      - 0.02
+    contact_eef_body_name:
+    - right_ankle_roll_link
+    - left_ankle_roll_link
+    contact_eef_pos_offset:
+    - - 0.0
+      - 0.0
+      - -0.06
+    - - 0.0
+      - 0.0
+      - -0.06
+    replay_motion: false
+    object_joint_name:
+    - front_left_wheel_joint
+    - front_right_wheel_joint
+    - rear_left_wheel_joint
+    - rear_right_wheel_joint
+    contact_target_pos_offset_per_motion:
+    - - - 0.12
+        - -0.025
+        - 0.02
+      - - -0.15
+        - -0.025
+        - 0.02
+    - - - -0.15
+        - 0.025
+        - 0.02
+      - - 0.12
+        - 0.025
+        - 0.02
+    contact_eef_pos_offset_per_motion:
+    - - - 0.0
+        - 0.0
+        - -0.06
+      - - 0.0
+        - 0.0
+        - -0.06
+    - - - 0.0
+        - 0.0
+        - -0.06
+      - - 0.0
+        - 0.0
+        - -0.06
+  enable_cameras: true
+  camera_width: 64
+  camera_height: 36
+  observation:
+    command:
+      ref_body_pos_future_local: {}
+      ref_joint_pos_future: {}
+      ref_motion_phase: {}
+    policy:
+      root_ang_vel_history:
+        history_steps:
+        - 0
+        noise_std: 0.05
+      projected_gravity_history:
+        history_steps:
+        - 0
+        noise_std: 0.05
+      joint_pos_history:
+        history_steps:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 8
+        noise_std: 0.015
+      prev_actions:
+        steps: 3
+    object_:
+      object_xy_b:
+        noise_std: 0.01
+        episodic_noise_std: 0.0
+      object_heading_b:
+        noise_std: 0.01
+        episodic_noise_std: 0.0
+      ref_contact_pos_b:
+        noise_std: 0.01
+        episodic_noise_std: 0.02
+        yaw_only: true
+      object_pos_b: {}
+      object_ori_b: {}
+    depth:
+      depth_camera:
+        camera_name: tiled_camera
+        noise_std: 0.05
+        episode_noise_range:
+        - -0.15
+        - 0.15
+        delay_range:
+        - 0
+        - 4
+        gaussian_filter_kernel_choices:
+        - 1
+        - 3
+        - 5
+        gaussian_filter_sigma_range:
+        - 1.0
+        - 1.5
+    priv:
+      root_ang_vel_history:
+        history_steps:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        noise_std: 0.0
+      projected_gravity_history:
+        history_steps:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        noise_std: 0.0
+      joint_pos_history:
+        history_steps:
+        - 0
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        noise_std: 0.0
+      ref_root_pos_future_b: {}
+      ref_root_ori_future_b: {}
+      diff_body_pos_future_local: {}
+      diff_body_ori_future_local: {}
+      diff_body_lin_vel_future_local: {}
+      diff_body_ang_vel_future_local: {}
+      root_linvel_b: {}
+      body_pos_b:
+        body_names: .*ankle_roll_link
+      body_vel_b:
+        body_names: .*ankle_roll_link
+      body_height:
+        body_names:
+        - .*ankle_roll_link
+        - pelvis
+        - torso_link
+      applied_action: {}
+      applied_torque: {}
+      object_pos_b: {}
+      object_ori_b: {}
+      diff_object_pos_future: {}
+      diff_object_ori_future: {}
+      ref_object_contact_future: {}
+      diff_contact_pos_b: {}
+    ref_joint_pos_:
+      ref_joint_pos_action_policy: {}
+    object_geo_:
+      object_points: {}
+    vel_command:
+      ref_root_vel_future_b: {}
+      ref_contact_flag_future: {}
+  reward:
+    tracking:
+      tracking_upper_body_pos(keypoint_pos_tracking_local_product):
+        body_names:
+        - .*_shoulder_pitch_link
+        - .*_elbow_link
+        - .*_wrist_yaw_link
+        weight: 0.5
+        sigma: 0.5
+      tracking_upper_body_ori(keypoint_ori_tracking_local_product):
+        body_names:
+        - .*_shoulder_pitch_link
+        - .*_elbow_link
+        - .*_wrist_yaw_link
+        weight: 0.5
+        sigma: 1.0
+      tracking_lower_body_pos(keypoint_pos_tracking_local_product):
+        body_names:
+        - .*_hip_pitch_link
+        - .*_knee_link
+        - .*_ankle_roll_link
+        weight: 0.5
+        sigma: 0.5
+      tracking_lower_body_ori(keypoint_ori_tracking_local_product):
+        body_names:
+        - .*_hip_pitch_link
+        - .*_knee_link
+        - .*_ankle_roll_link
+        weight: 0.5
+        sigma: 1.0
+      tracking_root_pos(keypoint_pos_tracking_product):
+        body_names:
+        - pelvis
+        weight: 0.5
+        sigma: 0.5
+      tracking_root_ori(keypoint_ori_tracking_product):
+        body_names:
+        - pelvis
+        weight: 0.5
+        sigma: 0.5
+      tracking_body_linvel(keypoint_lin_vel_tracking_product):
+        body_names:
+        - pelvis
+        - .*_hip_yaw_link
+        - .*_knee_link
+        - .*_ankle_roll_link
+        - torso_link
+        - .*_shoulder_pitch_link
+        - .*_elbow_link
+        - .*_wrist_yaw_link
+        weight: 0.5
+        sigma: 0.5
+      tracking_body_angvel(keypoint_ang_vel_tracking_product):
+        body_names:
+        - pelvis
+        - .*_hip_yaw_link
+        - .*_knee_link
+        - .*_ankle_roll_link
+        - torso_link
+        - .*_shoulder_pitch_link
+        - .*_elbow_link
+        - .*_wrist_yaw_link
+        weight: 0.5
+        sigma: 2.5
+      joint_pos_tracking_product:
+        joint_names:
+        - waist_.*_joint
+        - .*_hip_.*_joint
+        - .*_knee_joint
+        - .*_shoulder_.*_joint
+        - .*_elbow_joint
+        weight: 0.5
+        sigma: 0.25
+      joint_vel_tracking_product:
+        joint_names:
+        - waist_.*_joint
+        - .*_hip_.*_joint
+        - .*_knee_joint
+        - .*_shoulder_.*_joint
+        - .*_elbow_joint
+        weight: 0.5
+        sigma: 2.5
+    object_tracking:
+      object_pos_tracking:
+        weight: 1.0
+        sigma: 0.5
+      object_ori_tracking:
+        weight: 1.0
+        sigma: 0.5
+      object_vel_tracking:
+        weight: 1.0
+        enabled: false
+        sigma: 0.5
+      eef_contact_exp:
+        weight: 1.0
+        enabled: true
+        pos_sigma: 0.3
+        frc_sigma: 40.0
+        frc_thres: 10.0
+        gain: 5.0
+    loco:
+      action_rate_l2:
+        weight: 0.1
+        enabled: true
+      joint_vel_l2:
+        weight: 0.0005
+        enabled: true
+        joint_names: .*
+      joint_pos_limits:
+        weight: 10.0
+        joint_names: .*
+        soft_factor: 0.9
+        enabled: true
+      joint_torque_limits:
+        weight: 0.01
+        enabled: true
+        soft_factor: 0.6
+      survival:
+        weight: 1.0
+        enabled: true
+    feet:
+      impact_force_l2:
+        weight: 1.0
+        enabled: true
+        body_names: left_ankle_roll_link
+      feet_slip:
+        weight: 0.5
+        tolerance: 0.0
+        enabled: true
+        body_names: left_ankle_roll_link
+      feet_air_time:
+        weight: 1.0
+        enabled: false
+        body_names: .*ankle_roll_link
+        thres: 0.3
+        soft_discount: 1.0
+      feet_air_lift:
+        weight: 1.0
+        enabled: false
+        body_names: .*ankle_roll_link
+        low_thres: 0.1
+        high_thres: 0.18
+        sigma: 1.0
+      feet_contact:
+        weight: 1.0
+        enabled: false
+        body_names: .*ankle_roll_link
+        sigma: 0.25
+      survival:
+        weight: 1.0
+        enabled: true
+      feet_air_time_skateboard:
+        weight: 5.0
+        enabled: true
+        body_names: .*ankle_roll_link
+        thres: 0.2
+        soft_discount: 1.0
+    debug:
+      feet_air_time:
+        weight: 5.0
+        enabled: false
+        body_names: .*ankle_roll_link
+        thres: 0.2
+        soft_discount: 1.0
+      feet_contact_count:
+        weight: 1.0
+        enabled: false
+        body_names: .*ankle_roll_link
+      joint_pos_limits:
+        weight: 1.0
+        enabled: false
+        soft_factor: 0.9
+        joint_names: .*
+      eef_contact_all:
+        weight: 1.0
+        enabled: false
+        frc_thres: 1.0
+        pos_thres: 0.1
+      root_pos_error(keypoint_pos_error):
+        body_names:
+        - pelvis
+        weight: 1.0
+        enabled: false
+      root_ori_error(keypoint_ori_error):
+        body_names:
+        - pelvis
+        weight: 1.0
+        enabled: false
+      body_pos_error_local(keypoint_pos_error_local):
+        body_names:
+        - .*_hip_pitch_link
+        - .*_knee_link
+        - .*_ankle_roll_link
+        - .*_shoulder_pitch_link
+        - .*_elbow_link
+        - .*_wrist_yaw_link
+        weight: 1.0
+        enabled: false
+      body_ori_error_local(keypoint_ori_error_local):
+        body_names:
+        - .*_hip_pitch_link
+        - .*_knee_link
+        - .*_ankle_roll_link
+        - .*_shoulder_pitch_link
+        - .*_elbow_link
+        - .*_wrist_yaw_link
+        weight: 1.0
+        enabled: false
+      joint_pos_error:
+        joint_names:
+        - waist_.*_joint
+        - .*_hip_.*_joint
+        - .*_knee_joint
+        - .*_shoulder_.*_joint
+        - .*_elbow_joint
+        weight: 1.0
+        enabled: false
+  randomization:
+    perturb_body_mass:
+      .*:
+      - 0.9
+      - 1.1
+    perturb_body_materials:
+      body_names:
+      - .*ankle_roll_link
+      - .*_wrist_yaw_link
+      static_friction_range:
+      - 0.3
+      - 1.6
+      dynamic_friction_range:
+      - 0.3
+      - 1.2
+      restitution_range:
+      - 0.0
+      - 0.2
+    perturb_body_com:
+      body_names:
+      - pelvis
+      - torso_link
+      com_range:
+      - -0.02
+      - 0.02
+    random_joint_offset:
+      .*:
+      - -0.01
+      - 0.01
+    object_joint_randomization:
+      armature_range:
+      - 0.0
+      - 0.001
+      friction_range:
+      - 0.0
+      - 3.0e-05
+      damping_range:
+      - 0.0
+      - 1.0e-05
+    object_body_randomization:
+      static_dynamic_friction_ratio_range:
+      - 1.0
+      - 2.0
+      dynamic_friction_range:
+      - 1.5
+      - 3.0
+      restitution_range:
+      - 0.0
+      - 0.02
+      mass_range:
+      - 1.0
+      - 2.5
+      wheel_mass_range:
+      - 0.05
+      - 0.2
+      wheel_dynamic_friction_range:
+      - 0.01
+      - 0.1
+      wheel_restitution_range:
+      - 0.0
+      - 0.002
+      wheel_static_dynamic_friction_ratio_range:
+      - 30.0
+      - 60.0
+    body_scale:
+      name: skateboard
+      scale_range:
+      - 0.8
+      - 1.1
+      homogeneous_scale: true
+  termination:
+    cum_body_pos_error:
+      body_names: torso_link
+      min_steps: 25
+      threshold: 0.5
+    cum_body_ori_error:
+      body_names: torso_link
+      min_steps: 25
+      threshold: 1.2
+    cum_body_pos_error_local:
+      body_names: .*
+      min_steps: 25
+      threshold: 0.5
+    cum_body_ori_error_local:
+      body_names: .*
+      min_steps: 25
+      threshold: 1.2
+    cum_object_pos_error:
+      min_steps: 5000
+      threshold: 0.5
+    cum_object_ori_error:
+      min_steps: 5000
+      threshold: 0.8
+    cum_lost_contact_steps:
+      min_steps: 25
+      pos_thres: 0.2
+      frc_thres: 1.0
+  camera_dr:
+    extrinsics_pos_noise_std:
+    - 0.01
+    - 0.01
+    - 0.01
+    extrinsics_rot_noise_std:
+    - 0.01
+    - 0.02
+    - 0.01
+    intrinsics_focal_length_noise_std: 0.02
+    intrinsics_aperture_noise_std: 0.05
+algo:
+  _target_: active_adaptation.learning.ppo.ppo_vel.PPOVEL
+  name: ppo_vel
+  train_every: 32
+  ppo_epochs: 3
+  num_minibatches: 8
+  clip_param: 0.2
+  gamma: 0.99
+  lmbda: 0.95
+  enable_residual_distillation: false
+  distill_with_priv_pred: false
+  train_dr_estimator: false
+  normalize_ratio: false
+  use_object_adapt: true
+  use_depth: true
+  lr: 0.0003
+  desired_kl: 0.01
+  entropy_coef_start: 0.001
+  entropy_coef_end: 0.001
+  entropy_decay_iters: 1000
+  init_noise_scale: 1.0
+  load_noise_scale: 0.5
+  clip_neg_reward: false
+  normalize_before_sum: false
+  layer_norm: before
+  value_norm: false
+  adapt_module: gru
+  latent_dim: 256
+  adapt_module_input_cmd: true
+  max_grad_norm: 1.0
+  clip_adv: null
+  phase: finetune
+  vecnorm: eval
+  checkpoint_path: null
+  in_keys:
+  - command
+  - policy
+  - object_
+  - priv
+  - object_geo_
+  - vel_command
+  - depth
+headless: true
+exp_name: ${oc.select:task.name,test}-${oc.select:algo.name,none}
+app:
+  headless: ${..headless}
+  enable_cameras: ${oc.select:..task.enable_cameras,${..eval_render}}
+total_frames: 400000000
+eval_render: false
+save_interval: 600
+seed: 0
+checkpoint_path: /home/hcc/research/VAIC/teachers/skateboard_general_tracking/wandb/latest-run/files/checkpoint_final.pt
+teacher_replay_buffer_path: null
+vecnorm: ${oc.select:algo.vecnorm,train}
+camera_follow: true
+wallclock_profile:
+  enabled: false
+  label: ''
+  phase: physical
+  start_rollout: 0
+  num_rollouts: 4
+  cuda_events: true
+  torch_profiler_sync_audit: false
+  nvml_sample_interval_s: 0.2
+  output_filename: wallclock_profile.json
+  skip_final_evaluation: false
+  profile_final_checkpoint: false
+wandb:
+  name: ${..exp_name}/${now:%m-%d}_${now:%H-%M}
+  job_type: train
+  project: vaic
+  mode: online
+  tags: []
+  upload_teacher_replay: false

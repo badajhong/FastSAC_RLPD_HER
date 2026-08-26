@@ -1,0 +1,4 @@
+- algo=ppo_vel_finetune
+- task=G1/vaic/skateboard_general_tracking_stu
+- checkpoint_path=/home/hcc/research/VAIC/teachers/skateboard_general_tracking/wandb/latest-run/files/checkpoint_final.pt
+- total_frames=400000000
