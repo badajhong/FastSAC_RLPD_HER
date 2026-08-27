@@ -5,7 +5,9 @@ the locked VAIC Actor, observation, DAgger, timeout, action, and C51 interfaces.
 FastSAC/TVKD Student replay stores the exact flat Actor inputs produced by live
 carried-hidden collection; successful Teacher replay stores each raw episode
 once and reconstructs it with the current EMA from its real reset.  Legacy TD3
-keeps its finite raw-window path.  The duplicate teacher H5 export is disabled.
+keeps its finite raw-window path.  Every raw state carries its matching object
+geometry, preserving PPOVEL's per-environment observation contract.  The
+duplicate teacher H5 export is disabled.
 """
 
 from __future__ import annotations
@@ -141,6 +143,7 @@ PERCEPTION_PREFILL_DISABLED_SEMANTICS = (
 PERCEPTION_DEPTH_U8_KEY = "perception_depth_u8"
 PERCEPTION_POLICY_RAW_KEY = "perception_policy_raw"
 PERCEPTION_VEL_COMMAND_RAW_KEY = "perception_vel_command_raw"
+PERCEPTION_OBJECT_GEO_ID_KEY = "perception_object_geo_id"
 PERCEPTION_IS_INIT_KEY = "perception_is_init"
 REPLAY_ACTOR_OBSERVATIONS_KEY = "replay_actor_observations"
 REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY = "replay_next_actor_observations"
@@ -178,7 +181,7 @@ TEACHER_EPISODE_UID_KEY = "teacher_episode_uid"
 TEACHER_EPISODE_STEP_KEY = "teacher_episode_step"
 _TEACHER_PENDING_EPISODE_STEP_KEY = "_teacher_pending_episode_step"
 TEACHER_ACTOR_CACHE_ENCODER_SEMANTICS = (
-    "full_success_episode_current_ema_carried_hidden_v1"
+    "full_success_episode_current_ema_carried_hidden_per_state_object_geo_v2"
 )
 COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS = (
     "student_collection_carried_hidden_current_next_plus_teacher_success_"
@@ -186,6 +189,9 @@ COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS = (
 )
 TEACHER_EPISODE_SIDECAR_SEMANTICS = (
     "fresh_nonserialized_success_episode_raw_journal_and_current_ema_cache_v1"
+)
+OBJECT_GEO_REPLAY_SEMANTICS = (
+    "exact_append_only_geometry_codebook_transition_aligned_int32_ids_v1"
 )
 
 REPLAY_SOURCE_ORDER = (
@@ -227,7 +233,8 @@ FAILURE_PHASE_REPLAY_SEMANTICS = (
     "teacher_internal_uniform_plus_focused_v1"
 )
 PERCEPTION_REPLAY_SEMANTICS = (
-    "raw_input_current_ema_reencode_zero_boundary_burn_in_8_v1"
+    "raw_input_per_state_object_geo_current_ema_reencode_zero_boundary_"
+    "burn_in_8_v2"
 )
 ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE = "online_student_rollout"
 ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS = (
@@ -276,6 +283,7 @@ _PERCEPTION_REPLAY_FIELDS = (
     PERCEPTION_DEPTH_U8_KEY,
     PERCEPTION_POLICY_RAW_KEY,
     PERCEPTION_VEL_COMMAND_RAW_KEY,
+    PERCEPTION_OBJECT_GEO_ID_KEY,
     PERCEPTION_IS_INIT_KEY,
 )
 
@@ -286,6 +294,7 @@ _STUDENT_DRIFT_RAW_FIELDS = (
     DEPTH_KEY,
     PERCEPTION_POLICY_RAW_KEY,
     PERCEPTION_VEL_COMMAND_RAW_KEY,
+    PERCEPTION_OBJECT_GEO_ID_KEY,
     PERCEPTION_IS_INIT_KEY,
 )
 
@@ -974,8 +983,8 @@ class _TD3DeviceReplay(_DeviceReplay):
                 for key, value in sampled.items()
             }
 
-        # All active replay fields are float32 or bool, but grouping by dtype
-        # keeps this helper exact if an audit-only integer field is introduced.
+        # Replay includes float, bool, and compact integer geometry IDs.
+        # Grouping by dtype keeps every field exact while coalescing transfers.
         dtype_groups: dict[torch.dtype, list[str]] = {}
         for key in fields:
             dtype_groups.setdefault(self.data[key].dtype, []).append(key)
@@ -1653,8 +1662,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._last_truncation_finals_used = 0
         self._perception_replay_history = None
         self._perception_replay_history_count = 0
-        self._replay_object_geo = None
+        # Values are replayed per raw state.  This fingerprint describes the
+        # stable shape/dtype contract.  The ID mapping is append-only, and its
+        # lifetime is reset atomically with the Teacher raw store; together the
+        # raw-store identity/generation and this contract fully define cache
+        # lineage without invalidating it for unrelated later appends.
         self._replay_object_geo_fingerprint = None
+        self._replay_object_geo_bank = None
+        self._replay_object_geo_hash_index: dict[str, list[int]] = {}
+        self._replay_object_geo_bank_generation = 0
+        self._replay_object_geo_device_banks: dict[
+            tuple[str, torch.dtype], tuple[int, torch.Tensor]
+        ] = {}
         self._failure_phase_histogram = torch.zeros(
             int(cfg.failure_phase_num_bins), dtype=torch.float64, device="cpu"
         )
@@ -2384,12 +2403,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self._teacher_prefill_raw_pending = None
 
     def _reset_teacher_episode_cache_state(self) -> None:
-        """Rebuild non-serialized Teacher replay sidecars from an empty lineage.
+        """Rebuild non-serialized geometry-ID sidecars from an empty lineage.
 
         Checkpoints deliberately contain neither replay rows nor the raw episode
         journal/current-EMA cache that interprets those rows.  A same-instance
         model restore must therefore discard every sidecar together, otherwise
-        a stale episode UID or EMA lineage can alias rows collected after load.
+        a stale episode UID, drift-probe geometry ID, or EMA lineage can alias
+        rows collected after load.
         """
         self._teacher_prefill_raw_pending = None
         self._teacher_episode_store = TeacherEpisodeSequenceStore(
@@ -2400,6 +2420,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._teacher_ring_cache_lineage = None
         self._teacher_episode_device_raw_fields = None
         self._teacher_episode_device_raw_lineage = None
+        self._student_perception_drift_pending = None
+        self._student_perception_drift_episodes = []
+        self._student_perception_drift_completed = 0
+        self._student_perception_drift_discarded_incomplete = 0
+        self._reset_replay_object_geo_codebook()
 
     def _teacher_actor_cache_lineage(self) -> TeacherActorCacheLineage:
         self._ensure_teacher_episode_cache_state()
@@ -2568,13 +2593,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _student_perception_drift_raw_values(
         self, td: TensorDict
     ) -> dict[str, torch.Tensor]:
-        self._register_replay_object_geo(td)
         return {
             DEPTH_KEY: self._replay_source(td, DEPTH_KEY).detach(),
             PERCEPTION_POLICY_RAW_KEY: self._replay_source(td, OBS_KEY).detach(),
             PERCEPTION_VEL_COMMAND_RAW_KEY: self._replay_source(
                 td, VEL_CMD_KEY
             ).detach(),
+            PERCEPTION_OBJECT_GEO_ID_KEY: self._encode_replay_object_geo(td),
             PERCEPTION_IS_INIT_KEY: td["is_init"].detach().bool(),
         }
 
@@ -2705,8 +2730,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self, episode: _StudentPerceptionDriftEpisode
     ) -> torch.Tensor:
         """Re-encode one complete episode from its true reset at current EMA."""
-        if self._replay_object_geo is None:
-            raise RuntimeError("Student drift probe lacks object geometry")
         length = int(episode.collection_actor.shape[0])
         if length < 1 or episode.collection_actor.shape != (
             length,
@@ -2717,7 +2740,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError("Student drift episode raw fields are misaligned")
 
         snapshot = self._vecnorm_snapshot()
-        geometry = self._replay_object_geo.to(self.device)
         depth_state = torch.zeros(1, self.depth_feature_dim, device=self.device)
         adapt_state = torch.zeros(1, int(self.cfg.latent_dim), device=self.device)
         encoded: list[torch.Tensor] = []
@@ -2736,6 +2758,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 vel_raw = episode.raw_fields[PERCEPTION_VEL_COMMAND_RAW_KEY][
                     start:stop
                 ].to(self.device).unsqueeze(0)
+                geometry = self._decode_replay_object_geo(
+                    episode.raw_fields[PERCEPTION_OBJECT_GEO_ID_KEY][start:stop],
+                    device=self.device,
+                    dtype=policy_raw.dtype,
+                ).unsqueeze(0)
                 depth = self._normalize_replay_value(
                     DEPTH_KEY, depth_raw, snapshot
                 )
@@ -2746,9 +2773,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         DEPTH_KEY: depth,
                         OBS_KEY: policy,
                         VEL_CMD_KEY: vel,
-                        OBJECT_GEO_KEY: geometry.to(dtype=policy.dtype)
-                        .view(1, 1, -1)
-                        .expand(1, sequence_length, -1),
+                        OBJECT_GEO_KEY: geometry.to(dtype=policy.dtype),
                         "is_init": episode.raw_fields[PERCEPTION_IS_INIT_KEY][
                             start:stop
                         ].to(self.device).unsqueeze(0),
@@ -4706,34 +4731,230 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "TD3 is fresh-only and cannot refill raw perception windows from H5"
         )
 
+    def _ensure_replay_object_geo_codebook(self) -> None:
+        """Install fresh-only geometry codebook state for focused test seams."""
+        if not hasattr(self, "_replay_object_geo_bank"):
+            self._replay_object_geo_bank = None
+        if not hasattr(self, "_replay_object_geo_hash_index"):
+            self._replay_object_geo_hash_index = {}
+        if not hasattr(self, "_replay_object_geo_bank_generation"):
+            self._replay_object_geo_bank_generation = 0
+        if not hasattr(self, "_replay_object_geo_device_banks"):
+            self._replay_object_geo_device_banks = {}
+        if not hasattr(self, "_replay_object_geo_fingerprint"):
+            self._replay_object_geo_fingerprint = None
+
+    def _reset_replay_object_geo_codebook(self) -> None:
+        """Discard geometry IDs together with the fresh-only replay rings."""
+        self._replay_object_geo_bank = None
+        self._replay_object_geo_hash_index = {}
+        self._replay_object_geo_bank_generation = 0
+        self._replay_object_geo_device_banks = {}
+        self._replay_object_geo_fingerprint = None
+
     @torch.no_grad()
-    def _register_replay_object_geo(self, td: TensorDict) -> None:
+    def _encode_replay_object_geo(self, td: TensorDict) -> torch.Tensor:
+        """Intern PPOVEL geometry rows and return transition-aligned int32 IDs."""
+        self._ensure_replay_object_geo_codebook()
+        if OBJECT_GEO_KEY not in td.keys(True, True):
+            raise KeyError(f"raw perception replay is missing {OBJECT_GEO_KEY!r}")
         geometry = td[OBJECT_GEO_KEY]
-        width = int(self.observation_spec[OBJECT_GEO_KEY].shape[-1])
-        flat = geometry.reshape(-1, width)
-        reference = flat[0].detach()
-        if not torch.equal(flat, reference.expand_as(flat)):
-            raise RuntimeError(
-                "TD3 raw replay requires object_geo_ to be constant within a run"
+        spec = self.observation_spec.get(OBJECT_GEO_KEY, None)
+        if spec is None:
+            raise KeyError(f"observation spec is missing {OBJECT_GEO_KEY!r}")
+        width = int(spec.shape[-1])
+        expected_shape = (*td.batch_size, width)
+        if geometry.shape != expected_shape:
+            raise ValueError(
+                f"{OBJECT_GEO_KEY} has shape {tuple(geometry.shape)}; "
+                f"expected {tuple(expected_shape)}"
             )
-        if self._replay_object_geo is None:
-            # Rollout collection runs under torch.inference_mode().  A clone
-            # made in that context remains an inference tensor and cannot be
-            # saved by autograd when Teacher replay later differentiates the
-            # predicted object transform.  Disable inference mode explicitly
-            # so this run-constant cache is an ordinary tensor.
-            with torch.inference_mode(False):
-                self._replay_object_geo = reference.clone()
-            payload = reference.float().contiguous().cpu().numpy().tobytes()
-            self._replay_object_geo_fingerprint = hashlib.sha256(payload).hexdigest()
-        elif not torch.equal(
-            reference.to(self._replay_object_geo), self._replay_object_geo
+        if geometry.numel() == 0:
+            raise ValueError(f"{OBJECT_GEO_KEY} replay batch cannot be empty")
+        if not geometry.is_floating_point() or not torch.isfinite(geometry).all():
+            raise ValueError(f"{OBJECT_GEO_KEY} must be finite floating point")
+
+        contract_payload = json.dumps(
+            {
+                "semantics": "exact_append_only_geometry_codebook_int32_id_v1",
+                "width": width,
+                "dtype": str(geometry.dtype),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        fingerprint = "sha256:" + hashlib.sha256(contract_payload).hexdigest()
+        current = getattr(self, "_replay_object_geo_fingerprint", None)
+        if current is None:
+            self._replay_object_geo_fingerprint = fingerprint
+        elif current != fingerprint:
+            raise RuntimeError("object_geo_ replay shape/dtype contract changed")
+
+        flat = geometry.detach().reshape(-1, width)
+
+        # A rollout normally repeats one geometry for many consecutive states.
+        # Running ``torch.unique`` across every wide state would sort hundreds
+        # of MiB for a typical many-environment rollout.  First retain only the
+        # first state and exact temporal changes for each environment.  This
+        # still handles arbitrary reset-time changes and degrades safely to all
+        # rows if geometry genuinely changes at every step.
+        temporal_change = None
+        if len(td.batch_size) == 2:
+            env_count, step_count = map(int, td.batch_size)
+            temporal = geometry.reshape(env_count, step_count, width)
+            temporal_change = torch.ones(
+                (env_count, step_count), dtype=torch.bool, device=geometry.device
+            )
+            if step_count > 1:
+                changed = torch.zeros(
+                    (env_count, step_count - 1),
+                    dtype=torch.bool,
+                    device=geometry.device,
+                )
+                # Bound comparison temporaries independently of geometry width.
+                for feature_start in range(0, width, 128):
+                    feature_stop = min(feature_start + 128, width)
+                    changed.logical_or_(
+                        temporal[:, 1:, feature_start:feature_stop]
+                        .ne(temporal[:, :-1, feature_start:feature_stop])
+                        .any(dim=-1)
+                    )
+                temporal_change[:, 1:] = changed
+            candidate_indices = temporal_change.reshape(-1).nonzero(
+                as_tuple=False
+            ).squeeze(-1)
+            candidates = flat.index_select(0, candidate_indices)
+        else:
+            candidates = flat
+
+        candidates_cpu = candidates.to(device="cpu").contiguous()
+        unique_cpu, candidate_inverse = torch.unique(
+            candidates_cpu, dim=0, return_inverse=True
+        )
+        bank = self._replay_object_geo_bank
+        if bank is not None and (
+            bank.dtype != unique_cpu.dtype or int(bank.shape[1]) != width
         ):
-            raise RuntimeError("object_geo_ changed after replay initialization")
+            raise RuntimeError("object_geo_ codebook contract changed")
+
+        resolved_unique_ids: list[int] = []
+        new_rows: list[torch.Tensor] = []
+        new_digests: list[str] = []
+        base_size = 0 if bank is None else int(bank.shape[0])
+        for row in unique_cpu:
+            digest = hashlib.sha256(
+                row.contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+            resolved = None
+            for candidate in self._replay_object_geo_hash_index.get(digest, ()):
+                if bank is not None and torch.equal(bank[candidate], row):
+                    resolved = int(candidate)
+                    break
+            if resolved is None:
+                # torch.unique has already removed duplicates within this call,
+                # so every unresolved row receives exactly one new ID.
+                resolved = base_size + len(new_rows)
+                new_rows.append(row.clone())
+                new_digests.append(digest)
+            resolved_unique_ids.append(resolved)
+
+        if new_rows:
+            if base_size + len(new_rows) > torch.iinfo(torch.int32).max + 1:
+                raise OverflowError("object geometry replay codebook exhausted int32 IDs")
+            appended = torch.stack(new_rows, dim=0).contiguous()
+            with torch.inference_mode(False):
+                appended = appended.detach().clone()
+                self._replay_object_geo_bank = (
+                    appended
+                    if bank is None
+                    else torch.cat((bank, appended), dim=0).contiguous()
+                )
+            for offset, digest in enumerate(new_digests):
+                self._replay_object_geo_hash_index.setdefault(digest, []).append(
+                    base_size + offset
+                )
+            self._replay_object_geo_bank_generation += 1
+            self._replay_object_geo_device_banks.clear()
+
+        unique_ids = torch.tensor(resolved_unique_ids, dtype=torch.int32)
+        candidate_ids = unique_ids.index_select(0, candidate_inverse.reshape(-1))
+        if temporal_change is None:
+            encoded = candidate_ids.reshape(tuple(td.batch_size)).to(
+                geometry.device
+            )
+        else:
+            # Map every unchanged state to the most recent candidate within its
+            # own environment.  Candidate ordinals increase in flattened
+            # environment/time order, so cumulative max is an exact forward fill.
+            change_cpu = temporal_change.to(device="cpu")
+            candidate_ordinal = torch.full(
+                change_cpu.shape, -1, dtype=torch.long, device="cpu"
+            )
+            candidate_ordinal[change_cpu] = torch.arange(
+                candidate_ids.numel(), dtype=torch.long
+            )
+            candidate_ordinal = candidate_ordinal.cummax(dim=1).values
+            encoded = candidate_ids.index_select(
+                0, candidate_ordinal.reshape(-1)
+            ).reshape(tuple(td.batch_size)).to(geometry.device)
+        # Collection may run under inference_mode; replay fields must own
+        # ordinary tensors because they are later copied into mutable rings.
+        with torch.inference_mode(False):
+            return encoded.detach().clone()
+
+    @torch.no_grad()
+    def _decode_replay_object_geo(
+        self,
+        geometry_ids: torch.Tensor,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Resolve transition-aligned IDs to exact PPOVEL geometry values."""
+        self._ensure_replay_object_geo_codebook()
+        bank = self._replay_object_geo_bank
+        if bank is None or int(bank.shape[0]) < 1:
+            raise RuntimeError("raw perception replay has no object geometry codebook")
+        if geometry_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("object geometry replay IDs must be int32 or int64")
+        output_device = torch.device(device)
+        cache_key = (str(output_device), dtype)
+        cached = self._replay_object_geo_device_banks.get(cache_key)
+        generation = int(self._replay_object_geo_bank_generation)
+        if cached is None or cached[0] != generation:
+            # Decode may first run inside rollout ``inference_mode``.  Cache an
+            # ordinary tensor so a later differentiable perception update can
+            # safely use geometry in operations that save it for backward.
+            with torch.inference_mode(False):
+                device_bank = (
+                    bank.to(device=output_device, dtype=dtype)
+                    .contiguous()
+                    .detach()
+                    .clone()
+                )
+            self._replay_object_geo_device_banks[cache_key] = (
+                generation,
+                device_bank,
+            )
+        else:
+            device_bank = cached[1]
+        flat_ids = geometry_ids.reshape(-1).to(
+            device=output_device, dtype=torch.long
+        )
+        if bool((flat_ids < 0).any()) or bool(
+            (flat_ids >= int(device_bank.shape[0])).any()
+        ):
+            raise IndexError("object geometry replay ID is outside the codebook")
+        # Keep the public decode result ordinary as well.  This makes the API
+        # safe even if a caller first decodes under rollout inference mode and
+        # later uses that tensor in differentiable object-transform code.
+        with torch.inference_mode(False):
+            return device_bank.index_select(0, flat_ids).reshape(
+                *geometry_ids.shape, int(device_bank.shape[-1])
+            )
 
     @torch.no_grad()
     def _raw_perception_values(self, td: TensorDict) -> dict[str, torch.Tensor]:
-        self._register_replay_object_geo(td)
         return {
             PERCEPTION_DEPTH_U8_KEY: _encode_replay_depth_u8(
                 self._replay_source(td, DEPTH_KEY)
@@ -4742,6 +4963,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             PERCEPTION_VEL_COMMAND_RAW_KEY: self._replay_source(
                 td, VEL_CMD_KEY
             ).detach(),
+            PERCEPTION_OBJECT_GEO_ID_KEY: self._encode_replay_object_geo(td),
             PERCEPTION_IS_INIT_KEY: td["is_init"].detach().bool(),
         }
 
@@ -4780,8 +5002,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         store = self._teacher_episode_store
         if not store.frozen:
             raise RuntimeError("Teacher Actor cache requires a frozen episode store")
-        if self._replay_object_geo is None:
-            raise RuntimeError("Teacher Actor cache lacks object geometry")
 
         # Keep the derived cache on the learning device.  Copying every
         # 525-wide state back to the CPU ring (and then copying sampled rows
@@ -4804,7 +5024,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             * (int(self.cfg.perception_replay_burn_in) + 2),
         )
         episode_batch_size = max(1, node_budget // time_chunk_size)
-        geometry = self._replay_object_geo.to(self.device)
         raw_lineage = store.lineage
         device_raw_lineage = (
             raw_lineage.store_id,
@@ -4862,6 +5081,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 vel_raw = chunk.raw_fields[PERCEPTION_VEL_COMMAND_RAW_KEY].to(
                     self.device
                 )
+                geometry = self._decode_replay_object_geo(
+                    chunk.raw_fields[PERCEPTION_OBJECT_GEO_ID_KEY],
+                    device=self.device,
+                    dtype=policy_raw.dtype,
+                )
                 depth = self._normalize_replay_value(
                     DEPTH_KEY, _decode_replay_depth_u8(depth_u8), snapshot
                 )
@@ -4876,9 +5100,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         DEPTH_KEY: depth,
                         OBS_KEY: policy,
                         VEL_CMD_KEY: vel,
-                        OBJECT_GEO_KEY: geometry.to(dtype=policy.dtype)
-                        .view(1, 1, -1)
-                        .expand(count, sequence_length, -1),
+                        OBJECT_GEO_KEY: geometry.to(dtype=policy.dtype),
                         "is_init": chunk.raw_fields[PERCEPTION_IS_INIT_KEY].to(
                             self.device
                         ),
@@ -5370,12 +5592,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise KeyError(
                 f"raw perception replay fields are missing: {sorted(missing)}"
             )
-        if self._replay_object_geo is None:
-            raise RuntimeError("raw perception replay has no object geometry contract")
 
         depth_u8 = batch[PERCEPTION_DEPTH_U8_KEY]
         policy_raw = batch[PERCEPTION_POLICY_RAW_KEY]
         vel_raw = batch[PERCEPTION_VEL_COMMAND_RAW_KEY]
+        geometry_ids = batch[PERCEPTION_OBJECT_GEO_ID_KEY]
         is_init = batch[PERCEPTION_IS_INIT_KEY]
         row_count, window_length = depth_u8.shape[:2]
         expected_length = int(self.cfg.perception_replay_burn_in) + 2
@@ -5389,14 +5610,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             window_length,
         ):
             raise ValueError("raw perception replay fields have inconsistent windows")
+        if geometry_ids.shape != (row_count, window_length):
+            raise ValueError("object geometry replay IDs have inconsistent windows")
 
         snapshot = self._vecnorm_snapshot()
         current_chunks: list[torch.Tensor] = []
         next_chunks: list[torch.Tensor] = []
         microbatch = int(self.cfg.perception_encode_microbatch_size)
-        geometry = self._replay_object_geo.to(
-            device=depth_u8.device, dtype=policy_raw.dtype
-        )
         with set_recurrent_mode(True):
             for start in range(0, int(row_count), microbatch):
                 stop = min(start + microbatch, int(row_count))
@@ -5411,15 +5631,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 vel = self._normalize_replay_value(
                     VEL_CMD_KEY, vel_raw[start:stop], snapshot
                 )
+                geometry = self._decode_replay_object_geo(
+                    geometry_ids[start:stop],
+                    device=depth_u8.device,
+                    dtype=policy.dtype,
+                )
                 count = stop - start
                 td = TensorDict(
                     {
                         DEPTH_KEY: depth,
                         OBS_KEY: policy,
                         VEL_CMD_KEY: vel,
-                        OBJECT_GEO_KEY: geometry.view(1, 1, -1).expand(
-                            count, window_length, -1
-                        ),
+                        OBJECT_GEO_KEY: geometry,
                         "is_init": is_init[start:stop],
                         "depth_hx": torch.zeros(
                             count,
@@ -6441,8 +6664,6 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise RuntimeError(
                 "teacher_perception_replay_fraction requires non-empty q_teacher_replay"
             )
-        if self._replay_object_geo is None:
-            raise RuntimeError("Teacher perception replay has no object geometry")
 
         requested_counts = None
         if four_way:
@@ -6486,6 +6707,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         depth_u8 = batch[PERCEPTION_DEPTH_U8_KEY]
         policy_raw = batch[PERCEPTION_POLICY_RAW_KEY]
         vel_raw = batch[PERCEPTION_VEL_COMMAND_RAW_KEY]
+        geometry_ids = batch[PERCEPTION_OBJECT_GEO_ID_KEY]
         is_init = batch[PERCEPTION_IS_INIT_KEY]
         row_count, window_length = depth_u8.shape[:2]
         expected_length = int(self.cfg.perception_replay_burn_in) + 2
@@ -6494,6 +6716,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 f"Teacher perception window has length {window_length}; "
                 f"expected {expected_length}"
             )
+        if geometry_ids.shape != (row_count, window_length):
+            raise ValueError("Teacher object geometry IDs are window-misaligned")
 
         snapshot = self._vecnorm_snapshot()
         depth = self._normalize_replay_value(
@@ -6501,13 +6725,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
         policy = self._normalize_replay_value(OBS_KEY, policy_raw, snapshot)
         vel = self._normalize_replay_value(VEL_CMD_KEY, vel_raw, snapshot)
-        geometry = self._replay_object_geo.to(device=depth.device, dtype=policy.dtype)
+        geometry = self._decode_replay_object_geo(
+            geometry_ids,
+            device=depth.device,
+            dtype=policy.dtype,
+        )
 
         target = TensorDict(
             {
                 OBS_PRIV_KEY: critic[OBS_PRIV_KEY],
                 OBJECT_KEY: critic[OBJECT_KEY],
-                OBJECT_GEO_KEY: geometry.view(1, -1).expand(row_count, -1),
+                OBJECT_GEO_KEY: geometry[:, -2],
             },
             batch_size=(row_count,),
             device=depth.device,
@@ -6521,9 +6749,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 DEPTH_KEY: depth,
                 OBS_KEY: policy,
                 VEL_CMD_KEY: vel,
-                OBJECT_GEO_KEY: geometry.view(1, 1, -1).expand(
-                    row_count, window_length, -1
-                ),
+                OBJECT_GEO_KEY: geometry,
                 "is_init": is_init,
                 "depth_hx": torch.zeros(
                     row_count,
@@ -7965,6 +8191,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     self._perception_initialization
                 ),
                 "teacher_prefill_semantics": TEACHER_PREFILL_SEMANTICS,
+                "object_geo_replay_semantics": OBJECT_GEO_REPLAY_SEMANTICS,
                 "perception_object_geo_fingerprint": (
                     self._replay_object_geo_fingerprint
                 ),

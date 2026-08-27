@@ -28,6 +28,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     DistributionalTD3TeacherBC,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
+    PERCEPTION_OBJECT_GEO_ID_KEY,
     PERCEPTION_DEPTH_U8_KEY,
     PERCEPTION_IS_INIT_KEY,
     PERCEPTION_POLICY_RAW_KEY,
@@ -286,6 +287,7 @@ def _strict_v5_policy_metadata(
         "teacher_episode_sidecar_semantics": (
             tvkd_module.TEACHER_EPISODE_SIDECAR_SEMANTICS
         ),
+        "object_geo_replay_semantics": tvkd_module.OBJECT_GEO_REPLAY_SEMANTICS,
         "bottleneck_location_semantics": (tvkd_module.BOTTLENECK_LOCATION_SEMANTICS),
         "bottleneck_fallback_mode": str(cfg.bottleneck_fallback_mode),
         "teacher_value_return_semantics": str(cfg.teacher_value_return_semantics),
@@ -379,6 +381,7 @@ def _tvkd_replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
         PERCEPTION_VEL_COMMAND_RAW_KEY: (
             row[:, None, None] + time[None, :, None] + 0.25
         ),
+        PERCEPTION_OBJECT_GEO_ID_KEY: torch.zeros(count, 2, dtype=torch.int32),
         PERCEPTION_IS_INIT_KEY: torch.zeros(count, 2, dtype=torch.bool),
     }
 
@@ -896,6 +899,7 @@ def test_student_drift_probe_commits_only_reset_complete_episode():
             DEPTH_KEY: td["raw_depth"],
             PERCEPTION_POLICY_RAW_KEY: td["raw_policy"],
             PERCEPTION_VEL_COMMAND_RAW_KEY: td["raw_vel"],
+            PERCEPTION_OBJECT_GEO_ID_KEY: td["raw_geo_id"],
             PERCEPTION_IS_INIT_KEY: td["is_init"],
         }
 
@@ -905,6 +909,7 @@ def test_student_drift_probe_commits_only_reset_complete_episode():
             "raw_depth": torch.arange(8).reshape(2, 4, 1).to(torch.uint8),
             "raw_policy": torch.arange(8).reshape(2, 4, 1).float(),
             "raw_vel": torch.ones(2, 4, 1),
+            "raw_geo_id": torch.zeros(2, 4, dtype=torch.int32),
             "is_init": torch.tensor(
                 [[[True], [False], [False], [False]], [[False]] * 4]
             ),
@@ -3023,6 +3028,10 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
     assert state["teacher_episode_sidecar_semantics"] == (
         tvkd_module.TEACHER_EPISODE_SIDECAR_SEMANTICS
     )
+    assert (
+        state["object_geo_replay_semantics"]
+        == tvkd_module.OBJECT_GEO_REPLAY_SEMANTICS
+    )
     assert state["dagger_backend_config"]["lambda_bc"] == pytest.approx(0.73)
     assert state["dagger_backend_config"][
         "failure_phase_student_fraction"
@@ -3066,7 +3075,20 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
     policy.opt_dr_estimator = torch.optim.Adam(
         policy.dr_estimator.parameters(), lr=0.25
     )
-    policy._load_fastsac_checkpoint_state(state, load_modules=False)
+    drifted_geometry_semantics = copy.deepcopy(state)
+    drifted_geometry_semantics["object_geo_replay_semantics"] = "wrong"
+    with pytest.raises(ValueError, match="object_geo_replay_semantics"):
+        policy._load_fastsac_checkpoint_state(
+            drifted_geometry_semantics, load_modules=False
+        )
+
+    # Version-8 checkpoints written before geometry IDs were introduced have
+    # fresh, non-serialized replay rings and may safely rebuild the new codebook.
+    pre_geometry_codebook_state = copy.deepcopy(state)
+    pre_geometry_codebook_state.pop("object_geo_replay_semantics")
+    policy._load_fastsac_checkpoint_state(
+        pre_geometry_codebook_state, load_modules=False
+    )
     assert policy.teacher_value_bottleneck_detector.state_dict() == expected_detector
     assert (
         policy.teacher_value_bottleneck_detector.last_diagnostics["no_candidate"]
@@ -3119,6 +3141,7 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
         v5_state["dagger_backend_config"].pop(name, None)
     v5_state.pop("actor_replay_observation_semantics")
     v5_state.pop("teacher_episode_sidecar_semantics")
+    v5_state.pop("object_geo_replay_semantics")
     with pytest.warns(UserWarning, match="TVKD v5 checkpoint to v8"):
         policy._load_fastsac_checkpoint_state(v5_state, load_modules=False)
     assert len(translated) == 2
@@ -3357,6 +3380,7 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     )
     v5_policy_state.pop("actor_replay_observation_semantics")
     v5_policy_state.pop("teacher_episode_sidecar_semantics")
+    v5_policy_state.pop("object_geo_replay_semantics")
     v5_checkpoint_path = checkpoint_path.with_name("checkpoint_v5.pt")
     torch.save(
         {
@@ -3877,6 +3901,19 @@ def test_public_tvkd_resume_rebuilds_rings_and_teacher_sidecars(
         "stale": torch.tensor([1.0])
     }
     policy._teacher_episode_device_raw_lineage = object()
+    stale_drift_pending = [{"raw": {"stale": [torch.tensor(1.0)]}}]
+    stale_drift_episode = object()
+    policy._student_perception_drift_pending = stale_drift_pending
+    policy._student_perception_drift_episodes = [stale_drift_episode]
+    policy._student_perception_drift_completed = 7
+    policy._student_perception_drift_discarded_incomplete = 3
+    policy._replay_object_geo_fingerprint = "stale"
+    policy._replay_object_geo_bank = torch.ones(1, 1)
+    policy._replay_object_geo_hash_index = {"stale": [0]}
+    policy._replay_object_geo_bank_generation = 1
+    policy._replay_object_geo_device_banks = {
+        ("cpu", torch.float32): (1, torch.ones(1, 1))
+    }
     restored = []
 
     def restore(self, state, *, load_modules=True):
@@ -3941,6 +3978,15 @@ def test_public_tvkd_resume_rebuilds_rings_and_teacher_sidecars(
     assert policy._teacher_ring_cache_lineage is None
     assert policy._teacher_episode_device_raw_fields is None
     assert policy._teacher_episode_device_raw_lineage is None
+    assert policy._student_perception_drift_pending is None
+    assert policy._student_perception_drift_episodes == []
+    assert policy._student_perception_drift_completed == 0
+    assert policy._student_perception_drift_discarded_incomplete == 0
+    assert policy._replay_object_geo_fingerprint is None
+    assert policy._replay_object_geo_bank is None
+    assert policy._replay_object_geo_hash_index == {}
+    assert policy._replay_object_geo_bank_generation == 0
+    assert policy._replay_object_geo_device_banks == {}
     assert policy._teacher_prefill_complete is False
     assert policy.teacher_prefill_rollout_count == 0
     assert policy.actor_adapt.training is True
@@ -4718,6 +4764,7 @@ def _v4_replay_rows(
         PERCEPTION_VEL_COMMAND_RAW_KEY: (
             row[:, None, None] + window[None, :, None] + 0.25
         ),
+        PERCEPTION_OBJECT_GEO_ID_KEY: torch.zeros(count, 10, dtype=torch.int32),
         PERCEPTION_IS_INIT_KEY: torch.zeros(count, 10, dtype=torch.bool),
     }
 
@@ -5210,7 +5257,7 @@ def test_v4_replay_perception_uses_failure_student_raw_windows_not_live_rollout(
 
     policy.q_critic_keys = ("priv", "object_")
     policy._q_critic_widths = (1, 1)
-    policy._replay_object_geo = torch.zeros(1)
+    policy._replay_object_geo_bank = torch.zeros(1, 1)
     policy.depth_feature_dim = 1
     policy._vecnorm_snapshot = lambda: {}
     policy._normalize_replay_flat = lambda value, keys, widths, snapshot: value

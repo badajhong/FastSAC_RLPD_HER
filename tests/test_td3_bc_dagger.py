@@ -44,6 +44,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
     PERCEPTION_DEPTH_U8_KEY,
     PERCEPTION_IS_INIT_KEY,
+    PERCEPTION_OBJECT_GEO_ID_KEY,
     PERCEPTION_POLICY_RAW_KEY,
     PERCEPTION_REPLAY_SEMANTICS,
     PERCEPTION_VEL_COMMAND_RAW_KEY,
@@ -157,6 +158,9 @@ def _replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
             (row + 4.0, row + 4.5, row + 4.75), dim=-1
         ),
         REFERENCE_PHASE_KEY: row.div(max(float(offset + count), 1.0)).clamp(0.0, 1.0),
+        REPLAY_PERCEPTION_EMA_GENERATION_KEY: torch.zeros(
+            count, dtype=torch.long
+        ),
         PERCEPTION_DEPTH_U8_KEY: (
             torch.arange(count * 10).reshape(count, 10, 1, 1, 1) % 101
         ).to(torch.uint8),
@@ -164,6 +168,7 @@ def _replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
         PERCEPTION_VEL_COMMAND_RAW_KEY: (
             row[:, None, None] + time[None, :, None] + 0.25
         ),
+        PERCEPTION_OBJECT_GEO_ID_KEY: torch.zeros(count, 10, dtype=torch.int32),
         PERCEPTION_IS_INIT_KEY: torch.zeros(count, 10, dtype=torch.bool),
     }
 
@@ -610,11 +615,13 @@ def test_raw_perception_replay_public_field_contract_has_no_priv_pred_latent():
         PERCEPTION_DEPTH_U8_KEY,
         PERCEPTION_POLICY_RAW_KEY,
         PERCEPTION_VEL_COMMAND_RAW_KEY,
+        PERCEPTION_OBJECT_GEO_ID_KEY,
         PERCEPTION_IS_INIT_KEY,
     ) == (
         "perception_depth_u8",
         "perception_policy_raw",
         "perception_vel_command_raw",
+        "perception_object_geo_id",
         "perception_is_init",
     )
 
@@ -795,9 +802,11 @@ def test_zero_teacher_actor_fraction_preserves_main_only_sampling_and_rng():
             "critic_observations",
             DAGGER_REPLAY_TEACHER_ACTIONS,
             DAGGER_TEACHER_ACTION_VALID_KEY,
+            REPLAY_PERCEPTION_EMA_GENERATION_KEY,
             PERCEPTION_DEPTH_U8_KEY,
             PERCEPTION_POLICY_RAW_KEY,
             PERCEPTION_VEL_COMMAND_RAW_KEY,
+            PERCEPTION_OBJECT_GEO_ID_KEY,
             PERCEPTION_IS_INIT_KEY,
         ),
     )
@@ -819,8 +828,11 @@ def _raw_transition_policy(*, train_every: int = 10):
         "object_geo_": SimpleNamespace(shape=(2,)),
     }
     policy._replay_vecnorm_keys = set()
-    policy._replay_object_geo = None
     policy._replay_object_geo_fingerprint = None
+    policy._replay_object_geo_bank = None
+    policy._replay_object_geo_hash_index = {}
+    policy._replay_object_geo_bank_generation = 0
+    policy._replay_object_geo_device_banks = {}
     policy._perception_replay_history = None
     policy._perception_replay_history_count = 0
     policy._rollout_final_batch = None
@@ -836,11 +848,18 @@ def _raw_transition_td(
     *,
     is_init: torch.Tensor | None = None,
     truncation_step: int | None = None,
+    object_geo: torch.Tensor | None = None,
 ) -> TensorDict:
     values = values.float()
     n, t = values.shape
     if is_init is None:
         is_init = torch.zeros(n, t, dtype=torch.bool)
+    if object_geo is None:
+        object_geo = torch.tensor([1.0, 2.0]).expand(n, t, 2).clone()
+    else:
+        object_geo = torch.as_tensor(object_geo, dtype=torch.float32)
+        if object_geo.shape != (n, t, 2):
+            raise ValueError("object_geo fixture must have shape [env,time,2]")
     done = torch.zeros(n, t, dtype=torch.bool)
     timeout = torch.zeros(n, t, dtype=torch.bool)
     if truncation_step is not None:
@@ -853,8 +872,10 @@ def _raw_transition_td(
             "depth": (values.remainder(101) / 100.0).reshape(n, t, 1, 1, 1),
             "policy": action + 100.0,
             "vel_command": action + 200.0,
-            REFERENCE_PHASE_KEY: values.div(max(float(t - 1), 1.0)).clamp(0.0, 1.0),
-            "object_geo_": torch.tensor([1.0, 2.0]).expand(n, t, 2).clone(),
+            REFERENCE_PHASE_KEY: values.div(max(float(t - 1), 1.0))
+            .clamp(0.0, 1.0)
+            .unsqueeze(-1),
+            "object_geo_": object_geo,
             "critic_raw": action + 300.0,
             "is_init": is_init,
             "step_count": torch.full((n, t), 100),
@@ -878,42 +899,103 @@ def _raw_transition_td(
     return td
 
 
-def _raw_final_td(value: float, *, is_init: bool = False) -> TensorDict:
-    scalar = torch.tensor([[value]], dtype=torch.float32)
+def _raw_final_td(
+    value: float | torch.Tensor,
+    *,
+    is_init: bool | torch.Tensor = False,
+    object_geo: torch.Tensor | None = None,
+) -> TensorDict:
+    values = torch.as_tensor(value, dtype=torch.float32).reshape(-1)
+    count = int(values.numel())
+    scalar = values.unsqueeze(-1)
+    init = torch.as_tensor(is_init, dtype=torch.bool)
+    if init.ndim == 0:
+        init = init.expand(count).clone()
+    else:
+        init = init.reshape(count)
+    if object_geo is None:
+        object_geo = torch.tensor([1.0, 2.0]).expand(count, 2).clone()
+    else:
+        object_geo = torch.as_tensor(object_geo, dtype=torch.float32)
+        if object_geo.shape != (count, 2):
+            raise ValueError("object_geo final fixture must have shape [env,2]")
     return TensorDict(
         {
-            "depth": torch.tensor([value % 101 / 100.0]).reshape(1, 1, 1, 1),
+            "depth": (values.remainder(101) / 100.0).reshape(count, 1, 1, 1),
             "policy": scalar + 100.0,
             "vel_command": scalar + 200.0,
-            "object_geo_": torch.tensor([[1.0, 2.0]]),
+            "object_geo_": object_geo,
             "critic_raw": scalar + 300.0,
-            "is_init": torch.tensor([is_init]),
+            "is_init": init,
         },
-        batch_size=(1,),
+        batch_size=(count,),
     )
 
 
-def test_replay_object_geometry_cached_during_inference_is_autograd_safe():
+def test_replay_object_geometry_codebook_is_exact_deduplicated_and_autograd_safe():
     policy = _raw_transition_policy()
+    first = torch.tensor([1.0, 2.0])
+    second = torch.tensor([0.5, 4.0])
+    values = torch.stack(
+        (
+            torch.stack((first, second, first)),
+            torch.stack((second, first, second)),
+        )
+    )
     geometry = TensorDict(
         {
-            OBJECT_GEO_KEY: torch.tensor([[[1.0, 2.0]]]),
+            OBJECT_GEO_KEY: values,
         },
-        batch_size=(1, 1),
+        batch_size=(2, 3),
     )
 
     with torch.inference_mode():
-        policy._register_replay_object_geo(geometry)
+        geometry_ids = policy._encode_replay_object_geo(geometry)
+        first_decoded = policy._decode_replay_object_geo(
+            geometry_ids,
+            device="cpu",
+            dtype=torch.float32,
+        )
 
-    cached = policy._replay_object_geo
-    assert cached is not None
-    assert not cached.is_inference()
+    assert geometry_ids.dtype is torch.int32
+    assert geometry_ids.unique().numel() == 2
+    assert not geometry_ids.is_inference()
+    assert not first_decoded.is_inference()
+    assert torch.equal(first_decoded, values)
+    assert policy._replay_object_geo_bank is not None
+    assert policy._replay_object_geo_bank.shape == (2, 2)
+    assert not policy._replay_object_geo_bank.is_inference()
+    generation = policy._replay_object_geo_bank_generation
+
+    decoded = policy._decode_replay_object_geo(
+        geometry_ids,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    assert torch.equal(decoded, values)
+
+    # Re-encoding the same values in a different order must reuse IDs instead
+    # of changing the append-only codebook or its generation.
+    reordered = TensorDict(
+        {OBJECT_GEO_KEY: values.flip(0)},
+        batch_size=(2, 3),
+    )
+    reordered_ids = policy._encode_replay_object_geo(reordered)
+    assert policy._replay_object_geo_bank_generation == generation
+    assert torch.equal(
+        policy._decode_replay_object_geo(
+            reordered_ids,
+            device="cpu",
+            dtype=torch.float32,
+        ),
+        values.flip(0),
+    )
 
     # Regression for the exact Teacher-perception failure: TransformObject's
-    # trainable orientation path must be able to save the cached points for
-    # the backward of torch.matmul.
-    orientation = nn.Parameter(torch.eye(cached.shape[-1]))
-    torch.matmul(cached, orientation.transpose(-1, -2)).sum().backward()
+    # trainable orientation path must be able to save decoded replay points for
+    # the backward of torch.matmul, even when collection used inference mode.
+    orientation = nn.Parameter(torch.eye(decoded.shape[-1]))
+    torch.matmul(decoded, orientation.transpose(-1, -2)).sum().backward()
     assert orientation.grad is not None
     assert torch.isfinite(orientation.grad).all()
 
@@ -939,6 +1021,15 @@ def test_raw_replay_window_alignment_reset_markers_and_no_priv_pred_storage():
     )
     assert first[PERCEPTION_POLICY_RAW_KEY][0, -2, 0].item() == 108.0
     assert first[PERCEPTION_POLICY_RAW_KEY][0, -1, 0].item() == 109.0
+    assert first[PERCEPTION_OBJECT_GEO_ID_KEY].dtype is torch.int32
+    assert torch.equal(
+        policy._decode_replay_object_geo(
+            first[PERCEPTION_OBJECT_GEO_ID_KEY],
+            device="cpu",
+            dtype=torch.float32,
+        ),
+        torch.tensor([1.0, 2.0]).expand(1, 10, 2),
+    )
     assert torch.equal(
         first[PERCEPTION_IS_INIT_KEY][0],
         torch.tensor(
@@ -952,7 +1043,11 @@ def test_raw_replay_window_alignment_reset_markers_and_no_priv_pred_storage():
 def test_timeout_replay_next_slot_uses_captured_true_final_raw_state():
     policy = _raw_transition_policy()
     rollout = _raw_transition_td(torch.arange(10).reshape(1, 10), truncation_step=8)
-    true_timeout_final = _raw_final_td(77.0)
+    true_timeout_geometry = torch.tensor([[7.0, 8.0]])
+    true_timeout_final = _raw_final_td(
+        77.0,
+        object_geo=true_timeout_geometry,
+    )
     timeout_capture = rollout[:, 8].clone()
     for key in (
         "depth",
@@ -964,7 +1059,12 @@ def test_timeout_replay_next_slot_uses_captured_true_final_raw_state():
     ):
         timeout_capture["next", key] = true_timeout_final[key]
     policy.capture_truncation_final_observations(timeout_capture, step=8)
-    policy.capture_rollout_final_observation(_raw_final_td(10.0))
+    policy.capture_rollout_final_observation(
+        _raw_final_td(
+            10.0,
+            object_geo=torch.tensor([[9.0, 10.0]]),
+        )
+    )
 
     first = next(policy._dagger_transition_chunks(rollout))
 
@@ -972,6 +1072,13 @@ def test_timeout_replay_next_slot_uses_captured_true_final_raw_state():
     assert first[PERCEPTION_POLICY_RAW_KEY][0, -2, 0].item() == 108.0
     assert first[PERCEPTION_POLICY_RAW_KEY][0, -1, 0].item() == 177.0
     assert first[PERCEPTION_VEL_COMMAND_RAW_KEY][0, -1, 0].item() == 277.0
+    decoded_geometry = policy._decode_replay_object_geo(
+        first[PERCEPTION_OBJECT_GEO_ID_KEY],
+        device="cpu",
+        dtype=torch.float32,
+    )
+    assert torch.equal(decoded_geometry[0, -2], torch.tensor([1.0, 2.0]))
+    assert torch.equal(decoded_geometry[0, -1], true_timeout_geometry[0])
     assert first["next_critic_observations"][0, 0].item() == 377.0
 
 
@@ -1126,6 +1233,92 @@ class _ResetAwareEMAProjection(nn.Module):
         return td
 
 
+class _GeometryAwareEMAProjection(nn.Module):
+    def forward(self, td):
+        td[PRIV_PRED_KEY] = td[OBJECT_GEO_KEY][..., :1]
+        return td
+
+
+def test_two_object_geometries_survive_window_replay_and_exact_reencoding():
+    policy = _raw_transition_policy()
+    policy.cfg.perception_encode_microbatch_size = 1
+    policy.cfg.latent_dim = 1
+    policy.depth_feature_dim = 1
+    policy._vecnorm_snapshot = lambda: None
+    policy._normalize_replay_value = lambda key, value, snapshot: value
+    policy.temporal_depth_gru_ema = _NoOpPerceptionModule()
+    policy.object_adapt_ema = _NoOpPerceptionModule()
+    policy.object_pred_transform = _NoOpPerceptionModule()
+    policy.adapt_ema = _GeometryAwareEMAProjection()
+
+    first_geometry = torch.tensor([0.5, 1.2])
+    second_geometry = torch.tensor([0.8, 1.1])
+    rollout_geometry = torch.stack(
+        (
+            first_geometry.expand(10, 2),
+            second_geometry.expand(10, 2),
+        )
+    ).clone()
+    rollout = _raw_transition_td(
+        torch.stack((torch.arange(10), torch.arange(10) + 20)),
+        object_geo=rollout_geometry,
+    )
+    final_geometry = torch.stack((second_geometry, first_geometry))
+    policy.capture_rollout_final_observation(
+        _raw_final_td(
+            torch.tensor([10.0, 30.0]),
+            object_geo=final_geometry,
+        )
+    )
+
+    _, final_step = tuple(policy._dagger_transition_chunks(rollout))
+    replay = _TD3DeviceReplay(4, "cpu")
+    replay.extend(final_step)
+    sampled = replay.sample_by_indices(
+        torch.tensor([1, 0]),
+        "cpu",
+        fields=_PERCEPTION_REPLAY_FIELDS,
+    )
+
+    decoded = policy._decode_replay_object_geo(
+        sampled[PERCEPTION_OBJECT_GEO_ID_KEY],
+        device="cpu",
+        dtype=torch.float32,
+    )
+    expected_windows = torch.stack(
+        (
+            torch.cat(
+                (
+                    second_geometry.expand(9, 2),
+                    first_geometry.unsqueeze(0),
+                )
+            ),
+            torch.cat(
+                (
+                    first_geometry.expand(9, 2),
+                    second_geometry.unsqueeze(0),
+                )
+            ),
+        )
+    )
+    assert torch.equal(decoded, expected_windows)
+    assert sampled[PERCEPTION_OBJECT_GEO_ID_KEY].dtype is torch.int32
+
+    encoded = policy._reencode_perception_windows(
+        sampled,
+        include_current=True,
+        include_next=True,
+    )
+    assert torch.equal(
+        encoded["observations"][:, -1],
+        torch.tensor([second_geometry[0], first_geometry[0]]),
+    )
+    assert torch.equal(
+        encoded["next_observations"][:, -1],
+        torch.tensor([first_geometry[0], second_geometry[0]]),
+    )
+
+
 def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
     policy = _bare_policy(
         perception_replay_burn_in=8,
@@ -1133,7 +1326,10 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
         latent_dim=1,
     )
     policy.depth_feature_dim = 1
-    policy._replay_object_geo = torch.tensor([1.0, 2.0])
+    policy.observation_spec = {
+        OBJECT_GEO_KEY: SimpleNamespace(shape=(2,)),
+    }
+    policy._reset_replay_object_geo_codebook()
     policy._vecnorm_snapshot = lambda: None
     policy._normalize_replay_value = lambda key, value, snapshot: value
     policy.temporal_depth_gru_ema = _NoOpPerceptionModule()
@@ -1144,10 +1340,21 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
     raw_vel = raw_policy + 100.0
     resets = torch.zeros(1, 10, dtype=torch.bool)
     resets[:, 4] = True
+    geometry_ids = policy._encode_replay_object_geo(
+        TensorDict(
+            {
+                OBJECT_GEO_KEY: torch.tensor([1.0, 2.0])
+                .expand(1, 10, 2)
+                .clone(),
+            },
+            batch_size=(1, 10),
+        )
+    )
     batch = {
         PERCEPTION_DEPTH_U8_KEY: torch.zeros(1, 10, 1, 1, 1, dtype=torch.uint8),
         PERCEPTION_POLICY_RAW_KEY: raw_policy,
         PERCEPTION_VEL_COMMAND_RAW_KEY: raw_vel,
+        PERCEPTION_OBJECT_GEO_ID_KEY: geometry_ids,
         PERCEPTION_IS_INIT_KEY: resets,
     }
     stored_before = {key: value.clone() for key, value in batch.items()}
@@ -1179,6 +1386,7 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
             PERCEPTION_DEPTH_U8_KEY,
             PERCEPTION_POLICY_RAW_KEY,
             PERCEPTION_VEL_COMMAND_RAW_KEY,
+            PERCEPTION_OBJECT_GEO_ID_KEY,
             PERCEPTION_IS_INIT_KEY,
         )
     )
@@ -1191,9 +1399,11 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
         "discounts",
         "next_critic_observations",
         REFERENCE_PHASE_KEY,
+        REPLAY_PERCEPTION_EMA_GENERATION_KEY,
         PERCEPTION_DEPTH_U8_KEY,
         PERCEPTION_POLICY_RAW_KEY,
         PERCEPTION_VEL_COMMAND_RAW_KEY,
+        PERCEPTION_OBJECT_GEO_ID_KEY,
         PERCEPTION_IS_INIT_KEY,
     }
     assert {"observations", "next_observations", "priv_pred"}.isdisjoint(
@@ -1238,6 +1448,9 @@ def test_collection_actor_prepare_uses_generic_cache_for_both_sources():
         ),
         PERCEPTION_POLICY_RAW_KEY: torch.zeros(row_count, 10, 1),
         PERCEPTION_VEL_COMMAND_RAW_KEY: torch.zeros(row_count, 10, 1),
+        PERCEPTION_OBJECT_GEO_ID_KEY: torch.zeros(
+            row_count, 10, dtype=torch.int32
+        ),
         PERCEPTION_IS_INIT_KEY: torch.zeros(row_count, 10, dtype=torch.bool),
         DAGGER_REPLAY_TEACHER_ACTIONS: torch.zeros(row_count, 1),
         "next_critic_observations": torch.zeros(row_count, 1),
@@ -1276,6 +1489,7 @@ def test_collection_actor_prepare_fails_closed_when_student_cache_is_missing():
         PERCEPTION_DEPTH_U8_KEY: torch.zeros(2, 10, 1, 1, 1, dtype=torch.uint8),
         PERCEPTION_POLICY_RAW_KEY: torch.zeros(2, 10, 1),
         PERCEPTION_VEL_COMMAND_RAW_KEY: torch.zeros(2, 10, 1),
+        PERCEPTION_OBJECT_GEO_ID_KEY: torch.zeros(2, 10, dtype=torch.int32),
         PERCEPTION_IS_INIT_KEY: torch.zeros(2, 10, dtype=torch.bool),
         DAGGER_REPLAY_TEACHER_ACTIONS: torch.zeros(2, 1),
         DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([True, False]),
@@ -1390,7 +1604,10 @@ def _teacher_perception_policy(
     policy.depth_feature_dim = 1
     policy.q_critic_keys = [OBS_PRIV_KEY, OBJECT_KEY]
     policy._q_critic_widths = [1, 1]
-    policy._replay_object_geo = torch.tensor([1.0])
+    policy.observation_spec = {
+        OBJECT_GEO_KEY: SimpleNamespace(shape=(1,)),
+    }
+    policy._reset_replay_object_geo_codebook()
     policy._vecnorm_snapshot = lambda: None
     policy._normalize_replay_value = lambda key, value, snapshot: value
     policy.temporal_depth_gru = _ReplayDepthStudent(0.5)
@@ -1422,6 +1639,12 @@ def _teacher_perception_policy(
     )
     rows[PERCEPTION_POLICY_RAW_KEY] = torch.ones(row_count, 10, 1)
     rows[PERCEPTION_VEL_COMMAND_RAW_KEY] = torch.full((row_count, 10, 1), 0.25)
+    rows[PERCEPTION_OBJECT_GEO_ID_KEY] = policy._encode_replay_object_geo(
+        TensorDict(
+            {OBJECT_GEO_KEY: torch.ones(row_count, 10, 1)},
+            batch_size=(row_count, 10),
+        )
+    )
     rows[PERCEPTION_IS_INIT_KEY] = torch.zeros(row_count, 10, dtype=torch.bool)
     policy.q_teacher_replay.extend(rows)
     return policy
@@ -2025,6 +2248,8 @@ def _initialize_prefill_episode_state(policy):
     policy._teacher_prefill_timeout_episodes = 0
     policy._teacher_prefill_incomplete_episodes = 0
     policy._teacher_prefill_discarded_rows = 0
+    policy._student_perception_drift_completed = 0
+    policy._student_perception_drift_discarded_incomplete = 0
     return policy
 
 

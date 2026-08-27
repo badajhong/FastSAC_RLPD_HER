@@ -74,6 +74,7 @@ from .td3_bc_dagger import (
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
+    OBJECT_GEO_REPLAY_SEMANTICS,
     PERCEPTION_PREFILL_DISABLED_SEMANTICS,
     REPLAY_MOTION_ID_KEY,
     STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY,
@@ -2717,6 +2718,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     PERCEPTION_PREFILL_DISABLED_SEMANTICS
                 ),
                 "teacher_prefill_semantics": FASTSAC_TEACHER_PREFILL_SEMANTICS,
+                "object_geo_replay_semantics": OBJECT_GEO_REPLAY_SEMANTICS,
                 "perception_initialization": copy.deepcopy(
                     self._perception_initialization
                 ),

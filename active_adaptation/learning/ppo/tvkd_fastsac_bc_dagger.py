@@ -62,6 +62,7 @@ from .ppo_vel import PPOVEL
 from .td3_bc_dagger import (
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
+    OBJECT_GEO_REPLAY_SEMANTICS,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
     REFERENCE_PHASE_KEY,
@@ -3302,6 +3303,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "teacher_episode_sidecar_semantics": (
                     TEACHER_EPISODE_SIDECAR_SEMANTICS
                 ),
+                "object_geo_replay_semantics": OBJECT_GEO_REPLAY_SEMANTICS,
                 "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                 "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
                 "bottleneck_selection_mode": str(
@@ -3388,6 +3390,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
         if not (legacy or previous or v3 or v5 or current):
             raise ValueError("not a TVKD FastSAC Teacher-BC checkpoint")
+        saved_object_geo_semantics = state.get("object_geo_replay_semantics")
+        if (
+            saved_object_geo_semantics is not None
+            and saved_object_geo_semantics != OBJECT_GEO_REPLAY_SEMANTICS
+        ):
+            raise ValueError(
+                "TVKD resume metadata mismatch at 'object_geo_replay_semantics'"
+            )
         backend = state.get("dagger_backend_config")
         if not isinstance(backend, Mapping):
             raise ValueError("TVKD checkpoint lacks backend config")
@@ -3987,6 +3997,7 @@ __all__ = [
     "LEGACY_CHECKPOINT_VERSION",
     "LEGACY_TRAINING_ALGORITHM",
     "NORMALIZED_ACTOR_LEARNING_SEMANTICS",
+    "OBJECT_GEO_REPLAY_SEMANTICS",
     "Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS",
     "PREVIOUS_CHECKPOINT_VERSION",
     "PREVIOUS_TRAINING_ALGORITHM",
