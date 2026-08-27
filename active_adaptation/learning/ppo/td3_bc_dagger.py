@@ -43,13 +43,17 @@ from .common import (
 )
 from .fastsac_vel import (
     FASTSAC_Q_DEFAULT_ACTION_FUSION,
+    FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS,
     FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
     FASTSAC_Q_LATE_FUSION_SEMANTICS,
     REPLAY_OBSERVATION_SEMANTICS,
+    TEACHER_ACTUATOR_CONTEXT_FIELD,
+    NEXT_TEACHER_ACTUATOR_CONTEXT_FIELD,
     TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
     _build_isolated_q_network,
     _filter_replay_rows,
     _measure_or_clip_grad_norm,
+    _normalize_q_actuator_context_metadata,
     _q_action_hidden_dim,
     _project_to_execution_support,
     _sac_bootstrap_mask as _bootstrap_mask,
@@ -186,6 +190,17 @@ TEACHER_ACTOR_CACHE_ENCODER_SEMANTICS = (
 COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS = (
     "student_collection_carried_hidden_current_next_plus_teacher_success_"
     "episode_current_ema_v1"
+)
+Q_ACTOR_STATE_SEMANTICS = (
+    "collection_exact_vel_command_plus_inferred_belief_q_only_v1"
+)
+Q_TERMINATION_COUNTER_CONTEXT_SEMANTICS = (
+    "ordered_clamped_cumulative_steps_div_min_steps_current_and_"
+    "post_action_pre_reset_q_only_v1"
+)
+Q_TERMINATION_COUNTER_CONTEXT_KEY = "q_termination_counter_progress"
+NEXT_Q_TERMINATION_COUNTER_CONTEXT_KEY = (
+    "next_q_termination_counter_progress"
 )
 TEACHER_EPISODE_SIDECAR_SEMANTICS = (
     "fresh_nonserialized_success_episode_raw_journal_and_current_ema_cache_v1"
@@ -1324,6 +1339,15 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     q_action_coordinates: str = "raw_joint_command"
     q_normalize_actions: bool = True
     q_action_input_gain: float = 1.0
+    # Augment Q with selected policy/transition inputs absent from q_critic_keys.
+    # The actor-only state is the exact collection-time [vel_command, priv_pred]
+    # cache; actuator state is the pre-step delayed-control context; cumulative
+    # termination progress is a Q-only private-state side channel. Base
+    # TD3/FastSAC stay disabled for checkpoint compatibility, while TVKD enables
+    # all three for fresh runs.
+    q_condition_on_actor_state: bool = False
+    q_condition_on_actuator_state: bool = False
+    q_condition_on_termination_counters: bool = False
     q_lr: float = 3e-5
     q_weight_decay: float = 1e-3
     q_seed: int = 0
@@ -1613,8 +1637,33 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         ]
         self._q_actor_dim = sum(self._q_actor_widths)
         self._q_critic_dim = sum(self._q_critic_widths)
+        self._q_vel_command_dim = self._q_actor_widths[0]
+        self._q_belief_dim = int(cfg.latent_dim)
+        self._q_actor_state_dim = (
+            self._q_vel_command_dim + self._q_belief_dim
+            if self._q_conditions_on_actor_state()
+            else 0
+        )
+        self._q_actuator_context_metadata_value = (
+            self._resolve_q_actuator_context_metadata()
+        )
+        self._q_actuator_context_dim = int(
+            self._q_actuator_context_metadata_value.get("dimension", 0)
+        )
+        self._q_termination_counter_metadata_value = (
+            self._resolve_q_termination_counter_metadata()
+        )
+        self._q_termination_counter_dim = int(
+            self._q_termination_counter_metadata_value.get("dimension", 0)
+        )
+        self._q_input_dim = (
+            self._q_critic_dim
+            + self._q_actor_state_dim
+            + self._q_actuator_context_dim
+            + self._q_termination_counter_dim
+        )
         self.qnet = _build_isolated_q_network(
-            self._q_critic_dim,
+            self._q_input_dim,
             self.action_dim,
             cfg.q_hidden_dim,
             cfg.q_num_atoms,
@@ -1659,6 +1708,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self._replay_vecnorm_fingerprint = None
         self._rollout_final_batch = None
         self._truncation_final_batches = []
+        self._rollout_q_actuator_contexts = []
+        self._rollout_q_termination_counter_contexts = []
         self._last_truncation_finals_used = 0
         self._perception_replay_history = None
         self._perception_replay_history_count = 0
@@ -1874,6 +1925,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError(
                 "distributional TD3 requires normalized raw-joint-command Q actions"
             )
+        for name in (
+            "q_condition_on_actor_state",
+            "q_condition_on_actuator_state",
+            "q_condition_on_termination_counters",
+        ):
+            if not isinstance(getattr(cfg, name, False), bool):
+                raise ValueError(f"{name} must be boolean")
         positive_integers = (
             "dagger_safe_min_teacher_steps",
             "dagger_beta_decay_rollouts",
@@ -1921,6 +1979,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError(
                 "perception_replay_mode must be 'online_student_rollout', "
                 "'legacy_online_student', or 'four_way'"
+            )
+        if bool(getattr(cfg, "q_condition_on_actor_state", False)) and (
+            perception_replay_mode != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+        ):
+            raise ValueError(
+                "q_condition_on_actor_state=true requires collection-exact "
+                "online_student_rollout perception replay"
             )
         if perception_replay_mode == "four_way" and bool(cfg.train_dr_estimator):
             raise ValueError(
@@ -2338,6 +2403,553 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "raw joint action overflowed Q normalization",
         )
         return transformed
+
+    def _q_conditions_on_actor_state(self) -> bool:
+        """Whether Q observes policy-only velocity command and inferred belief."""
+        return bool(getattr(self.cfg, "q_condition_on_actor_state", False))
+
+    def _q_conditions_on_actuator_state(self) -> bool:
+        return bool(getattr(self.cfg, "q_condition_on_actuator_state", False))
+
+    def _q_conditions_on_termination_counters(self) -> bool:
+        return bool(
+            getattr(self.cfg, "q_condition_on_termination_counters", False)
+        )
+
+    def _q_actor_state_metadata(self) -> dict:
+        if not self._q_conditions_on_actor_state():
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "semantics": Q_ACTOR_STATE_SEMANTICS,
+            "dimension": int(self._q_actor_state_dim),
+            "vel_command_dim": int(self._q_vel_command_dim),
+            "belief_dim": int(self._q_belief_dim),
+        }
+
+    def _resolve_q_actuator_context_metadata(self) -> dict:
+        """Resolve the native FastSAC delayed-actuator Q-only coordinates."""
+        if not self._q_conditions_on_actuator_state():
+            return {"enabled": False}
+        manager = getattr(self.env, "action_manager", None)
+        required = ("min_delay", "max_delay", "alpha_range", "delay", "alpha")
+        missing = [name for name in required if not hasattr(manager, name)]
+        if missing:
+            raise ValueError(
+                "q_condition_on_actuator_state requires a delayed JointPosition "
+                f"action manager; missing attributes {missing}"
+            )
+        delay_min = manager.min_delay
+        delay_max = manager.max_delay
+        if (
+            isinstance(delay_min, bool)
+            or isinstance(delay_max, bool)
+            or int(delay_min) != delay_min
+            or int(delay_max) != delay_max
+            or int(delay_min) > int(delay_max)
+        ):
+            raise ValueError(
+                "q_condition_on_actuator_state requires ordered integer delay bounds"
+            )
+        alpha_range = manager.alpha_range
+        if not isinstance(alpha_range, (list, tuple)) or len(alpha_range) != 2:
+            raise ValueError(
+                "q_condition_on_actuator_state requires a two-value alpha_range"
+            )
+        alpha_low, alpha_high = (float(value) for value in alpha_range)
+        if (
+            not math.isfinite(alpha_low)
+            or not math.isfinite(alpha_high)
+            or alpha_low > alpha_high
+        ):
+            raise ValueError(
+                "q_condition_on_actuator_state requires finite ordered alpha bounds"
+            )
+        delay_min = int(delay_min)
+        delay_max = int(delay_max)
+        return _normalize_q_actuator_context_metadata(
+            {
+                "enabled": True,
+                "semantics": FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS,
+                "dimension": delay_max - delay_min + 2,
+                "delay_range": [delay_min, delay_max],
+                "alpha_range": [alpha_low, alpha_high],
+            }
+        )
+
+    def _resolve_q_termination_counter_metadata(self) -> dict:
+        """Bind an ordered set of cumulative termination counters for Q."""
+        if not self._q_conditions_on_termination_counters():
+            self._q_termination_counter_sources = ()
+            return {"enabled": False}
+        termination_funcs = getattr(self.env, "termination_funcs", None)
+        if not isinstance(termination_funcs, Mapping):
+            raise ValueError(
+                "q_condition_on_termination_counters requires environment "
+                "termination_funcs"
+            )
+        sources = []
+        names = []
+        min_steps = []
+        for name, termination in termination_funcs.items():
+            reader = getattr(
+                termination, "q_cumulative_counter_progress", None
+            )
+            if not callable(reader):
+                continue
+            configured_min_steps = getattr(termination, "min_steps", None)
+            if (
+                isinstance(configured_min_steps, bool)
+                or not isinstance(configured_min_steps, Integral)
+                or int(configured_min_steps) < 1
+            ):
+                raise ValueError(
+                    f"Q cumulative termination {name!r} has invalid min_steps"
+                )
+            names.append(str(name))
+            min_steps.append(int(configured_min_steps))
+            sources.append((str(name), reader))
+        if not sources:
+            raise ValueError(
+                "q_condition_on_termination_counters found no cumulative "
+                "termination counters"
+            )
+        self._q_termination_counter_sources = tuple(sources)
+        return {
+            "enabled": True,
+            "semantics": Q_TERMINATION_COUNTER_CONTEXT_SEMANTICS,
+            "dimension": len(sources),
+            "names": names,
+            "min_steps": min_steps,
+            "normalization": "clamp(cumulative_steps/min_steps,0,1)",
+        }
+
+    @torch.no_grad()
+    def capture_q_termination_counter_context(
+        self, *, after_last_update: bool = False
+    ) -> torch.Tensor | None:
+        """Read current or post-action/pre-reset cumulative Q state."""
+        if not self._q_conditions_on_termination_counters():
+            return None
+        if not isinstance(after_last_update, bool):
+            raise TypeError("after_last_update must be boolean")
+        sources = getattr(self, "_q_termination_counter_sources", ())
+        if len(sources) != self._q_termination_counter_dim:
+            raise RuntimeError("Q cumulative termination source contract changed")
+        row_count = int(self.env.num_envs)
+        chunks = []
+        for name, reader in sources:
+            progress = reader(after_last_update=after_last_update)
+            if not isinstance(progress, torch.Tensor) or progress.shape != (
+                row_count,
+                1,
+            ):
+                raise ValueError(
+                    f"Q cumulative termination {name!r} returned an invalid shape"
+                )
+            if progress.device != torch.device(self.device):
+                raise ValueError(
+                    f"Q cumulative termination {name!r} is on the wrong device"
+                )
+            if not progress.is_floating_point():
+                raise ValueError(
+                    f"Q cumulative termination {name!r} must be floating point"
+                )
+            chunks.append(progress)
+        return torch.cat(chunks, dim=-1).detach().clone()
+
+    def record_rollout_q_termination_counter_context(
+        self,
+        current_context: torch.Tensor | None,
+        next_context: torch.Tensor | None,
+    ) -> None:
+        if not self._q_conditions_on_termination_counters():
+            if current_context is not None or next_context is not None:
+                raise ValueError(
+                    "Received cumulative termination context while Q conditioning "
+                    "is disabled"
+                )
+            return
+        if current_context is None or next_context is None:
+            raise ValueError(
+                "Enabled Q cumulative termination conditioning requires current "
+                "and next contexts"
+            )
+        expected = (int(self.env.num_envs), self._q_termination_counter_dim)
+        if current_context.shape != expected or next_context.shape != expected:
+            raise ValueError(
+                "Q cumulative termination rollout context has an invalid shape"
+            )
+        if current_context.device != next_context.device:
+            raise ValueError(
+                "Q cumulative termination current/next contexts must share a device"
+            )
+        self._rollout_q_termination_counter_contexts.append(
+            (current_context.detach().clone(), next_context.detach().clone())
+        )
+
+    def _consume_rollout_q_termination_counter_contexts(
+        self, num_steps: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        contexts = getattr(
+            self, "_rollout_q_termination_counter_contexts", []
+        )
+        self._rollout_q_termination_counter_contexts = []
+        if not self._q_conditions_on_termination_counters():
+            if contexts:
+                raise RuntimeError(
+                    "Captured cumulative termination contexts while conditioning "
+                    "is disabled"
+                )
+            return None
+        if len(contexts) != int(num_steps):
+            raise RuntimeError(
+                "TD3/FastSAC cumulative termination context count does not match "
+                f"rollout length: got {len(contexts)}, expected {int(num_steps)}"
+            )
+        current, following = zip(*contexts)
+        return torch.stack(current, dim=1), torch.stack(following, dim=1)
+
+    @torch.no_grad()
+    def _encode_q_actuator_context(
+        self,
+        delay: torch.Tensor,
+        alpha: torch.Tensor,
+        *,
+        validate_values: bool = True,
+    ) -> torch.Tensor:
+        metadata = self._q_actuator_context_metadata_value
+        if not metadata["enabled"]:
+            raise RuntimeError("Q actuator context is disabled")
+        if delay.ndim < 1 or delay.shape[-1] != 1:
+            raise ValueError(
+                f"Actuator delay must end in one value, got {tuple(delay.shape)}"
+            )
+        if alpha.shape != delay.shape:
+            raise ValueError(
+                "Actuator delay and alpha shapes must match, got "
+                f"{tuple(delay.shape)} and {tuple(alpha.shape)}"
+            )
+        if delay.device != alpha.device:
+            raise ValueError("Actuator delay and alpha must share one device")
+        delay_values = delay.squeeze(-1)
+        delay_min, delay_max = metadata["delay_range"]
+        alpha_low, alpha_high = metadata["alpha_range"]
+        if validate_values:
+            if delay_values.is_floating_point() and not torch.equal(
+                delay_values, delay_values.round()
+            ):
+                raise ValueError("Actuator delay values must be integral")
+            if ((delay_values < delay_min) | (delay_values > delay_max)).any():
+                raise ValueError(
+                    "Actuator delay is outside the checkpointed context range "
+                    f"[{delay_min}, {delay_max}]"
+                )
+            if not torch.isfinite(alpha).all():
+                raise ValueError("Actuator alpha contains non-finite values")
+            if ((alpha < alpha_low) | (alpha > alpha_high)).any():
+                raise ValueError(
+                    "Actuator alpha is outside the checkpointed context range "
+                    f"[{alpha_low}, {alpha_high}]"
+                )
+        delay_one_hot = F.one_hot(
+            delay_values.long() - delay_min,
+            num_classes=delay_max - delay_min + 1,
+        ).to(dtype=torch.float32)
+        if alpha_high == alpha_low:
+            alpha_centered = torch.zeros_like(alpha, dtype=torch.float32)
+        else:
+            alpha_centered = (
+                2.0 * (alpha.float() - alpha_low) / (alpha_high - alpha_low) - 1.0
+            )
+        context = torch.cat((delay_one_hot, alpha_centered), dim=-1)
+        if context.shape[-1] != self._q_actuator_context_dim:
+            raise RuntimeError("Encoded Q actuator-context dimension is inconsistent")
+        return context
+
+    @torch.no_grad()
+    def capture_q_actuator_context(self) -> torch.Tensor | None:
+        """Snapshot actuator state before the environment step can reset it."""
+        if not self._q_conditions_on_actuator_state():
+            return None
+        manager = self.env.action_manager
+        return self._encode_q_actuator_context(
+            manager.delay, manager.alpha, validate_values=False
+        ).detach().clone()
+
+    def record_rollout_q_actuator_context(
+        self, context: torch.Tensor | None
+    ) -> None:
+        if not self._q_conditions_on_actuator_state():
+            if context is not None:
+                raise ValueError(
+                    "Received actuator context while Q conditioning is disabled"
+                )
+            return
+        if context is None:
+            raise ValueError(
+                "Enabled Q actuator conditioning requires pre-step context"
+            )
+        self._rollout_q_actuator_contexts.append(context.detach().clone())
+
+    def _transition_q_actuator_context(
+        self,
+        context: torch.Tensor | None,
+        row_count: int,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if not self._q_conditions_on_actuator_state():
+            if context is not None:
+                raise ValueError(
+                    "Received transition actuator context while conditioning is disabled"
+                )
+            return None
+        if context is None:
+            raise ValueError(
+                "Enabled Q actuator conditioning requires a pre-step transition context"
+            )
+        expected = (int(row_count), self._q_actuator_context_dim)
+        if tuple(context.shape) != expected:
+            raise ValueError(
+                f"Transition actuator context has shape {tuple(context.shape)}, "
+                f"expected {expected}"
+            )
+        if context.device != device:
+            raise ValueError(
+                f"Transition actuator context is on {context.device}, expected {device}"
+            )
+        return context.detach()
+
+    def _consume_rollout_q_actuator_contexts(
+        self, num_steps: int
+    ) -> torch.Tensor | None:
+        contexts = getattr(self, "_rollout_q_actuator_contexts", [])
+        self._rollout_q_actuator_contexts = []
+        if not self._q_conditions_on_actuator_state():
+            if contexts:
+                raise RuntimeError(
+                    "Captured actuator contexts while conditioning is disabled"
+                )
+            return None
+        if len(contexts) != int(num_steps):
+            raise RuntimeError(
+                "TD3/FastSAC rollout actuator-context count does not match rollout "
+                f"length: got {len(contexts)}, expected {int(num_steps)}"
+            )
+        return torch.stack(contexts, dim=1)
+
+    def _q_observation_input(
+        self,
+        critic_observations: torch.Tensor,
+        actor_observations: torch.Tensor | None = None,
+        actuator_context: torch.Tensor | None = None,
+        termination_counter_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Append the selected policy/actuator state at the Q boundary.
+
+        The recurrent Actor cache and actuator context are replay data, never
+        optimization targets.  Detaching them here makes that contract hold
+        even for direct callers while retaining gradients through the ordinary
+        critic-observation argument for focused diagnostics.
+        """
+        if not isinstance(critic_observations, torch.Tensor) or (
+            critic_observations.ndim < 1
+        ):
+            raise ValueError("Q critic observations must be a non-scalar tensor")
+        actor_state_enabled = self._q_conditions_on_actor_state()
+        actuator_state_enabled = self._q_conditions_on_actuator_state()
+        termination_counter_enabled = (
+            self._q_conditions_on_termination_counters()
+        )
+        # Retain the exact historical forward for disabled and lightweight
+        # unit-policy paths.  Production augmented policies always carry the
+        # dimensions installed by __init__ and enter the strict branch below.
+        if (
+            not actor_state_enabled
+            and not actuator_state_enabled
+            and not termination_counter_enabled
+        ):
+            if actor_observations is not None:
+                raise ValueError(
+                    "Received Q Actor-state cache while conditioning is disabled"
+                )
+            if actuator_context is not None:
+                raise ValueError(
+                    "Received Q actuator context while conditioning is disabled"
+                )
+            if termination_counter_context is not None:
+                raise ValueError(
+                    "Received Q cumulative termination context while conditioning "
+                    "is disabled"
+                )
+            return critic_observations
+        if not hasattr(self, "_q_critic_dim") or (
+            critic_observations.shape[-1] != self._q_critic_dim
+        ):
+            raise ValueError("Q critic observations have an invalid final dimension")
+        pieces = [critic_observations]
+        if actor_state_enabled:
+            if actor_observations is None:
+                raise ValueError(
+                    "q_condition_on_actor_state=true requires exact Actor "
+                    "observations for every Q call"
+                )
+            expected = (*critic_observations.shape[:-1], self._q_actor_dim)
+            if tuple(actor_observations.shape) != expected:
+                raise ValueError(
+                    "Q Actor-state cache shape does not match critic observations: "
+                    f"got {tuple(actor_observations.shape)}, expected {expected}"
+                )
+            if actor_observations.device != critic_observations.device:
+                raise ValueError(
+                    "Q critic observations and Actor-state cache must share a device"
+                )
+            if not actor_observations.is_floating_point():
+                raise ValueError("Q Actor-state cache must be floating point")
+            actor_observations = actor_observations.detach()
+            actor_state = torch.cat(
+                (
+                    actor_observations[..., : self._q_vel_command_dim],
+                    actor_observations[..., -self._q_belief_dim :],
+                ),
+                dim=-1,
+            )
+            if actor_state.shape[-1] != self._q_actor_state_dim:
+                raise RuntimeError("Q Actor-state dimension is inconsistent")
+            pieces.append(actor_state)
+        elif actor_observations is not None:
+            raise ValueError(
+                "Received Q Actor-state cache while conditioning is disabled"
+            )
+
+        if actuator_state_enabled:
+            if actuator_context is None:
+                raise ValueError(
+                    "q_condition_on_actuator_state=true requires actuator context "
+                    "for every Q call"
+                )
+            expected = (
+                *critic_observations.shape[:-1],
+                self._q_actuator_context_dim,
+            )
+            if tuple(actuator_context.shape) != expected:
+                raise ValueError(
+                    "Q actuator-context shape does not match critic observations: "
+                    f"got {tuple(actuator_context.shape)}, expected {expected}"
+                )
+            if actuator_context.device != critic_observations.device:
+                raise ValueError(
+                    "Q critic observations and actuator context must share a device"
+                )
+            if not actuator_context.is_floating_point():
+                raise ValueError("Q actuator context must be floating point")
+            pieces.append(
+                actuator_context.detach().to(dtype=critic_observations.dtype)
+            )
+        elif actuator_context is not None:
+            raise ValueError(
+                "Received Q actuator context while conditioning is disabled"
+            )
+        if termination_counter_enabled:
+            if termination_counter_context is None:
+                raise ValueError(
+                    "q_condition_on_termination_counters=true requires cumulative "
+                    "termination context for every Q call"
+                )
+            expected = (
+                *critic_observations.shape[:-1],
+                self._q_termination_counter_dim,
+            )
+            if tuple(termination_counter_context.shape) != expected:
+                raise ValueError(
+                    "Q cumulative termination context shape does not match critic "
+                    f"observations: got {tuple(termination_counter_context.shape)}, "
+                    f"expected {expected}"
+                )
+            if termination_counter_context.device != critic_observations.device:
+                raise ValueError(
+                    "Q critic observations and cumulative termination context "
+                    "must share a device"
+                )
+            if not termination_counter_context.is_floating_point():
+                raise ValueError(
+                    "Q cumulative termination context must be floating point"
+                )
+            pieces.append(
+                termination_counter_context.detach().to(
+                    dtype=critic_observations.dtype
+                )
+            )
+        elif termination_counter_context is not None:
+            raise ValueError(
+                "Received Q cumulative termination context while conditioning "
+                "is disabled"
+            )
+        return critic_observations if len(pieces) == 1 else torch.cat(pieces, dim=-1)
+
+    def _q_forward(
+        self,
+        qnet: nn.Module,
+        critic_observations: torch.Tensor,
+        q_action: torch.Tensor,
+        *,
+        actor_observations: torch.Tensor | None = None,
+        actuator_context: torch.Tensor | None = None,
+        termination_counter_context: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return qnet(
+            self._q_observation_input(
+                critic_observations,
+                actor_observations,
+                actuator_context,
+                termination_counter_context,
+            ),
+            q_action,
+        )
+
+    def _q_batch_state_kwargs(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        *,
+        next_state: bool,
+    ) -> dict[str, torch.Tensor | None]:
+        """Select aligned current/next Q-only state, failing on missing replay."""
+        actor_key = "next_observations" if next_state else "observations"
+        actuator_key = (
+            NEXT_TEACHER_ACTUATOR_CONTEXT_FIELD
+            if next_state
+            else TEACHER_ACTUATOR_CONTEXT_FIELD
+        )
+        actor_observations = None
+        if self._q_conditions_on_actor_state():
+            if actor_key not in batch:
+                raise KeyError(f"Q batch is missing Actor state {actor_key!r}")
+            actor_observations = batch[actor_key]
+        actuator_context = None
+        if self._q_conditions_on_actuator_state():
+            if actuator_key not in batch:
+                raise KeyError(
+                    f"Q batch is missing actuator context {actuator_key!r}"
+                )
+            actuator_context = batch[actuator_key]
+        termination_counter_context = None
+        if self._q_conditions_on_termination_counters():
+            termination_key = (
+                NEXT_Q_TERMINATION_COUNTER_CONTEXT_KEY
+                if next_state
+                else Q_TERMINATION_COUNTER_CONTEXT_KEY
+            )
+            if termination_key not in batch:
+                raise KeyError(
+                    "Q batch is missing cumulative termination context "
+                    f"{termination_key!r}"
+                )
+            termination_counter_context = batch[termination_key]
+        return {
+            "actor_observations": actor_observations,
+            "actuator_context": actuator_context,
+            "termination_counter_context": termination_counter_context,
+        }
 
     def _q_action_to_physical(self, q_action: torch.Tensor) -> torch.Tensor:
         center = self._fastsac_q_action_center.to(q_action)
@@ -3664,6 +4276,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if self._has_canonical_replay_mix()
             else _Q_REPLAY_FIELDS
         )
+        if self._q_conditions_on_actuator_state():
+            fields = (
+                *fields,
+                TEACHER_ACTUATOR_CONTEXT_FIELD,
+                NEXT_TEACHER_ACTUATOR_CONTEXT_FIELD,
+            )
+        if self._q_conditions_on_termination_counters():
+            fields = (
+                *fields,
+                Q_TERMINATION_COUNTER_CONTEXT_KEY,
+                NEXT_Q_TERMINATION_COUNTER_CONTEXT_KEY,
+            )
         if self._teacher_episode_cache_enabled():
             return tuple(
                 key for key in fields if key not in _PERCEPTION_REPLAY_FIELDS
@@ -5306,6 +5930,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         values["indices"] = indices * int(self.cfg.train_every) + int(step)
         self._truncation_final_batches.append(values)
 
+    def begin_transition_collection(self) -> None:
+        """Clear rollout-local Q sidecars before collecting a new rollout."""
+        self._rollout_final_batch = None
+        self._truncation_final_batches.clear()
+        self._rollout_q_actuator_contexts = []
+        self._rollout_q_termination_counter_contexts = []
+        self._last_truncation_finals_used = 0
+
     @torch.no_grad()
     def capture_rollout_final_observation(self, carry: TensorDict):
         if not self._collect_dagger_replay_this_rollout():
@@ -5330,6 +5962,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         n, t = td.batch_size
         if int(t) != int(self.cfg.train_every):
             raise ValueError("rollout length does not match train_every")
+        actuator_contexts = self._consume_rollout_q_actuator_contexts(int(t))
+        termination_counter_contexts = (
+            self._consume_rollout_q_termination_counter_contexts(int(t))
+        )
         burn_in = int(self.cfg.perception_replay_burn_in)
         final_batch = self._rollout_final_batch
         self._rollout_final_batch = None
@@ -5550,6 +6186,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 transitions[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY] = (
                     next_actor
                 )
+            if actuator_contexts is not None:
+                context = self._transition_q_actuator_context(
+                    actuator_contexts[:, step], int(n), current.device
+                )
+                # Delay/alpha are episode constants.  For a terminal row the
+                # bootstrap is masked; for a timeout this is the true pre-reset
+                # final-state actuator context captured before stepping.
+                transitions[TEACHER_ACTUATOR_CONTEXT_FIELD] = context
+                transitions[NEXT_TEACHER_ACTUATOR_CONTEXT_FIELD] = context
+            if termination_counter_contexts is not None:
+                current_counter, next_counter = termination_counter_contexts
+                transitions[Q_TERMINATION_COUNTER_CONTEXT_KEY] = (
+                    current_counter[:, step].detach()
+                )
+                transitions[NEXT_Q_TERMINATION_COUNTER_CONTEXT_KEY] = (
+                    next_counter[:, step].detach()
+                )
             transitions, valid = _filter_replay_rows(
                 current, transitions, DAGGER_REPLAY_MIN_STEP_COUNT
             )
@@ -5692,7 +6345,62 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         Baseline TD3 never enables this cache and follows its raw-window path.
         """
         prepared = PPOBCDaggerFinetune._prepare_dagger_learning_batch(self, batch)
-        include_current = DAGGER_REPLAY_TEACHER_ACTIONS in batch
+        if self._q_conditions_on_actuator_state():
+            for context_key in (
+                TEACHER_ACTUATOR_CONTEXT_FIELD,
+                NEXT_TEACHER_ACTUATOR_CONTEXT_FIELD,
+            ):
+                context = prepared.get(context_key)
+                if context is None:
+                    continue
+                expected = (
+                    int(prepared["critic_observations"].shape[0]),
+                    self._q_actuator_context_dim,
+                )
+                if tuple(context.shape) != expected:
+                    raise ValueError(
+                        f"Replay actuator context {context_key!r} has shape "
+                        f"{tuple(context.shape)}, expected {expected}"
+                    )
+                if (
+                    not context.is_floating_point()
+                    or not torch.isfinite(context).all()
+                ):
+                    raise ValueError(
+                        f"Replay actuator context {context_key!r} is invalid"
+                    )
+                prepared[context_key] = context.detach()
+        if self._q_conditions_on_termination_counters():
+            for context_key in (
+                Q_TERMINATION_COUNTER_CONTEXT_KEY,
+                NEXT_Q_TERMINATION_COUNTER_CONTEXT_KEY,
+            ):
+                context = prepared.get(context_key)
+                if context is None:
+                    continue
+                expected = (
+                    int(prepared["critic_observations"].shape[0]),
+                    self._q_termination_counter_dim,
+                )
+                if tuple(context.shape) != expected:
+                    raise ValueError(
+                        f"Replay cumulative termination context {context_key!r} "
+                        f"has shape {tuple(context.shape)}, expected {expected}"
+                    )
+                if (
+                    not context.is_floating_point()
+                    or not torch.isfinite(context).all()
+                    or bool(((context < 0.0) | (context > 1.0)).any())
+                ):
+                    raise ValueError(
+                        f"Replay cumulative termination context {context_key!r} "
+                        "is invalid"
+                    )
+                prepared[context_key] = context.detach()
+        include_current = (
+            DAGGER_REPLAY_TEACHER_ACTIONS in batch
+            or self._q_conditions_on_actor_state()
+        )
         include_next = "next_critic_observations" in batch
         if not self._student_collection_actor_cache_enabled():
             prepared.update(
@@ -5733,7 +6441,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 raise ValueError(
                     f"collection-exact Actor cache {cache_key!r} is invalid"
                 )
-            prepared[output_key] = cache
+            prepared[output_key] = cache.detach()
         return prepared
 
     @torch.no_grad()
@@ -5773,8 +6481,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         smoothed_q_action, target_noise, next_action = self._smoothed_target_q_action(
             batch["next_observations"]
         )
-        target_logits = self.qnet_target(
-            batch["next_critic_observations"], smoothed_q_action
+        target_logits = self._q_forward(
+            self.qnet_target,
+            batch["next_critic_observations"],
+            smoothed_q_action,
+            **self._q_batch_state_kwargs(batch, next_state=True),
         )
         selected_probability, target_expected_heads, selected_head = (
             _select_lower_expected_c51_distribution(
@@ -5821,8 +6532,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _critic_update(self, batch: dict[str, torch.Tensor]):
         """One independent twin-Q C51 update against a common detached target."""
         projected_target, target_metrics = self._distributional_td3_target(batch)
-        logits = self.qnet(
-            batch["critic_observations"], self._q_action_input(batch["actions"])
+        logits = self._q_forward(
+            self.qnet,
+            batch["critic_observations"],
+            self._q_action_input(batch["actions"]),
+            **self._q_batch_state_kwargs(batch, next_state=False),
         )
         log_probabilities = F.log_softmax(logits, dim=-1)
         per_head = (
@@ -5866,8 +6580,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.actor_optimizer.zero_grad(set_to_none=True)
+        q_observations = self._q_observation_input(
+            batch["critic_observations"],
+            **self._q_batch_state_kwargs(batch, next_state=False),
+        )
         td3_actor_loss, expected_q1 = _td3_actor_q1_loss(
-            self.qnet, batch["critic_observations"], q_action
+            self.qnet, q_observations, q_action
         )
         exact_bc_loss = _exact_teacher_bc_loss(
             prediction_action,
@@ -5951,6 +6669,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "critic_obs_keys": list(self.q_critic_keys),
             "actor_obs_dim": self._q_actor_dim,
             "critic_obs_dim": self._q_critic_dim,
+            "q_input_dim": self._q_input_dim,
+            "q_actor_state": self._q_actor_state_metadata(),
+            "q_actuator_context": copy.deepcopy(
+                self._q_actuator_context_metadata_value
+            ),
+            "q_termination_counter_context": copy.deepcopy(
+                self._q_termination_counter_metadata_value
+            ),
             "action_dim": self.action_dim,
             "hidden_dim": int(self.cfg.q_hidden_dim),
             "q_action_fusion": str(self.cfg.q_action_fusion),
@@ -6073,6 +6799,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_action_coordinates",
             "q_normalize_actions",
             "q_action_input_gain",
+            "q_condition_on_actor_state",
+            "q_condition_on_actuator_state",
+            "q_condition_on_termination_counters",
             "q_lr",
             "q_weight_decay",
             "q_seed",
@@ -6159,15 +6888,32 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         collection_cache_enabled = self._student_collection_actor_cache_enabled()
         student_q_fields = q_fields
         if collection_cache_enabled:
-            cache_key = REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY
-            if student_count and cache_key not in self.dagger_replay.data:
-                raise RuntimeError(
-                    "Student Q replay lacks collection-exact next Actor observations"
-                )
+            cache_keys = (
+                REPLAY_ACTOR_OBSERVATIONS_KEY,
+                REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY,
+            )
+            if self._q_conditions_on_actor_state():
+                missing_cache = [
+                    key
+                    for key in cache_keys
+                    if student_count and key not in self.dagger_replay.data
+                ]
+                if missing_cache:
+                    raise RuntimeError(
+                        "Student Q replay lacks collection-exact Actor state: "
+                        f"{missing_cache}"
+                    )
+                student_q_fields = (*q_fields, *cache_keys)
+            else:
+                cache_key = REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY
+                if student_count and cache_key not in self.dagger_replay.data:
+                    raise RuntimeError(
+                        "Student Q replay lacks collection-exact next Actor observations"
+                    )
+                student_q_fields = (*q_fields, cache_key)
             # Teacher Actor inputs live once in the current-EMA device cache;
             # only Student rows own self-contained collection-time cache
             # fields in their CPU FIFO.
-            student_q_fields = (*q_fields, cache_key)
         teacher = None
         student = None
         teacher_indices = torch.empty(0, dtype=torch.long)
@@ -6242,6 +6988,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if permutation.shape != (batch_size,):
                 raise ValueError("Q replay sample plan has the wrong permutation shape")
         if collection_cache_enabled and teacher is not None:
+            if self._q_conditions_on_actor_state():
+                teacher[REPLAY_ACTOR_OBSERVATIONS_KEY] = (
+                    self._teacher_actor_observations_for_indices(
+                        teacher_indices, next_state=False
+                    )
+                )
             teacher[REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY] = (
                 self._teacher_actor_observations_for_indices(
                     teacher_indices, next_state=True
@@ -6286,6 +7038,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             DAGGER_REPLAY_TEACHER_ACTIONS,
             DAGGER_TEACHER_ACTION_VALID_KEY,
             REPLAY_PERCEPTION_EMA_GENERATION_KEY,
+            *(
+                (TEACHER_ACTUATOR_CONTEXT_FIELD,)
+                if self._q_conditions_on_actuator_state()
+                else ()
+            ),
+            *(
+                (Q_TERMINATION_COUNTER_CONTEXT_KEY,)
+                if self._q_conditions_on_termination_counters()
+                else ()
+            ),
             *(
                 (REPLAY_ACTOR_OBSERVATIONS_KEY,)
                 if collection_cache_enabled
@@ -6409,6 +7171,16 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         teacher_fields = (
             "critic_observations",
             "actions",
+            *(
+                (TEACHER_ACTUATOR_CONTEXT_FIELD,)
+                if self._q_conditions_on_actuator_state()
+                else ()
+            ),
+            *(
+                (Q_TERMINATION_COUNTER_CONTEXT_KEY,)
+                if self._q_conditions_on_termination_counters()
+                else ()
+            ),
             *(
                 (REPLAY_PERCEPTION_EMA_GENERATION_KEY,)
                 if REPLAY_PERCEPTION_EMA_GENERATION_KEY in main_fields

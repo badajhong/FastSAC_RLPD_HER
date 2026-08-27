@@ -2121,8 +2121,15 @@ def test_teacher_perception_loss_reencodes_raw_window_with_trainable_current_mod
     assert policy.object_adapt.scale.grad.abs().item() > 0
     assert policy.adapt_module.scale.grad.abs().item() > 0
     assert PRIV_PRED_KEY not in policy.q_teacher_replay.data
+    replay_size = policy.q_teacher_replay.size
     for key, value in stored_before.items():
-        assert torch.equal(policy.q_teacher_replay.data[key], value)
+        # Unused replay capacity is intentionally allocated with torch.empty;
+        # compare only initialized rows so arbitrary NaN bit patterns outside
+        # the logical FIFO cannot make this immutability check nondeterministic.
+        assert torch.equal(
+            policy.q_teacher_replay.data[key][:replay_size],
+            value[:replay_size],
+        )
 
 
 def test_teacher_perception_warmup_is_teacher_only_once_and_hard_syncs_ema():

@@ -455,6 +455,13 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     # Fresh v5 matches the parent FastSAC optimizer timescale. A v3 migration
     # explicitly replaces this with the checkpoint's saved cadence.
     sac_alpha_update_cadence: str = "actor"
+    # Fresh TVKD critics observe the collection-exact policy-only vel_command
+    # and priv_pred inputs, delayed actuator regime, and normalized cumulative
+    # termination progress. Parent TD3/FastSAC defaults remain false so legacy
+    # configurations retain their original Q architecture.
+    q_condition_on_actor_state: bool = True
+    q_condition_on_actuator_state: bool = True
+    q_condition_on_termination_counters: bool = True
 
     # Resolved canonical mixtures. The TVKD CLI may derive Q/Actor values from
     # explicit total-Teacher and conditional failure-focus overrides before
@@ -1364,8 +1371,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         if not torch.isfinite(soft_reward).all():
             raise RuntimeError("TVKD soft C51 reward contains NaN/Inf")
 
-        target_logits = self.qnet_target(
-            batch["next_critic_observations"], self._q_action_input(next_action)
+        target_logits = self._q_forward(
+            self.qnet_target,
+            batch["next_critic_observations"],
+            self._q_action_input(next_action),
+            **self._q_batch_state_kwargs(batch, next_state=True),
         )
         target_probabilities = F.softmax(target_logits, dim=-1)
         projected_heads = []
@@ -3270,6 +3280,18 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             getattr(self.cfg, "replay_task_fingerprint", None),
         )
         verified_histogram_state = self._failure_curriculum_checkpoint_state()
+        q_state_context_metadata = {}
+        if hasattr(self, "_q_input_dim"):
+            q_state_context_metadata = {
+                "q_input_dim": int(self._q_input_dim),
+                "q_actor_state": self._q_actor_state_metadata(),
+                "q_actuator_context": copy.deepcopy(
+                    self._q_actuator_context_metadata_value
+                ),
+                "q_termination_counter_context": copy.deepcopy(
+                    self._q_termination_counter_metadata_value
+                ),
+            }
         state.update(
             {
                 "training_algorithm": TRAINING_ALGORITHM,
@@ -3279,6 +3301,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     self.cfg
                 ),
                 "q_backend_config": {
+                    **q_state_context_metadata,
                     "target_semantics": CRITIC_LEARNING_SEMANTICS,
                     "bc_weighting_semantics": (
                         SPRED_P_BC_SEMANTICS
@@ -3634,6 +3657,19 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     getattr(self.cfg, "bottleneck_selection_mode", "first")
                 ),
             }
+            if current and hasattr(self, "_q_input_dim"):
+                expected_q_metadata.update(
+                    {
+                        "q_input_dim": int(self._q_input_dim),
+                        "q_actor_state": self._q_actor_state_metadata(),
+                        "q_actuator_context": copy.deepcopy(
+                            self._q_actuator_context_metadata_value
+                        ),
+                        "q_termination_counter_context": copy.deepcopy(
+                            self._q_termination_counter_metadata_value
+                        ),
+                    }
+                )
             for name, expected in expected_q_metadata.items():
                 if q_backend.get(name, metadata_defaults.get(name)) != expected:
                     raise ValueError(

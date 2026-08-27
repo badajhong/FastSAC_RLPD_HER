@@ -177,11 +177,26 @@ def _gradient_cosine(
     return _finite_float((dot / denominator).clamp(-1.0, 1.0))
 
 
-def _expected_twin_q(policy, critic_observations, actions):
-    logits = policy.qnet(
-        critic_observations,
-        policy._q_action_input(actions),
-    )
+def _expected_twin_q(
+    policy,
+    critic_observations,
+    actions,
+    q_state_kwargs: Mapping[str, torch.Tensor | None] | None = None,
+):
+    """Evaluate Q through the production state-augmentation boundary."""
+    q_state_kwargs = {} if q_state_kwargs is None else dict(q_state_kwargs)
+    if hasattr(policy, "_q_forward"):
+        logits = policy._q_forward(
+            policy.qnet,
+            critic_observations,
+            policy._q_action_input(actions),
+            **q_state_kwargs,
+        )
+    else:  # Backward-compatible seam for lightweight diagnostic fixtures.
+        logits = policy.qnet(
+            critic_observations,
+            policy._q_action_input(actions),
+        )
     expected = (F.softmax(logits, dim=-1) * policy.qnet.support).sum(dim=-1)
     minimum = _reduce_actor_q_values(expected, True)
     return expected, minimum
@@ -262,9 +277,16 @@ def _scalar_stratum_metrics(
     return metrics
 
 
-def _action_q_gradients(policy, critic_observations, action):
+def _action_q_gradients(
+    policy,
+    critic_observations,
+    action,
+    q_state_kwargs: Mapping[str, torch.Tensor | None] | None = None,
+):
     leaf = action.detach().clone().requires_grad_(True)
-    _, minimum = _expected_twin_q(policy, critic_observations, leaf)
+    _, minimum = _expected_twin_q(
+        policy, critic_observations, leaf, q_state_kwargs
+    )
     # Rows are independent, so differentiating the sum returns one unscaled
     # dQ/da vector for every row.
     gradient = torch.autograd.grad(minimum.sum(), leaf, create_graph=False)[0]
@@ -343,6 +365,11 @@ def diagnose_fastsac_actor_gradients(
     lambda_bc = float(policy.cfg.lambda_bc)
     eta_sac = float(policy.cfg.eta_sac)
     alpha = policy.log_alpha.detach().exp()
+    q_state_kwargs = (
+        policy._q_batch_state_kwargs(batch, next_state=False)
+        if hasattr(policy, "_q_batch_state_kwargs")
+        else {}
+    )
 
     with torch.enable_grad(), _temporarily_enable_grad(all_parameters):
         raw_prediction = policy._actor_mean_from_flat(observations)
@@ -355,17 +382,17 @@ def diagnose_fastsac_actor_gradients(
         )
         normalized_log_prob = policy._normalized_action_log_prob(raw_log_prob)
         twin_sample_q, minimum_sample_q = _expected_twin_q(
-            policy, critic_observations, sampled_action
+            policy, critic_observations, sampled_action, q_state_kwargs
         )
         with torch.no_grad():
             twin_mean_q, minimum_mean_q = _expected_twin_q(
-                policy, critic_observations, mean_action.detach()
+                policy, critic_observations, mean_action.detach(), q_state_kwargs
             )
             finite_teacher_action = torch.nan_to_num(
                 teacher_action, nan=0.0, posinf=0.0, neginf=0.0
             )
             twin_teacher_q, minimum_teacher_q = _expected_twin_q(
-                policy, critic_observations, finite_teacher_action
+                policy, critic_observations, finite_teacher_action, q_state_kwargs
             )
 
         teacher_source = batch.get(DAGGER_Q_TEACHER_SOURCE_KEY)
@@ -509,11 +536,13 @@ def diagnose_fastsac_actor_gradients(
         # therefore tests the Critic's local action sensitivity independently
         # of both the Actor Jacobian and the BC objective.
         sample_dqda = _action_q_gradients(
-            policy, critic_observations, sampled_action
+            policy, critic_observations, sampled_action, q_state_kwargs
         )
-        mean_dqda = _action_q_gradients(policy, critic_observations, mean_action)
+        mean_dqda = _action_q_gradients(
+            policy, critic_observations, mean_action, q_state_kwargs
+        )
         teacher_dqda = _action_q_gradients(
-            policy, critic_observations, finite_teacher_action
+            policy, critic_observations, finite_teacher_action, q_state_kwargs
         )
 
         # Check whether the local Critic direction agrees with Teacher BC in
@@ -555,11 +584,13 @@ def diagnose_fastsac_actor_gradients(
                 policy,
                 critic_observations,
                 mean_action.detach() + epsilon * physical_step_direction,
+                q_state_kwargs,
             )
             _, q_minus = _expected_twin_q(
                 policy,
                 critic_observations,
                 mean_action.detach() - epsilon * physical_step_direction,
+                q_state_kwargs,
             )
             finite_difference_derivative = (q_plus - q_minus) / (2.0 * epsilon)
         derivative_scale = torch.maximum(

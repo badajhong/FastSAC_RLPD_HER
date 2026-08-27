@@ -1523,8 +1523,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         entropy_tax = effective_discount * bootstrap * alpha * next_log_prob
         soft_reward = batch["rewards"] - entropy_tax
 
-        target_logits = self.qnet_target(
-            batch["next_critic_observations"], self._q_action_input(next_action)
+        target_logits = self._q_forward(
+            self.qnet_target,
+            batch["next_critic_observations"],
+            self._q_action_input(next_action),
+            **self._q_batch_state_kwargs(batch, next_state=True),
         )
         target_probabilities = F.softmax(target_logits, dim=-1)
         projected_heads = []
@@ -1658,8 +1661,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         projected_target, target_metrics, target_log_prob = (
             self._distributional_fastsac_target(batch)
         )
-        logits = self.qnet(
-            batch["critic_observations"], self._q_action_input(batch["actions"])
+        logits = self._q_forward(
+            self.qnet,
+            batch["critic_observations"],
+            self._q_action_input(batch["actions"]),
+            **self._q_batch_state_kwargs(batch, next_state=False),
         )
         log_probabilities = F.log_softmax(logits, dim=-1)
         per_head = (
@@ -1766,7 +1772,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             for parameter in self.qnet.parameters():
                 parameter.requires_grad_(False)
                 parameter.grad = None
-            twin_logits = self.qnet(batch["critic_observations"], q_action)
+            twin_logits = self._q_forward(
+                self.qnet,
+                batch["critic_observations"],
+                q_action,
+                **self._q_batch_state_kwargs(batch, next_state=False),
+            )
             twin_expected = (F.softmax(twin_logits, dim=-1) * self.qnet.support).sum(
                 dim=-1
             )
@@ -1816,17 +1827,21 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 # head to its expected return before fitting the two Gaussian
                 # action-value distributions.  Sequential forwards keep peak
                 # memory lower than concatenating a doubled Actor batch.
-                policy_online_logits = self.qnet(
+                policy_online_logits = self._q_forward(
+                    self.qnet,
                     batch["critic_observations"],
                     self._q_action_input(prediction_action.detach()),
+                    **self._q_batch_state_kwargs(batch, next_state=False),
                 )
                 policy_online_q = (
                     F.softmax(policy_online_logits, dim=-1) * self.qnet.support
                 ).sum(dim=-1)
                 del policy_online_logits
-                teacher_online_logits = self.qnet(
+                teacher_online_logits = self._q_forward(
+                    self.qnet,
                     batch["critic_observations"],
                     self._q_action_input(safe_teacher_actions.detach()),
+                    **self._q_batch_state_kwargs(batch, next_state=False),
                 )
                 teacher_online_q = (
                     F.softmax(teacher_online_logits, dim=-1) * self.qnet.support

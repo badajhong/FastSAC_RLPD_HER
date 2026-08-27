@@ -919,6 +919,14 @@ def run_training(cfg: DictConfig):
                     # completed rows. Snapshot the Q-only context while it still
                     # belongs to the action and transition being collected.
                     actuator_context = policy.capture_q_actuator_context()
+                termination_counter_context = None
+                if hasattr(policy, "capture_q_termination_counter_context"):
+                    # This is the current pre-action counter state. The matching
+                    # next state is read from each termination's post-update
+                    # snapshot after step/reset below, never from reset carry.
+                    termination_counter_context = (
+                        policy.capture_q_termination_counter_context()
+                    )
                 if not interleaved_updates and hasattr(
                     policy, "record_rollout_q_actuator_context"
                 ):
@@ -928,6 +936,20 @@ def run_training(cfg: DictConfig):
                         td, carry = env.step_and_maybe_reset(carry)
                 else:
                     td, carry = env.step_and_maybe_reset(carry)
+                next_termination_counter_context = None
+                if hasattr(policy, "capture_q_termination_counter_context"):
+                    next_termination_counter_context = (
+                        policy.capture_q_termination_counter_context(
+                            after_last_update=True
+                        )
+                    )
+                if not interleaved_updates and hasattr(
+                    policy, "record_rollout_q_termination_counter_context"
+                ):
+                    policy.record_rollout_q_termination_counter_context(
+                        termination_counter_context,
+                        next_termination_counter_context,
+                    )
                 if interleaved_updates:
                     update_start = time.perf_counter()
                     # Replay tensors are ordinary device tensors, so gradients
