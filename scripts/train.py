@@ -77,6 +77,29 @@ _ENV_EMA_SCALAR_FIELDS = (
     "ema_cnt",
 )
 
+_BC_DAGGER_MAIN_STEP_METRIC = "progress/main_rollout"
+_BC_DAGGER_PREFILL_STEP_METRIC = "progress/prefill_rollout"
+_BC_DAGGER_PREFILL_METRIC_GLOBS = (
+    # Register these before their broader families: W&B resolves matching
+    # metric globs in insertion order.
+    "td3/prefill_*",
+    "fastsac/prefill_*",
+)
+_BC_DAGGER_MAIN_METRIC_GLOBS = (
+    "train/*",
+    "td3/*",
+    "fastsac/*",
+    "tvkd/*",
+    "loss/*",
+    "source/*",
+    "bottleneck/*",
+    "dagger/*",
+    "adapt/*",
+    "replay/*",
+    "reward.*",
+    "performance*",
+)
+
 
 _PROFILE_ALGO_INVARIANTS = (
     "name",
@@ -231,6 +254,77 @@ def _base_training_env(env):
     return current
 
 
+def _set_teacher_prefill_nominal_reset(env, enabled: bool) -> bool:
+    """Toggle the command's narrow t=0/unperturbed-root reset contract."""
+    if not isinstance(enabled, bool):
+        raise TypeError("teacher-prefill nominal-reset flag must be boolean")
+    base_env = _base_training_env(env)
+    command_manager = getattr(base_env, "command_manager", None)
+    setter = getattr(command_manager, "set_teacher_prefill_nominal_reset", None)
+    if not callable(setter):
+        if enabled:
+            raise RuntimeError(
+                "Teacher prefill requires a command manager implementing "
+                "set_teacher_prefill_nominal_reset(bool)"
+            )
+        return False
+    setter(enabled)
+    return True
+
+
+def _define_bc_dagger_wandb_metrics(run, main_rollout_budget: int | None) -> None:
+    """Give prefill and main training independent, explicit W&B x-axes."""
+    if main_rollout_budget is None:
+        return
+    define_metric = getattr(run, "define_metric", None)
+    if not callable(define_metric):
+        raise RuntimeError("dynamic DAgger logging requires W&B define_metric()")
+
+    define_metric(_BC_DAGGER_MAIN_STEP_METRIC, summary="max")
+    define_metric(_BC_DAGGER_PREFILL_STEP_METRIC, summary="max")
+    define_metric("progress/run_physical_rollout", summary="max")
+    define_metric("progress/main_env_frames", summary="max")
+    define_metric("progress/prefill_env_frames", summary="max")
+    for pattern in _BC_DAGGER_PREFILL_METRIC_GLOBS:
+        define_metric(
+            pattern,
+            step_metric=_BC_DAGGER_PREFILL_STEP_METRIC,
+            step_sync=True,
+        )
+    for pattern in _BC_DAGGER_MAIN_METRIC_GLOBS:
+        define_metric(
+            pattern,
+            step_metric=_BC_DAGGER_MAIN_STEP_METRIC,
+            step_sync=True,
+        )
+
+
+def _bc_dagger_log_progress(
+    policy,
+    *,
+    physical_rollout: int,
+    num_envs: int,
+    main_rollout_budget: int | None,
+) -> dict[str, int]:
+    """Return separate logical counters without relabeling physical work."""
+    if main_rollout_budget is None:
+        return {}
+    main_rollouts = int(getattr(policy, "dagger_rollout_count", 0))
+    prefill_rollouts = int(getattr(policy, "teacher_prefill_rollout_count", 0))
+    main_environment_steps = int(getattr(policy, "dagger_environment_steps", 0))
+    prefill_environment_steps = int(
+        getattr(policy, "teacher_prefill_environment_steps", 0)
+    )
+    return {
+        _BC_DAGGER_MAIN_STEP_METRIC: main_rollouts,
+        _BC_DAGGER_PREFILL_STEP_METRIC: prefill_rollouts,
+        "progress/run_physical_rollout": int(physical_rollout),
+        "progress/main_rollout_budget": int(main_rollout_budget),
+        "progress/main_env_frames": main_environment_steps * int(num_envs),
+        "progress/prefill_env_frames": prefill_environment_steps * int(num_envs),
+    }
+
+
 def _zero_accumulator_tree(tree) -> None:
     """Zero tensor/scalar accumulator leaves without replacing containers."""
     if isinstance(tree, dict):
@@ -245,19 +339,11 @@ def _zero_accumulator_tree(tree) -> None:
         tree.zero_()
 
 
-def _reset_after_teacher_prefill(env, episode_stats):
-    """Start main DAgger from clean episodes and clean environment EMAs.
-
-    Teacher prefill can end midway through every physical environment's
-    episode.  Merely dropping completed prefill episodes is insufficient: a
-    later main-policy termination would still expose cumulative episode stats
-    whose prefix was controlled by the Teacher.  Reset all environments at
-    the phase boundary, then erase the reward/performance running statistics
-    accumulated by prefill (including the reset operation itself).
-    """
+def _reset_environment_and_clear_emas(env, episode_stats):
+    """Reset every environment and remove statistics from the prior phase."""
     # Isaac's simulator state is created and advanced under inference mode in
-    # the rollout loop.  Reset mutates those tensors in-place, and therefore
-    # must run under the same mode.  Keep the subsequent accumulator clearing
+    # the rollout loop. Reset mutates those tensors in-place, and therefore
+    # must run under the same mode. Keep the subsequent accumulator clearing
     # in this context as those trees may also contain inference tensors.
     with torch.inference_mode():
         if len(episode_stats):
@@ -273,6 +359,28 @@ def _reset_after_teacher_prefill(env, episode_stats):
             if hasattr(base_env, field):
                 setattr(base_env, field, 0.0)
     return carry
+
+
+def _reset_before_teacher_prefill_collection(env, episode_stats):
+    """Discard the shape warm-up step and restart prefill exactly at t=0."""
+    _set_teacher_prefill_nominal_reset(env, True)
+    return _reset_environment_and_clear_emas(env, episode_stats)
+
+
+def _reset_after_teacher_prefill(env, episode_stats):
+    """Start main DAgger from clean episodes and normal training resets.
+
+    Teacher prefill can end midway through every physical environment's
+    episode.  Merely dropping completed prefill episodes is insufficient: a
+    later main-policy termination would still expose cumulative episode stats
+    whose prefix was controlled by the Teacher.  Reset all environments at
+    the phase boundary, then erase the reward/performance running statistics
+    accumulated by prefill (including the reset operation itself).
+    """
+    # Restore normal random-phase/root-perturbation training resets before the
+    # boundary reset so main rollout 1 cannot inherit prefill semantics.
+    _set_teacher_prefill_nominal_reset(env, False)
+    return _reset_environment_and_clear_emas(env, episode_stats)
 
 
 def _bc_dagger_checkpoint_index(
@@ -620,6 +728,8 @@ def run_training(cfg: DictConfig):
         if isinstance(main_rollout_budget, bool) or int(main_rollout_budget) < 1:
             raise ValueError("_bc_dagger_main_rollout_budget must be positive")
         main_rollout_budget = int(main_rollout_budget)
+    if aa.is_main_process():
+        _define_bc_dagger_wandb_metrics(run, main_rollout_budget)
     main_rollout_budget_complete = False
     save_interval = cfg.get("save_interval", -1)
 
@@ -675,6 +785,17 @@ def run_training(cfg: DictConfig):
         return i > 0 and save_interval > 0 and i % save_interval == 0
 
     # 4. --- Training Loop ---
+    teacher_prefill_active_at_start = bool(
+        hasattr(policy, "is_teacher_prefill_active")
+        and policy.is_teacher_prefill_active()
+    )
+    if teacher_prefill_active_at_start:
+        _set_teacher_prefill_nominal_reset(env, True)
+        logging.info(
+            "Teacher prefill reset contract enabled: reference t=0 and zero "
+            "additive robot-root pose/velocity perturbations; joint/object/"
+            "actuator/domain randomization remains in training mode."
+        )
     carry = env.reset()
     rollout_policy: TensorDictModuleBase = policy.get_rollout_policy("train")
     interleaved_updates = (
@@ -685,9 +806,9 @@ def run_training(cfg: DictConfig):
     with torch.inference_mode():
         tmp_carry = rollout_policy(carry.clone(False))
         # This warm-up step fixes rollout buffer shapes, but it also advances
-        # the physical simulator.  Keep its returned state as the first real
-        # carry so policy observations cannot lag one control step behind the
-        # robot/reference state.
+        # the physical simulator. Plain training keeps its returned state so
+        # observations cannot lag the robot/reference state; Teacher prefill
+        # performs a clean second reset below before collecting any rows.
         tmp_td, carry = env.step_and_maybe_reset(tmp_carry.clone(False))
         if interleaved_updates:
             # Stage-1 replay has already consumed one-step raw aliases. Keep
@@ -715,6 +836,13 @@ def run_training(cfg: DictConfig):
         buf = torch.empty((N, T, *shape_tail), dtype=value.dtype, device=device)
         data_buf.set(key, buf)
     logging.info(f"Data buffer size: {data_buf.bytes() / 1e6:.2f} MB")
+
+    if teacher_prefill_active_at_start:
+        # The shape probe above advances the simulator once but is not stored.
+        # Reset again so the first measured prefill transition owns a true
+        # reset-boundary carry (is_init=True, recurrent histories cleared) at
+        # reference t=0 rather than beginning one step into an episode.
+        carry = _reset_before_teacher_prefill_collection(env, episode_stats)
 
     progress = _TrainingProgress(
         total_iters,
@@ -913,6 +1041,14 @@ def run_training(cfg: DictConfig):
         info["env_frames"] = env_frames
         info["rollout_fps"] = data_buf.numel() / rollout_time
         info["training_time"] = training_time
+        info.update(
+            _bc_dagger_log_progress(
+                policy,
+                physical_rollout=i + 1,
+                num_envs=env.num_envs,
+                main_rollout_budget=main_rollout_budget,
+            )
+        )
 
         checkpoint_index = _bc_dagger_checkpoint_index(
             policy,

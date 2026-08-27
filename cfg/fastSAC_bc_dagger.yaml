@@ -143,7 +143,14 @@ algo:
   # from load_noise_scale. Fixed-temperature and autotuned SAC are both valid.
   eta_sac: 1.0e-4
   lambda_bc: 1.0
+  # Optional low-memory SPReD-P weighting: use the online twin Critic's
+  # ensemble mean/sample-std to assign each valid Teacher label a continuous
+  # Gaussian-CDF weight. The weight is detached from the Actor gradient.
+  use_q_filtered_bc: false
   sac_actor_lr: 3.0e-4
+  # Independent from q_weight_decay. Zero makes an exact zero-gradient
+  # SAC+BC Actor update a true no-op instead of shrinking the pretrained mean.
+  sac_actor_weight_decay: 0.0
   sac_action_distribution: normalized_tanh
   # Physical Gaussian only: the ordinary SAC alpha*logpi-Q objective controls
   # actor_std; Teacher BC remains mean-only. A separate small-LR Adam and hard

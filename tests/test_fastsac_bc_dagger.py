@@ -53,6 +53,7 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     DistributionalFastSACTeacherBCConfig,
     _DeterministicFastSACStudentEvalPolicy,
     _DistributionalFastSACDaggerRolloutPolicy,
+    _spred_p_teacher_probability,
 )
 from active_adaptation.learning.ppo.fastsac_gradient_probe import (
     GRADIENT_PROBE_SCHEMA,
@@ -133,6 +134,12 @@ class _TableTwinC51(nn.Module):
         return torch.stack(
             tuple(head(observations, actions) for head in self.qnets), dim=0
         )
+
+
+class _UnexpectedCriticCall(nn.Module):
+    def forward(self, observations, actions):
+        del observations, actions
+        raise AssertionError("SPReD-P must not query the target Critic")
 
 
 class _CountingSGD(torch.optim.SGD):
@@ -311,6 +318,33 @@ def test_config_allows_explicit_pure_sac_ablation_without_inherited_td3_eta():
     cfg = DistributionalFastSACTeacherBCConfig(lambda_bc=0.0, eta_sac=1.0)
 
     DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize("actor_weight_decay", (0.0, 1.0e-4))
+def test_actor_weight_decay_is_an_explicit_independent_nonnegative_control(
+    actor_weight_decay,
+):
+    cfg = DistributionalFastSACTeacherBCConfig(
+        q_weight_decay=0.37,
+        sac_actor_weight_decay=actor_weight_decay,
+    )
+
+    DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+    assert cfg.q_weight_decay == pytest.approx(0.37)
+    assert cfg.sac_actor_weight_decay == pytest.approx(actor_weight_decay)
+
+
+@pytest.mark.parametrize("actor_weight_decay", (-1.0, math.inf, math.nan, True))
+def test_actor_weight_decay_rejects_negative_nonfinite_and_boolean_values(
+    actor_weight_decay,
+):
+    cfg = DistributionalFastSACTeacherBCConfig(
+        sac_actor_weight_decay=actor_weight_decay,
+    )
+
+    with pytest.raises(ValueError, match="sac_actor_weight_decay.*non-negative"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
 def test_config_rejects_entropy_target_above_maximum_gaussian_entropy():
@@ -1276,6 +1310,164 @@ def test_bc_only_actor_step_does_not_update_global_log_std():
     assert torch.equal(policy.bc_dagger_sac_adapter.log_std, log_std_before)
 
 
+def test_spred_p_teacher_probability_matches_official_cdf_and_is_detached():
+    policy_q = torch.tensor([[0.0, 2.0], [2.0, 4.0]], requires_grad=True)
+    teacher_q = torch.tensor([[2.0, 0.0], [4.0, 2.0]], requires_grad=True)
+
+    weights, advantages, combined_std = _spred_p_teacher_probability(
+        policy_q, teacher_q
+    )
+
+    expected_weights = 0.5 * (
+        1.0 + torch.erf(torch.tensor([1.0, -1.0]) / math.sqrt(2.0))
+    )
+    assert torch.allclose(weights, expected_weights)
+    assert torch.equal(advantages, torch.tensor([2.0, -2.0]))
+    assert torch.allclose(combined_std, torch.tensor([2.0, 2.0]))
+    assert not weights.requires_grad
+    assert not advantages.requires_grad
+    assert not combined_std.requires_grad
+
+    # Identical, zero-disagreement twins are numerically defined: equal action
+    # values mean an exactly neutral Teacher probability rather than NaN.
+    neutral, _, uncertainty = _spred_p_teacher_probability(
+        torch.zeros(2, 1), torch.zeros(2, 1)
+    )
+    assert neutral.item() == pytest.approx(0.5)
+    assert torch.isfinite(uncertainty).all()
+
+
+def test_q_filtered_bc_uses_online_twin_detached_spred_p_and_valid_denominator():
+    policy = _bare_policy(
+        eta_sac=0.0,
+        lambda_bc=1.0,
+        use_q_filtered_bc=True,
+        dagger_actor_huber_delta=1.0,
+        sac_log_std_min=-5.0,
+        sac_log_std_max=1.0,
+        sac_max_grad_norm=1.0e6,
+        q_action_input_gain=1.0,
+    )
+    _install_unit_action_contract(policy)
+    _install_tiny_stochastic_actor(policy, actor_weight=0.25)
+    policy.qnet = _ActionSensitiveTwinC51(first_slope=1.0, second_slope=2.0)
+    policy.qnet_target = _UnexpectedCriticCall()
+    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.4)))
+    policy.actor_optimizer = _CountingSGD(policy._fastsac_actor_parameters, lr=0.05)
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
+    policy.sac_action_rng = torch.Generator().manual_seed(313)
+    policy.actor_update_count = 0
+    batch = {
+        "observations": torch.tensor([[1.0], [2.0], [3.0]]),
+        "critic_observations": torch.ones(3, 1),
+        # Row 0 favors Student and receives a soft weight below 0.5. Row 1
+        # favors Teacher and receives a soft weight above 0.5. Row 2 is invalid.
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.tensor([[0.0], [1.0], [float("nan")]]),
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.tensor([True, True, False]),
+        # Row 0 came from Student replay; rows 1 and 2 came from Teacher replay.
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([False, True, True]),
+    }
+
+    raw_prediction = policy._actor_mean_from_flat(batch["observations"])
+    prediction_action = policy._sac_dist_from_mean(raw_prediction).mean
+    safe_teacher = torch.where(
+        batch[DAGGER_TEACHER_ACTION_VALID_KEY].unsqueeze(-1),
+        batch[DAGGER_REPLAY_TEACHER_ACTIONS],
+        prediction_action.detach(),
+    )
+    with torch.no_grad():
+        policy_q = policy.qnet.values(
+            policy.qnet(
+                batch["critic_observations"],
+                policy._q_action_input(prediction_action.detach()),
+            )
+        )
+        teacher_q = policy.qnet.values(
+            policy.qnet(
+                batch["critic_observations"],
+                policy._q_action_input(safe_teacher),
+            )
+        )
+        weights, advantages, combined_std = _spred_p_teacher_probability(
+            policy_q, teacher_q
+        )
+    per_row_bc = torch.nn.functional.smooth_l1_loss(
+        prediction_action,
+        safe_teacher,
+        beta=1.0,
+        reduction="none",
+    ).mean(dim=1)
+    expected_bc = (per_row_bc[:2] * weights[:2]).sum() / 2.0
+    expected_actor_gradient = torch.autograd.grad(
+        expected_bc, policy.actor_adapt.weight
+    )[0]
+    actor_weight_before = policy.actor_adapt.weight.detach().clone()
+
+    metrics = policy._actor_update(batch)
+
+    assert 0.0 < weights[0].item() < 0.5
+    assert 0.5 < weights[1].item() < 1.0
+    assert metrics["exact_bc_loss"].item() == pytest.approx(
+        expected_bc.item(), abs=5.0e-6
+    )
+    assert torch.allclose(
+        policy.actor_adapt.weight,
+        actor_weight_before - 0.05 * expected_actor_gradient,
+        atol=5.0e-6,
+    )
+    assert metrics["q_filtered_bc_active_fraction"].item() == pytest.approx(
+        weights[:2].mean().item()
+    )
+    assert metrics["q_filtered_bc_policy_better_fraction"].item() == pytest.approx(
+        0.5
+    )
+    assert metrics["spred_p_bc_weight_mean"].item() == pytest.approx(
+        weights[:2].mean().item()
+    )
+    assert metrics["spred_p_bc_weight_std"].item() == pytest.approx(
+        weights[:2].std(unbiased=False).item()
+    )
+    assert metrics["spred_p_teacher_advantage_mean"].item() == pytest.approx(
+        advantages[:2].mean().item()
+    )
+    assert metrics["spred_p_combined_q_std_mean"].item() == pytest.approx(
+        combined_std[:2].mean().item()
+    )
+    assert metrics["spred_p_source_metadata_available"].item() == pytest.approx(1.0)
+    assert metrics["spred_p_teacher_source_valid_fraction"].item() == pytest.approx(
+        1.0 / 3.0
+    )
+    assert metrics["spred_p_student_source_valid_fraction"].item() == pytest.approx(
+        1.0 / 3.0
+    )
+    assert metrics["spred_p_teacher_source_bc_weight_mean"].item() == pytest.approx(
+        weights[1].item()
+    )
+    assert metrics["spred_p_student_source_bc_weight_mean"].item() == pytest.approx(
+        weights[0].item()
+    )
+    assert metrics[
+        "spred_p_teacher_source_teacher_advantage_mean"
+    ].item() == pytest.approx(advantages[1].item())
+    assert metrics[
+        "spred_p_student_source_teacher_advantage_mean"
+    ].item() == pytest.approx(advantages[0].item())
+    assert metrics[
+        "spred_p_teacher_source_combined_q_std_mean"
+    ].item() == pytest.approx(combined_std[1].item())
+    assert metrics[
+        "spred_p_student_source_combined_q_std_mean"
+    ].item() == pytest.approx(combined_std[0].item())
+    assert metrics[
+        "q_filtered_bc_teacher_source_policy_better_fraction"
+    ].item() == pytest.approx(0.0)
+    assert metrics[
+        "q_filtered_bc_student_source_policy_better_fraction"
+    ].item() == pytest.approx(1.0)
+    assert all(parameter.grad is None for parameter in policy.qnet.parameters())
+    assert all(parameter.grad is None for parameter in policy.qnet_target.parameters())
+
+
 def test_gradient_probe_separates_components_and_is_strictly_read_only():
     policy = _bare_policy(
         eta_sac=0.2,
@@ -1377,6 +1569,73 @@ def test_gradient_probe_separates_components_and_is_strictly_read_only():
     )
     for parameter, gradient in zip(actor_parameters, gradients_before):
         assert torch.equal(parameter.grad, gradient)
+
+
+def test_zero_gradient_actor_update_is_noop_despite_nonzero_q_weight_decay():
+    policy = _bare_policy(
+        eta_sac=0.0,
+        lambda_bc=1.0,
+        q_weight_decay=0.37,
+        sac_actor_weight_decay=0.0,
+        dagger_actor_huber_delta=1.0,
+        sac_log_std_min=-10.0,
+        sac_log_std_max=-2.0,
+        sac_max_grad_norm=1.0,
+        q_action_input_gain=1.0,
+    )
+    _install_unit_action_contract(policy)
+    _install_tiny_stochastic_actor(policy, actor_weight=0.25, log_std=-3.0)
+    policy.qnet = _ActionSensitiveTwinC51()
+    policy.critic_optimizer = torch.optim.AdamW(
+        policy.qnet.parameters(), lr=0.01, weight_decay=policy.cfg.q_weight_decay
+    )
+    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.4)))
+    policy.actor_optimizer = torch.optim.AdamW(
+        (
+            {
+                "params": tuple(policy.actor_adapt.parameters()),
+                "weight_decay": policy.cfg.q_weight_decay,
+            },
+            {
+                "params": tuple(policy.bc_dagger_sac_adapter.parameters()),
+                "weight_decay": policy.cfg.q_weight_decay,
+            },
+        ),
+        lr=0.01,
+    )
+    policy._apply_actor_optimizer_weight_decay_contract()
+    policy.sac_action_rng = torch.Generator().manual_seed(919)
+    policy.actor_update_count = 0
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in policy.named_parameters()
+        if name.startswith(("actor_adapt.", "bc_dagger_sac_adapter."))
+    }
+    observations = torch.tensor([[1.0], [-2.0]])
+    with torch.no_grad():
+        exact_teacher_actions = policy._sac_dist_from_mean(
+            policy._actor_mean_from_flat(observations)
+        ).mean.clone()
+    batch = {
+        "observations": observations,
+        "critic_observations": torch.ones(2, 1),
+        DAGGER_REPLAY_TEACHER_ACTIONS: exact_teacher_actions,
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.ones(2, dtype=torch.bool),
+    }
+
+    metrics = policy._actor_update(batch)
+
+    assert [
+        group["weight_decay"] for group in policy.actor_optimizer.param_groups
+    ] == [0.0, 0.0]
+    assert policy.critic_optimizer.param_groups[0]["weight_decay"] == pytest.approx(
+        0.37
+    )
+    assert metrics["exact_bc_loss"].item() == pytest.approx(0.0)
+    assert metrics["weighted_sac_actor_loss"].item() == pytest.approx(0.0)
+    assert metrics["total_actor_loss"].item() == pytest.approx(0.0)
+    for name, expected in before.items():
+        assert torch.equal(dict(policy.named_parameters())[name], expected)
 
 
 def _rollout_owner(*, prefill: bool, beta: float = 0.5):
@@ -1928,6 +2187,43 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
             torch.rand(8, generator=source_generator),
             torch.rand(8, generator=restored_generator),
         )
+
+
+def test_legacy_checkpoint_actor_q_decay_is_sanitized_without_touching_critic():
+    source = _checkpoint_policy(1200)
+    source.critic_optimizer.param_groups[0]["weight_decay"] = 0.019
+    state = copy.deepcopy(source._fastsac_checkpoint_state())
+    state.pop("actor_mean_optimizer_semantics")
+    state.pop("actor_mean_weight_decay")
+    state["optimizer_resume_state"]["actor_optimizer"]["param_groups"][0][
+        "weight_decay"
+    ] = 0.019
+
+    restored = _checkpoint_policy(2200)
+    restored._load_fastsac_checkpoint_state(state)
+
+    assert restored.actor_optimizer.param_groups[0]["weight_decay"] == pytest.approx(
+        0.0
+    )
+    assert restored.critic_optimizer.param_groups[0]["weight_decay"] == pytest.approx(
+        0.019
+    )
+    assert (
+        restored.actor_optimizer.state_dict()["state"]
+        == source.actor_optimizer.state_dict()["state"]
+    )
+
+
+def test_checkpoint_rejects_actor_optimizer_group_that_conflicts_with_contract():
+    source = _checkpoint_policy(1250)
+    state = copy.deepcopy(source._fastsac_checkpoint_state())
+    state["optimizer_resume_state"]["actor_optimizer"]["param_groups"][0][
+        "weight_decay"
+    ] = 0.019
+
+    restored = _checkpoint_policy(2250)
+    with pytest.raises(ValueError, match="disagrees.*weight-decay contract"):
+        restored._load_fastsac_checkpoint_state(state)
 
 
 def _install_tiny_fastsac_inference_perception_stack(policy, seed: int) -> None:

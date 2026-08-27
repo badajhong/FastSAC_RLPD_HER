@@ -165,6 +165,7 @@ outputs_play/*
 outputs_probe/*
 diagnostics/*
 notes/*
+students/*
 teachers/*
 wandb/
 artifacts/

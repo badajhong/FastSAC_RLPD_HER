@@ -599,6 +599,10 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         "sac_max_grad_norm",
     ):
         _finite_nonnegative(f"algo.{name}", cfg.algo.get(name, None))
+    _finite_nonnegative(
+        "algo.sac_actor_weight_decay",
+        cfg.algo.get("sac_actor_weight_decay", 0.0),
+    )
     for name in (
         "action_support_clip",
         "dagger_bc_lr",
@@ -616,6 +620,8 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
 
     if cfg.algo.get("sac_use_autotune", None) not in (True, False):
         raise ValueError("algo.sac_use_autotune must be boolean")
+    if cfg.algo.get("use_q_filtered_bc", False) not in (True, False):
+        raise ValueError("algo.use_q_filtered_bc must be boolean")
     if action_distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION:
         if str(
             cfg.algo.get(

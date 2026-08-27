@@ -104,6 +104,12 @@ class RobotTracking(Command):
         self.sample_motion = sample_motion
         self.replay_motion = replay_motion
         self.record_motion = record_motion
+        # This is a transient collection-phase control, not part of the task
+        # configuration or checkpoint state.  Teacher prefill needs complete
+        # episodes from the reference boundary while the physical environment
+        # remains in training mode (and therefore keeps its other training
+        # randomizations).
+        self._teacher_prefill_nominal_reset = False
 
         if self.replay_motion:
             self.pose_range.fill_(0.0)
@@ -121,6 +127,21 @@ class RobotTracking(Command):
             self.update()
             if self.record_motion:
                 self.motion_frames = []
+
+    def set_teacher_prefill_nominal_reset(self, enabled: bool) -> None:
+        """Select eval-style reference/root resets only for Teacher prefill.
+
+        Enabling this forces every sampled motion to start at ``t=0`` and
+        removes only the additive robot-root pose and velocity perturbations.
+        Joint/object initialization noise and the environment's other domain
+        randomizations deliberately remain in their normal training mode.
+        """
+        if not isinstance(enabled, bool):
+            raise TypeError("teacher-prefill nominal-reset flag must be boolean")
+        self._teacher_prefill_nominal_reset = enabled
+
+    def _uses_unperturbed_robot_root_reset(self) -> bool:
+        return (not self.env.training) or self._teacher_prefill_nominal_reset
         
     def _sample_motions(self, env_ids: torch.Tensor) -> None:
         if self.sample_motion or self.first_sample_motion:
@@ -148,9 +169,15 @@ class RobotTracking(Command):
         if not self.env.training or self.record_motion:
             start_t.fill_(0)
 
-        if self.replay_motion:
+        if self.replay_motion and not self._teacher_prefill_nominal_reset:
             self.replay_motion_t[env_ids] = (self.replay_motion_t[env_ids] + 1) % motion_len
             start_t = self.replay_motion_t[env_ids]
+
+        # The prefill contract is explicitly "always t=0", including if
+        # replay_motion is ever enabled by a future task configuration. Do not
+        # advance its cursor while the override is active.
+        if self._teacher_prefill_nominal_reset:
+            start_t.fill_(0)
 
         self.t[env_ids] = start_t
 
@@ -170,7 +197,7 @@ class RobotTracking(Command):
 
         # poses
         rand_samples = sample_uniform(self.pose_range[:, 0], self.pose_range[:, 1], (len(env_ids), 6), device=self.device)
-        if not self.env.training:
+        if self._uses_unperturbed_robot_root_reset():
             rand_samples.fill_(0.0)
         init_root_pos = init_root_pos + self.env.scene.env_origins[env_ids] + rand_samples[:, 0:3]
         orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
@@ -178,7 +205,7 @@ class RobotTracking(Command):
 
         # velocities
         rand_samples = sample_uniform(self.velocity_range[:, 0], self.velocity_range[:, 1], (len(env_ids), 6), device=self.device)
-        if not self.env.training:
+        if self._uses_unperturbed_robot_root_reset():
             rand_samples.fill_(0.0)
         velocities = torch.cat([init_root_lin_vel, init_root_ang_vel], dim=-1) + rand_samples
 

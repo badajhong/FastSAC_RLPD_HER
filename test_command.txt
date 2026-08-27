@@ -124,3 +124,12 @@ python scripts/eval.py \
 checkpoint_path=/home/hcc/research/VAIC/outputs/2026-08-25/05-16-18-G1SkateboardGeneralTracking-tvkd_fastsac_bc_dagger/wandb/latest-run/files/checkpoint_9500.pt \
 seed=64 \
 eval_render=false
+
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
+python scripts/eval.py \
+--config-path=/home/hcc/research/VAIC/teachers/skateboard_general_tracking/wandb/latest-run/files/ \
+--config-name=cfg \
+checkpoint_path=/home/hcc/research/VAIC/teachers/skateboard_general_tracking/wandb/latest-run/files/checkpoint_36600.pt \
+seed=64 \
+eval_render=false
+

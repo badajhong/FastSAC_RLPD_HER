@@ -10,9 +10,13 @@ from scripts import TD3_bc_dagger as td3_entry
 from scripts.train import (
     _TrainingProgress,
     _bc_dagger_checkpoint_index,
+    _bc_dagger_log_progress,
     _bc_dagger_main_budget_complete,
     _bc_dagger_progress_state,
+    _define_bc_dagger_wandb_metrics,
     _reset_after_teacher_prefill,
+    _reset_before_teacher_prefill_collection,
+    _set_teacher_prefill_nominal_reset,
     run_training as shared_run_training,
 )
 
@@ -903,6 +907,114 @@ def test_prefill_boundary_resets_episodes_and_all_environment_emas():
     assert all(
         getattr(physical, field) == 0.0 for field in train_module._ENV_EMA_SCALAR_FIELDS
     )
+
+
+def test_prefill_reset_contract_is_enabled_before_prefill_reset_and_restored_before_main():
+    events = []
+
+    class Command:
+        nominal_reset = False
+
+        def set_teacher_prefill_nominal_reset(self, enabled):
+            self.nominal_reset = enabled
+            events.append(("set", enabled))
+
+    class PhysicalEnv:
+        def __init__(self):
+            self.command_manager = Command()
+
+        def reset(self):
+            events.append(("reset", self.command_manager.nominal_reset))
+            return "carry"
+
+    class Wrapper:
+        def __init__(self, base_env):
+            self.base_env = base_env
+
+        def reset(self):
+            return self.base_env.reset()
+
+    class EmptyEpisodes:
+        def __len__(self):
+            return 0
+
+    physical = PhysicalEnv()
+    env = Wrapper(Wrapper(physical))
+    episodes = EmptyEpisodes()
+
+    assert _reset_before_teacher_prefill_collection(env, episodes) == "carry"
+    assert physical.command_manager.nominal_reset is True
+    assert events == [("set", True), ("reset", True)]
+
+    assert _reset_after_teacher_prefill(env, episodes) == "carry"
+    assert physical.command_manager.nominal_reset is False
+    assert events[-2:] == [("set", False), ("reset", False)]
+
+
+def test_prefill_nominal_reset_fails_loudly_when_command_cannot_honor_it():
+    env = type("Env", (), {})()
+
+    with pytest.raises(RuntimeError, match="set_teacher_prefill_nominal_reset"):
+        _set_teacher_prefill_nominal_reset(env, True)
+
+    # Disabling is deliberately a no-op for legacy/non-tracking environments.
+    assert _set_teacher_prefill_nominal_reset(env, False) is False
+
+
+def test_dynamic_wandb_metrics_use_distinct_prefill_and_main_axes():
+    calls = []
+
+    class Run:
+        def define_metric(self, name, **kwargs):
+            calls.append((name, kwargs))
+
+    _define_bc_dagger_wandb_metrics(Run(), 14_000)
+    by_name = dict(calls)
+
+    assert by_name["fastsac/prefill_*"]["step_metric"] == (
+        "progress/prefill_rollout"
+    )
+    assert by_name["fastsac/*"]["step_metric"] == "progress/main_rollout"
+    assert by_name["train/*"]["step_metric"] == "progress/main_rollout"
+    assert by_name["loss/*"]["step_metric"] == "progress/main_rollout"
+    assert by_name["source/*"]["step_metric"] == "progress/main_rollout"
+    assert by_name["bottleneck/*"]["step_metric"] == "progress/main_rollout"
+    assert [name for name, _ in calls].index("fastsac/prefill_*") < [
+        name for name, _ in calls
+    ].index("fastsac/*")
+
+
+def test_dynamic_log_progress_does_not_add_prefill_to_main_rollouts():
+    policy = type(
+        "Policy",
+        (),
+        {
+            "dagger_rollout_count": 200,
+            "teacher_prefill_rollout_count": 25,
+            "dagger_environment_steps": 6_400,
+            "teacher_prefill_environment_steps": 800,
+        },
+    )()
+
+    progress = _bc_dagger_log_progress(
+        policy,
+        physical_rollout=225,
+        num_envs=512,
+        main_rollout_budget=14_000,
+    )
+
+    assert progress["progress/main_rollout"] == 200
+    assert progress["progress/prefill_rollout"] == 25
+    assert progress["progress/run_physical_rollout"] == 225
+    assert progress["progress/main_rollout_budget"] == 14_000
+    assert progress["progress/main_env_frames"] == 6_400 * 512
+    assert progress["progress/prefill_env_frames"] == 800 * 512
+    assert _bc_dagger_log_progress(
+        policy,
+        physical_rollout=225,
+        num_envs=512,
+        main_rollout_budget=None,
+    ) == {}
 
 
 def test_dynamic_prefill_checkpoint_index_uses_only_completed_main_rollouts():

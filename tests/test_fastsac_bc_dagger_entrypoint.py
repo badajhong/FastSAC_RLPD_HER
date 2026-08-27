@@ -597,6 +597,7 @@ def test_inherited_td3_noise_must_remain_zero(field):
     ("field", "value", "message"),
     (
         ("eta_sac", -1.0, "non-negative"),
+        ("sac_actor_weight_decay", -1.0, "non-negative"),
         ("action_support_clip", 0.0, "positive"),
         ("sac_actor_lr", 0.0, "positive"),
         ("sac_initial_action_std", 0.0, "positive"),

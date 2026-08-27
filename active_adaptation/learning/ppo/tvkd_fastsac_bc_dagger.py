@@ -45,6 +45,7 @@ from .fastsac_bc_dagger import (
     NORMALIZED_TANH_ACTION_DISTRIBUTION,
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
+    SPRED_P_BC_SEMANTICS,
     TRAINING_ALGORITHM as BASE_FASTSAC_TRAINING_ALGORITHM,
     DistributionalFastSACTeacherBC,
     DistributionalFastSACTeacherBCConfig,
@@ -127,14 +128,19 @@ V5_ACTOR_LEARNING_SEMANTICS = (
 def _tvkd_actor_learning_semantics(config) -> str:
     distribution = _fastsac_action_distribution(config)
     if distribution == NORMALIZED_TANH_ACTION_DISTRIBUTION:
-        return NORMALIZED_ACTOR_LEARNING_SEMANTICS
-    if distribution == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
+        semantics = NORMALIZED_ACTOR_LEARNING_SEMANTICS
+    elif distribution == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
         if str(
             getattr(config, "sac_physical_std_bound_mode", "uniform_physical")
         ) == Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE:
-            return Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS
-        return ACTOR_LEARNING_SEMANTICS
-    raise ValueError(f"unsupported FastSAC action distribution {distribution!r}")
+            semantics = Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS
+        else:
+            semantics = ACTOR_LEARNING_SEMANTICS
+    else:
+        raise ValueError(f"unsupported FastSAC action distribution {distribution!r}")
+    if getattr(config, "use_q_filtered_bc", False):
+        return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
+    return semantics
 
 
 BOTTLENECK_SELECTION_MODES = ("first", "last", "deepest")
@@ -3273,6 +3279,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 ),
                 "q_backend_config": {
                     "target_semantics": CRITIC_LEARNING_SEMANTICS,
+                    "bc_weighting_semantics": (
+                        SPRED_P_BC_SEMANTICS
+                        if getattr(self.cfg, "use_q_filtered_bc", False)
+                        else "fixed_unweighted_valid_teacher_bc"
+                    ),
                     "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
                     "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                     "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
@@ -3451,6 +3462,16 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 backend = dict(backend)
                 for name in missing_physical_bound_fields:
                     backend[name] = legacy_physical_bound_defaults[name]
+            # Checkpoints written before Actor decay was disentangled from the
+            # Critic did not carry this field.  Their explicit migrated contract
+            # is zero Actor decay; the baseline loader below also rewrites the
+            # stale optimizer param-group value after restoring its moments.
+            if "sac_actor_weight_decay" not in backend:
+                backend = dict(backend)
+                backend["sac_actor_weight_decay"] = 0.0
+            if "use_q_filtered_bc" not in backend:
+                backend = dict(backend)
+                backend["use_q_filtered_bc"] = False
             # These knobs are measurement-only and were added after the first
             # v6 checkpoints.  They do not affect policy, critic, replay, or
             # optimizer semantics, so an older checkpoint may safely inherit
@@ -3575,7 +3596,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
             # Checkpoints written before the selection knob carry no such key;
             # their behavior was exactly what "first" reproduces.
-            metadata_defaults = {"bottleneck_selection_mode": "first"}
+            metadata_defaults = {
+                "bottleneck_selection_mode": "first",
+                "bc_weighting_semantics": "fixed_unweighted_valid_teacher_bc",
+            }
             for name, expected in exact_metadata.items():
                 if not isinstance(expected, str) or not expected:
                     raise ValueError(f"TVKD runtime lacks required metadata {name!r}")
@@ -3588,6 +3612,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 )
             expected_q_metadata = {
                 "target_semantics": CRITIC_LEARNING_SEMANTICS,
+                "bc_weighting_semantics": (
+                    SPRED_P_BC_SEMANTICS
+                    if getattr(self.cfg, "use_q_filtered_bc", False)
+                    else "fixed_unweighted_valid_teacher_bc"
+                ),
                 "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
                 "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                 "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),

@@ -7,7 +7,8 @@ prefill, DAgger source selection, timeout handling, and twin-C51 topology from
 * Student collection and Actor updates use either the historical bounded
   Gaussian in nominal joint coordinates or an opt-in PPOVEL-compatible raw
   physical-action Gaussian;
-* exact Teacher BC is applied only to the distribution's noise-free mean;
+* Teacher BC is applied only to the distribution's noise-free mean, optionally
+  with a detached SPReD-P probability from the online twin Critic;
 * the soft Bellman target contains the next-policy entropy term;
 * both online critics learn from the complete target-C51 head with the lower
   expected return; and
@@ -120,6 +121,25 @@ CRITIC_SEMANTICS = (
     "current_stochastic_actor_entropy_soft_target_lower_expected_complete_"
     "c51_distribution_projection_v1"
 )
+ACTOR_MEAN_OPTIMIZER_SEMANTICS = (
+    "adamw_explicit_actor_mean_weight_decay_with_unregularized_variance_v1"
+)
+SPRED_P_BC_SEMANTICS = (
+    "online_twin_sample_std_gaussian_cdf_teacher_superiority_detached_v1"
+)
+_SPRED_P_SOURCE_METRIC_KEYS = (
+    "spred_p_source_metadata_available",
+    "spred_p_teacher_source_valid_fraction",
+    "spred_p_student_source_valid_fraction",
+    "spred_p_teacher_source_bc_weight_mean",
+    "spred_p_student_source_bc_weight_mean",
+    "spred_p_teacher_source_teacher_advantage_mean",
+    "spred_p_student_source_teacher_advantage_mean",
+    "spred_p_teacher_source_combined_q_std_mean",
+    "spred_p_student_source_combined_q_std_mean",
+    "q_filtered_bc_teacher_source_policy_better_fraction",
+    "q_filtered_bc_student_source_policy_better_fraction",
+)
 ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_normalized_std_bounded_alpha_logpi_minus_online_twin_min_plus_"
     "joint_normalized_raw_teacher_mean_bc_v1"
@@ -164,6 +184,65 @@ def _fastsac_actor_backend(cfg) -> str:
     if _fastsac_action_distribution(cfg) == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
         return PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
     return ACTOR_BACKEND
+
+
+def _fastsac_actor_weight_decay(cfg) -> float:
+    """Return the explicit Actor decay, defaulting legacy config objects to zero."""
+    return float(getattr(cfg, "sac_actor_weight_decay", 0.0))
+
+
+def _spred_p_teacher_probability(
+    policy_q: torch.Tensor,
+    teacher_q: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return detached SPReD-P Teacher weights from an online twin-Q ensemble.
+
+    SPReD-P models the two action values as independent Gaussians fitted across
+    Critic heads.  The returned probability is
+
+    ``Phi((mean(Q_teacher) - mean(Q_policy)) / combined_std)``.
+
+    The official implementation leaves this computation in the Actor graph.
+    This backend deliberately uses the semi-gradient variant requested for
+    stability: the probability, advantage, and uncertainty are all detached,
+    so the Actor can reduce BC only by changing its action loss rather than by
+    differentiating through the gate itself.
+    """
+    if policy_q.ndim != 2 or teacher_q.ndim != 2:
+        raise ValueError("SPReD-P Q tensors must have shape [critic, batch]")
+    if policy_q.shape != teacher_q.shape:
+        raise ValueError("SPReD-P Student and Teacher Q shapes must match")
+    if policy_q.shape[0] != 2:
+        raise ValueError("low-memory SPReD-P requires exactly two Critic heads")
+    if not policy_q.is_floating_point() or not teacher_q.is_floating_point():
+        raise TypeError("SPReD-P Q tensors must be floating point")
+    if policy_q.device != teacher_q.device or policy_q.dtype != teacher_q.dtype:
+        raise ValueError("SPReD-P Q tensors must share device and dtype")
+
+    policy_q = policy_q.detach()
+    teacher_q = teacher_q.detach()
+    q_values_are_finite = torch.isfinite(policy_q).all() & torch.isfinite(
+        teacher_q
+    ).all()
+    if not q_values_are_finite:
+        raise RuntimeError("SPReD-P online Critic values contain NaN/Inf")
+
+    policy_mean = policy_q.mean(dim=0)
+    teacher_mean = teacher_q.mean(dim=0)
+    # torch.std's default Bessel correction matches the authors' official
+    # ``torch.std(..., dim=0)`` implementation.  With the locked twin Critic,
+    # each uncertainty estimate therefore uses the two available heads.
+    policy_std = policy_q.std(dim=0)
+    teacher_std = teacher_q.std(dim=0)
+    variance_floor = torch.finfo(policy_q.dtype).eps
+    combined_std = torch.sqrt(
+        (policy_std.square() + teacher_std.square()).clamp_min(variance_floor)
+    )
+    teacher_advantage = teacher_mean - policy_mean
+    z_score = teacher_advantage / combined_std
+    teacher_probability = 0.5 * (1.0 + torch.erf(z_score / math.sqrt(2.0)))
+    teacher_probability = teacher_probability.clamp(0.0, 1.0)
+    return teacher_probability, teacher_advantage, combined_std
 
 
 class FastSACPhysicalNormal:
@@ -303,7 +382,16 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
 
     eta_sac: float = 1e-4
     lambda_bc: float = 1.0
+    # Weight Teacher BC continuously with a detached SPReD-P probability from
+    # the online twin Critic.  The legacy option name is retained so existing
+    # Hydra commands do not need another migration.
+    use_q_filtered_bc: bool = False
     sac_actor_lr: float = 3e-4
+    # Actor regularization is an independent learning-rule choice.  In
+    # particular, the Critic's q_weight_decay must never leak into the
+    # pretrained PPOVEL mean: at an exact BC solution such leakage would move
+    # the Actor even though both configured Actor objectives have zero gradient.
+    sac_actor_weight_decay: float = 0.0
     # ``normalized_tanh`` preserves the historical FastSAC policy.  The
     # opt-in ``ppo_physical_gaussian`` mode uses PPOVEL's raw physical-action
     # mean and its direct per-joint Actor.actor_std parameter. The ordinary SAC
@@ -629,7 +717,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             {
                 "params": actor_mean_parameters,
                 "lr": float(cfg.sac_actor_lr),
-                "weight_decay": float(cfg.q_weight_decay),
+                "weight_decay": _fastsac_actor_weight_decay(cfg),
             }
         ]
         if not physical_gaussian:
@@ -695,6 +783,47 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.alpha_update_count = 0
         self.actor_std_update_count = 0
         self._last_fastsac_diagnostics: dict[str, float] = {}
+
+    def _apply_actor_optimizer_weight_decay_contract(self) -> None:
+        """Install the explicit Actor decay after construction or resume.
+
+        Adam/AdamW optimizer state dictionaries own their param-group options.
+        Loading a checkpoint therefore overwrites constructor values.  Older
+        FastSAC checkpoints accidentally stored ``q_weight_decay`` on the Actor
+        mean group; normalize that legacy metadata to the explicit Actor
+        contract while retaining its moments and step counters.
+        """
+        groups = self.actor_optimizer.param_groups
+        if not groups:
+            raise RuntimeError("FastSAC Actor optimizer has no parameter groups")
+        groups[0]["weight_decay"] = _fastsac_actor_weight_decay(self.cfg)
+        # The optional second group is the normalized-tanh variance adapter.
+        # Physical Gaussian variance has a separate Adam optimizer.  Neither is
+        # part of the Actor-mean regularization contract.
+        for group in groups[1:]:
+            group["weight_decay"] = 0.0
+
+    def _validate_actor_optimizer_weight_decay_contract(self) -> None:
+        groups = self.actor_optimizer.param_groups
+        if not groups:
+            raise RuntimeError("FastSAC Actor optimizer has no parameter groups")
+        expected = (_fastsac_actor_weight_decay(self.cfg),) + (0.0,) * (
+            len(groups) - 1
+        )
+        for index, (group, expected_decay) in enumerate(zip(groups, expected)):
+            decay = group.get("weight_decay", 0.0)
+            if (
+                isinstance(decay, bool)
+                or not isinstance(decay, (int, float))
+                or not math.isfinite(float(decay))
+                or not math.isclose(
+                    float(decay), expected_decay, rel_tol=0.0, abs_tol=1e-12
+                )
+            ):
+                raise RuntimeError(
+                    "FastSAC Actor optimizer weight-decay contract mismatch at "
+                    f"param group {index}: expected {expected_decay}, got {decay!r}"
+                )
 
     def _student_collection_actor_cache_enabled(self) -> bool:
         """Use live carried-hidden Actor inputs in the locked online mode."""
@@ -880,6 +1009,18 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             value = float(getattr(cfg, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
+        if getattr(cfg, "use_q_filtered_bc", False) not in (True, False):
+            raise ValueError("use_q_filtered_bc must be boolean")
+        actor_weight_decay = getattr(cfg, "sac_actor_weight_decay", 0.0)
+        if (
+            isinstance(actor_weight_decay, bool)
+            or not isinstance(actor_weight_decay, (int, float))
+            or not math.isfinite(float(actor_weight_decay))
+            or float(actor_weight_decay) < 0.0
+        ):
+            raise ValueError(
+                "sac_actor_weight_decay must be finite and non-negative"
+            )
         if float(cfg.eta_sac) == 0.0 and float(cfg.lambda_bc) == 0.0:
             raise ValueError("eta_sac and lambda_bc cannot both be zero")
         for name in ("sac_policy_frequency", "sac_learning_starts"):
@@ -923,10 +1064,17 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
 
     def _actor_learning_semantics(self) -> str:
         if not self._uses_ppo_physical_gaussian():
-            return ACTOR_LEARNING_SEMANTICS
-        if self._physical_std_bound_mode() == Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE:
-            return Q_NORMALIZED_PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
-        return PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
+            semantics = ACTOR_LEARNING_SEMANTICS
+        elif (
+            self._physical_std_bound_mode()
+            == Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE
+        ):
+            semantics = Q_NORMALIZED_PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
+        else:
+            semantics = PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
+        if getattr(self.cfg, "use_q_filtered_bc", False):
+            return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
+        return semantics
 
     def _entropy_semantics(self) -> str:
         if self._uses_ppo_physical_gaussian():
@@ -1631,14 +1779,167 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             ):
                 parameter.requires_grad_(requires_grad)
 
-        exact_bc_loss = _exact_teacher_bc_loss(
-            prediction_action,
-            batch[DAGGER_REPLAY_TEACHER_ACTIONS],
-            batch[DAGGER_TEACHER_ACTION_VALID_KEY],
-            self._fastsac_q_action_center,
-            self._fastsac_q_action_scale,
-            float(self.cfg.dagger_actor_huber_delta),
-        )
+        teacher_actions = batch[DAGGER_REPLAY_TEACHER_ACTIONS]
+        teacher_valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
+        q_filter_metrics = {
+            # Compatibility alias: under continuous SPReD-P this is the mean
+            # effective BC weight, not a fraction of binary-active rows.
+            "q_filtered_bc_active_fraction": prediction_action.new_tensor(1.0),
+            "q_filtered_bc_policy_better_fraction": prediction_action.new_zeros(()),
+            "spred_p_bc_weight_mean": prediction_action.new_tensor(1.0),
+            "spred_p_bc_weight_std": prediction_action.new_zeros(()),
+            "spred_p_bc_weight_min": prediction_action.new_tensor(1.0),
+            "spred_p_bc_weight_max": prediction_action.new_tensor(1.0),
+            "spred_p_teacher_advantage_mean": prediction_action.new_zeros(()),
+            "spred_p_combined_q_std_mean": prediction_action.new_zeros(()),
+            **{
+                key: prediction_action.new_zeros(())
+                for key in _SPRED_P_SOURCE_METRIC_KEYS
+            },
+        }
+        if getattr(self.cfg, "use_q_filtered_bc", False):
+            if prediction_action.shape != teacher_actions.shape:
+                raise ValueError("SPReD-P Student and Teacher action shapes must match")
+            if prediction_action.shape[0] != teacher_valid.numel():
+                raise ValueError("SPReD-P validity mask does not match batch rows")
+            # Invalid replay labels may contain NaN. Substitute a finite action
+            # before the online-Q forward, then exclude those rows from both
+            # the probability statistics and BC normalization below.
+            safe_teacher_actions = torch.where(
+                teacher_valid.unsqueeze(-1),
+                teacher_actions,
+                prediction_action.detach(),
+            )
+            with torch.no_grad():
+                # SPReD-P uses the current online ensemble.  Collapse each C51
+                # head to its expected return before fitting the two Gaussian
+                # action-value distributions.  Sequential forwards keep peak
+                # memory lower than concatenating a doubled Actor batch.
+                policy_online_logits = self.qnet(
+                    batch["critic_observations"],
+                    self._q_action_input(prediction_action.detach()),
+                )
+                policy_online_q = (
+                    F.softmax(policy_online_logits, dim=-1) * self.qnet.support
+                ).sum(dim=-1)
+                del policy_online_logits
+                teacher_online_logits = self.qnet(
+                    batch["critic_observations"],
+                    self._q_action_input(safe_teacher_actions.detach()),
+                )
+                teacher_online_q = (
+                    F.softmax(teacher_online_logits, dim=-1) * self.qnet.support
+                ).sum(dim=-1)
+                (
+                    teacher_probability,
+                    teacher_advantage,
+                    combined_q_std,
+                ) = _spred_p_teacher_probability(
+                    policy_online_q,
+                    teacher_online_q,
+                )
+
+            if teacher_valid.any():
+                center = self._fastsac_q_action_center.to(prediction_action)
+                scale = self._fastsac_q_action_scale.to(prediction_action)
+                per_element_bc = F.smooth_l1_loss(
+                    (prediction_action - center) / scale,
+                    (safe_teacher_actions.detach() - center) / scale,
+                    beta=float(self.cfg.dagger_actor_huber_delta),
+                    reduction="none",
+                )
+                per_row_bc = per_element_bc.flatten(start_dim=1).mean(dim=1)
+                bc_weights = torch.where(
+                    teacher_valid,
+                    teacher_probability.to(per_row_bc),
+                    torch.zeros_like(per_row_bc),
+                )
+                # Normalize by all valid Teacher rows exactly as an ordinary
+                # per-demo weighted loss.  Its effective strength changes
+                # continuously without a hand-authored lambda scheduler.
+                exact_bc_loss = (
+                    per_row_bc * bc_weights
+                ).sum() / teacher_valid.sum()
+                valid_weights = teacher_probability[teacher_valid]
+                valid_advantage = teacher_advantage[teacher_valid]
+                valid_combined_std = combined_q_std[teacher_valid]
+                policy_better = valid_advantage < 0.0
+                q_filter_metrics.update(
+                    {
+                        "q_filtered_bc_active_fraction": valid_weights.mean(),
+                        "q_filtered_bc_policy_better_fraction": (
+                            policy_better.float().mean()
+                        ),
+                        "spred_p_bc_weight_mean": valid_weights.mean(),
+                        "spred_p_bc_weight_std": valid_weights.std(unbiased=False),
+                        "spred_p_bc_weight_min": valid_weights.min(),
+                        "spred_p_bc_weight_max": valid_weights.max(),
+                        "spred_p_teacher_advantage_mean": valid_advantage.mean(),
+                        "spred_p_combined_q_std_mean": valid_combined_std.mean(),
+                    }
+                )
+            else:
+                exact_bc_loss = prediction_action.sum() * 0.0
+                q_filter_metrics = {
+                    key: prediction_action.new_zeros(()) for key in q_filter_metrics
+                }
+
+            # A single aggregate can hide opposite behavior on factual
+            # Teacher-replay rows and counterfactual Teacher labels attached to
+            # Student-replay rows.  Preserve the replay provenance and report
+            # SPReD-P diagnostics independently for both sources.  These
+            # statistics are read-only: neither the masks nor the detached
+            # probability feed a new gradient path into the Critic.
+            teacher_source = batch.get(DAGGER_Q_TEACHER_SOURCE_KEY)
+            if teacher_source is not None:
+                if teacher_source.numel() != teacher_valid.numel():
+                    raise ValueError(
+                        "SPReD-P replay-source mask does not match batch rows"
+                    )
+                teacher_source = teacher_source.reshape(-1).bool()
+                q_filter_metrics["spred_p_source_metadata_available"] = (
+                    prediction_action.new_tensor(1.0)
+                )
+                policy_better_values = (teacher_advantage < 0.0).float()
+                for source_name, source_mask in (
+                    ("teacher", teacher_source),
+                    ("student", ~teacher_source),
+                ):
+                    source_valid = teacher_valid & source_mask
+                    source_valid_float = source_valid.to(teacher_probability)
+                    source_valid_count = source_valid_float.sum().clamp_min(1.0)
+                    q_filter_metrics.update(
+                        {
+                            f"spred_p_{source_name}_source_valid_fraction": (
+                                source_valid_float.mean()
+                            ),
+                            f"spred_p_{source_name}_source_bc_weight_mean": (
+                                (teacher_probability * source_valid_float).sum()
+                                / source_valid_count
+                            ),
+                            f"spred_p_{source_name}_source_teacher_advantage_mean": (
+                                (teacher_advantage * source_valid_float).sum()
+                                / source_valid_count
+                            ),
+                            f"spred_p_{source_name}_source_combined_q_std_mean": (
+                                (combined_q_std * source_valid_float).sum()
+                                / source_valid_count
+                            ),
+                            f"q_filtered_bc_{source_name}_source_policy_better_fraction": (
+                                (policy_better_values * source_valid_float).sum()
+                                / source_valid_count
+                            ),
+                        }
+                    )
+        else:
+            exact_bc_loss = _exact_teacher_bc_loss(
+                prediction_action,
+                teacher_actions,
+                teacher_valid,
+                self._fastsac_q_action_center,
+                self._fastsac_q_action_scale,
+                float(self.cfg.dagger_actor_huber_delta),
+            )
         weighted_sac = float(self.cfg.eta_sac) * sac_actor_loss
         weighted_bc = float(self.cfg.lambda_bc) * exact_bc_loss
         total_actor_loss = weighted_sac + weighted_bc
@@ -1699,6 +2000,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_std_min": self._policy_log_std().detach().exp().min(),
             "actor_std_max": self._policy_log_std().detach().exp().max(),
             "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
+            **{key: value.detach() for key, value in q_filter_metrics.items()},
             "actor_failure_phase_teacher_fraction": batch.get(
                 FAILURE_PHASE_TEACHER_SOURCE_KEY,
                 torch.zeros_like(batch[DAGGER_TEACHER_ACTION_VALID_KEY]),
@@ -1810,6 +2112,15 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_raw_log_std_mean",
             "actor_std_min",
             "actor_std_max",
+            "q_filtered_bc_active_fraction",
+            "q_filtered_bc_policy_better_fraction",
+            "spred_p_bc_weight_mean",
+            "spred_p_bc_weight_std",
+            "spred_p_bc_weight_min",
+            "spred_p_bc_weight_max",
+            "spred_p_teacher_advantage_mean",
+            "spred_p_combined_q_std_mean",
+            *_SPRED_P_SOURCE_METRIC_KEYS,
         )
         if self._uses_ppo_physical_gaussian():
             actor_keys += (
@@ -1917,6 +2228,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             {
                 "target_semantics": CRITIC_SEMANTICS,
                 "actor_q_reduction": "minimum_online_twin_expectations",
+                "actor_mean_optimizer_semantics": ACTOR_MEAN_OPTIMIZER_SEMANTICS,
+                "actor_mean_weight_decay": _fastsac_actor_weight_decay(self.cfg),
+                "bc_weighting_semantics": (
+                    SPRED_P_BC_SEMANTICS
+                    if getattr(self.cfg, "use_q_filtered_bc", False)
+                    else "fixed_unweighted_valid_teacher_bc"
+                ),
                 "actor_target": False,
                 "stochastic_actor": True,
                 "action_distribution": _fastsac_action_distribution(self.cfg),
@@ -1983,6 +2301,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 for name in (
                     "eta_sac",
                     "lambda_bc",
+                    "use_q_filtered_bc",
                     "sac_actor_lr",
                     "sac_action_distribution",
                     "sac_physical_std_lr",
@@ -2008,6 +2327,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 )
             }
         )
+        common["sac_actor_weight_decay"] = _fastsac_actor_weight_decay(self.cfg)
         common.update(
             {
                 "method": TRAINING_ALGORITHM,
@@ -2017,12 +2337,26 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     if self._uses_ppo_physical_gaussian()
                     else "smooth_tanh_bounded_normalized_std_raw_action_normal"
                 ),
-                "bc_loss": "joint_normalized_raw_mean_teacher_smooth_l1",
+                "bc_loss": (
+                    "detached_spred_p_weighted_joint_normalized_raw_mean_teacher_"
+                    "smooth_l1"
+                    if getattr(self.cfg, "use_q_filtered_bc", False)
+                    else "joint_normalized_raw_mean_teacher_smooth_l1"
+                ),
+                "bc_q_filter": (
+                    SPRED_P_BC_SEMANTICS
+                    if getattr(self.cfg, "use_q_filtered_bc", False)
+                    else "disabled"
+                ),
             }
         )
         return common
 
     def _fastsac_checkpoint_state(self):
+        # Canonicalize even lightweight/legacy optimizer constructions before
+        # serializing so the saved param-group contract has stable scalar types.
+        self._apply_actor_optimizer_weight_decay_contract()
+        self._validate_actor_optimizer_weight_decay_contract()
         return {
             "training_algorithm": TRAINING_ALGORITHM,
             "checkpoint_version": CHECKPOINT_VERSION,
@@ -2031,6 +2365,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             ),
             "critic_learning_semantics": CRITIC_SEMANTICS,
             "actor_learning_semantics": self._actor_learning_semantics(),
+            "actor_mean_optimizer_semantics": ACTOR_MEAN_OPTIMIZER_SEMANTICS,
+            "actor_mean_weight_decay": _fastsac_actor_weight_decay(self.cfg),
             "entropy_semantics": self._entropy_semantics(),
             "action_distribution": _fastsac_action_distribution(self.cfg),
             "actor_adapt": self.actor_adapt.state_dict(),
@@ -2096,6 +2432,32 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise ValueError(
                 "distributional FastSAC action distribution mismatch"
             )
+        has_actor_decay_contract = "actor_mean_weight_decay" in state
+        saved_actor_decay = state.get("actor_mean_weight_decay", 0.0)
+        if (
+            isinstance(saved_actor_decay, bool)
+            or not isinstance(saved_actor_decay, (int, float))
+            or not math.isfinite(float(saved_actor_decay))
+            or float(saved_actor_decay) < 0.0
+        ):
+            raise ValueError("FastSAC checkpoint Actor mean weight decay is invalid")
+        if not math.isclose(
+            float(saved_actor_decay),
+            _fastsac_actor_weight_decay(self.cfg),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("FastSAC checkpoint Actor mean weight decay mismatch")
+        saved_optimizer_semantics = state.get("actor_mean_optimizer_semantics")
+        if has_actor_decay_contract:
+            if saved_optimizer_semantics != ACTOR_MEAN_OPTIMIZER_SEMANTICS:
+                raise ValueError(
+                    "FastSAC checkpoint Actor mean optimizer semantics mismatch"
+                )
+        elif saved_optimizer_semantics is not None:
+            raise ValueError(
+                "legacy FastSAC checkpoint has incomplete Actor optimizer metadata"
+            )
         if load_modules:
             for name in (
                 "actor_adapt",
@@ -2111,7 +2473,37 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         optimizers = state.get("optimizer_resume_state")
         if not isinstance(optimizers, dict):
             raise ValueError("FastSAC checkpoint lacks optimizer state")
-        self.actor_optimizer.load_state_dict(optimizers["actor_optimizer"])
+        saved_actor_optimizer = optimizers["actor_optimizer"]
+        if not isinstance(saved_actor_optimizer, Mapping):
+            raise ValueError("FastSAC checkpoint lacks Actor optimizer state")
+        saved_actor_groups = saved_actor_optimizer.get("param_groups")
+        if not isinstance(saved_actor_groups, list) or not saved_actor_groups:
+            raise ValueError("FastSAC checkpoint Actor optimizer groups are invalid")
+        for index, group in enumerate(saved_actor_groups):
+            if not isinstance(group, Mapping):
+                raise ValueError("FastSAC checkpoint Actor optimizer group is invalid")
+            decay = group.get("weight_decay", 0.0)
+            if (
+                isinstance(decay, bool)
+                or not isinstance(decay, (int, float))
+                or not math.isfinite(float(decay))
+                or float(decay) < 0.0
+            ):
+                raise ValueError(
+                    "FastSAC checkpoint Actor optimizer weight decay is invalid"
+                )
+            if has_actor_decay_contract:
+                expected_decay = float(saved_actor_decay) if index == 0 else 0.0
+                if not math.isclose(
+                    float(decay), expected_decay, rel_tol=0.0, abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        "FastSAC checkpoint Actor optimizer group disagrees with "
+                        "its explicit weight-decay contract"
+                    )
+        self.actor_optimizer.load_state_dict(saved_actor_optimizer)
+        self._apply_actor_optimizer_weight_decay_contract()
+        self._validate_actor_optimizer_weight_decay_contract()
         actor_std_optimizer_state = optimizers.get("actor_std_optimizer")
         actor_std_optimizer = getattr(self, "actor_std_optimizer", None)
         if actor_std_optimizer is None:
@@ -2407,6 +2799,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
 __all__ = [
     "ACTION_CONTRACT_SEMANTICS",
     "ACTOR_BACKEND",
+    "ACTOR_MEAN_OPTIMIZER_SEMANTICS",
     "CHECKPOINT_VERSION",
     "FASTSAC_ACTION_PROJECTION_KEY",
     "FastSACPhysicalNormal",
@@ -2415,6 +2808,7 @@ __all__ = [
     "PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION",
     "PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND",
     "Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE",
+    "SPRED_P_BC_SEMANTICS",
     "UNIFORM_PHYSICAL_STD_BOUND_MODE",
     "PREVIOUS_CHECKPOINT_VERSION",
     "TRAINING_ALGORITHM",
@@ -2422,4 +2816,5 @@ __all__ = [
     "DistributionalFastSACTeacherBCConfig",
     "_DeterministicFastSACStudentEvalPolicy",
     "_DistributionalFastSACDaggerRolloutPolicy",
+    "_spred_p_teacher_probability",
 ]

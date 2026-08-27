@@ -1233,6 +1233,13 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault(
         "sac_action_distribution", "normalized_tanh"
     )
+    # Older FastSAC/TVKD checkpoints accidentally reused q_weight_decay for the
+    # Actor optimizer and therefore had no independent Actor-decay field.  The
+    # bug-fixed resume contract is explicit zero; policy loading retains the
+    # optimizer moments but sanitizes that stale param-group option.
+    source_algo_contract.setdefault("sac_actor_weight_decay", 0.0)
+    # Older checkpoints used unconditional Teacher BC.
+    source_algo_contract.setdefault("use_q_filtered_bc", False)
     # Legacy v1 checkpoints predate this explicit provenance field but already
     # used one alpha update per Critic. v2+ checkpoints must contain it.
     if legacy:
