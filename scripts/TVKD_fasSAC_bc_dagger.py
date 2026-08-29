@@ -50,6 +50,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     V6_TRAINING_ALGORITHM,
     V7_CHECKPOINT_VERSION,
     V7_TRAINING_ALGORITHM,
+    V8_CHECKPOINT_VERSION,
+    V8_TRAINING_ALGORITHM,
     SOURCE_FAILURE_TEACHER,
     SOURCE_STUDENT,
     SOURCE_UNIFORM_TEACHER,
@@ -62,6 +64,7 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     TVKDDistributionalFastSACTeacherBCConfig,
     _same_verified_histogram_state,
     _tvkd_actor_learning_semantics,
+    _tvkd_critic_learning_semantics,
     _validate_tvkd_algorithm_config,
     compute_teacher_value_terms,
 )
@@ -715,7 +718,12 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         policy_state.get("training_algorithm"),
         policy_state.get("checkpoint_version"),
     ) == (V5_TRAINING_ALGORITHM, V5_CHECKPOINT_VERSION)
-    label = "v5" if legacy_v5 else "v8"
+    label = "v5" if legacy_v5 else f"v{CHECKPOINT_VERSION}"
+    critic_semantics = (
+        CRITIC_LEARNING_SEMANTICS
+        if legacy_v5
+        else _tvkd_critic_learning_semantics(cfg.algo)
+    )
     replay_mix = policy_state.get("replay_mix_state")
     if not isinstance(replay_mix, Mapping):
         raise ValueError(f"TVKD {label} checkpoint lacks replay mix state")
@@ -746,7 +754,7 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
 
     vecnorm_fingerprint = policy_state.get("vecnorm_fingerprint")
     exact = {
-        "critic_learning_semantics": CRITIC_LEARNING_SEMANTICS,
+        "critic_learning_semantics": critic_semantics,
         "actor_learning_semantics": (
             V5_ACTOR_LEARNING_SEMANTICS
             if legacy_v5
@@ -804,7 +812,7 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
     if not isinstance(q_backend, Mapping):
         raise ValueError(f"TVKD {label} checkpoint lacks Q backend metadata")
     expected_q_metadata = {
-        "target_semantics": CRITIC_LEARNING_SEMANTICS,
+        "target_semantics": critic_semantics,
         "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
         "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
         "bottleneck_fallback_mode": str(cfg.algo.bottleneck_fallback_mode),
@@ -1049,8 +1057,9 @@ def _prepare_tvkd_checkpoint(
     v5 = algorithm == V5_TRAINING_ALGORITHM and version == V5_CHECKPOINT_VERSION
     v6 = algorithm == V6_TRAINING_ALGORITHM and version == V6_CHECKPOINT_VERSION
     v7 = algorithm == V7_TRAINING_ALGORITHM and version == V7_CHECKPOINT_VERSION
+    v8 = algorithm == V8_TRAINING_ALGORITHM and version == V8_CHECKPOINT_VERSION
     current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
-    same_scientific_contract = v5 or current
+    same_scientific_contract = current
     explicitly_changed_mix = frozenset(explicit_replay_mix_fields).intersection(
         _ALL_Q_ACTOR_MIX_FIELDS
     )
@@ -1086,7 +1095,7 @@ def _prepare_tvkd_checkpoint(
     if same_scientific_contract and explicitly_changed_mix.intersection(
         canonical_authority_alias_fields
     ):
-        version_label = "v5" if v5 else "v8"
+        version_label = "v5" if v5 else "v9"
         warnings.warn(
             f"This TVKD {version_label} checkpoint predates CLI alias resolution: "
             "its saved "
@@ -1098,22 +1107,36 @@ def _prepare_tvkd_checkpoint(
     if v4:
         raise ValueError(
             "TVKD v4 checkpoints cannot resume under the verified replay/value "
-            "contract; start v8 from the frozen PPO checkpoint"
+            "contract; start v9 from the frozen PPO checkpoint"
+        )
+    if v5:
+        raise ValueError(
+            "TVKD v5 training resume is incompatible with the v9 finite-horizon "
+            "boundary, replay-sidecar, and Teacher-residual critic contracts; "
+            "start v9 from the frozen PPO checkpoint. The v5 checkpoint remains "
+            "available for model-only inference."
         )
     if v6:
         raise ValueError(
             "TVKD v6 training resume is incompatible with the v8 physical-std "
-            "optimizer contract; start v8 from the frozen PPO checkpoint. "
+            "optimizer contract; start v9 from the frozen PPO checkpoint. "
             "The v6 checkpoint remains available for model-only inference."
         )
     if v7:
         raise ValueError(
             "TVKD v7 training resume is incompatible with the v8 physical-std "
-            "SAC-gradient, separate-Adam, and rollout-KL contract; start v8 "
+            "SAC-gradient, separate-Adam, and rollout-KL contract; start v9 "
             "from the frozen PPO checkpoint. The v7 checkpoint remains "
             "available for model-only inference."
         )
-    if not (legacy or previous or v3 or v5 or current):
+    if v8:
+        raise ValueError(
+            "TVKD v8 training resume is incompatible with the v9 finite-horizon "
+            "command-terminal and phase-faded-potential target contract; start "
+            "v9 from the frozen PPO checkpoint. The v8 checkpoint remains "
+            "available for model-only inference."
+        )
+    if not (legacy or previous or v3 or current):
         raise ValueError("fastsac_bc_dagger_checkpoint is not a TVKD checkpoint")
     if legacy:
         warnings.warn(
@@ -1141,15 +1164,6 @@ def _prepare_tvkd_checkpoint(
             UserWarning,
             stacklevel=2,
         )
-    elif v5:
-        warnings.warn(
-            "Migrating a normalized-tanh TVKD v5 checkpoint to v8 with fresh "
-            "replay rings and "
-            "fresh Teacher episode/current-EMA cache sidecars; model, optimizer, "
-            "RNG, bottleneck, and verified-histogram state are retained.",
-            UserWarning,
-            stacklevel=2,
-        )
     if policy_state.get("actor_backend") != _fastsac_actor_backend(cfg.algo):
         raise ValueError("TVKD resume checkpoint actor backend mismatch")
     required_mappings = [
@@ -1159,7 +1173,7 @@ def _prepare_tvkd_checkpoint(
         "action_contract",
         "perception_initialization",
     ]
-    if previous or v3 or v5 or current:
+    if previous or v3 or current:
         required_mappings.append("teacher_value_bottleneck_replay_state")
     for name in required_mappings:
         if not isinstance(policy_state.get(name), Mapping):
@@ -1240,6 +1254,18 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault("sac_actor_weight_decay", 0.0)
     # Older checkpoints used unconditional Teacher BC.
     source_algo_contract.setdefault("use_q_filtered_bc", False)
+    # Older checkpoints used the ordinary shaped-Q parameterization.
+    source_algo_contract.setdefault("use_teacher_residual_critic", False)
+    # V9 checkpoints written before selectable Student n-step replay were
+    # exactly the mixed-horizon default: both sources one-step.
+    source_algo_contract.setdefault("q_n_step", 1)
+    source_algo_contract.setdefault("q_teacher_n_step", 1)
+    # Checkpoints before the analytic actuator-effect branch used the original
+    # normalized-command-plus-delay/alpha Q input.
+    source_algo_contract.setdefault("q_use_predicted_effect", False)
+    # Older checkpoints predate delay/alpha-conditioned residual FiLM.
+    source_algo_contract.setdefault("q_use_residual_film", False)
+    source_algo_contract.setdefault("q_residual_film_scale", 0.1)
     # Legacy v1 checkpoints predate this explicit provenance field but already
     # used one alpha update per Critic. v2+ checkpoints must contain it.
     if legacy:
@@ -1257,16 +1283,6 @@ def _prepare_tvkd_checkpoint(
         ("sac_physical_std_normalized_max", 0.11),
     ):
         source_algo_contract.setdefault(name, value)
-    if v5:
-        # TVKD v5 was normalized-tanh only; the v8 physical-std controls are
-        # inert for that distribution and can safely take today's defaults.
-        for name in (
-            "sac_physical_std_lr",
-            "sac_physical_std_max_kl",
-            "sac_physical_std_min",
-            "sac_physical_std_max",
-        ):
-            source_algo_contract.setdefault(name, runtime_algo_contract[name])
     if legacy:
         for name in LEGACY_ADAPTIVE_BC_CONFIG_FIELDS:
             source_algo_contract.pop(name, None)
@@ -1302,6 +1318,8 @@ def _prepare_tvkd_checkpoint(
             "failure_phase_samples_per_failure",
             "teacher_value_return_semantics",
             "teacher_value_boundary_semantics",
+            "use_phase_faded_teacher_potential",
+            "teacher_value_potential_semantics",
             "teacher_value_reward_group_fingerprint",
             "replay_task_fingerprint",
         ):

@@ -25,6 +25,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .fastsac_bc_dagger import _spred_p_teacher_probability
 from .fastsac_vel import _reduce_actor_q_values
 from .ppo_bc_dagger import (
     DAGGER_Q_TEACHER_SOURCE_KEY,
@@ -33,6 +34,7 @@ from .ppo_bc_dagger import (
 )
 from .td3_bc_dagger import (
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
+    Q_ACTUATOR_CONTEXT_KEY,
     _exact_teacher_bc_loss,
 )
 
@@ -181,22 +183,12 @@ def _expected_twin_q(
     policy,
     critic_observations,
     actions,
-    q_state_kwargs: Mapping[str, torch.Tensor | None] | None = None,
+    actuator_context: torch.Tensor | None,
 ):
-    """Evaluate Q through the production state-augmentation boundary."""
-    q_state_kwargs = {} if q_state_kwargs is None else dict(q_state_kwargs)
-    if hasattr(policy, "_q_forward"):
-        logits = policy._q_forward(
-            policy.qnet,
-            critic_observations,
-            policy._q_action_input(actions),
-            **q_state_kwargs,
-        )
-    else:  # Backward-compatible seam for lightweight diagnostic fixtures.
-        logits = policy.qnet(
-            critic_observations,
-            policy._q_action_input(actions),
-        )
+    logits = policy.qnet(
+        critic_observations,
+        policy._q_action_features(actions, actuator_context),
+    )
     expected = (F.softmax(logits, dim=-1) * policy.qnet.support).sum(dim=-1)
     minimum = _reduce_actor_q_values(expected, True)
     return expected, minimum
@@ -207,6 +199,58 @@ def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     if not selected.numel():
         raise ValueError("cannot average an empty diagnostic stratum")
     return selected.mean()
+
+
+def _diagnostic_teacher_bc_loss(
+    prediction_action: torch.Tensor,
+    teacher_action: torch.Tensor,
+    teacher_valid: torch.Tensor,
+    action_center: torch.Tensor,
+    action_scale: torch.Tensor,
+    huber_delta: float,
+    *,
+    detached_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    """Mirror production exact or detached SPReD-P Teacher BC."""
+    if detached_weights is None:
+        return _exact_teacher_bc_loss(
+            prediction_action,
+            teacher_action,
+            teacher_valid,
+            action_center,
+            action_scale,
+            huber_delta,
+        )
+    teacher_valid = teacher_valid.reshape(-1).bool()
+    if detached_weights.shape != teacher_valid.shape:
+        raise ValueError("SPReD-P diagnostic weights do not match batch rows")
+    if prediction_action.shape != teacher_action.shape:
+        raise ValueError("SPReD-P diagnostic action shapes do not match")
+    if prediction_action.shape[0] != teacher_valid.numel():
+        raise ValueError("SPReD-P diagnostic validity mask does not match actions")
+    if not bool(teacher_valid.any()):
+        return prediction_action.sum() * 0.0
+
+    safe_teacher_action = torch.where(
+        teacher_valid.unsqueeze(-1),
+        teacher_action,
+        prediction_action.detach(),
+    )
+    center = action_center.to(prediction_action)
+    scale = action_scale.to(prediction_action)
+    per_element_bc = F.smooth_l1_loss(
+        (prediction_action - center) / scale,
+        (safe_teacher_action.detach() - center) / scale,
+        beta=float(huber_delta),
+        reduction="none",
+    )
+    per_row_bc = per_element_bc.flatten(start_dim=1).mean(dim=1)
+    effective_weights = torch.where(
+        teacher_valid,
+        detached_weights.detach().to(per_row_bc),
+        torch.zeros_like(per_row_bc),
+    )
+    return (per_row_bc * effective_weights).sum() / teacher_valid.sum()
 
 
 def _scalar_stratum_metrics(
@@ -281,11 +325,11 @@ def _action_q_gradients(
     policy,
     critic_observations,
     action,
-    q_state_kwargs: Mapping[str, torch.Tensor | None] | None = None,
+    actuator_context: torch.Tensor | None,
 ):
     leaf = action.detach().clone().requires_grad_(True)
     _, minimum = _expected_twin_q(
-        policy, critic_observations, leaf, q_state_kwargs
+        policy, critic_observations, leaf, actuator_context
     )
     # Rows are independent, so differentiating the sum returns one unscaled
     # dQ/da vector for every row.
@@ -300,6 +344,7 @@ def diagnose_fastsac_actor_gradients(
     sample_seed: int = 0,
     source_gradients: bool = True,
     finite_difference_epsilon: float = 1.0e-3,
+    use_q_filtered_bc: bool | None = None,
 ) -> dict[str, Any]:
     """Measure the production Actor objective without changing the policy.
 
@@ -316,6 +361,9 @@ def diagnose_fastsac_actor_gradients(
             Teacher, and failure-focused source masks when present.
         finite_difference_epsilon: Central-difference step in unit-normalized
             Q-action coordinates for the Teacher direction check.
+        use_q_filtered_bc: Optional diagnostic override. ``None`` mirrors the
+            checkpoint config; a boolean enables a counterfactual comparison
+            on the same checkpoint without mutating it.
 
     Returns:
         A JSON-serializable nested diagnostic mapping.
@@ -337,6 +385,7 @@ def diagnose_fastsac_actor_gradients(
 
     observations = batch["observations"]
     critic_observations = batch["critic_observations"]
+    actuator_context = batch.get(Q_ACTUATOR_CONTEXT_KEY)
     teacher_action = batch[DAGGER_REPLAY_TEACHER_ACTIONS]
     teacher_valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
     row_count = int(observations.shape[0])
@@ -365,10 +414,11 @@ def diagnose_fastsac_actor_gradients(
     lambda_bc = float(policy.cfg.lambda_bc)
     eta_sac = float(policy.cfg.eta_sac)
     alpha = policy.log_alpha.detach().exp()
-    q_state_kwargs = (
-        policy._q_batch_state_kwargs(batch, next_state=False)
-        if hasattr(policy, "_q_batch_state_kwargs")
-        else {}
+    configured_q_filter = bool(getattr(policy.cfg, "use_q_filtered_bc", False))
+    q_filter_enabled = (
+        configured_q_filter
+        if use_q_filtered_bc is None
+        else bool(use_q_filtered_bc)
     )
 
     with torch.enable_grad(), _temporarily_enable_grad(all_parameters):
@@ -382,18 +432,35 @@ def diagnose_fastsac_actor_gradients(
         )
         normalized_log_prob = policy._normalized_action_log_prob(raw_log_prob)
         twin_sample_q, minimum_sample_q = _expected_twin_q(
-            policy, critic_observations, sampled_action, q_state_kwargs
+            policy, critic_observations, sampled_action, actuator_context
         )
         with torch.no_grad():
             twin_mean_q, minimum_mean_q = _expected_twin_q(
-                policy, critic_observations, mean_action.detach(), q_state_kwargs
+                policy,
+                critic_observations,
+                mean_action.detach(),
+                actuator_context,
             )
-            finite_teacher_action = torch.nan_to_num(
-                teacher_action, nan=0.0, posinf=0.0, neginf=0.0
+            # Match production: invalid labels are replaced by the current
+            # detached mean before the online-Critic SPReD-P forward.  A
+            # non-finite label marked valid remains an error rather than being
+            # silently converted into an arbitrary action.
+            finite_teacher_action = torch.where(
+                teacher_valid.unsqueeze(-1),
+                teacher_action,
+                mean_action.detach(),
             )
             twin_teacher_q, minimum_teacher_q = _expected_twin_q(
-                policy, critic_observations, finite_teacher_action, q_state_kwargs
+                policy,
+                critic_observations,
+                finite_teacher_action,
+                actuator_context,
             )
+            (
+                spred_p_teacher_probability,
+                spred_p_teacher_advantage,
+                spred_p_combined_q_std,
+            ) = _spred_p_teacher_probability(twin_mean_q, twin_teacher_q)
 
         teacher_source = batch.get(DAGGER_Q_TEACHER_SOURCE_KEY)
         if teacher_source is None:
@@ -441,13 +508,18 @@ def diagnose_fastsac_actor_gradients(
         scalar_reports = {}
         saw_all_gradients = False
         for name, mask in masks.items():
-            bc_loss = _exact_teacher_bc_loss(
+            bc_loss = _diagnostic_teacher_bc_loss(
                 mean_action[mask],
                 teacher_action[mask],
                 teacher_valid[mask],
                 policy._fastsac_q_action_center,
                 policy._fastsac_q_action_scale,
                 float(policy.cfg.dagger_actor_huber_delta),
+                detached_weights=(
+                    spred_p_teacher_probability[mask]
+                    if q_filter_enabled
+                    else None
+                ),
             )
             scalar_reports[name] = _scalar_stratum_metrics(
                 mask,
@@ -462,6 +534,57 @@ def diagnose_fastsac_actor_gradients(
                 teacher_action=finite_teacher_action,
                 action_scale=policy._fastsac_q_action_scale,
             )
+            valid = mask & teacher_valid
+            if bool(valid.any()):
+                candidate_weights = spred_p_teacher_probability[valid]
+                effective_weights = (
+                    candidate_weights
+                    if q_filter_enabled
+                    else torch.ones_like(candidate_weights)
+                )
+                scalar_reports[name].update(
+                    {
+                        "bc_effective_weight_mean": _finite_float(
+                            effective_weights.mean()
+                        ),
+                        "spred_p_teacher_probability_mean": _finite_float(
+                            candidate_weights.mean()
+                        ),
+                        "spred_p_teacher_probability_std": _finite_float(
+                            candidate_weights.std(unbiased=False)
+                        ),
+                        "spred_p_teacher_probability_min": _finite_float(
+                            candidate_weights.min()
+                        ),
+                        "spred_p_teacher_probability_max": _finite_float(
+                            candidate_weights.max()
+                        ),
+                        "spred_p_teacher_advantage_mean": _finite_float(
+                            spred_p_teacher_advantage[valid].mean()
+                        ),
+                        "spred_p_combined_q_std_mean": _finite_float(
+                            spred_p_combined_q_std[valid].mean()
+                        ),
+                        "spred_p_policy_better_fraction": _finite_float(
+                            (spred_p_teacher_advantage[valid] < 0.0)
+                            .float()
+                            .mean()
+                        ),
+                    }
+                )
+            else:
+                scalar_reports[name].update(
+                    {
+                        "bc_effective_weight_mean": None,
+                        "spred_p_teacher_probability_mean": None,
+                        "spred_p_teacher_probability_std": None,
+                        "spred_p_teacher_probability_min": None,
+                        "spred_p_teacher_probability_max": None,
+                        "spred_p_teacher_advantage_mean": None,
+                        "spred_p_combined_q_std_mean": None,
+                        "spred_p_policy_better_fraction": None,
+                    }
+                )
             if name not in gradient_masks:
                 continue
             q_loss = -_masked_mean(minimum_sample_q, mask)
@@ -519,9 +642,7 @@ def diagnose_fastsac_actor_gradients(
                     "alpha_log_prob": _finite_float(entropy_loss),
                     "sac": _finite_float(q_loss + entropy_loss),
                     "weighted_bc": _finite_float(lambda_bc * bc_loss),
-                    "weighted_sac": _finite_float(
-                        eta_sac * (q_loss + entropy_loss)
-                    ),
+                    "weighted_sac": _finite_float(eta_sac * (q_loss + entropy_loss)),
                     "total": _finite_float(
                         lambda_bc * bc_loss + eta_sac * (q_loss + entropy_loss)
                     ),
@@ -536,13 +657,13 @@ def diagnose_fastsac_actor_gradients(
         # therefore tests the Critic's local action sensitivity independently
         # of both the Actor Jacobian and the BC objective.
         sample_dqda = _action_q_gradients(
-            policy, critic_observations, sampled_action, q_state_kwargs
+            policy, critic_observations, sampled_action, actuator_context
         )
         mean_dqda = _action_q_gradients(
-            policy, critic_observations, mean_action, q_state_kwargs
+            policy, critic_observations, mean_action, actuator_context
         )
         teacher_dqda = _action_q_gradients(
-            policy, critic_observations, finite_teacher_action, q_state_kwargs
+            policy, critic_observations, finite_teacher_action, actuator_context
         )
 
         # Check whether the local Critic direction agrees with Teacher BC in
@@ -584,13 +705,13 @@ def diagnose_fastsac_actor_gradients(
                 policy,
                 critic_observations,
                 mean_action.detach() + epsilon * physical_step_direction,
-                q_state_kwargs,
+                actuator_context,
             )
             _, q_minus = _expected_twin_q(
                 policy,
                 critic_observations,
                 mean_action.detach() - epsilon * physical_step_direction,
-                q_state_kwargs,
+                actuator_context,
             )
             finite_difference_derivative = (q_plus - q_minus) / (2.0 * epsilon)
         derivative_scale = torch.maximum(
@@ -668,6 +789,16 @@ def diagnose_fastsac_actor_gradients(
         "source_masks_present": source_available,
         "failure_source_mask_present": failure_available,
         "source_gradients": bool(source_gradients),
+        "bc_filter": {
+            "configured": configured_q_filter,
+            "enabled_for_probe": q_filter_enabled,
+            "overridden": use_q_filtered_bc is not None,
+            "weight_semantics": (
+                "detached_online_twin_spred_p_teacher_probability"
+                if q_filter_enabled
+                else "uniform_valid_teacher_rows"
+            ),
+        },
         "coefficients": {
             "lambda_bc": lambda_bc,
             "eta_sac": eta_sac,

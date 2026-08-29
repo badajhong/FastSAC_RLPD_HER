@@ -26,8 +26,10 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
 )
 from active_adaptation.learning.ppo.ppo_vel import PPOVEL
 from active_adaptation.learning.ppo.td3_bc_dagger import (
+    NEXT_Q_ACTUATOR_CONTEXT_KEY,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     PRETRAINED_PERCEPTION_MODULES,
+    Q_ACTUATOR_CONTEXT_KEY,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
     TD3_NOISE_FREE_STUDENT_ACTION_KEY,
@@ -41,6 +43,8 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
+    FASTSAC_PREFILL_TEACHER_NOISE_KEY,
+    FASTSAC_PREFILL_TEACHER_PROJECTION_KEY,
     FastSACPhysicalNormal,
     NORMALIZED_TANH_ACTION_DISTRIBUTION,
     Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
@@ -114,6 +118,22 @@ class _ActionSensitiveTwinC51(nn.Module):
         return _categorical_expected_value(logits, self.support)
 
 
+class _RecordingActionSensitiveTwinC51(_ActionSensitiveTwinC51):
+    def __init__(self, first_slope: float = 1.0, second_slope: float = -2.0):
+        super().__init__(first_slope, second_slope)
+        self.action_inputs: list[torch.Tensor] = []
+
+    def forward(self, observations, actions):
+        self.action_inputs.append(actions.detach().clone())
+        logits = super().forward(observations, actions)
+        # Keep a zero-valued autograd edge to every appended context feature.
+        # If the production action-feature helper stops detaching the context,
+        # the Actor/SPReD test below observes a zero Tensor gradient instead of
+        # ``None`` and fails without changing the fixture's Q values.
+        context_edge = actions[:, 1:].sum(dim=-1) * 0.0
+        return logits + context_edge.unsqueeze(0).unsqueeze(-1)
+
+
 class _TableC51Head(nn.Module):
     def __init__(self, probabilities: torch.Tensor):
         super().__init__()
@@ -134,6 +154,16 @@ class _TableTwinC51(nn.Module):
         return torch.stack(
             tuple(head(observations, actions) for head in self.qnets), dim=0
         )
+
+
+class _RecordingTableTwinC51(_TableTwinC51):
+    def __init__(self, first: torch.Tensor, second: torch.Tensor):
+        super().__init__(first, second)
+        self.action_inputs: list[torch.Tensor] = []
+
+    def forward(self, observations, actions):
+        self.action_inputs.append(actions.detach().clone())
+        return super().forward(observations, actions)
 
 
 class _UnexpectedCriticCall(nn.Module):
@@ -223,6 +253,15 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.perception_replay_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
     assert cfg.teacher_perception_replay_fraction == 0.0
     assert cfg.teacher_perception_warmup_steps == 0
+    assert cfg.teacher_prefill_use_ppo_noise is True
+
+
+def test_teacher_prefill_ppo_noise_flag_must_be_boolean():
+    cfg = DistributionalFastSACTeacherBCConfig()
+    cfg.teacher_prefill_use_ppo_noise = 1
+
+    with pytest.raises(ValueError, match="teacher_prefill_use_ppo_noise"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
 def test_physical_gaussian_config_allows_autotune_and_requires_ppo_load_scale():
@@ -805,6 +844,19 @@ def test_raw_replay_and_teacher_prefill_implementation_is_inherited_unchanged():
         assert getattr(DistributionalFastSACTeacherBC, method) is getattr(
             DistributionalTD3TeacherBC, method
         )
+
+
+def test_noisy_teacher_prefill_schema_retains_clean_bc_label_separately():
+    policy = _bare_policy(teacher_prefill_use_ppo_noise=True)
+    policy._has_canonical_replay_mix = lambda: False
+    policy._q_conditions_on_actuator_state = lambda: False
+    policy._teacher_episode_cache_enabled = lambda: False
+
+    fields = policy._q_replay_prefill_storage_fields()
+
+    assert "actions" in fields
+    assert DAGGER_REPLAY_TEACHER_ACTIONS in fields
+    assert fields.count(DAGGER_REPLAY_TEACHER_ACTIONS) == 1
 
 
 def test_fastsac_uses_the_shared_td3_failure_phase_curriculum_contract():
@@ -1468,6 +1520,133 @@ def test_q_filtered_bc_uses_online_twin_detached_spred_p_and_valid_denominator()
     assert all(parameter.grad is None for parameter in policy.qnet_target.parameters())
 
 
+def test_gradient_probe_matches_production_q_filtered_bc_and_supports_override():
+    policy = _bare_policy(
+        eta_sac=0.2,
+        lambda_bc=1.0,
+        use_q_filtered_bc=True,
+        dagger_actor_huber_delta=1.0,
+        sac_log_std_min=-5.0,
+        sac_log_std_max=1.0,
+        q_action_input_gain=1.0,
+    )
+    _install_unit_action_contract(policy)
+    _install_tiny_stochastic_actor(policy, actor_weight=0.25)
+    policy.qnet = _ActionSensitiveTwinC51(first_slope=1.0, second_slope=2.0)
+    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.4)))
+    policy.actor_optimizer = torch.optim.AdamW(
+        (
+            {"params": tuple(policy.actor_adapt.parameters())},
+            {"params": tuple(policy.bc_dagger_sac_adapter.parameters())},
+        ),
+        lr=0.01,
+    )
+    batch = {
+        "observations": torch.tensor([[1.0], [2.0], [3.0]]),
+        "critic_observations": torch.ones(3, 1),
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.tensor(
+            [[0.0], [1.0], [float("nan")]]
+        ),
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.tensor([True, True, False]),
+        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor([False, True, True]),
+    }
+
+    prediction = policy._sac_dist_from_mean(
+        policy._actor_mean_from_flat(batch["observations"])
+    ).mean
+    safe_teacher = torch.where(
+        batch[DAGGER_TEACHER_ACTION_VALID_KEY].unsqueeze(-1),
+        batch[DAGGER_REPLAY_TEACHER_ACTIONS],
+        prediction.detach(),
+    )
+    with torch.no_grad():
+        policy_q = policy.qnet.values(
+            policy.qnet(
+                batch["critic_observations"],
+                policy._q_action_input(prediction.detach()),
+            )
+        )
+        teacher_q = policy.qnet.values(
+            policy.qnet(
+                batch["critic_observations"],
+                policy._q_action_input(safe_teacher),
+            )
+        )
+        weights, _, _ = _spred_p_teacher_probability(policy_q, teacher_q)
+    per_row_bc = torch.nn.functional.smooth_l1_loss(
+        prediction,
+        safe_teacher,
+        beta=1.0,
+        reduction="none",
+    ).mean(dim=1)
+    expected_filtered_bc = (per_row_bc[:2] * weights[:2]).sum() / 2.0
+    expected_filtered_gradient = torch.autograd.grad(
+        expected_filtered_bc, policy.actor_adapt.weight, retain_graph=True
+    )[0]
+
+    filtered = diagnose_fastsac_actor_gradients(
+        policy,
+        batch,
+        sample_seed=313,
+        source_gradients=False,
+    )
+    ordinary = diagnose_fastsac_actor_gradients(
+        policy,
+        batch,
+        sample_seed=313,
+        source_gradients=False,
+        use_q_filtered_bc=False,
+    )
+    policy.cfg.use_q_filtered_bc = False
+    counterfactual_filtered = diagnose_fastsac_actor_gradients(
+        policy,
+        batch,
+        sample_seed=313,
+        source_gradients=False,
+        use_q_filtered_bc=True,
+    )
+
+    assert filtered["bc_filter"] == {
+        "configured": True,
+        "enabled_for_probe": True,
+        "overridden": False,
+        "weight_semantics": (
+            "detached_online_twin_spred_p_teacher_probability"
+        ),
+    }
+    assert filtered["gradients"]["all"]["losses"]["bc"] == pytest.approx(
+        expected_filtered_bc.item(), abs=5.0e-6
+    )
+    assert filtered["gradients"]["all"]["groups"]["actor_mean"][
+        "unweighted_norms"
+    ]["bc"] == pytest.approx(expected_filtered_gradient.norm().item(), abs=5.0e-6)
+    assert filtered["strata"]["all"][
+        "spred_p_teacher_probability_mean"
+    ] == pytest.approx(weights[:2].mean().item())
+    assert ordinary["bc_filter"]["enabled_for_probe"] is False
+    assert ordinary["bc_filter"]["overridden"] is True
+    assert ordinary["strata"]["all"]["bc_effective_weight_mean"] == 1.0
+    assert ordinary["gradients"]["all"]["losses"]["bc"] == pytest.approx(
+        per_row_bc[:2].mean().item(), abs=5.0e-6
+    )
+    assert filtered["gradients"]["all"]["losses"]["bc"] != pytest.approx(
+        ordinary["gradients"]["all"]["losses"]["bc"]
+    )
+    assert counterfactual_filtered["bc_filter"]["configured"] is False
+    assert counterfactual_filtered["bc_filter"]["enabled_for_probe"] is True
+    assert counterfactual_filtered["bc_filter"]["overridden"] is True
+    assert counterfactual_filtered["gradients"]["all"]["losses"][
+        "bc"
+    ] == pytest.approx(filtered["gradients"]["all"]["losses"]["bc"])
+    assert counterfactual_filtered["gradients"]["all"]["groups"][
+        "actor_mean"
+    ]["unweighted_norms"]["bc"] == pytest.approx(
+        filtered["gradients"]["all"]["groups"]["actor_mean"][
+            "unweighted_norms"
+        ]["bc"]
+    )
+
+
 def test_gradient_probe_separates_components_and_is_strictly_read_only():
     policy = _bare_policy(
         eta_sac=0.2,
@@ -1638,7 +1817,9 @@ def test_zero_gradient_actor_update_is_noop_despite_nonzero_q_weight_decay():
         assert torch.equal(dict(policy.named_parameters())[name], expected)
 
 
-def _rollout_owner(*, prefill: bool, beta: float = 0.5):
+def _rollout_owner(
+    *, prefill: bool, beta: float = 0.5, teacher_prefill_ppo_noise: bool = False
+):
     action_dim = 2
     batch_size = 64
     raw_mean = torch.zeros(batch_size, action_dim)
@@ -1655,6 +1836,7 @@ def _rollout_owner(*, prefill: bool, beta: float = 0.5):
         sac_log_std_min=-10.0,
         sac_log_std_max=-2.0,
         action_support_clip=20.0,
+        teacher_prefill_use_ppo_noise=teacher_prefill_ppo_noise,
     )
     owner = SimpleNamespace(cfg=cfg)
     owner.teacher_prefill_rollout_count = 0 if prefill else 1
@@ -1662,9 +1844,14 @@ def _rollout_owner(*, prefill: bool, beta: float = 0.5):
     owner.dagger_rng = torch.Generator().manual_seed(17)
     owner.sac_rollout_rng = torch.Generator().manual_seed(18)
     owner.sac_action_rng = torch.Generator().manual_seed(19)
+    owner.teacher_prefill_action_rng = torch.Generator().manual_seed(20)
     owner._student_raw_action_proposal = lambda td: raw_mean.clone()
     owner._student_mean_action = lambda td: 20.0 * torch.tanh(raw_mean / 20.0)
     owner._teacher_action = lambda td: teacher.clone()
+    owner._teacher_action_statistics = lambda td: (
+        teacher.clone(),
+        torch.full_like(teacher, 0.1),
+    )
     owner._teacher_prefill_active = lambda: prefill
     owner._effective_control_mode = lambda: "beta"
     owner._teacher_mixture_probability = lambda: beta
@@ -1741,6 +1928,7 @@ def test_teacher_only_prefill_is_bitwise_exact_and_does_not_draw_sac_noise():
         batch_size=[raw_mean.shape[0]],
     )
     rollout_rng_before = owner.sac_rollout_rng.get_state().clone()
+    teacher_rng_before = owner.teacher_prefill_action_rng.get_state().clone()
 
     result = policy(td)
 
@@ -1748,7 +1936,70 @@ def test_teacher_only_prefill_is_bitwise_exact_and_does_not_draw_sac_noise():
     assert torch.equal(result[ACTION_KEY], teacher)
     assert torch.equal(result[TD3_EXPLORATORY_STUDENT_ACTION_KEY], teacher)
     assert torch.equal(result[TD3_COLLECTOR_NOISE_KEY], torch.zeros_like(teacher))
+    assert torch.equal(
+        result[FASTSAC_PREFILL_TEACHER_NOISE_KEY], torch.zeros_like(teacher)
+    )
     assert torch.equal(owner.sac_rollout_rng.get_state(), rollout_rng_before)
+    assert torch.equal(owner.teacher_prefill_action_rng.get_state(), teacher_rng_before)
+
+
+def test_teacher_prefill_uses_exact_ppo_gaussian_but_keeps_clean_bc_label():
+    owner, _, teacher = _rollout_owner(
+        prefill=True, beta=0.0, teacher_prefill_ppo_noise=True
+    )
+    policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
+    td = TensorDict(
+        {"is_init": torch.zeros(teacher.shape[0], dtype=torch.bool)},
+        batch_size=[teacher.shape[0]],
+    )
+    expected_rng = torch.Generator().set_state(
+        owner.teacher_prefill_action_rng.get_state()
+    )
+    expected_action, _ = FastSACPhysicalNormal(
+        teacher, torch.full_like(teacher, 0.1)
+    ).rsample_with_log_prob(generator=expected_rng)
+    teacher_rng_before = owner.teacher_prefill_action_rng.get_state().clone()
+    dagger_rng_before = owner.dagger_rng.get_state().clone()
+    rollout_rng_before = owner.sac_rollout_rng.get_state().clone()
+    learning_rng_before = owner.sac_action_rng.get_state().clone()
+
+    result = policy(td)
+
+    assert not result[DAGGER_IS_STUDENT_ACTION_KEY].any()
+    assert torch.equal(result[ACTION_KEY], expected_action)
+    assert torch.equal(result[DAGGER_TEACHER_ACTION_KEY], teacher)
+    assert torch.equal(
+        result[FASTSAC_PREFILL_TEACHER_NOISE_KEY], expected_action - teacher
+    )
+    assert not result[FASTSAC_PREFILL_TEACHER_PROJECTION_KEY].any()
+    assert not torch.equal(
+        owner.teacher_prefill_action_rng.get_state(), teacher_rng_before
+    )
+    assert torch.equal(owner.dagger_rng.get_state(), dagger_rng_before)
+    assert torch.equal(owner.sac_rollout_rng.get_state(), rollout_rng_before)
+    assert torch.equal(owner.sac_action_rng.get_state(), learning_rng_before)
+
+
+def test_prefill_ppo_noise_never_changes_main_teacher_takeover_action():
+    owner, _, teacher = _rollout_owner(
+        prefill=False, beta=1.0, teacher_prefill_ppo_noise=True
+    )
+    policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
+    td = TensorDict(
+        {"is_init": torch.zeros(teacher.shape[0], dtype=torch.bool)},
+        batch_size=[teacher.shape[0]],
+    )
+    teacher_rng_before = owner.teacher_prefill_action_rng.get_state().clone()
+
+    result = policy(td)
+
+    assert not result[DAGGER_IS_STUDENT_ACTION_KEY].any()
+    assert torch.equal(result[ACTION_KEY], teacher)
+    assert torch.equal(result[DAGGER_TEACHER_ACTION_KEY], teacher)
+    assert torch.equal(
+        result[FASTSAC_PREFILL_TEACHER_NOISE_KEY], torch.zeros_like(teacher)
+    )
+    assert torch.equal(owner.teacher_prefill_action_rng.get_state(), teacher_rng_before)
 
 
 def test_deterministic_eval_uses_mean_without_advancing_any_sac_rng():
@@ -1987,6 +2238,8 @@ def _checkpoint_policy(seed: int):
         sac_log_std_min=-10.0,
         sac_log_std_max=-2.0,
         q_batch_size=512,
+        q_seed=seed,
+        teacher_prefill_use_ppo_noise=True,
     )
     with torch.random.fork_rng():
         torch.manual_seed(seed)
@@ -2015,6 +2268,7 @@ def _checkpoint_policy(seed: int):
     policy.sac_action_rng = torch.Generator().manual_seed(seed + 3)
     policy.sac_rollout_rng = torch.Generator().manual_seed(seed + 4)
     policy.teacher_perception_rng = torch.Generator().manual_seed(seed + 5)
+    policy.teacher_prefill_action_rng = torch.Generator().manual_seed(seed + 6)
     policy.actor_target = None
     policy._last_fastsac_diagnostics = {}
     policy._fastsac_action_contract = {
@@ -2125,6 +2379,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
             source.sac_action_rng,
             source.sac_rollout_rng,
             source.teacher_perception_rng,
+            source.teacher_prefill_action_rng,
         ),
         start=1,
     ):
@@ -2136,6 +2391,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     assert "collector_exploration_rng_state" not in state
     assert "sac_action_rng_state" in state
     assert "sac_rollout_rng_state" in state
+    assert "teacher_prefill_action_rng_state" in state
     assert "teacher_perception_rng_state" in state
 
     restored = _checkpoint_policy(900)
@@ -2178,6 +2434,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
         "q_rng",
         "sac_action_rng",
         "sac_rollout_rng",
+        "teacher_prefill_action_rng",
         "teacher_perception_rng",
     ):
         source_generator = getattr(source, name)
@@ -2269,6 +2526,7 @@ def test_fastsac_inference_loader_restores_models_without_training_state(
         source.sac_action_rng,
         source.sac_rollout_rng,
         source.teacher_perception_rng,
+        source.teacher_prefill_action_rng,
     ):
         torch.rand(7, generator=generator)
 
@@ -2328,6 +2586,7 @@ def test_fastsac_inference_loader_restores_models_without_training_state(
             "sac_action_rng",
             "sac_rollout_rng",
             "teacher_perception_rng",
+            "teacher_prefill_action_rng",
         )
     }
 
@@ -2446,3 +2705,120 @@ def test_fastsac_inference_requires_exact_bounded_action_contract_fingerprint(
     )
     with pytest.raises(ValueError, match=message):
         policy.load_inference_state_dict(state)
+
+
+def test_fastsac_target_routes_only_next_actuator_context_to_q_action_branch():
+    policy = _bare_policy(
+        gamma=1.0,
+        q_action_input_gain=1.0,
+        q_condition_on_actuator_state=True,
+    )
+    _install_unit_action_contract(policy)
+    policy._q_actuator_context_dim = 6
+    probabilities = torch.tensor([[0.2, 0.3, 0.5], [0.2, 0.3, 0.5]])
+    policy.qnet_target = _RecordingTableTwinC51(
+        probabilities, probabilities
+    ).requires_grad_(False)
+    policy.log_alpha = nn.Parameter(torch.tensor(-20.0))
+    policy.sac_action_rng = torch.Generator().manual_seed(91)
+    policy._actor_dist_from_flat = lambda observations: _FixedStochasticDist(
+        observations.shape[0], action=0.25, log_prob=0.0
+    )
+    next_context = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.25],
+        ]
+    )
+    batch = {
+        "next_observations": torch.zeros(2, 1),
+        "next_critic_observations": torch.zeros(2, 1),
+        "rewards": torch.zeros(2),
+        "dones": torch.zeros(2, dtype=torch.bool),
+        "truncations": torch.zeros(2, dtype=torch.bool),
+        "discounts": torch.ones(2),
+        NEXT_Q_ACTUATOR_CONTEXT_KEY: next_context,
+    }
+
+    policy._distributional_fastsac_target(batch)
+
+    assert len(policy.qnet_target.action_inputs) == 1
+    expected = torch.cat((torch.full((2, 1), 0.25), next_context), dim=-1)
+    assert torch.equal(policy.qnet_target.action_inputs[0], expected)
+
+
+def test_fastsac_critic_routes_current_actuator_context_to_factual_action():
+    policy = _bare_policy(
+        q_action_input_gain=1.0,
+        q_condition_on_actuator_state=True,
+        sac_max_grad_norm=1.0,
+        sac_alpha_update_cadence="actor",
+        sac_policy_frequency=2,
+        sac_use_autotune=False,
+        sac_tau=0.005,
+    )
+    _install_unit_action_contract(policy)
+    policy._q_actuator_context_dim = 6
+    policy.qnet = _RecordingActionSensitiveTwinC51()
+    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.01)
+    policy.log_alpha = nn.Parameter(torch.tensor(-20.0))
+    policy.critic_update_count = 0
+    policy.alpha_update_count = 0
+    projected = torch.full((3, 3), 1.0 / 3.0)
+    policy._distributional_fastsac_target = MethodType(
+        lambda owner, batch: (projected, {}, torch.zeros(3)), policy
+    )
+    current_context = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, -0.5],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    actions = torch.tensor([[0.1], [0.2], [0.3]])
+    batch = {
+        "critic_observations": torch.ones(3, 1),
+        "actions": actions,
+        "dones": torch.zeros(3, dtype=torch.bool),
+        "truncations": torch.zeros(3, dtype=torch.bool),
+        Q_ACTUATOR_CONTEXT_KEY: current_context,
+    }
+
+    policy._critic_update(batch)
+
+    assert len(policy.qnet.action_inputs) == 1
+    assert torch.equal(
+        policy.qnet.action_inputs[0], torch.cat((actions, current_context), dim=-1)
+    )
+
+
+def test_fastsac_actor_and_spred_share_detached_current_actuator_context():
+    policy = _tiny_physical_policy()
+    policy.cfg.q_condition_on_actuator_state = True
+    policy.cfg.use_q_filtered_bc = True
+    policy._q_actuator_context_dim = 6
+    policy.qnet = _RecordingActionSensitiveTwinC51(
+        first_slope=1.0, second_slope=2.0
+    )
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
+    context = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, -0.5],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ],
+        requires_grad=True,
+    )
+    batch = _tiny_physical_batch()
+    batch[Q_ACTUATOR_CONTEXT_KEY] = context
+
+    policy._actor_update(batch)
+
+    # One SAC sampled-action query, followed by SPReD-P Student-mean and
+    # Teacher-label queries. All compare actions under the identical dynamics.
+    assert len(policy.qnet.action_inputs) == 3
+    for action_input in policy.qnet.action_inputs:
+        assert action_input.shape == (3, 7)
+        assert torch.equal(action_input[:, 1:], context.detach())
+    assert context.grad is None

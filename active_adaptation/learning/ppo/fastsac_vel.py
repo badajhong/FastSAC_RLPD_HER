@@ -59,9 +59,9 @@ from .ppo_vel import (
 )
 
 
-TEACHER_REPLAY_FORMAT_VERSION = 11
+TEACHER_REPLAY_FORMAT_VERSION = 12
 TRUNCATION_NEXT_OBSERVATION_SEMANTICS = (
-    "episode_time_limit_pre_reset_final_command_finished_terminal_v3"
+    "episode_time_limit_pre_reset_final_command_finished_terminal_v5"
 )
 REPLAY_OBSERVATION_SEMANTICS = "raw_pre_vecnorm_sample_current_v1"
 SAC_REWARD_SCALARIZATION = "sum_reward_groups_v1"
@@ -349,12 +349,18 @@ FASTSAC_Q_REFERENCE_RESIDUAL_SEMANTICS = (
     "executable_action_minus_frame_reference_divide_half_range_no_clamp_then_gain_v1"
 )
 FASTSAC_Q_ACTION_COORDINATES = ("absolute", "reference_residual")
-FASTSAC_Q_ACTION_FUSIONS = ("early", "late")
+FASTSAC_Q_ACTION_FUSIONS = ("early", "late", "balanced")
 FASTSAC_Q_DEFAULT_ACTION_FUSION = "late"
 FASTSAC_Q_LEGACY_ACTION_FUSION = "early"
 FASTSAC_Q_EARLY_FUSION_SEMANTICS = "input_concat_then_shared_trunk_v1"
 FASTSAC_Q_LATE_FUSION_SEMANTICS = (
     "separate_obs_and_action_stems_then_shared_trunk_v1"
+)
+FASTSAC_Q_BALANCED_FUSION_SEMANTICS = (
+    "equal_width_obs_and_action_stems_same_total_fusion_width_v1"
+)
+FASTSAC_Q_RESIDUAL_FILM_SEMANTICS = (
+    "zero_init_bounded_delay_alpha_action_stem_residual_film_v1"
 )
 FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS = (
     "monolithic_action_conditioned_c51_logits_v1"
@@ -364,6 +370,9 @@ FASTSAC_Q_REFERENCE_DUELING_ARCHITECTURE_SEMANTICS = (
 )
 FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS = (
     "delay_one_hot_min_to_max_plus_fixed_range_centered_alpha_q_only_v1"
+)
+FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS = (
+    "delay_one_hot_centered_alpha_plus_previous_physical_command_q_only_v1"
 )
 FASTSAC_DETERMINISTIC_ACTION_KEY = "_fastsac_deterministic_action"
 FASTSAC_REFERENCE_EPS = 1e-6
@@ -484,20 +493,33 @@ def _normalize_q_actuator_context_metadata(metadata=None) -> dict:
             )
         return {"enabled": False}
 
-    required = {
+    base_required = {
         "enabled",
         "semantics",
         "dimension",
         "delay_range",
         "alpha_range",
     }
+    semantics = str(metadata.get("semantics", ""))
+    predicted_effect = semantics == FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS
+    required = set(base_required)
+    if predicted_effect:
+        required.update(
+            {
+                "previous_action_dim",
+                "control_decimation",
+                "effect_intervals",
+            }
+        )
     if set(metadata) != required:
         raise ValueError(
             "Enabled Q actuator-context metadata fields do not match the current "
             f"schema: got {sorted(metadata)}, expected {sorted(required)}"
         )
-    semantics = str(metadata["semantics"])
-    if semantics != FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS:
+    if semantics not in {
+        FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS,
+        FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS,
+    }:
         raise ValueError(
             f"Unsupported Q actuator-context semantics {semantics!r}"
         )
@@ -525,19 +547,63 @@ def _normalize_q_actuator_context_metadata(metadata=None) -> dict:
     if isinstance(dimension, bool) or int(dimension) != dimension:
         raise ValueError("Q actuator-context dimension must be an integer")
     dimension = int(dimension)
-    expected_dimension = delay_max - delay_min + 2
+    previous_action_dim = 0
+    control_decimation = 0
+    effect_intervals = 0
+    if predicted_effect:
+        previous_action_dim = metadata["previous_action_dim"]
+        control_decimation = metadata["control_decimation"]
+        effect_intervals = metadata["effect_intervals"]
+        for name, value in (
+            ("previous_action_dim", previous_action_dim),
+            ("control_decimation", control_decimation),
+            ("effect_intervals", effect_intervals),
+        ):
+            if isinstance(value, bool) or int(value) != value or int(value) < 1:
+                raise ValueError(
+                    f"Q predicted-effect context {name} must be a positive integer"
+                )
+        previous_action_dim = int(previous_action_dim)
+        control_decimation = int(control_decimation)
+        effect_intervals = int(effect_intervals)
+    expected_dimension = delay_max - delay_min + 2 + previous_action_dim
     if dimension != expected_dimension:
         raise ValueError(
-            "Q actuator-context dimension does not match delay one-hot plus alpha: "
+            "Q actuator-context dimension does not match its encoded fields: "
             f"got {dimension}, expected {expected_dimension}"
         )
-    return {
+    normalized = {
         "enabled": True,
         "semantics": semantics,
         "dimension": dimension,
         "delay_range": [delay_min, delay_max],
         "alpha_range": [alpha_low, alpha_high],
     }
+    if predicted_effect:
+        normalized.update(
+            {
+                "previous_action_dim": previous_action_dim,
+                "control_decimation": control_decimation,
+                "effect_intervals": effect_intervals,
+            }
+        )
+    return normalized
+
+
+def _q_state_hidden_dim(hidden_dim: int, action_fusion: str) -> int:
+    """Return the observation-stem width for one Q fusion topology."""
+    if action_fusion not in FASTSAC_Q_ACTION_FUSIONS:
+        raise ValueError(
+            f"q_action_fusion must be one of {FASTSAC_Q_ACTION_FUSIONS}, "
+            f"got {action_fusion!r}"
+        )
+    if action_fusion == "early":
+        return 0
+    if action_fusion == "balanced":
+        # Preserve the historical total fusion width H + H/6, but split it
+        # equally. H=768 therefore becomes 448 state + 448 action.
+        return max(2, (int(hidden_dim) + max(2, int(hidden_dim) // 6)) // 2)
+    return int(hidden_dim)
 
 
 def _q_action_hidden_dim(hidden_dim: int, action_fusion: str) -> int:
@@ -555,6 +621,8 @@ def _q_action_hidden_dim(hidden_dim: int, action_fusion: str) -> int:
         )
     if action_fusion == "early":
         return 0
+    if action_fusion == "balanced":
+        return _q_state_hidden_dim(hidden_dim, action_fusion)
     return max(2, int(hidden_dim) // 6)
 
 
@@ -1568,8 +1636,9 @@ def _vaic_truncation_mask(td: TensorDict) -> torch.Tensor:
 
     The environment flags remain unchanged.  FastSAC interprets an episode
     time limit as a truncation and bootstraps from its real pre-reset final
-    observation.  Command/motion completion is instead a task terminal, as in
-    HOI WBT, so it ends an n-step return without bootstrap.  Command completion
+    observation.  Command/motion completion is the end of the finite tracking
+    task, so it cuts the Bellman return.  Treating that row as a current-state
+    self-loop would repeat its final reward indefinitely.  Command completion
     and physical termination both win if causes happen simultaneously.
     """
     required = (
@@ -1588,6 +1657,21 @@ def _vaic_truncation_mask(td: TensorDict) -> torch.Tensor:
     reset_cause = episode_time_limit | command_finished
     if (reset_cause & ~td[DONE_KEY].bool()).any():
         raise RuntimeError("A VAIC FastSAC reset-cause row is not marked done")
+    return episode_time_limit & ~command_finished & ~terminated
+
+
+def _vaic_pre_reset_final_observation_mask(td: TensorDict) -> torch.Tensor:
+    """Return rows that need a captured real pre-reset final observation.
+
+    Only a pure episode time limit uses the environment's final observation.
+    Command completion and physical termination are both terminal cuts; a
+    simultaneous command/time-limit row is therefore also cut.
+    ``_vaic_truncation_mask`` performs the shared cause/done validation.
+    """
+    _vaic_truncation_mask(td)
+    episode_time_limit = td["next", "stats", "episode_time_limit"].bool()
+    command_finished = td["next", "stats", "command_finished"].bool()
+    terminated = td[TERM_KEY].bool()
     return episode_time_limit & ~command_finished & ~terminated
 
 
@@ -1820,6 +1904,58 @@ class _Stage1NStepAccumulator:
         return out
 
 
+class ResidualActionFiLM(nn.Module):
+    """Bounded, zero-initialized FiLM for a critic action stem.
+
+    Parameters are allocated directly as zeros instead of constructing an
+    ``nn.Linear`` and then clearing it.  This avoids consuming the isolated Q
+    RNG stream, so enabling FiLM preserves every pre-existing critic weight and
+    produces exactly the non-FiLM output at initialization.
+    """
+
+    def __init__(self, condition_dim: int, feature_dim: int, scale: float):
+        super().__init__()
+        if isinstance(condition_dim, bool) or int(condition_dim) < 1:
+            raise ValueError("FiLM condition_dim must be a positive integer")
+        if isinstance(feature_dim, bool) or int(feature_dim) < 1:
+            raise ValueError("FiLM feature_dim must be a positive integer")
+        if (
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(float(scale))
+            or not 0.0 < float(scale) <= 1.0
+        ):
+            raise ValueError("FiLM scale must be finite and in (0, 1]")
+        self.condition_dim = int(condition_dim)
+        self.feature_dim = int(feature_dim)
+        self.scale = float(scale)
+        self.weight = nn.Parameter(
+            torch.zeros(2 * self.feature_dim, self.condition_dim)
+        )
+        self.bias = nn.Parameter(torch.zeros(2 * self.feature_dim))
+
+    def forward(
+        self, features: torch.Tensor, condition: torch.Tensor
+    ) -> torch.Tensor:
+        expected_condition = (*features.shape[:-1], self.condition_dim)
+        if tuple(condition.shape) != expected_condition:
+            raise ValueError(
+                "FiLM condition shape does not match action features: got "
+                f"{tuple(condition.shape)}, expected {expected_condition}"
+            )
+        if int(features.shape[-1]) != self.feature_dim:
+            raise ValueError(
+                "FiLM feature width does not match its configured action stem"
+            )
+        gamma, beta = F.linear(condition, self.weight, self.bias).chunk(2, dim=-1)
+        gain_scale = self.scale
+        shift_scale = 0.5 * self.scale
+        return (
+            (1.0 + gain_scale * torch.tanh(gamma)) * features
+            + shift_scale * torch.tanh(beta)
+        )
+
+
 class DistributionalQNetwork(nn.Module):
     """The distributional Q network used by HOI FastSAC/r1-student."""
 
@@ -1832,14 +1968,44 @@ class DistributionalQNetwork(nn.Module):
         layer_norm=True,
         action_fusion=FASTSAC_Q_DEFAULT_ACTION_FUSION,
         reference_dueling=False,
+        residual_film_condition_dim=0,
+        residual_film_scale=0.1,
     ):
         super().__init__()
         if not isinstance(reference_dueling, bool):
             raise ValueError("reference_dueling must be a boolean")
         self.reference_dueling = reference_dueling
         self.action_fusion = str(action_fusion)
+        self.state_hidden_dim = _q_state_hidden_dim(
+            hidden_dim, self.action_fusion
+        )
         self.action_hidden_dim = _q_action_hidden_dim(
             hidden_dim, self.action_fusion
+        )
+        if (
+            isinstance(residual_film_condition_dim, bool)
+            or int(residual_film_condition_dim) < 0
+        ):
+            raise ValueError(
+                "residual_film_condition_dim must be a non-negative integer"
+            )
+        self.residual_film_condition_dim = int(residual_film_condition_dim)
+        if self.residual_film_condition_dim and self.action_fusion == "early":
+            raise ValueError(
+                "Residual FiLM requires a late or balanced Q action stem"
+            )
+        if self.residual_film_condition_dim > int(action_dim):
+            raise ValueError(
+                "Residual FiLM condition cannot exceed the Q action input width"
+            )
+        self.action_film = (
+            ResidualActionFiLM(
+                self.residual_film_condition_dim,
+                self.action_hidden_dim,
+                residual_film_scale,
+            )
+            if self.residual_film_condition_dim
+            else None
         )
         if self.reference_dueling:
             value_layers: list[nn.Module] = [nn.Linear(obs_dim, hidden_dim)]
@@ -1883,10 +2049,10 @@ class DistributionalQNetwork(nn.Module):
                 return
 
             advantage_obs_layers: list[nn.Module] = [
-                nn.Linear(obs_dim, hidden_dim)
+                nn.Linear(obs_dim, self.state_hidden_dim)
             ]
             if layer_norm:
-                advantage_obs_layers.append(nn.LayerNorm(hidden_dim))
+                advantage_obs_layers.append(nn.LayerNorm(self.state_hidden_dim))
             advantage_obs_layers.append(nn.SiLU())
             self.advantage_obs_net = nn.Sequential(*advantage_obs_layers)
 
@@ -1904,7 +2070,8 @@ class DistributionalQNetwork(nn.Module):
 
             advantage_layers = [
                 nn.Linear(
-                    hidden_dim + self.action_hidden_dim, hidden_dim // 2
+                    self.state_hidden_dim + self.action_hidden_dim,
+                    hidden_dim // 2,
                 )
             ]
             if layer_norm:
@@ -1938,9 +2105,11 @@ class DistributionalQNetwork(nn.Module):
             self.net = nn.Sequential(*layers)
             return
 
-        obs_layers: list[nn.Module] = [nn.Linear(obs_dim, hidden_dim)]
+        obs_layers: list[nn.Module] = [
+            nn.Linear(obs_dim, self.state_hidden_dim)
+        ]
         if layer_norm:
-            obs_layers.append(nn.LayerNorm(hidden_dim))
+            obs_layers.append(nn.LayerNorm(self.state_hidden_dim))
         obs_layers.append(nn.SiLU())
         self.obs_net = nn.Sequential(*obs_layers)
 
@@ -1954,7 +2123,8 @@ class DistributionalQNetwork(nn.Module):
 
         layers = [
             nn.Linear(
-                hidden_dim + self.action_hidden_dim, hidden_dim // 2
+                self.state_hidden_dim + self.action_hidden_dim,
+                hidden_dim // 2,
             )
         ]
         if layer_norm:
@@ -1972,6 +2142,18 @@ class DistributionalQNetwork(nn.Module):
             )
         return self.value_net(obs)
 
+    def _action_stem_features(self, action, *, reference_dueling=False):
+        stem = (
+            self.advantage_action_net
+            if reference_dueling
+            else self.action_net
+        )
+        features = stem(action)
+        if self.action_film is None:
+            return features
+        condition = action[..., -self.residual_film_condition_dim :].detach()
+        return self.action_film(features, condition)
+
     def advantage_logits(self, obs, action):
         if not self.reference_dueling:
             raise RuntimeError(
@@ -1980,7 +2162,9 @@ class DistributionalQNetwork(nn.Module):
         if self.action_fusion == "early":
             return self.advantage_net(torch.cat((obs, action), dim=-1))
         obs_features = self.advantage_obs_net(obs)
-        action_features = self.advantage_action_net(action)
+        action_features = self._action_stem_features(
+            action, reference_dueling=True
+        )
         return self.advantage_net(
             torch.cat((obs_features, action_features), dim=-1)
         )
@@ -2009,7 +2193,7 @@ class DistributionalQNetwork(nn.Module):
         if self.action_fusion == "early":
             return self.net(torch.cat((obs, action), dim=-1))
         obs_features = self.obs_net(obs)
-        action_features = self.action_net(action)
+        action_features = self._action_stem_features(action)
         return self.net(torch.cat((obs_features, action_features), dim=-1))
 
 
@@ -2025,6 +2209,8 @@ class TwinDistributionalQ(nn.Module):
         layer_norm=True,
         action_fusion=FASTSAC_Q_DEFAULT_ACTION_FUSION,
         reference_dueling=False,
+        residual_film_condition_dim=0,
+        residual_film_scale=0.1,
     ):
         super().__init__()
         self.num_atoms = num_atoms
@@ -2042,6 +2228,8 @@ class TwinDistributionalQ(nn.Module):
                 layer_norm,
                 action_fusion,
                 reference_dueling,
+                residual_film_condition_dim,
+                residual_film_scale,
             )
             for _ in range(2)
         )
@@ -2094,6 +2282,8 @@ def _build_isolated_q_network(
     layer_norm, device, seed,
     action_fusion=FASTSAC_Q_DEFAULT_ACTION_FUSION,
     reference_dueling=False,
+    residual_film_condition_dim=0,
+    residual_film_scale=0.1,
 ):
     """Build Q1/Q2 without advancing VAIC/environment default RNG streams."""
     device = torch.device(device)
@@ -2111,7 +2301,8 @@ def _build_isolated_q_network(
                 torch.cuda.manual_seed(int(seed))
         qnet = TwinDistributionalQ(
             obs_dim, action_dim, hidden_dim, num_atoms, v_min, v_max, layer_norm,
-            action_fusion, reference_dueling,
+            action_fusion, reference_dueling, residual_film_condition_dim,
+            residual_film_scale,
         ).to(device)
     return qnet
 
@@ -2518,7 +2709,7 @@ class TeacherReplayBuffer:
             or isinstance(q_action_hidden_dim, bool)
             or int(q_action_hidden_dim) < 0
             or (
-                self.q_action_fusion == "late"
+                self.q_action_fusion in ("late", "balanced")
                 and int(q_action_hidden_dim) < 1
             )
             or (
@@ -2528,7 +2719,7 @@ class TeacherReplayBuffer:
         ):
             raise ValueError(
                 "q_action_hidden_dim must be zero for early fusion and "
-                "positive for late fusion"
+                "positive for late/balanced fusion"
             )
         self.q_action_hidden_dim = int(q_action_hidden_dim)
         self.q_action_coordinates = str(q_action_coordinates)
@@ -5640,6 +5831,9 @@ class FastSACVEL(_FastSACVAICBase):
         q_action_hidden_dim = _q_action_hidden_dim(
             self.cfg.q_hidden_dim, q_action_fusion
         )
+        q_state_hidden_dim = _q_state_hidden_dim(
+            self.cfg.q_hidden_dim, q_action_fusion
+        )
         clipped_double_q = bool(
             getattr(self.cfg, "sac_clipped_double_q", True)
         )
@@ -5665,11 +5859,16 @@ class FastSACVEL(_FastSACVAICBase):
             "action_dim": self.action_dim,
             "hidden_dim": self.cfg.q_hidden_dim,
             "q_action_fusion": q_action_fusion,
+            "q_state_hidden_dim": q_state_hidden_dim,
             "q_action_hidden_dim": q_action_hidden_dim,
             "q_action_fusion_semantics": (
                 FASTSAC_Q_EARLY_FUSION_SEMANTICS
                 if q_action_fusion == "early"
-                else FASTSAC_Q_LATE_FUSION_SEMANTICS
+                else (
+                    FASTSAC_Q_BALANCED_FUSION_SEMANTICS
+                    if q_action_fusion == "balanced"
+                    else FASTSAC_Q_LATE_FUSION_SEMANTICS
+                )
             ),
             "q_reference_dueling": q_reference_dueling,
             "q_architecture_semantics": (
@@ -6788,14 +6987,14 @@ class FastSACVEL(_FastSACVAICBase):
         )
         next_values = self._prepare_teacher_final_state(rollout_carry.clone())
         truncations = _vaic_truncation_mask(current).reshape(n).bool()
-        if truncations.any():
-            env_indices = truncations.nonzero(as_tuple=False).squeeze(-1)
+        capture_mask = _vaic_pre_reset_final_observation_mask(current).reshape(n).bool()
+        if capture_mask.any():
+            env_indices = capture_mask.nonzero(as_tuple=False).squeeze(-1)
             truncation_values = self._prepare_teacher_final_state(
                 current["next"][env_indices].clone()
             )
             for key, values in truncation_values.items():
                 next_values[key].index_copy_(0, env_indices, values)
-
         transitions = {
             "critic_observations": self._cat_replay_sources(
                 current, self.q_critic_keys
@@ -6820,7 +7019,7 @@ class FastSACVEL(_FastSACVAICBase):
         })
         valid = _replay_valid_mask(current, TEACHER_REPLAY_MIN_STEP_COUNT)
         self._last_truncation_finals_used += int(
-            (truncations & valid).sum().item()
+            (capture_mask & valid).sum().item()
         )
         return self._get_teacher_n_step_accumulator().append(
             transitions, valid
@@ -6831,10 +7030,10 @@ class FastSACVEL(_FastSACVAICBase):
         if self.cfg.phase != "train":
             return
 
-        truncations = _vaic_truncation_mask(td).reshape(-1).bool()
-        if not truncations.any():
+        capture_mask = _vaic_pre_reset_final_observation_mask(td).reshape(-1).bool()
+        if not capture_mask.any():
             return
-        env_indices = truncations.nonzero(as_tuple=False).squeeze(-1)
+        env_indices = capture_mask.nonzero(as_tuple=False).squeeze(-1)
         final_values = self._prepare_teacher_final_state(
             td["next"][env_indices].clone()
         )
@@ -6893,8 +7092,36 @@ class FastSACVEL(_FastSACVAICBase):
         else:
             self._last_truncation_finals_used = 0
 
+        expected_final_indices = (
+            _vaic_pre_reset_final_observation_mask(td)
+            .reshape(int(n * t))
+            .nonzero(as_tuple=False)
+            .squeeze(-1)
+        )
+        actual_final_indices = (
+            expected_final_indices[:0]
+            if truncation_finals is None
+            else truncation_finals["indices"].to(
+                device=expected_final_indices.device, dtype=torch.long
+            )
+        )
+        if (
+            actual_final_indices.numel() != expected_final_indices.numel()
+            or not torch.equal(
+                actual_final_indices.sort().values,
+                expected_final_indices.sort().values,
+            )
+        ):
+            raise RuntimeError(
+                "Teacher FastSAC captured pre-reset final observations do not "
+                "exactly match the rollout's pure time-limit rows"
+            )
+
         for step in range(int(t)):
             current = td[:, step]
+            current_critic_observations = self._cat_replay_sources(
+                current, self.q_critic_keys
+            ).reshape(n, self._q_critic_dim)
             if step + 1 < int(t):
                 following = td[:, step + 1]
                 next_values = {
@@ -6909,11 +7136,8 @@ class FastSACVEL(_FastSACVAICBase):
                 })
             else:
                 next_values = final_batch
-
             transitions = {
-                "critic_observations": self._cat_replay_sources(
-                    current, self.q_critic_keys
-                ).reshape(n, self._q_critic_dim),
+                "critic_observations": current_critic_observations,
                 "actions": current[ACTION_KEY].reshape(n, self.action_dim),
                 "rewards": self._scalarize_sac_reward(
                     current[REWARD_KEY]
@@ -9637,10 +9861,10 @@ class FastSACVelFinetune(FastSACVEL):
 
     @torch.no_grad()
     def capture_truncation_final_observations(self, td: TensorDict, step: int):
-        truncations = _vaic_truncation_mask(td).reshape(-1).bool()
-        if not truncations.any():
+        capture_mask = _vaic_pre_reset_final_observation_mask(td).reshape(-1).bool()
+        if not capture_mask.any():
             return
-        env_indices = truncations.nonzero(as_tuple=False).squeeze(-1)
+        env_indices = capture_mask.nonzero(as_tuple=False).squeeze(-1)
         final_values = self._prepare_student_final_state(
             td["next"][env_indices].clone()
         )
@@ -9690,8 +9914,39 @@ class FastSACVelFinetune(FastSACVEL):
         else:
             self._last_truncation_finals_used = 0
 
+        expected_final_indices = (
+            _vaic_pre_reset_final_observation_mask(td)
+            .reshape(int(n * t))
+            .nonzero(as_tuple=False)
+            .squeeze(-1)
+        )
+        actual_final_indices = (
+            expected_final_indices[:0]
+            if truncation_finals is None
+            else truncation_finals["indices"].to(
+                device=expected_final_indices.device, dtype=torch.long
+            )
+        )
+        if (
+            actual_final_indices.numel() != expected_final_indices.numel()
+            or not torch.equal(
+                actual_final_indices.sort().values,
+                expected_final_indices.sort().values,
+            )
+        ):
+            raise RuntimeError(
+                "Student FastSAC captured pre-reset final observations do not "
+                "exactly match the rollout's pure time-limit rows"
+            )
+
         for step in range(int(t)):
             current = td[:, step]
+            current_observations = self._cat_replay_sources(
+                current, self.q_actor_keys
+            ).reshape(n, self._q_actor_dim)
+            current_critic_observations = self._cat_replay_sources(
+                current, self.q_critic_keys
+            ).reshape(n, self._q_critic_dim)
             if step + 1 < int(t):
                 following = td[:, step + 1]
                 next_values = {
@@ -9711,12 +9966,8 @@ class FastSACVelFinetune(FastSACVEL):
             else:
                 next_values = final_batch
             transitions = {
-                "observations": self._cat_replay_sources(
-                    current, self.q_actor_keys
-                ).reshape(n, self._q_actor_dim),
-                "critic_observations": self._cat_replay_sources(
-                    current, self.q_critic_keys
-                ).reshape(n, self._q_critic_dim),
+                "observations": current_observations,
+                "critic_observations": current_critic_observations,
                 "actions": current[ACTION_KEY].reshape(n, self.action_dim),
                 "rewards": self._scalarize_sac_reward(
                     current[REWARD_KEY]

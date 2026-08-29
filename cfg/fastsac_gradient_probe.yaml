@@ -26,6 +26,9 @@ gradient_probe:
   collection_seed: 0
   sample_seed: 313
   source_gradients: true
+  # null mirrors the checkpoint. Set true/false to compare the detached
+  # SPReD-P BC gate counterfactually without changing checkpoint state.
+  use_q_filtered_bc_override: null
   output_path: fastsac_gradient_probe.json
 
 hydra:

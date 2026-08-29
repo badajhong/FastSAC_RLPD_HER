@@ -14,6 +14,7 @@ from active_adaptation.learning.ppo.fastsac_vel import (
     OfflineReplayH5,
     TeacherReplayBuffer,
     _sac_bootstrap_mask,
+    _vaic_pre_reset_final_observation_mask,
     _vaic_truncation_mask,
 )
 from active_adaptation.learning.ppo.ppo_vel import PPOVEL
@@ -75,10 +76,10 @@ def test_sac_bootstrap_truth_table():
     )
 
 
-def test_only_episode_limit_is_a_sac_truncation():
+def test_only_pure_timeout_bootstraps_and_requires_final_state_capture():
     # ordinary, command completion, episode limit, term+limit, command+limit,
-    # term+command. Command completion and true termination both win over a
-    # simultaneous timeout and therefore do not bootstrap.
+    # term+command. Command completion is a finite-task terminal, while only a
+    # pure artificial episode limit bootstraps from its pre-reset final state.
     done = torch.tensor([[False], [True], [True], [True], [True], [True]])
     terminated = torch.tensor(
         [[False], [False], [False], [True], [False], [True]]
@@ -111,6 +112,10 @@ def test_only_episode_limit_is_a_sac_truncation():
 
     assert torch.equal(
         _vaic_truncation_mask(td).squeeze(-1),
+        torch.tensor([False, False, True, False, False, False]),
+    )
+    assert torch.equal(
+        _vaic_pre_reset_final_observation_mask(td).squeeze(-1),
         torch.tensor([False, False, True, False, False, False]),
     )
     truncations = _vaic_truncation_mask(td).squeeze(-1)

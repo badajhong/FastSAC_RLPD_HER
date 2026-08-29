@@ -25,47 +25,14 @@ class _cum_error_mixin:
             self.error = torch.zeros(self.num_envs)
             self.__exceeded = torch.zeros(self.num_envs, dtype=bool)
             self.__cum_steps = torch.zeros(self.num_envs, dtype=torch.int32)
-            # Reset callbacks run before a learner can inspect the transition.
-            # Keep the most recent post-action/pre-reset value in a separate
-            # read-only side channel for Q replay alignment.
-            self.__post_update_cum_steps = torch.zeros(
-                self.num_envs, dtype=torch.int32
-            )
         
     def update(self):
         self.__exceeded = self.error >= self.threshold
         self.__cum_steps[self.__exceeded] += 1
         self.__cum_steps[~self.__exceeded] = 0
-        self.__post_update_cum_steps.copy_(self.__cum_steps)
 
     def reset(self, env_ids):
         self.__cum_steps[env_ids] = 0
-
-    def q_cumulative_counter_progress(
-        self, *, after_last_update: bool = False
-    ) -> torch.Tensor:
-        """Return normalized consecutive-exceedance progress for Q only.
-
-        ``after_last_update=False`` reads the current state, including any
-        environment reset. ``True`` reads the value captured by the latest
-        update before reset callbacks could clear a terminal/timeout row.
-        Conversion from the private integer storage returns a detached tensor,
-        so callers cannot mutate the termination process through this method.
-        """
-        if not isinstance(after_last_update, bool):
-            raise TypeError("after_last_update must be boolean")
-        steps = (
-            self.__post_update_cum_steps
-            if after_last_update
-            else self.__cum_steps
-        )
-        return (
-            steps.detach()
-            .to(dtype=torch.float32)
-            .div(float(self.min_steps))
-            .clamp_(0.0, 1.0)
-            .unsqueeze(-1)
-        )
     
     def __call__(self):
         return (self.__cum_steps >= self.min_steps).unsqueeze(-1)

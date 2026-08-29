@@ -257,6 +257,13 @@ def test_entrypoint_accepts_ppo_physical_gaussian_with_autotune():
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
+def test_entrypoint_accepts_balanced_q_action_fusion():
+    cfg = _cfg()
+    cfg.algo.q_action_fusion = "balanced"
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
 def test_physical_std_kl_cap_composes_from_hydra_cli():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):

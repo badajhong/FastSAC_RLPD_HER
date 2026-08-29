@@ -320,9 +320,11 @@ class TeacherEpisodeSequenceStore:
     ) -> torch.Tensor:
         """Resolve replay row keys to compact raw-node indices.
 
-        The final successful transition has no bootstrapped successor.  Its
-        dense ``next`` lookup aliases the current state, never an autoreset
-        observation from the following episode.
+        A successful command has no in-episode successor node.  For dense
+        cache lookup only, its padded ``next`` index aliases the final node
+        rather than an autoreset observation from another episode.  Learning
+        must pair that placeholder with zero continuation; it is not a
+        Bellman self-loop.
         """
 
         if not self._frozen:

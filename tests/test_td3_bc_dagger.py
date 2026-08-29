@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
 import copy
+import importlib
 import math
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -13,8 +16,12 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from active_adaptation.learning.ppo.common import ACTION_KEY, OBS_KEY, OBS_PRIV_KEY
 from active_adaptation.learning.ppo.fastsac_vel import (
+    FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS,
+    FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS,
     TwinDistributionalQ,
     _sac_bootstrap_mask,
+    _vaic_pre_reset_final_observation_mask,
+    _vaic_truncation_mask,
 )
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     DistributionalFastSACTeacherBC,
@@ -51,8 +58,15 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     PERCEPTION_WARMSTART_MODE_FRESH,
     PREVIOUS_CHECKPOINT_VERSION,
     PRETRAINED_PERCEPTION_MODULES,
+    NEXT_Q_ACTUATOR_CONTEXT_KEY,
+    NEXT_REFERENCE_PHASE_KEY,
+    Q_ACTUATOR_ACTION_FEATURE_SEMANTICS,
+    Q_ACTUATOR_CONTEXT_KEY,
+    Q_PREDICTED_EFFECT_ACTION_FEATURE_SEMANTICS,
+    Q_PREDICTED_EFFECT_INTERVALS,
     REFERENCE_PHASE_KEY,
     REPLAY_INTRINSIC_FOCUSED_KEY,
+    REPLAY_COMMAND_FINISHED_KEY,
     REPLAY_MOTION_ID_KEY,
     REPLAY_PERCEPTION_EMA_GENERATION_KEY,
     REPLAY_SAMPLE_IS_TEACHER_KEY,
@@ -93,6 +107,10 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     _valid_raw_action_rows,
 )
 
+fastsac_dagger_module = importlib.import_module(
+    "active_adaptation.learning.ppo.fastsac_bc_dagger"
+)
+
 
 def _parameter_storage(module: nn.Module) -> set[int]:
     return {parameter.untyped_storage().data_ptr() for parameter in module.parameters()}
@@ -104,6 +122,398 @@ def _bare_policy(**cfg) -> DistributionalTD3TeacherBC:
     policy.cfg = SimpleNamespace(**cfg)
     policy.device = torch.device("cpu")
     return policy
+
+
+def _actuator_context_metadata() -> dict:
+    return {
+        "enabled": True,
+        "semantics": FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS,
+        "dimension": 6,
+        "delay_range": [2, 6],
+        "alpha_range": [0.8, 1.0],
+    }
+
+
+def _predicted_effect_context_metadata(action_dim: int = 2) -> dict:
+    return {
+        "enabled": True,
+        "semantics": FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS,
+        "dimension": 6 + int(action_dim),
+        "delay_range": [2, 6],
+        "alpha_range": [0.8, 1.0],
+        "previous_action_dim": int(action_dim),
+        "control_decimation": 4,
+        "effect_intervals": Q_PREDICTED_EFFECT_INTERVALS,
+    }
+
+
+def _predicted_effect_policy(action_dim: int = 2):
+    policy = _bare_policy(
+        q_condition_on_actuator_state=True,
+        q_use_predicted_effect=True,
+        q_action_input_gain=1.0,
+        action_support_clip=20.0,
+    )
+    policy.action_dim = int(action_dim)
+    policy._q_actuator_parameter_context_dim = 6
+    policy._q_actuator_context_dim = 6 + int(action_dim)
+    policy._q_action_input_dim = (2 + Q_PREDICTED_EFFECT_INTERVALS) * int(
+        action_dim
+    ) + 6
+    policy._q_actuator_context_metadata_value = (
+        _predicted_effect_context_metadata(action_dim)
+    )
+    policy._fastsac_q_action_center = torch.zeros(action_dim)
+    policy._fastsac_q_action_scale = torch.tensor(
+        [2.0, 4.0][:action_dim], dtype=torch.float32
+    )
+    policy._fastsac_action_low = torch.full((action_dim,), -20.0)
+    policy._fastsac_action_high = torch.full((action_dim,), 20.0)
+    return policy
+
+
+def _joint_position_impulse_interval_means(
+    delay: int,
+    alpha: float,
+    *,
+    decimation: int = 4,
+    intervals: int = Q_PREDICTED_EFFECT_INTERVALS,
+) -> torch.Tensor:
+    """Independent scalar oracle for JointPosition's queue plus lerp."""
+    command_slots = [0.0] * intervals
+    applied = 0.0
+    interval_means = []
+    for interval in range(intervals):
+        command_slots = [
+            1.0 if interval == 0 else 0.0,
+            *command_slots[:-1],
+        ]
+        interval_sum = 0.0
+        for substep in range(decimation):
+            selected_slot = (delay - substep + decimation - 1) // decimation
+            selected = command_slots[selected_slot]
+            applied = (1.0 - alpha) * applied + alpha * selected
+            interval_sum += applied
+        interval_means.append(interval_sum / decimation)
+    return torch.tensor(interval_means, dtype=torch.float32)
+
+
+def test_dagger_q_actuator_context_encoding_and_action_branch_detach_are_exact():
+    policy = _bare_policy(q_condition_on_actuator_state=True)
+    policy._q_actuator_context_dim = 6
+    manager = SimpleNamespace(
+        min_delay=2,
+        max_delay=6,
+        alpha_range=(0.8, 1.0),
+        delay=torch.tensor([[2], [3], [4], [5], [6]]),
+        alpha=torch.tensor([[0.8], [0.85], [0.9], [0.95], [1.0]]),
+    )
+    policy.env = SimpleNamespace(action_manager=manager)
+    policy._q_actuator_context_metadata_value = (
+        policy._resolve_q_actuator_context_metadata()
+    )
+
+    captured = policy.capture_q_actuator_context()
+
+    assert captured is not None
+    assert policy._q_actuator_context_metadata_value == _actuator_context_metadata()
+    assert torch.equal(captured[:, :5], torch.eye(5))
+    assert torch.allclose(
+        captured[:, -1],
+        torch.tensor([-1.0, -0.5, 0.0, 0.5, 1.0]),
+        atol=1e-6,
+    )
+    manager.delay.fill_(6)
+    manager.alpha.fill_(1.0)
+    assert torch.equal(captured[:, :5], torch.eye(5))
+
+    q_action = torch.randn(5, 2, requires_grad=True)
+    context = captured.clone().requires_grad_(True)
+    features = policy._append_q_actuator_context(q_action, context)
+    assert torch.equal(features, torch.cat((q_action, context.detach()), dim=-1))
+    features.sum().backward()
+    assert torch.equal(q_action.grad, torch.ones_like(q_action))
+    assert context.grad is None
+
+    with pytest.raises(ValueError, match="requires context"):
+        policy._append_q_actuator_context(q_action.detach(), None)
+    with pytest.raises(ValueError, match="shape"):
+        policy._append_q_actuator_context(
+            q_action.detach(), torch.zeros(5, 5)
+        )
+
+    disabled = _bare_policy(q_condition_on_actuator_state=False)
+    unchanged = torch.randn(2, 3)
+    assert disabled._append_q_actuator_context(unchanged, None) is unchanged
+    with pytest.raises(ValueError, match="conditioning is disabled"):
+        disabled._append_q_actuator_context(unchanged, torch.zeros(2, 6))
+
+
+def test_dagger_predicted_effect_context_metadata_and_capture_are_exact():
+    policy = _bare_policy(
+        q_condition_on_actuator_state=True,
+        q_use_predicted_effect=True,
+    )
+    policy.action_dim = 2
+    previous_action = torch.tensor(
+        [
+            [-1.0, 1.0],
+            [-0.5, 0.5],
+            [0.0, 0.0],
+            [0.5, -0.5],
+            [1.0, -1.0],
+        ]
+    )
+    action_buf = torch.zeros(5, 2, Q_PREDICTED_EFFECT_INTERVALS)
+    action_buf[:, :, 0] = previous_action
+    manager = SimpleNamespace(
+        min_delay=2,
+        max_delay=6,
+        alpha_range=(0.8, 1.0),
+        delay=torch.tensor([[2], [3], [4], [5], [6]]),
+        alpha=torch.tensor([[0.8], [0.85], [0.9], [0.95], [1.0]]),
+        action_buf=action_buf,
+    )
+    policy.env = SimpleNamespace(action_manager=manager, decimation=4)
+    policy._q_actuator_context_metadata_value = (
+        policy._resolve_q_actuator_context_metadata()
+    )
+    policy._q_actuator_context_dim = 8
+    policy._q_actuator_parameter_context_dim = 6
+
+    captured = policy.capture_q_actuator_context()
+
+    assert policy._q_actuator_context_metadata_value == (
+        _predicted_effect_context_metadata(2)
+    )
+    assert captured.shape == (5, 8)
+    assert torch.equal(captured[:, :5], torch.eye(5))
+    assert torch.allclose(
+        captured[:, 5],
+        torch.tensor([-1.0, -0.5, 0.0, 0.5, 1.0]),
+        atol=1e-6,
+    )
+    assert torch.equal(captured[:, 6:], previous_action)
+
+    manager.delay.fill_(6)
+    manager.alpha.fill_(1.0)
+    manager.action_buf[:, :, 0].fill_(9.0)
+    assert torch.equal(captured[:, :5], torch.eye(5))
+    assert torch.equal(captured[:, 6:], previous_action)
+
+
+def test_dagger_predicted_effect_gains_match_joint_position_delay_alpha_grid():
+    policy = _predicted_effect_policy(action_dim=2)
+    parameter_rows = []
+    expected_rows = []
+    for delay in range(2, 7):
+        for alpha in (0.8, 0.9, 1.0):
+            delay_one_hot = F.one_hot(
+                torch.tensor(delay - 2), num_classes=5
+            ).float()
+            alpha_centered = torch.tensor(
+                [2.0 * (alpha - 0.8) / (1.0 - 0.8) - 1.0]
+            )
+            parameter_rows.append(torch.cat((delay_one_hot, alpha_centered)))
+            expected_rows.append(
+                _joint_position_impulse_interval_means(delay, alpha)
+            )
+
+    actual = policy._predicted_effect_interval_gains(
+        torch.stack(parameter_rows)
+    )
+    expected = torch.stack(expected_rows)
+
+    assert torch.allclose(actual, expected, rtol=0.0, atol=1e-6)
+    # This independent closed-form anchor catches a shared queue-index or
+    # pre/post-lerp off-by-one error in both an implementation and an oracle.
+    assert torch.equal(
+        actual[2::3],
+        torch.tensor(
+            [
+                [0.50, 0.50, 0.00],
+                [0.25, 0.75, 0.00],
+                [0.00, 1.00, 0.00],
+                [0.00, 0.75, 0.25],
+                [0.00, 0.50, 0.50],
+            ]
+        ),
+    )
+
+
+def test_dagger_predicted_effect_feature_layout_dim_and_actor_gradient_are_exact():
+    policy = _predicted_effect_policy(action_dim=2)
+    candidate_action = torch.tensor([[1.0, -2.0]], requires_grad=True)
+    previous_action = torch.tensor([[-1.0, 2.0]])
+    # delay=4, alpha=1 gives exact interval gains [0, 1, 0].
+    parameter_context = torch.tensor(
+        [[0.0, 0.0, 1.0, 0.0, 0.0, 1.0]]
+    )
+    actuator_context = torch.cat(
+        (parameter_context, previous_action), dim=-1
+    ).requires_grad_()
+
+    features = policy._q_action_features(candidate_action, actuator_context)
+
+    expected_q_action = torch.tensor([[0.5, -0.5]])
+    expected_delta = torch.tensor([[1.0, -1.0]])
+    expected_effects = torch.tensor(
+        [[0.0, 0.0, 1.0, -1.0, 0.0, 0.0]]
+    )
+    expected = torch.cat(
+        (
+            expected_q_action,
+            expected_delta,
+            expected_effects,
+            parameter_context,
+        ),
+        dim=-1,
+    )
+    assert policy._q_action_input_dim == 5 * policy.action_dim + 6 == 16
+    assert features.shape == (1, policy._q_action_input_dim)
+    assert torch.equal(features, expected)
+
+    effect_start = 2 * policy.action_dim
+    effect_end = (2 + Q_PREDICTED_EFFECT_INTERVALS) * policy.action_dim
+    features[:, effect_start:effect_end].sum().backward()
+    assert torch.allclose(
+        candidate_action.grad,
+        torch.tensor([[0.5, 0.25]]),
+        rtol=0.0,
+        atol=1e-7,
+    )
+    assert actuator_context.grad is None
+
+
+def test_dagger_predicted_effect_next_context_advances_previous_physical_action():
+    policy = _predicted_effect_policy(action_dim=2)
+    parameter_context = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0, -1.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+        ]
+    )
+    old_previous = torch.tensor([[-1.0, 1.0], [2.0, -2.0]])
+    actuator_context = torch.cat(
+        (parameter_context, old_previous), dim=-1
+    ).requires_grad_()
+    issued_action = torch.tensor(
+        [[25.0, -25.0], [-3.0, 5.0]], requires_grad=True
+    )
+
+    next_context = policy._next_q_actuator_context(
+        actuator_context, issued_action
+    )
+
+    assert torch.equal(next_context[:, :6], parameter_context)
+    assert torch.equal(
+        next_context[:, 6:], torch.tensor([[20.0, -20.0], [-3.0, 5.0]])
+    )
+    assert torch.equal(actuator_context[:, 6:].detach(), old_previous)
+    assert next_context.untyped_storage().data_ptr() != (
+        actuator_context.untyped_storage().data_ptr()
+    )
+    assert not next_context.requires_grad
+    assert issued_action.grad is None
+    assert actuator_context.grad is None
+
+
+def test_dagger_q_actuator_schema_and_checkpoint_metadata_keep_physical_action_dim():
+    cfg = DistributionalTD3TeacherBCConfig()
+    cfg.q_condition_on_actuator_state = True
+    policy = DistributionalTD3TeacherBC.__new__(DistributionalTD3TeacherBC)
+    nn.Module.__init__(policy)
+    policy.cfg = cfg
+    policy.device = torch.device("cpu")
+    policy.q_actor_keys = ["actor"]
+    policy.q_critic_keys = ["critic"]
+    policy._q_actor_dim = 3
+    policy._q_critic_dim = 4
+    policy.action_dim = 2
+    policy._q_actuator_context_dim = 6
+    policy._q_action_input_dim = 8
+    policy._q_actuator_context_metadata_value = _actuator_context_metadata()
+    policy._teacher_episode_cache_enabled = lambda: False
+    policy.reward_groups = ("reward",)
+    policy.joint_names = ("joint_0", "joint_1")
+    policy._fastsac_action_low = torch.tensor([-20.0, -20.0])
+    policy._fastsac_action_high = torch.tensor([20.0, 20.0])
+    policy._fastsac_q_action_center = torch.zeros(2)
+    policy._fastsac_q_action_scale = torch.ones(2)
+    policy._fastsac_action_contract = {
+        "q_action_transform_fingerprint": "fixture-action-transform"
+    }
+
+    fields = policy._q_replay_storage_fields()
+    metadata = policy._q_backend_metadata()
+    checkpoint = policy._checkpoint_config()
+
+    assert Q_ACTUATOR_CONTEXT_KEY in fields
+    assert NEXT_Q_ACTUATOR_CONTEXT_KEY in fields
+    assert metadata["action_dim"] == 2
+    assert metadata["q_action_input_dim"] == 8
+    assert metadata["q_actuator_context"] == _actuator_context_metadata()
+    assert (
+        metadata["q_action_feature_semantics"]
+        == Q_ACTUATOR_ACTION_FEATURE_SEMANTICS
+    )
+    assert checkpoint["q_condition_on_actuator_state"] is True
+
+
+def test_dagger_predicted_effect_schema_and_checkpoint_metadata_are_exact():
+    cfg = DistributionalTD3TeacherBCConfig()
+    cfg.q_condition_on_actuator_state = True
+    cfg.q_use_predicted_effect = True
+    policy = DistributionalTD3TeacherBC.__new__(DistributionalTD3TeacherBC)
+    nn.Module.__init__(policy)
+    policy.cfg = cfg
+    policy.device = torch.device("cpu")
+    policy.q_actor_keys = ["actor"]
+    policy.q_critic_keys = ["critic"]
+    policy._q_actor_dim = 3
+    policy._q_critic_dim = 4
+    policy.action_dim = 2
+    policy._q_actuator_parameter_context_dim = 6
+    policy._q_actuator_context_dim = 8
+    policy._q_action_input_dim = 16
+    policy._q_actuator_context_metadata_value = (
+        _predicted_effect_context_metadata(2)
+    )
+    policy._teacher_episode_cache_enabled = lambda: False
+    policy.reward_groups = ("reward",)
+    policy.joint_names = ("joint_0", "joint_1")
+    policy._fastsac_action_low = torch.tensor([-20.0, -20.0])
+    policy._fastsac_action_high = torch.tensor([20.0, 20.0])
+    policy._fastsac_q_action_center = torch.zeros(2)
+    policy._fastsac_q_action_scale = torch.ones(2)
+    policy._fastsac_action_contract = {
+        "q_action_transform_fingerprint": "fixture-action-transform"
+    }
+
+    fields = policy._q_replay_storage_fields()
+    metadata = policy._q_backend_metadata()
+    checkpoint = policy._checkpoint_config()
+
+    assert Q_ACTUATOR_CONTEXT_KEY in fields
+    assert NEXT_Q_ACTUATOR_CONTEXT_KEY in fields
+    assert metadata["action_dim"] == 2
+    assert metadata["q_action_input_dim"] == 16
+    assert metadata["q_actuator_context"] == (
+        _predicted_effect_context_metadata(2)
+    )
+    assert (
+        metadata["q_action_feature_semantics"]
+        == Q_PREDICTED_EFFECT_ACTION_FEATURE_SEMANTICS
+    )
+    assert metadata["q_predicted_effect"] == {
+        "enabled": True,
+        "intervals": Q_PREDICTED_EFFECT_INTERVALS,
+        "aggregation": "mean_post_lerp_applied_action_per_control_interval",
+        "reference": "hold_previous_issued_command",
+        "action_gradient": "candidate_recomputed_not_replay_detached",
+    }
+    assert checkpoint["q_condition_on_actuator_state"] is True
+    assert checkpoint["q_use_predicted_effect"] is True
 
 
 class _CountingSGD(torch.optim.SGD):
@@ -153,6 +563,7 @@ def _replay_rows(count: int, offset: int) -> dict[str, torch.Tensor]:
         "rewards": row + 2.0,
         "dones": torch.arange(count) % 3 == 0,
         "truncations": torch.arange(count) % 4 == 0,
+        REPLAY_COMMAND_FINISHED_KEY: torch.zeros(count, dtype=torch.bool),
         "discounts": torch.full((count,), 0.95),
         "next_critic_observations": torch.stack(
             (row + 4.0, row + 4.5, row + 4.75), dim=-1
@@ -203,6 +614,46 @@ def test_shared_replay_schema_carries_reference_phase_but_no_failure_copy():
     assert FAILURE_PHASE_TEACHER_SOURCE_KEY == "failure_phase_teacher_source"
     assert REFERENCE_PHASE_KEY in _Q_REPLAY_FIELDS
     assert all("pre_failure" not in field for field in _Q_REPLAY_FIELDS)
+
+
+def test_cumulative_termination_rejects_invalid_min_steps_without_q_sidechannel():
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "active_adaptation/envs/mdp/commands/hdmi/terminations.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    mixin_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "_cum_error_mixin"
+    )
+    namespace = {"torch": torch}
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[mixin_node], type_ignores=[])
+            ),
+            str(source_path),
+            "exec",
+        ),
+        namespace,
+    )
+    mixin = namespace["_cum_error_mixin"]
+
+    class Base:
+        def __init__(self, **kwargs):
+            del kwargs
+            self.device = torch.device("cpu")
+            self.num_envs = 1
+
+    candidate = type("Candidate", (mixin, Base), {})
+    for invalid in (False, 0, -1, 1.5):
+        with pytest.raises(ValueError, match="min_steps"):
+            candidate(min_steps=invalid)
+
+    valid = candidate(min_steps=2.0)
+    assert valid.min_steps == 2
+    assert not hasattr(valid, "q_cumulative_counter_progress")
 
 
 def test_student_replay_age_rollup_preserves_mean_of_batch_metrics(monkeypatch):
@@ -737,11 +1188,13 @@ def test_actor_batch_optionally_mixes_exact_teacher_replay_labels_and_raw_inputs
     policy = _bare_policy(
         dagger_batch_size=4,
         teacher_actor_replay_fraction=0.5,
+        teacher_prefill_use_ppo_noise=True,
     )
     policy.q_rng = torch.Generator().manual_seed(19)
     policy.q_teacher_replay = _TD3DeviceReplay(16, "cpu")
     policy.dagger_replay = _TD3DeviceReplay(16, "cpu")
     teacher = _replay_rows(4, 100)
+    teacher[DAGGER_REPLAY_TEACHER_ACTIONS] = teacher["actions"] + 3_000.0
     main = _replay_rows(5, 1_000)
     main[DAGGER_REPLAY_TEACHER_ACTIONS] = (
         torch.arange(5, dtype=torch.float32)[:, None] + 2_000.0
@@ -763,6 +1216,10 @@ def test_actor_batch_optionally_mixes_exact_teacher_replay_labels_and_raw_inputs
     source = batch[DAGGER_Q_TEACHER_SOURCE_KEY]
     assert torch.equal(source, torch.tensor([True, True, False, False]))
     assert torch.equal(
+        batch[DAGGER_REPLAY_TEACHER_ACTIONS][source],
+        teacher[DAGGER_REPLAY_TEACHER_ACTIONS][[0, 2]],
+    )
+    assert not torch.equal(
         batch[DAGGER_REPLAY_TEACHER_ACTIONS][source],
         teacher["actions"][[0, 2]],
     )
@@ -924,12 +1381,46 @@ def _raw_final_td(
             "depth": (values.remainder(101) / 100.0).reshape(count, 1, 1, 1),
             "policy": scalar + 100.0,
             "vel_command": scalar + 200.0,
+            REFERENCE_PHASE_KEY: values.div(10.0).clamp(0.0, 1.0).unsqueeze(-1),
             "object_geo_": object_geo,
             "critic_raw": scalar + 300.0,
             "is_init": init,
         },
         batch_size=(count,),
     )
+
+
+def test_student_replay_keeps_each_pre_step_actuator_context_and_issued_action():
+    policy = _raw_transition_policy(train_every=10)
+    policy.cfg.q_condition_on_actuator_state = True
+    policy._q_actuator_context_dim = 6
+    policy._q_actuator_context_metadata_value = _actuator_context_metadata()
+    policy.begin_transition_collection()
+    contexts = []
+    for step in range(10):
+        context = torch.tensor(
+            [[
+                float(step == 0),
+                float(step == 1),
+                float(step == 2),
+                float(step == 3),
+                float(step >= 4),
+                -1.0 + 0.2 * step,
+            ]]
+        )
+        contexts.append(context)
+        policy.record_rollout_q_actuator_context(context)
+
+    rollout = _raw_transition_td(torch.arange(10).reshape(1, 10))
+    policy.capture_rollout_final_observation(_raw_final_td(10.0))
+    chunks = list(policy._dagger_transition_chunks(rollout))
+
+    assert len(chunks) == 2  # burn-in retains rollout steps 8 and 9
+    for chunk, step in zip(chunks, (8, 9)):
+        assert torch.equal(chunk[Q_ACTUATOR_CONTEXT_KEY], contexts[step])
+        assert torch.equal(chunk[NEXT_Q_ACTUATOR_CONTEXT_KEY], contexts[step])
+        assert torch.equal(chunk["actions"], rollout[ACTION_KEY][:, step])
+    assert policy._rollout_q_actuator_contexts == []
 
 
 def test_replay_object_geometry_codebook_is_exact_deduplicated_and_autograd_safe():
@@ -1056,6 +1547,7 @@ def test_timeout_replay_next_slot_uses_captured_true_final_raw_state():
         "object_geo_",
         "critic_raw",
         "is_init",
+        REFERENCE_PHASE_KEY,
     ):
         timeout_capture["next", key] = true_timeout_final[key]
     policy.capture_truncation_final_observations(timeout_capture, step=8)
@@ -1080,6 +1572,44 @@ def test_timeout_replay_next_slot_uses_captured_true_final_raw_state():
     assert torch.equal(decoded_geometry[0, -2], torch.tensor([1.0, 2.0]))
     assert torch.equal(decoded_geometry[0, -1], true_timeout_geometry[0])
     assert first["next_critic_observations"][0, 0].item() == 377.0
+    assert first[NEXT_REFERENCE_PHASE_KEY].item() == pytest.approx(1.0)
+
+
+def test_command_finished_replay_is_terminal_without_a_fabricated_self_loop():
+    policy = _raw_transition_policy()
+    rollout = _raw_transition_td(torch.arange(10).reshape(1, 10))
+    rollout["next", "done"][:, 8] = True
+    rollout["next", "terminated"] = torch.zeros_like(rollout["next", "done"])
+    rollout["next", "stats", "command_finished"][:, 8] = True
+
+    # Command completion must not run the timeout capture path. Its stored
+    # successor remains the real collected following state, but bootstrap is
+    # cut so that successor cannot affect the Q target.
+    policy.capture_truncation_final_observations(rollout[:, 8].clone(), step=8)
+    assert policy._truncation_final_batches == []
+    policy.capture_rollout_final_observation(_raw_final_td(999.0))
+
+    first = next(policy._dagger_transition_chunks(rollout))
+
+    assert first["truncations"].item() is False
+    assert _sac_bootstrap_mask(first["dones"], first["truncations"]).item() == 0.0
+    assert first["critic_observations"][0, 0].item() == 308.0
+    assert first["next_critic_observations"][0, 0].item() == 309.0
+    assert first[PERCEPTION_POLICY_RAW_KEY][0, -2, 0].item() == 108.0
+    assert first[PERCEPTION_POLICY_RAW_KEY][0, -1, 0].item() == 109.0
+    assert first[PERCEPTION_VEL_COMMAND_RAW_KEY][0, -1, 0].item() == 209.0
+
+
+def test_physical_termination_overrides_command_and_timeout_boundary_causes():
+    rollout = _raw_transition_td(torch.arange(10).reshape(1, 10))
+    rollout["next", "done"][:, 8] = True
+    rollout["next", "terminated"][:, 8] = True
+    rollout["next", "stats", "command_finished"][:, 8] = True
+    rollout["next", "stats", "episode_time_limit"][:, 8] = True
+    row = rollout[:, 8]
+
+    assert not _vaic_truncation_mask(row).item()
+    assert not _vaic_pre_reset_final_observation_mask(row).item()
 
 
 def _enable_collection_actor_cache_for_raw_fixture(policy):
@@ -1127,6 +1657,7 @@ def test_collection_actor_cache_uses_following_final_and_true_timeout_states():
         "object_geo_",
         "critic_raw",
         "is_init",
+        REFERENCE_PHASE_KEY,
     ):
         timeout_capture["next", key] = true_timeout_final[key]
     timeout_capture["next", "cache_oracle"] = torch.tensor([[777.0]])
@@ -1145,6 +1676,38 @@ def test_collection_actor_cache_uses_following_final_and_true_timeout_states():
     assert (
         timeout_first[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY].item()
         != 409.0
+    )
+
+    command = _raw_transition_policy()
+    _enable_collection_actor_cache_for_raw_fixture(command)
+    command_rollout = _raw_transition_td(torch.arange(10).reshape(1, 10))
+    command_rollout["next", "done"][:, 8] = True
+    command_rollout["next", "terminated"] = torch.zeros_like(
+        command_rollout["next", "done"]
+    )
+    command_rollout["next", "stats", "command_finished"][:, 8] = True
+    command_rollout[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
+        torch.arange(10, dtype=torch.float32).reshape(1, 10, 1) + 400.0
+    )
+    command.capture_truncation_final_observations(
+        command_rollout[:, 8].clone(), step=8
+    )
+    command_final = _raw_final_td(10.0)
+    command_final["cache_oracle"] = torch.tensor([[999.0]])
+    command.capture_rollout_final_observation(command_final)
+
+    command_first = next(command._dagger_transition_chunks(command_rollout))
+
+    assert command_first["truncations"].item() is False
+    assert (
+        _sac_bootstrap_mask(command_first["dones"], command_first["truncations"])
+        .item()
+        == 0.0
+    )
+    assert command_first[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY].item() == 408.0
+    assert (
+        command_first[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY].item()
+        == 409.0
     )
 
 
@@ -1172,6 +1735,7 @@ def test_timeout_collection_actor_cache_materializes_at_full_env_batch_geometry(
     capture["next", "object_geo_"] = torch.tensor([1.0, 2.0]).expand(4, 2)
     capture["next", "critic_raw"] = torch.zeros(4, 1)
     capture["next", "is_init"] = torch.zeros(4, dtype=torch.bool)
+    capture["next", REFERENCE_PHASE_KEY] = torch.full((4, 1), 0.75)
     capture["next", "cache_oracle"] = torch.arange(4.0).unsqueeze(-1) + 700.0
 
     policy.capture_truncation_final_observations(capture, step=8)
@@ -1408,6 +1972,66 @@ def test_current_ema_reencoding_changes_without_mutating_stored_raw_inputs():
     }
     assert {"observations", "next_observations", "priv_pred"}.isdisjoint(
         _Q_REPLAY_FIELDS
+    )
+
+
+def test_legacy_command_boundary_keeps_the_real_successor_encoding():
+    policy = _bare_policy(
+        perception_replay_burn_in=8,
+        perception_encode_microbatch_size=1,
+        latent_dim=1,
+    )
+    policy.depth_feature_dim = 1
+    policy.q_actor_keys = (VEL_CMD_KEY, OBS_KEY, PRIV_PRED_KEY)
+    policy._q_actor_widths = (1, 1, 1)
+    policy.q_critic_keys = ("critic",)
+    policy._q_critic_widths = (1,)
+    policy.observation_spec = {OBJECT_GEO_KEY: SimpleNamespace(shape=(2,))}
+    policy._reset_replay_object_geo_codebook()
+    policy._vecnorm_snapshot = lambda: None
+    policy._normalize_replay_value = lambda key, value, snapshot: value
+    policy.temporal_depth_gru_ema = _NoOpPerceptionModule()
+    policy.object_adapt_ema = _NoOpPerceptionModule()
+    policy.object_pred_transform = _NoOpPerceptionModule()
+    policy.adapt_ema = _ResetAwareEMAProjection(1.0)
+
+    # A command completion is terminal, so its successor is ignored by the Q
+    # target. Replay must still retain the real collected successor instead
+    # of fabricating a recurrent current-state self-loop.
+    raw_policy = torch.tensor(
+        [[[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [7.0], [8.0], [9.0], [9.0]]]
+    )
+    raw_vel = raw_policy + 100.0
+    resets = torch.zeros(1, 10, dtype=torch.bool)
+    resets[:, 4] = True
+    geometry_ids = policy._encode_replay_object_geo(
+        TensorDict(
+            {
+                OBJECT_GEO_KEY: torch.tensor([1.0, 2.0])
+                .expand(1, 10, 2)
+                .clone(),
+            },
+            batch_size=(1, 10),
+        )
+    )
+    batch = {
+        "critic_observations": torch.tensor([[7.0]]),
+        "next_critic_observations": torch.tensor([[8.0]]),
+        "truncations": torch.tensor([False]),
+        PERCEPTION_DEPTH_U8_KEY: torch.zeros(
+            1, 10, 1, 1, 1, dtype=torch.uint8
+        ),
+        PERCEPTION_POLICY_RAW_KEY: raw_policy,
+        PERCEPTION_VEL_COMMAND_RAW_KEY: raw_vel,
+        PERCEPTION_OBJECT_GEO_ID_KEY: geometry_ids,
+        PERCEPTION_IS_INIT_KEY: resets,
+    }
+
+    prepared = policy._prepare_dagger_learning_batch(batch)
+
+    assert "observations" not in prepared
+    assert torch.equal(
+        prepared["next_observations"], torch.tensor([[109.0, 9.0, 44.0]])
     )
 
 
@@ -2247,6 +2871,73 @@ def test_teacher_perception_fraction_mixes_losses_in_existing_steps_and_updates_
     assert torch.allclose(policy.temporal_depth_gru_ema.scale, expected_ema)
 
 
+def test_replay_only_field_exclusion_preserves_ppovel_perception_update_exactly():
+    reference = _teacher_perception_policy(fraction=0.0)
+    optimized = _teacher_perception_policy(fraction=0.0)
+    for policy in (reference, optimized):
+        policy.cfg.perception_replay_mode = "online_student_rollout"
+        policy.cfg.use_object_adapt = True
+        policy.cfg.enable_residual_distillation = False
+
+    live = TensorDict(
+        {
+            DEPTH_KEY: torch.tensor(
+                [[[[[0.25]]], [[[0.75]]]]], dtype=torch.float32
+            ),
+            OBS_KEY: torch.tensor([[[0.5], [1.5]]]),
+            VEL_CMD_KEY: torch.tensor([[[0.1], [0.2]]]),
+            OBS_PRIV_KEY: torch.tensor([[[1.0], [1.25]]]),
+            OBJECT_KEY: torch.tensor([[[2.0], [2.5]]]),
+            OBJECT_GEO_KEY: torch.ones(1, 2, 1),
+            "is_init": torch.zeros(1, 2, 1, dtype=torch.bool),
+            "depth_hx": torch.zeros(1, 2, 1),
+            "adapt_hx": torch.zeros(1, 2, 1),
+            DAGGER_IS_STUDENT_ACTION_KEY: torch.ones(1, 2, dtype=torch.bool),
+        },
+        batch_size=(1, 2),
+    )
+    replay_heavy = live.clone()
+    replay_heavy["_fastsac_raw"] = TensorDict(
+        {DEPTH_KEY: torch.full((1, 2, 1, 32, 32), 7.0)},
+        batch_size=(1, 2),
+    )
+    replay_heavy[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = torch.full(
+        (1, 2, 3), 11.0
+    )
+    replay_heavy[STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY] = torch.full(
+        (1, 2, 3), 13.0
+    )
+    perception_input = replay_heavy.exclude(
+        "_fastsac_raw",
+        STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY,
+        STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY,
+    )
+
+    assert set(perception_input.keys()) == set(live.keys())
+    for key in live.keys(True, True):
+        assert torch.equal(perception_input[key], live[key])
+
+    reference_info = reference.train_adapt(live.clone())
+    optimized_info = optimized.train_adapt(perception_input.clone())
+
+    _assert_nested_equal(optimized_info, reference_info)
+    for name in (
+        "temporal_depth_gru",
+        "object_adapt",
+        "adapt_module",
+        "temporal_depth_gru_ema",
+        "object_adapt_ema",
+        "adapt_ema",
+    ):
+        _assert_nested_equal(
+            getattr(optimized, name).state_dict(),
+            getattr(reference, name).state_dict(),
+        )
+    _assert_nested_equal(
+        optimized.opt_adapt.state_dict(), reference.opt_adapt.state_dict()
+    )
+
+
 def _initialize_prefill_episode_state(policy):
     policy._teacher_prefill_complete = False
     policy._teacher_prefill_pending = None
@@ -2274,6 +2965,8 @@ def _mark_prefill_stub_as_success(chunk):
     chunk[_PREFILL_TERMINATED_KEY] = torch.zeros(count, dtype=torch.bool)
     chunk[_PREFILL_COMMAND_FINISHED_KEY] = torch.zeros(count, dtype=torch.bool)
     chunk[_PREFILL_COMMAND_FINISHED_KEY][-1] = True
+    chunk[REPLAY_COMMAND_FINISHED_KEY] = torch.zeros(count, dtype=torch.bool)
+    chunk[REPLAY_COMMAND_FINISHED_KEY][-1] = True
     chunk["dones"] = torch.zeros(count, dtype=torch.bool)
     chunk["dones"][-1] = True
     return chunk
@@ -2362,6 +3055,53 @@ def _prefill_episode_rows(
     if is_init is not None:
         rows[PERCEPTION_IS_INIT_KEY][:, -2] = torch.as_tensor(is_init, dtype=torch.bool)
     return rows
+
+
+def test_teacher_prefill_preserves_actuator_context_across_rollout_chunks():
+    policy = _prefill_episode_policy(capacity=4)
+    policy.cfg.q_condition_on_actuator_state = True
+    policy._teacher_episode_cache_enabled = lambda: False
+    policy._q_replay_prefill_storage_fields = lambda: (
+        "actions",
+        Q_ACTUATOR_CONTEXT_KEY,
+        NEXT_Q_ACTUATOR_CONTEXT_KEY,
+    )
+    first = _prefill_episode_rows([1.0], [0], step_indices=[0])
+    second = _prefill_episode_rows(
+        [2.0],
+        [0],
+        done=[True],
+        command_finished=[True],
+        step_indices=[1],
+    )
+    first[Q_ACTUATOR_CONTEXT_KEY] = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0, 0.0, -1.0]]
+    )
+    first[NEXT_Q_ACTUATOR_CONTEXT_KEY] = first[Q_ACTUATOR_CONTEXT_KEY].clone()
+    second[Q_ACTUATOR_CONTEXT_KEY] = torch.tensor(
+        [[0.0, 1.0, 0.0, 0.0, 0.0, -0.5]]
+    )
+    second[NEXT_Q_ACTUATOR_CONTEXT_KEY] = second[Q_ACTUATOR_CONTEXT_KEY].clone()
+
+    assert policy._stage_teacher_prefill_rows(first) == (0, 0)
+    assert policy._stage_teacher_prefill_rows(second) == (2, 0)
+
+    assert torch.equal(
+        policy.q_teacher_replay.data[Q_ACTUATOR_CONTEXT_KEY][:2],
+        torch.cat(
+            (first[Q_ACTUATOR_CONTEXT_KEY], second[Q_ACTUATOR_CONTEXT_KEY]), dim=0
+        ),
+    )
+    assert torch.equal(
+        policy.q_teacher_replay.data[NEXT_Q_ACTUATOR_CONTEXT_KEY][:2],
+        torch.cat(
+            (
+                first[NEXT_Q_ACTUATOR_CONTEXT_KEY],
+                second[NEXT_Q_ACTUATOR_CONTEXT_KEY],
+            ),
+            dim=0,
+        ),
+    )
 
 
 def _prefill_event_rollout(
@@ -3069,7 +3809,20 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
     policy._mean_metric_dict = lambda metrics, keys: {key: 0.0 for key in keys}
     policy.train_adapt = lambda rollout: perception_updates.append(rollout) or {}
 
-    main_info = policy.train_op(TensorDict({}, batch_size=[]))
+    perception_sentinel = torch.tensor([17.0])
+    main_rollout = TensorDict(
+        {
+            "_fastsac_raw": TensorDict(
+                {DEPTH_KEY: torch.full((1, 4, 4), 23.0)},
+                batch_size=[],
+            ),
+            STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY: torch.tensor([31.0]),
+            STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY: torch.tensor([37.0]),
+            "perception_sentinel": perception_sentinel,
+        },
+        batch_size=[],
+    )
+    main_info = policy.train_op(main_rollout)
 
     frozen_ptr, frozen_size, frozen_seen, frozen_data = frozen_teacher_state
     assert (
@@ -3124,6 +3877,17 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
     assert len(critic_batches) == 1
     assert len(actor_batches) == 1
     assert len(perception_updates) == 1
+    perception_rollout = perception_updates[0]
+    assert "_fastsac_raw" not in perception_rollout.keys()
+    assert (
+        STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY
+        not in perception_rollout.keys()
+    )
+    assert (
+        STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY
+        not in perception_rollout.keys()
+    )
+    assert torch.equal(perception_rollout["perception_sentinel"], perception_sentinel)
 
     # The critic receives the configured 25/75 mix of immutable prefill Teacher
     # actions and Student-executed main actions. The Actor batch comes entirely
@@ -3647,6 +4411,155 @@ def test_td3_indexed_cpu_replay_preserves_requested_fields_values_and_state():
     assert replay._pinned_sample_staging == {}
 
 
+def _assert_replay_storage_equal(actual, expected):
+    assert (actual.ptr, actual.size, actual.seen) == (
+        expected.ptr,
+        expected.size,
+        expected.seen,
+    )
+    assert actual.data.keys() == expected.data.keys()
+    stored_rows = actual.capacity if actual.size == actual.capacity else actual.size
+    for key in actual.data:
+        assert actual.data[key].dtype == expected.data[key].dtype
+        assert torch.equal(
+            actual.data[key][:stored_rows],
+            expected.data[key][:stored_rows],
+        ), key
+
+
+@pytest.mark.parametrize(
+    ("case", "initial_rows", "raw_indices"),
+    (
+        ("append", 3, [5, 99, 1, 99, 5, 99, 0]),
+        ("wrap", 6, [9, 99, 2, 99, 7, 99, 1]),
+        ("capacity", 2, [11, 10, 9, 8, 7, 6, 5, 4, 3, 2]),
+        ("empty", 5, []),
+    ),
+)
+@pytest.mark.parametrize(
+    "source_device",
+    (
+        "cpu",
+        pytest.param(
+            "cuda:0",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ),
+)
+def test_direct_indexed_extend_matches_public_extend_for_fifo_cases(
+    case,
+    initial_rows,
+    raw_indices,
+    source_device,
+):
+    del case
+    capacity = 8
+    row_count = 12
+    # Transpose produces a non-contiguous source with the requested row-major
+    # shape; the strided slice below likewise makes non-contiguous indices.
+    vector = torch.arange(row_count * 3, dtype=torch.float32).reshape(3, row_count).t()
+    source = {
+        "vector": vector.to(source_device),
+        "valid": (torch.arange(row_count) % 3 == 0).to(source_device),
+        "integer": torch.arange(row_count, dtype=torch.int64).to(source_device),
+        "small_integer": torch.arange(row_count, dtype=torch.int16).to(source_device),
+    }
+    expected = _TD3DeviceReplay(capacity, "cpu")
+    actual = _TD3DeviceReplay(capacity, "cpu")
+    prefix = {key: value[:initial_rows] for key, value in source.items()}
+    expected.extend(prefix)
+    actual.extend(prefix)
+    expected.valid_count("valid")
+    actual.valid_count("valid")
+
+    if raw_indices:
+        raw = torch.tensor(raw_indices, dtype=torch.long, device=source_device)
+        indices = raw if 99 not in raw_indices else raw[::2]
+    else:
+        indices = torch.empty(0, dtype=torch.long, device=source_device)
+    assert indices.is_contiguous() is (indices.numel() < 2 or 99 not in raw_indices)
+    staged = {
+        key: value.index_select(0, indices.to(value.device)).to("cpu")
+        for key, value in source.items()
+    }
+
+    expected_count = expected.extend(staged)
+    actual_count = actual.extend_by_indices(source, indices)
+
+    assert actual_count == expected_count == indices.numel()
+    _assert_replay_storage_equal(actual, expected)
+    assert actual._valid_index_cache.keys() == expected._valid_index_cache.keys()
+    for key in actual._valid_index_cache:
+        assert torch.equal(
+            actual._valid_index_cache[key], expected._valid_index_cache[key]
+        )
+    if indices.numel():
+        assert actual._valid_index_cache == {}
+
+
+def test_direct_indexed_extend_preserves_schema_failure_and_public_extend():
+    rows = {
+        "vector": torch.arange(18, dtype=torch.float32).reshape(6, 3),
+        "valid": torch.tensor([True, False, True, True, False, True]),
+    }
+    replay = _TD3DeviceReplay(8, "cpu")
+    assert replay.extend(rows) == 6
+    before = (replay.ptr, replay.size, replay.seen)
+    before_data = {key: value.clone() for key, value in replay.data.items()}
+
+    with pytest.raises(KeyError, match="field set changed"):
+        replay.extend_by_indices(
+            rows,
+            torch.tensor([1, 3]),
+            fields=("vector",),
+        )
+
+    # Even when count exceeds capacity, discarded prefix indices are validated
+    # just as the old index-select-then-extend path validated the full input.
+    with pytest.raises(IndexError, match="outside"):
+        replay.extend_by_indices(
+            rows,
+            torch.tensor([99, 0, 1, 2, 3, 4, 5, 0, 1]),
+        )
+
+    assert (replay.ptr, replay.size, replay.seen) == before
+    for key, value in before_data.items():
+        assert torch.equal(replay.data[key], value)
+    # The existing public API remains usable and retains its original FIFO
+    # behavior after a rejected indexed insertion.
+    assert replay.extend(rows) == 6
+    assert (replay.ptr, replay.size, replay.seen) == (4, 8, 12)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    ("source_device", "index_device"),
+    (("cuda:0", "cpu"), ("cpu", "cuda:0")),
+)
+def test_direct_indexed_extend_matches_device_mismatch_failure(
+    source_device,
+    index_device,
+):
+    rows = {
+        "vector": torch.arange(18, dtype=torch.float32)
+        .reshape(6, 3)
+        .to(source_device),
+        "valid": torch.tensor(
+            [True, False, True, True, False, True], device=source_device
+        ),
+    }
+    indices = torch.tensor([1, 3], dtype=torch.long, device=index_device)
+    replay = _TD3DeviceReplay(8, "cpu")
+
+    with pytest.raises(RuntimeError, match="share a device"):
+        replay.extend_by_indices(rows, indices)
+
+    assert (replay.ptr, replay.size, replay.seen) == (0, 0, 0)
+    assert replay.data == {}
+
+
 @pytest.mark.parametrize(
     "device",
     (
@@ -3854,7 +4767,8 @@ def test_c51_projection_obeys_ordinary_timeout_and_terminal_truth_table():
 
     # ordinary, pure timeout, true termination, command completion, and a
     # timeout coincident with true termination after the authoritative VAIC
-    # cause-resolution logic. Only the pure timeout remains a truncation.
+    # cause-resolution logic. Only the pure timeout bootstraps; command
+    # completion and physical termination are finite-task terminals.
     dones = torch.tensor([False, True, True, True, True])
     truncations = torch.tensor([False, True, False, False, False])
     bootstrap = _sac_bootstrap_mask(dones, truncations)
@@ -3869,8 +4783,8 @@ def test_c51_projection_obeys_ordinary_timeout_and_terminal_truth_table():
     )
 
     expected = torch.zeros_like(source)
-    expected[:2, 3] = 1.0  # 0 + 0.5 * z_max = 1
-    expected[2:, 2] = 1.0  # terminals collapse onto immediate reward 0
+    expected[[0, 1], 3] = 1.0  # 0 + 0.5 * z_max = 1
+    expected[[2, 3, 4], 2] = 1.0  # all finite terminals collapse to reward 0
     assert torch.equal(projected, expected)
     assert torch.equal(projected.sum(-1), torch.ones(5))
     assert left_clip_fraction.item() == pytest.approx(0.0)
@@ -3916,6 +4830,69 @@ def test_c51_projection_accepts_locked_float32_501_atom_support():
     assert projected.sum().item() == pytest.approx(1.0)
     assert left_clip_fraction.item() == pytest.approx(0.0)
     assert right_clip_fraction.item() == pytest.approx(0.0)
+
+
+def test_base_fastsac_selects_twin_head_before_c51_projection(monkeypatch):
+    """Finite-support projection must not decide the clipped-double-Q head."""
+
+    class TableTwin(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("support", torch.tensor([-1.0, 0.0, 1.0]))
+            probabilities = torch.tensor(
+                [[[0.80, 0.15, 0.05]], [[0.05, 0.15, 0.80]]]
+            )
+            self.register_buffer("logits", probabilities.log())
+
+        def forward(self, observations, actions):
+            del actions
+            return self.logits.expand(-1, observations.shape[0], -1)
+
+    class FixedDist:
+        mean = torch.zeros(1, 1)
+
+        def rsample_with_log_prob(self, generator=None):
+            del generator
+            return torch.zeros(1, 1), torch.zeros(1)
+
+    policy = DistributionalFastSACTeacherBC.__new__(
+        DistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(gamma=1.0)
+    policy.qnet_target = TableTwin().requires_grad_(False)
+    policy.log_alpha = nn.Parameter(torch.tensor(-20.0))
+    policy.sac_action_rng = torch.Generator().manual_seed(37)
+    policy._actor_dist_from_flat = lambda observations: FixedDist()
+    policy._normalized_action_log_prob = lambda value: value
+    policy._q_action_input = lambda action: action
+
+    # Q1 is lower before projection. Deliberately reverse the projected
+    # expectations to catch the old projection-then-select implementation.
+    projected_q1 = torch.tensor([[0.0, 0.0, 1.0]])
+    projected_q2 = torch.tensor([[1.0, 0.0, 0.0]])
+    projections = iter((projected_q1, projected_q2))
+
+    def projection(*args, **kwargs):
+        del args, kwargs
+        return next(projections), torch.tensor(0.0), torch.tensor(0.0)
+
+    monkeypatch.setattr(
+        fastsac_dagger_module, "_project_c51_probabilities", projection
+    )
+    projected, metrics, _ = policy._distributional_fastsac_target(
+        {
+            "next_observations": torch.zeros(1, 1),
+            "next_critic_observations": torch.zeros(1, 1),
+            "rewards": torch.zeros(1),
+            "dones": torch.zeros(1, dtype=torch.bool),
+            "truncations": torch.zeros(1, dtype=torch.bool),
+            "discounts": torch.ones(1),
+        }
+    )
+
+    assert torch.equal(projected, projected_q1)
+    assert metrics["target_select_q1_fraction"].item() == 1.0
 
 
 def test_both_online_critics_train_against_the_same_detached_projection():

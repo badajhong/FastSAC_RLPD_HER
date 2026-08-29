@@ -52,6 +52,7 @@ except ImportError:
 
 from active_adaptation.learning.ppo.common import ACTION_KEY
 from active_adaptation.learning.ppo.fastsac_vel import FastSACTanhNormal
+from active_adaptation.learning.ppo.ppo_vel import PRIV_FEATURE_KEY, PRIV_PRED_KEY
 
 
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +75,7 @@ class FixedStdFastSACStudentPolicy(nn.Module):
         normalized_std: float | None,
         use_checkpoint_std: bool = False,
         action_seed: int,
+        policy_source: str = "student",
     ):
         super().__init__()
         required = (
@@ -98,6 +100,17 @@ class FixedStdFastSACStudentPolicy(nn.Module):
         # Register exactly the modules selected by the authoritative evaluation
         # policy so .eval() propagates through the complete EMA Student path.
         self.student_eval_modules = owner.get_rollout_policy("eval")
+        self.policy_source = str(policy_source)
+        if self.policy_source not in {"student", "oracle_latent", "teacher"}:
+            raise ValueError(
+                "policy_source must be 'student', 'oracle_latent', or 'teacher'"
+            )
+        if self.policy_source != "student" and (
+            normalized_std is not None or use_checkpoint_std
+        ):
+            raise ValueError(
+                "oracle/Teacher diagnostics are deterministic-only"
+            )
         self.normalized_std = (
             None if normalized_std is None else float(normalized_std)
         )
@@ -131,7 +144,22 @@ class FixedStdFastSACStudentPolicy(nn.Module):
     @torch.no_grad()
     def forward(self, td: TensorDict):
         owner = self._owner
-        raw_mean = owner._student_raw_action_proposal(td)
+        if self.policy_source == "student":
+            raw_mean = owner._student_raw_action_proposal(td)
+        elif self.policy_source == "oracle_latent":
+            # Diagnostic only: keep the Student's ordinary velocity command,
+            # policy observation, and Actor, but replace its inferred latent
+            # with the privileged encoder target used by PPOVEL.train_adapt.
+            # This never enters training or replay; it separates perception
+            # error from Actor optimization at a fixed checkpoint.
+            owner.object_transform(td)
+            if hasattr(owner, "height_encoder"):
+                owner.height_encoder(td)
+            owner.encoder_priv(td)
+            td[PRIV_PRED_KEY] = td[PRIV_FEATURE_KEY]
+            raw_mean = owner.actor_adapt.get_dist(td).mean
+        else:
+            raw_mean = owner._teacher_action(td)
         if not torch.isfinite(raw_mean).all():
             raise RuntimeError("FastSAC evaluation Actor produced a non-finite mean")
         mean_action = owner._project_execution_action(
@@ -201,6 +229,24 @@ def _optional_env_scalar(td, key: str, num_envs: int) -> torch.Tensor | None:
 
 
 @torch.inference_mode()
+def _frozen_teacher_value_from_live_td(
+    policy: FixedStdFastSACStudentPolicy,
+    td: TensorDict,
+) -> torch.Tensor | None:
+    """Evaluate the frozen PPO critic on a live, already-normalized state.
+
+    This is diagnostic-only.  It lets the evaluation report the exact target
+    discontinuity produced by treating ``command_finished`` as a terminal,
+    without changing collection, replay, or training behavior.
+    """
+    owner = policy._owner
+    if not hasattr(owner, "get_frozen_teacher_value"):
+        return None
+    observations = torch.cat([td[key] for key in owner.q_critic_keys], dim=-1)
+    return owner.get_frozen_teacher_value(observations).reshape(-1)
+
+
+@torch.inference_mode()
 def collect_first_episodes(
     env,
     policy: FixedStdFastSACStudentPolicy,
@@ -240,10 +286,15 @@ def collect_first_episodes(
     terminal_step_count = torch.zeros(
         (num_envs, 1), dtype=torch.long, device=device
     )
+    terminal_teacher_v_current = torch.zeros(num_envs, device=device)
+    terminal_teacher_v_real_next = torch.zeros(num_envs, device=device)
+    terminal_raw_reward = torch.zeros(num_envs, device=device)
+    terminal_boundary_value_available = torch.zeros_like(captured)
     inference_seconds: list[float] = []
 
     progress = tqdm(range(int(env.max_episode_length)), desc="first episodes", miniters=10)
     for step in progress:
+        teacher_v_current = _frozen_teacher_value_from_live_td(policy, td)
         start = time.perf_counter()
         td = policy(td)
         inference_seconds.append(time.perf_counter() - start)
@@ -289,6 +340,17 @@ def collect_first_episodes(
                 stat_buffers[key][capture] = value[capture]
             terminal_terminated[capture] = next_td.get("terminated").reshape(-1).bool()[capture]
             terminal_truncated[capture] = next_td.get("truncated").reshape(-1).bool()[capture]
+            if teacher_v_current is not None:
+                capture_indices = capture.nonzero(as_tuple=False).squeeze(-1)
+                teacher_v_real_next = _frozen_teacher_value_from_live_td(
+                    policy, next_td[capture_indices]
+                )
+                if teacher_v_real_next is None:  # pragma: no cover - same owner
+                    raise RuntimeError("frozen Teacher value disappeared mid-rollout")
+                terminal_teacher_v_current[capture] = teacher_v_current[capture]
+                terminal_teacher_v_real_next[capture] = teacher_v_real_next
+                terminal_raw_reward[capture] = scalar_reward[capture]
+                terminal_boundary_value_available[capture] = True
             phase = _optional_env_scalar(next_td, "ref_motion_phase_", num_envs)
             if phase is not None:
                 terminal_phase[capture] = phase[capture].to(terminal_phase.dtype)
@@ -332,6 +394,22 @@ def collect_first_episodes(
         "probe/terminal_discount_power": discount_power,
         "probe/q_effective_discounted_dense_return": q_effective_discounted_return,
         "probe/q_effective_terminal_discount_power": q_effective_discount_power,
+        "probe/terminal_teacher_v_current": terminal_teacher_v_current,
+        "probe/terminal_teacher_v_real_next": terminal_teacher_v_real_next,
+        "probe/terminal_raw_reward": terminal_raw_reward,
+        "probe/terminal_boundary_value_available": (
+            terminal_boundary_value_available.float()
+        ),
+        # The current FastSAC contract cuts every command completion, yielding
+        # -V(s).  PPOVEL's value workaround bootstraps done-but-not-terminated
+        # rows from V(s), yielding (gamma - 1) * V(s).  These two columns make
+        # the resulting TVKD reward impulse directly measurable per episode.
+        "probe/command_terminal_potential_delta_current": (
+            -terminal_teacher_v_current
+        ),
+        "probe/command_self_loop_potential_delta_ppovel": (
+            (gamma - 1.0) * terminal_teacher_v_current
+        ),
         "_has_done": has_done,
         "_done_step": done_step,
         "_terminated": terminal_terminated,
@@ -440,6 +518,8 @@ def _probe_settings(cfg: DictConfig) -> dict[str, Any]:
     )
     include_deterministic = bool(probe.get("include_deterministic", True))
     include_checkpoint_std = bool(probe.get("include_checkpoint_std", True))
+    include_oracle_latent = bool(probe.get("include_oracle_latent", False))
+    include_teacher = bool(probe.get("include_teacher", False))
     if not include_deterministic and not include_checkpoint_std and not fixed_stds:
         raise ValueError("eval_probe must enable at least one action mode")
     output_dir = Path(
@@ -453,6 +533,8 @@ def _probe_settings(cfg: DictConfig) -> dict[str, Any]:
         "fixed_stds": fixed_stds,
         "include_deterministic": include_deterministic,
         "include_checkpoint_std": include_checkpoint_std,
+        "include_oracle_latent": include_oracle_latent,
+        "include_teacher": include_teacher,
         "action_seed_base": int(probe.get("action_seed_base", 9_170_003)),
         "output_dir": output_dir,
     }
@@ -494,17 +576,21 @@ def main(cfg: DictConfig):
             checkpoint_label = _safe_checkpoint_label(checkpoint_path)
             checkpoint_info = _checkpoint_metadata(agent, state["policy"])
 
-            conditions: list[tuple[str, float | None, bool]] = []
+            conditions: list[tuple[str, float | None, bool, str]] = []
             if settings["include_deterministic"]:
-                conditions.append(("deterministic", None, False))
+                conditions.append(("deterministic", None, False, "student"))
             if settings["include_checkpoint_std"]:
-                conditions.append(("checkpoint_std", None, True))
+                conditions.append(("checkpoint_std", None, True, "student"))
             conditions.extend(
-                (f"fixed_std_{normalized_std:g}", normalized_std, False)
+                (f"fixed_std_{normalized_std:g}", normalized_std, False, "student")
                 for normalized_std in settings["fixed_stds"]
             )
+            if settings["include_oracle_latent"]:
+                conditions.append(("oracle_latent", None, False, "oracle_latent"))
+            if settings["include_teacher"]:
+                conditions.append(("teacher", None, False, "teacher"))
             for evaluation_seed in settings["seeds"]:
-                for mode, normalized_std, use_checkpoint_std in conditions:
+                for mode, normalized_std, use_checkpoint_std, policy_source in conditions:
                     # Reusing this exact seed for every std provides common
                     # Gaussian draws joint-by-joint and step-by-step.
                     condition_key = (
@@ -516,6 +602,7 @@ def main(cfg: DictConfig):
                         normalized_std=normalized_std,
                         use_checkpoint_std=use_checkpoint_std,
                         action_seed=action_seed,
+                        policy_source=policy_source,
                     )
                     stat_values, per_env, timing = collect_first_episodes(
                         env,
@@ -529,6 +616,7 @@ def main(cfg: DictConfig):
                         "checkpoint_path": str(checkpoint_path),
                         "evaluation_seed": int(evaluation_seed),
                         "mode": mode,
+                        "policy_source": policy_source,
                         "fixed_normalized_action_std": normalized_std,
                         "uses_checkpoint_std": use_checkpoint_std,
                         "action_seed": (

@@ -417,6 +417,12 @@ def _apply_direct_sac_dagger_q_transfer(algo_cfg, source_q_backend):
         "q_condition_on_actuator_state": bool(
             algo_cfg.get("q_condition_on_actuator_state", False)
         ),
+        "q_use_predicted_effect": bool(
+            algo_cfg.get("q_use_predicted_effect", False)
+        ),
+        "q_use_residual_film": bool(
+            algo_cfg.get("q_use_residual_film", False)
+        ),
         "sac_q_action_input_gain": (
             not np.isfinite(float(transferred["sac_q_action_input_gain"]))
             or float(transferred["sac_q_action_input_gain"]) <= 0.0
@@ -465,6 +471,7 @@ def _load_policy_checkpoint(
         "distributional_tvkd_fastsac_teacher_bc_v6",
         "distributional_tvkd_fastsac_teacher_bc_v7",
         "distributional_tvkd_fastsac_teacher_bc_v8",
+        "distributional_tvkd_fastsac_teacher_bc_v9",
     }
     if inference_only and algorithm in replayless_inference_algorithms:
         loader = getattr(policy, "load_inference_state_dict", None)
@@ -524,6 +531,7 @@ def _fill_replayless_inference_algo_defaults(
         "distributional_tvkd_fastsac_teacher_bc_v6",
         "distributional_tvkd_fastsac_teacher_bc_v7",
         "distributional_tvkd_fastsac_teacher_bc_v8",
+        "distributional_tvkd_fastsac_teacher_bc_v9",
     }:
         from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
             TVKDDistributionalFastSACTeacherBCConfig,
@@ -544,10 +552,76 @@ def _fill_replayless_inference_algo_defaults(
     backend = policy_state.get("dagger_backend_config")
     if not isinstance(backend, Mapping):
         backend = {}
+    q_backend = policy_state.get("q_backend_config")
+    if not isinstance(q_backend, Mapping):
+        q_backend = {}
 
     filled_checkpoint = []
     filled_defaults = []
     with open_dict(cfg.algo):
+        q_context = q_backend.get(
+            "q_actuator_context",
+            {"enabled": backend.get("q_condition_on_actuator_state", False)},
+        )
+        if not isinstance(q_context, Mapping) or not isinstance(
+            q_context.get("enabled"), bool
+        ):
+            raise ValueError(
+                "inference checkpoint has invalid Q actuator-context metadata"
+            )
+        predicted_effect = q_backend.get(
+            "q_predicted_effect",
+            {"enabled": backend.get("q_use_predicted_effect", False)},
+        )
+        if not isinstance(predicted_effect, Mapping) or not isinstance(
+            predicted_effect.get("enabled"), bool
+        ):
+            raise ValueError(
+                "inference checkpoint has invalid Q predicted-effect metadata"
+            )
+        saved_q_context = bool(q_context["enabled"])
+        saved_predicted_effect = bool(predicted_effect["enabled"])
+        residual_film = q_backend.get(
+            "q_residual_film",
+            {
+                "enabled": backend.get("q_use_residual_film", False),
+                "gain_scale": backend.get("q_residual_film_scale", 0.1),
+            },
+        )
+        if not isinstance(residual_film, Mapping) or not isinstance(
+            residual_film.get("enabled"), bool
+        ):
+            raise ValueError(
+                "inference checkpoint has invalid Q residual-FiLM metadata"
+            )
+        saved_residual_film = bool(residual_film["enabled"])
+        if saved_predicted_effect and not saved_q_context:
+            raise ValueError(
+                "inference checkpoint enables Q predicted effect without actuator context"
+            )
+        if saved_residual_film and not saved_q_context:
+            raise ValueError(
+                "inference checkpoint enables Q residual FiLM without actuator context"
+            )
+        saved_residual_film_scale = residual_film.get("gain_scale", 0.1)
+        if (
+            isinstance(saved_residual_film_scale, bool)
+            or not isinstance(saved_residual_film_scale, (int, float))
+            or not np.isfinite(float(saved_residual_film_scale))
+            or not 0.0 < float(saved_residual_film_scale) <= 1.0
+        ):
+            raise ValueError(
+                "inference checkpoint has invalid Q residual-FiLM scale"
+            )
+        for name, saved_value in (
+            ("q_condition_on_actuator_state", saved_q_context),
+            ("q_use_predicted_effect", saved_predicted_effect),
+            ("q_use_residual_film", saved_residual_film),
+            ("q_residual_film_scale", float(saved_residual_film_scale)),
+        ):
+            if cfg.algo.get(name) != saved_value:
+                cfg.algo[name] = saved_value
+                filled_checkpoint.append(name)
         if algorithm in {
             "distributional_fastsac_teacher_bc_v1",
             "distributional_tvkd_fastsac_teacher_bc_v1",
@@ -558,6 +632,7 @@ def _fill_replayless_inference_algo_defaults(
             "distributional_tvkd_fastsac_teacher_bc_v6",
             "distributional_tvkd_fastsac_teacher_bc_v7",
             "distributional_tvkd_fastsac_teacher_bc_v8",
+            "distributional_tvkd_fastsac_teacher_bc_v9",
         }:
             # This field changes Actor parameter ownership and the distribution
             # class, so the checkpoint must select it before construction even
@@ -625,6 +700,7 @@ def _fill_replayless_inference_algo_defaults(
             "distributional_tvkd_fastsac_teacher_bc_v6",
             "distributional_tvkd_fastsac_teacher_bc_v7",
             "distributional_tvkd_fastsac_teacher_bc_v8",
+            "distributional_tvkd_fastsac_teacher_bc_v9",
         }:
             # ValueNorm changes the module type, so it must be selected from
             # the checkpoint before policy construction even when an eval
@@ -1068,6 +1144,12 @@ def make_env_policy(
                     "q_condition_on_actuator_state": bool(cfg.algo.get(
                         "q_condition_on_actuator_state", False
                     )),
+                    "q_use_predicted_effect": bool(cfg.algo.get(
+                        "q_use_predicted_effect", False
+                    )),
+                    "q_use_residual_film": bool(cfg.algo.get(
+                        "q_use_residual_film", False
+                    )),
                 }
                 enabled = [
                     name
@@ -1104,6 +1186,38 @@ def make_env_policy(
                 cfg.algo.q_condition_on_actuator_state = bool(
                     actuator_context.get("enabled", False)
                 )
+                predicted_effect = source_q_backend.get(
+                    "q_predicted_effect", {"enabled": False}
+                )
+                if not isinstance(predicted_effect, dict):
+                    raise ValueError(
+                        "Stage-2 BC adapter checkpoint has invalid Q predicted-effect metadata"
+                    )
+                cfg.algo.q_use_predicted_effect = bool(
+                    predicted_effect.get("enabled", False)
+                )
+                residual_film = source_q_backend.get(
+                    "q_residual_film", {"enabled": False}
+                )
+                if not isinstance(residual_film, dict):
+                    raise ValueError(
+                        "Stage-2 BC adapter checkpoint has invalid Q residual-FiLM metadata"
+                    )
+                cfg.algo.q_use_residual_film = bool(
+                    residual_film.get("enabled", False)
+                )
+                if cfg.algo.q_use_residual_film:
+                    film_scale = residual_film.get("gain_scale")
+                    if (
+                        isinstance(film_scale, bool)
+                        or not isinstance(film_scale, (int, float))
+                        or not np.isfinite(float(film_scale))
+                        or not 0.0 < float(film_scale) <= 1.0
+                    ):
+                        raise ValueError(
+                            "Stage-2 BC adapter checkpoint has invalid Q residual-FiLM scale"
+                        )
+                    cfg.algo.q_residual_film_scale = float(film_scale)
 
             if same_stage_resume:
                 source_detail = (

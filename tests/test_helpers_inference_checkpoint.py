@@ -178,6 +178,38 @@ def test_physical_fastsac_checkpoint_overrides_structured_tanh_inference_default
     assert "sac_action_distribution" in filled["checkpoint"]
 
 
+def test_predicted_effect_checkpoint_overrides_structured_q_inference_defaults():
+    cfg = OmegaConf.create(
+        {
+            "algo": {
+                "q_condition_on_actuator_state": False,
+                "q_use_predicted_effect": False,
+            }
+        }
+    )
+    policy_state = {
+        "training_algorithm": "distributional_tvkd_fastsac_teacher_bc_v9",
+        "dagger_backend_config": {
+            "q_condition_on_actuator_state": True,
+            "q_use_predicted_effect": True,
+            "value_norm": False,
+        },
+        "q_backend_config": {
+            "q_actuator_context": {"enabled": True},
+            "q_predicted_effect": {"enabled": True},
+        },
+    }
+
+    filled = helpers._fill_replayless_inference_algo_defaults(
+        cfg, policy_state, inference_only=True
+    )
+
+    assert cfg.algo.q_condition_on_actuator_state is True
+    assert cfg.algo.q_use_predicted_effect is True
+    assert "q_condition_on_actuator_state" in filled["checkpoint"]
+    assert "q_use_predicted_effect" in filled["checkpoint"]
+
+
 def test_physical_fastsac_inference_restores_sac_std_guard_contract():
     cfg = OmegaConf.create(
         {

@@ -37,12 +37,9 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_TEACHER_ACTION_VALID_KEY,
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
-    Q_TERMINATION_COUNTER_CONTEXT_KEY,
+    Q_ACTUATOR_CONTEXT_KEY,
     REPLAY_ACTOR_OBSERVATIONS_KEY,
     _PERCEPTION_REPLAY_FIELDS,
-)
-from active_adaptation.learning.ppo.fastsac_vel import (
-    TEACHER_ACTUATOR_CONTEXT_FIELD,
 )
 
 
@@ -84,8 +81,6 @@ def _reset_collection_windows(policy) -> None:
     policy._rollout_final_batch = None
     policy._truncation_final_batches = []
     policy._last_truncation_finals_used = 0
-    policy._rollout_q_actuator_contexts = []
-    policy._rollout_q_termination_counter_contexts = []
 
 
 @contextmanager
@@ -149,11 +144,10 @@ def _collect_one_rollout(env, policy, *, teacher_probability: float, seed: int):
         warm = rollout_policy(carry.clone(False))
         warm_td, carry = env.step_and_maybe_reset(warm.clone(False))
         warm_td = _trim_next(warm_td)
-        if hasattr(policy, "begin_transition_collection"):
-            policy.begin_transition_collection()
 
         env_count = int(env.num_envs)
         step_count = int(policy.cfg.train_every)
+        policy.begin_transition_collection()
         data = TensorDict(
             {}, batch_size=(env_count, step_count), device=env.device
         )
@@ -176,24 +170,7 @@ def _collect_one_rollout(env, policy, *, teacher_probability: float, seed: int):
             )
             if hasattr(policy, "record_rollout_q_actuator_context"):
                 policy.record_rollout_q_actuator_context(actuator_context)
-            termination_counter_context = (
-                policy.capture_q_termination_counter_context()
-                if hasattr(policy, "capture_q_termination_counter_context")
-                else None
-            )
             td, carry = env.step_and_maybe_reset(carry)
-            next_termination_counter_context = (
-                policy.capture_q_termination_counter_context(
-                    after_last_update=True
-                )
-                if hasattr(policy, "capture_q_termination_counter_context")
-                else None
-            )
-            if hasattr(policy, "record_rollout_q_termination_counter_context"):
-                policy.record_rollout_q_termination_counter_context(
-                    termination_counter_context,
-                    next_termination_counter_context,
-                )
             policy.capture_truncation_final_observations(td, step)
             data[:, step] = _trim_next(td)
         policy.capture_rollout_final_observation(carry)
@@ -222,13 +199,8 @@ def _actor_probe_fields(policy) -> tuple[str, ...]:
         DAGGER_REPLAY_TEACHER_ACTIONS,
         DAGGER_TEACHER_ACTION_VALID_KEY,
         *(
-            (TEACHER_ACTUATOR_CONTEXT_FIELD,)
+            (Q_ACTUATOR_CONTEXT_KEY,)
             if policy._q_conditions_on_actuator_state()
-            else ()
-        ),
-        *(
-            (Q_TERMINATION_COUNTER_CONTEXT_KEY,)
-            if policy._q_conditions_on_termination_counters()
             else ()
         ),
         *(
@@ -390,6 +362,11 @@ def main(cfg: DictConfig):
             prepared,
             sample_seed=int(cfg.gradient_probe.sample_seed),
             source_gradients=bool(cfg.gradient_probe.source_gradients),
+            use_q_filtered_bc=(
+                None
+                if cfg.gradient_probe.use_q_filtered_bc_override is None
+                else bool(cfg.gradient_probe.use_q_filtered_bc_override)
+            ),
         )
         result["checkpoint_path"] = os.path.realpath(
             os.path.abspath(os.fspath(cfg.checkpoint_path))

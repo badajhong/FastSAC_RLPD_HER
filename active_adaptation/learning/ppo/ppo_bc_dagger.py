@@ -2224,8 +2224,28 @@ class PPOBCDaggerFinetune(PPOVEL):
         )
 
     @torch.no_grad()
+    def _teacher_action_statistics(
+        self, td: TensorDict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the PPO Teacher's absolute mean and residual-action scale.
+
+        PPOVEL models a diagonal Normal over residual joint commands during
+        training.  DAgger normally consumes only its mean.  Keeping the scale
+        available through the same single encoder/Actor forward lets a
+        prefill collector reproduce PPOVEL exploration without recomputing the
+        expensive privileged Teacher path.
+        """
+        self.object_transform(td)
+        if hasattr(self, "height_encoder"):
+            self.height_encoder(td)
+        self.encoder_priv(td)
+        residual_dist = self.actor.get_dist(td)
+        absolute_mean = td[REF_JPOS_KEY] + residual_dist.mean
+        return absolute_mean.detach(), residual_dist.scale.detach()
+
+    @torch.no_grad()
     def _teacher_action(self, td: TensorDict):
-        """Return the checkpoint PPO teacher in absolute command coordinates."""
+        """Return the checkpoint PPO Teacher in absolute command coordinates."""
         self.object_transform(td)
         if hasattr(self, "height_encoder"):
             self.height_encoder(td)

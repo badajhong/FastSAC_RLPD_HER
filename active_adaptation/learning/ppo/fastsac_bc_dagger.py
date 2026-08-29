@@ -76,7 +76,9 @@ from .td3_bc_dagger import (
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
     OBJECT_GEO_REPLAY_SEMANTICS,
     PERCEPTION_PREFILL_DISABLED_SEMANTICS,
+    NEXT_Q_ACTUATOR_CONTEXT_KEY,
     REPLAY_MOTION_ID_KEY,
+    Q_ACTUATOR_CONTEXT_KEY,
     STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY,
     TEACHER_EPISODE_SIDECAR_SEMANTICS,
     TD3_BETA_KEY,
@@ -111,6 +113,11 @@ PHYSICAL_STD_BOUND_MODES = frozenset(
     (UNIFORM_PHYSICAL_STD_BOUND_MODE, Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE)
 )
 FASTSAC_ACTION_PROJECTION_KEY = "fastsac_action_projection"
+FASTSAC_PREFILL_TEACHER_NOISE_KEY = "fastsac_prefill_teacher_ppo_noise_q"
+FASTSAC_PREFILL_TEACHER_PROJECTION_KEY = (
+    "fastsac_prefill_teacher_action_projection"
+)
+Q_EFFECTIVE_N_STEPS_KEY = "effective_n_steps"
 _LEGACY_EFFECTIVE_LOG_STD_CHECKPOINT_VERSION = 3
 _LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND = (
     "ppo_vel_normalized_std_tanh_bounded_fastsac_bc_v1"
@@ -165,13 +172,77 @@ PPO_PHYSICAL_GAUSSIAN_ENTROPY_SEMANTICS = (
     "probability_auto_or_fixed_temperature_actor_cadence_v3"
 )
 FASTSAC_TEACHER_PREFILL_SEMANTICS = (
-    "forced_valid_teacher_successful_episode_commit_until_replay_capacity_"
-    "then_main_live_student_perception_v1"
+    "ppo_gaussian_noisy_issued_action_clean_mean_bc_label_forced_valid_teacher_"
+    "successful_episode_commit_until_replay_capacity_then_main_live_student_"
+    "perception_v2"
 )
 _CRITIC_CADENCE_ENTROPY_SEMANTICS = (
     "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
     "auto_temperature_v2"
 )
+
+
+def _q_target_discount_factors(cfg, batch: Mapping[str, torch.Tensor]):
+    """Return endpoint discount, gamma power, and factual replay horizon.
+
+    ``q_n_step=1`` deliberately keeps the historical multiplication order.
+    For an opt-in multi-step Student row, replay already owns the discounted
+    raw reward and the product of environment discounts; this helper supplies
+    only ``gamma**k`` for its endpoint soft bootstrap.
+    """
+    discounts = batch["discounts"]
+    configured = int(getattr(cfg, "q_n_step", 1))
+    if configured == 1:
+        effective_n_steps = batch.get(
+            Q_EFFECTIVE_N_STEPS_KEY, torch.ones_like(discounts)
+        )
+        return (
+            float(cfg.gamma) * discounts,
+            float(cfg.gamma),
+            effective_n_steps,
+        )
+
+    if Q_EFFECTIVE_N_STEPS_KEY not in batch:
+        raise KeyError(
+            "multi-step Q replay is missing 'effective_n_steps'; rebuild the "
+            "fresh replay rings"
+        )
+    effective_n_steps = batch[Q_EFFECTIVE_N_STEPS_KEY]
+    if effective_n_steps.shape != discounts.shape:
+        raise ValueError("effective_n_steps and discounts must have identical shape")
+    if effective_n_steps.dtype == torch.bool:
+        raise ValueError("effective_n_steps cannot be boolean")
+    rounded_steps = effective_n_steps.round()
+    invalid_steps = (
+        ~torch.isfinite(effective_n_steps)
+        | (effective_n_steps < 1)
+        | (effective_n_steps > configured)
+        | (effective_n_steps != rounded_steps)
+    )
+    if bool(invalid_steps.any()):
+        raise ValueError(
+            "effective_n_steps must contain finite integer horizons in "
+            f"[1, {configured}]"
+        )
+    teacher_source = batch.get(DAGGER_Q_TEACHER_SOURCE_KEY)
+    if teacher_source is not None:
+        teacher_source = teacher_source.reshape(-1).bool()
+        if teacher_source.shape != effective_n_steps.reshape(-1).shape:
+            raise ValueError(
+                "Q Teacher-source markers and effective_n_steps are misaligned"
+            )
+        if bool(
+            (
+                teacher_source
+                & (effective_n_steps.reshape(-1) != 1)
+            ).any()
+        ):
+            raise ValueError("Teacher Q replay rows must remain one-step")
+    gamma_power = torch.pow(
+        torch.full_like(discounts, float(cfg.gamma)),
+        effective_n_steps.to(dtype=discounts.dtype),
+    )
+    return gamma_power * discounts, gamma_power, effective_n_steps
 
 
 def _fastsac_action_distribution(cfg) -> str:
@@ -361,6 +432,11 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     dagger_beta_start: float = 0.0
     dagger_beta_end: float = 0.0
 
+    # During successful-only Teacher prefill, reproduce PPOVEL's diagonal
+    # physical-action Gaussian.  Q receives the factual noisy command while
+    # Actor BC retains the clean Teacher mean. Main DAgger/eval remain mean-only.
+    teacher_prefill_use_ppo_noise: bool = True
+
     # SAC replaces every TD3 noise mechanism.  These inherited fields remain
     # only because the raw-replay base dataclass owns them.
     eta_td3: float = 0.0
@@ -387,6 +463,14 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # the online twin Critic.  The legacy option name is retained so existing
     # Hydra commands do not need another migration.
     use_q_filtered_bc: bool = False
+    # Give Q the episode-constant delayed-actuator parameters as action-side
+    # execution metadata. Actor and Critic observations remain unchanged.
+    q_condition_on_actuator_state: bool = False
+    # Add the exact queue/lerp counterfactual response of each candidate action.
+    q_use_predicted_effect: bool = False
+    # Bounded delay/alpha-conditioned residual FiLM on the Q action stem.
+    q_use_residual_film: bool = False
+    q_residual_film_scale: float = 0.1
     sac_actor_lr: float = 3e-4
     # Actor regularization is an independent learning-rule choice.  In
     # particular, the Critic's q_weight_decay must never leak into the
@@ -455,6 +539,9 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
     def forward(self, td: TensorDict):
         owner = self._owner
         teacher_prefill_active = owner._teacher_prefill_active()
+        teacher_prefill_ppo_noise = teacher_prefill_active and bool(
+            getattr(owner.cfg, "teacher_prefill_use_ppo_noise", False)
+        )
         raw_student_mean = owner._student_raw_action_proposal(td)
         cache_enabled = getattr(
             owner, "_student_collection_actor_cache_enabled", lambda: False
@@ -480,12 +567,42 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
             if scratch_key in td.keys(True, True):
                 td.del_(scratch_key)
 
-        teacher_action = owner._teacher_action(td.clone(False))
+        if teacher_prefill_ppo_noise:
+            teacher_action, teacher_scale = owner._teacher_action_statistics(
+                td.clone(False)
+            )
+            if teacher_scale.shape != teacher_action.shape:
+                raise ValueError(
+                    "PPO Teacher mean and scale must have identical shapes"
+                )
+        else:
+            teacher_action = owner._teacher_action(td.clone(False))
+            teacher_scale = None
         valid = _valid_raw_action_rows(teacher_action)
+        if teacher_scale is not None:
+            valid = valid & torch.isfinite(teacher_scale).all(dim=-1) & (
+                teacher_scale > 0.0
+            ).all(dim=-1)
         finite_teacher_action = torch.nan_to_num(
             teacher_action, nan=0.0, posinf=0.0, neginf=0.0
         )
         bounded_teacher_action = owner._project_execution_action(finite_teacher_action)
+        if teacher_scale is not None:
+            finite_teacher_scale = torch.nan_to_num(
+                teacher_scale, nan=1.0e-6, posinf=1.0e-6, neginf=1.0e-6
+            ).clamp_min(1.0e-6)
+            raw_prefill_teacher_action, _ = FastSACPhysicalNormal(
+                finite_teacher_action, finite_teacher_scale
+            ).rsample_with_log_prob(generator=owner.teacher_prefill_action_rng)
+            bounded_prefill_teacher_action = owner._project_execution_action(
+                raw_prefill_teacher_action
+            )
+            prefill_teacher_projection = valid & (
+                bounded_prefill_teacher_action != raw_prefill_teacher_action
+            ).any(dim=-1)
+        else:
+            bounded_prefill_teacher_action = bounded_teacher_action
+            prefill_teacher_projection = torch.zeros_like(valid)
         student_valid = torch.isfinite(raw_student_mean).all(dim=-1)
         finite_student_mean = torch.nan_to_num(
             raw_student_mean, nan=0.0, posinf=0.0, neginf=0.0
@@ -519,8 +636,9 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         safe_takeover = torch.zeros_like(valid)
         safe_release = torch.zeros_like(valid)
         if teacher_prefill_active:
-            # Prefill is a deterministic Teacher data phase.  Do not advance
-            # either SAC sampling stream on its invalid-label fallback rows.
+            # Prefill always selects a valid Teacher. Its optional PPOVEL draw
+            # owns a separate RNG, so collection duration cannot shift either
+            # Student SAC sampling stream.
             choose_teacher = valid
             beta_teacher = torch.zeros_like(valid)
         elif control_mode in ("safe", "hybrid"):
@@ -580,7 +698,7 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         ).any(dim=-1)
         issued_action = torch.where(
             choose_teacher.unsqueeze(-1),
-            bounded_teacher_action,
+            bounded_prefill_teacher_action,
             projected_student_action,
         )
         # Both branches have already passed through the authoritative execution
@@ -588,6 +706,14 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         # so projecting the combined tensor again only repeats the same kernels.
         sample_q_deviation = owner._q_action_input(sampled_student_action) - (
             owner._q_action_input(mean_student_action)
+        )
+        prefill_teacher_q_noise = owner._q_action_input(
+            bounded_prefill_teacher_action
+        ) - owner._q_action_input(bounded_teacher_action)
+        prefill_teacher_q_noise = torch.where(
+            (choose_teacher & teacher_prefill_ppo_noise).unsqueeze(-1),
+            prefill_teacher_q_noise,
+            torch.zeros_like(prefill_teacher_q_noise),
         )
 
         td[ACTION_KEY] = issued_action
@@ -610,6 +736,10 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         td[TD3_EXPLORATORY_STUDENT_ACTION_KEY] = sampled_student_action
         td[TD3_COLLECTOR_NOISE_KEY] = sample_q_deviation
         td[FASTSAC_ACTION_PROJECTION_KEY] = student_projection
+        td[FASTSAC_PREFILL_TEACHER_NOISE_KEY] = prefill_teacher_q_noise
+        td[FASTSAC_PREFILL_TEACHER_PROJECTION_KEY] = (
+            prefill_teacher_projection & choose_teacher
+        )
         td[TD3_BETA_KEY] = torch.full_like(discrepancy_rms, float(scheduled_beta))
         motion_ids = getattr(
             getattr(getattr(owner, "env", None), "command_manager", None),
@@ -781,9 +911,22 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.sac_rollout_rng = torch.Generator(device=generator_device).manual_seed(
             int(cfg.q_seed) + 2
         )
+        self.teacher_prefill_action_rng = torch.Generator(
+            device=generator_device
+        ).manual_seed(int(cfg.q_seed) + 4)
         self.alpha_update_count = 0
         self.actor_std_update_count = 0
         self._last_fastsac_diagnostics: dict[str, float] = {}
+
+    def _q_replay_prefill_storage_fields(self) -> tuple[str, ...]:
+        """Keep noisy Q actions and clean Teacher BC labels side by side."""
+        fields = super()._q_replay_storage_fields()
+        if (
+            bool(getattr(self.cfg, "teacher_prefill_use_ppo_noise", False))
+            and DAGGER_REPLAY_TEACHER_ACTIONS not in fields
+        ):
+            fields = (*fields, DAGGER_REPLAY_TEACHER_ACTIONS)
+        return fields
 
     def _apply_actor_optimizer_weight_decay_contract(self) -> None:
         """Install the explicit Actor decay after construction or resume.
@@ -842,6 +985,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         base_cfg = copy.copy(cfg)
         base_cfg.eta_td3 = float(cfg.eta_sac)
         DistributionalTD3TeacherBC._validate_td3_config(base_cfg)
+        if not isinstance(cfg.teacher_prefill_use_ppo_noise, bool):
+            raise ValueError("teacher_prefill_use_ppo_noise must be a boolean")
         if str(cfg.perception_replay_mode) != (
             ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
         ):
@@ -1012,6 +1157,38 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 raise ValueError(f"{name} must be finite and non-negative")
         if getattr(cfg, "use_q_filtered_bc", False) not in (True, False):
             raise ValueError("use_q_filtered_bc must be boolean")
+        if not isinstance(
+            getattr(cfg, "q_condition_on_actuator_state", False), bool
+        ):
+            raise ValueError("q_condition_on_actuator_state must be boolean")
+        if not isinstance(getattr(cfg, "q_use_predicted_effect", False), bool):
+            raise ValueError("q_use_predicted_effect must be boolean")
+        if bool(getattr(cfg, "q_use_predicted_effect", False)) and not bool(
+            getattr(cfg, "q_condition_on_actuator_state", False)
+        ):
+            raise ValueError(
+                "q_use_predicted_effect requires q_condition_on_actuator_state=true"
+            )
+        if not isinstance(getattr(cfg, "q_use_residual_film", False), bool):
+            raise ValueError("q_use_residual_film must be boolean")
+        if bool(getattr(cfg, "q_use_residual_film", False)):
+            if not bool(getattr(cfg, "q_condition_on_actuator_state", False)):
+                raise ValueError(
+                    "q_use_residual_film requires "
+                    "q_condition_on_actuator_state=true"
+                )
+            if str(cfg.q_action_fusion) not in ("late", "balanced"):
+                raise ValueError(
+                    "q_use_residual_film requires a late or balanced action stem"
+                )
+        residual_film_scale = getattr(cfg, "q_residual_film_scale", 0.1)
+        if (
+            isinstance(residual_film_scale, bool)
+            or not isinstance(residual_film_scale, (int, float))
+            or not math.isfinite(float(residual_film_scale))
+            or not 0.0 < float(residual_film_scale) <= 1.0
+        ):
+            raise ValueError("q_residual_film_scale must be finite and in (0, 1]")
         actor_weight_decay = getattr(cfg, "sac_actor_weight_decay", 0.0)
         if (
             isinstance(actor_weight_decay, bool)
@@ -1518,18 +1695,24 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         next_log_prob = self._normalized_action_log_prob(next_raw_log_prob)
         bootstrap = (batch["truncations"].bool() | ~batch["dones"].bool()).float()
-        effective_discount = float(self.cfg.gamma) * batch["discounts"]
+        effective_discount, _, effective_n_steps = _q_target_discount_factors(
+            self.cfg, batch
+        )
         alpha = self.log_alpha.exp()
         entropy_tax = effective_discount * bootstrap * alpha * next_log_prob
         soft_reward = batch["rewards"] - entropy_tax
 
-        target_logits = self._q_forward(
-            self.qnet_target,
+        target_logits = self.qnet_target(
             batch["next_critic_observations"],
-            self._q_action_input(next_action),
-            **self._q_batch_state_kwargs(batch, next_state=True),
+            self._q_action_features(
+                next_action,
+                batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
+            ),
         )
         target_probabilities = F.softmax(target_logits, dim=-1)
+        raw_expected_heads = (target_probabilities * self.qnet_target.support).sum(
+            dim=-1
+        )
         projected_heads = []
         support_clip_fractions = []
         for head_probability in target_probabilities:
@@ -1570,7 +1753,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         projected_expected_heads = (projected_heads * self.qnet_target.support).sum(
             dim=-1
         )
-        selected_head = projected_expected_heads.argmin(dim=0)
+        # Clipped double-Q chooses the lower next-state distribution before the
+        # reward/discount C51 projection.  Projection is nonlinear at support
+        # boundaries, so selecting after projection can reverse the intended
+        # head exactly on the rows where clipping is most consequential.
+        selected_head = raw_expected_heads.argmin(dim=0)
         selected_target = projected_heads.gather(
             0,
             selected_head[None, :, None].expand(
@@ -1584,9 +1771,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             selected_target
             * selected_target.clamp_min(torch.finfo(selected_target.dtype).tiny).log()
         ).sum(dim=-1)
-        raw_expected_heads = (target_probabilities * self.qnet_target.support).sum(
-            dim=-1
-        )
         reward_abs = batch["rewards"].abs().mean()
         metrics = {
             "target_expected_q1_mean": raw_expected_heads[0].mean(),
@@ -1619,6 +1803,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "entropy_tax_abs_mean": entropy_tax.abs().mean(),
             "entropy_tax_reward_abs_ratio": entropy_tax.abs().mean()
             / reward_abs.clamp_min(torch.finfo(reward_abs.dtype).eps),
+            "effective_n_steps_mean": effective_n_steps.float().mean(),
             "alpha": alpha.detach(),
         }
         return selected_target.detach(), metrics, next_log_prob.detach()
@@ -1661,11 +1846,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         projected_target, target_metrics, target_log_prob = (
             self._distributional_fastsac_target(batch)
         )
-        logits = self._q_forward(
-            self.qnet,
+        logits = self.qnet(
             batch["critic_observations"],
-            self._q_action_input(batch["actions"]),
-            **self._q_batch_state_kwargs(batch, next_state=False),
+            self._q_action_features(
+                batch["actions"],
+                batch.get(Q_ACTUATOR_CONTEXT_KEY),
+            ),
         )
         log_probabilities = F.log_softmax(logits, dim=-1)
         per_head = (
@@ -1761,7 +1947,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             generator=self.sac_action_rng
         )
         normalized_log_prob = self._normalized_action_log_prob(raw_log_prob)
-        q_action = self._q_action_input(sampled_action)
+        q_action = self._q_action_features(
+            sampled_action,
+            batch.get(Q_ACTUATOR_CONTEXT_KEY),
+        )
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.actor_optimizer.zero_grad(set_to_none=True)
@@ -1772,12 +1961,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             for parameter in self.qnet.parameters():
                 parameter.requires_grad_(False)
                 parameter.grad = None
-            twin_logits = self._q_forward(
-                self.qnet,
-                batch["critic_observations"],
-                q_action,
-                **self._q_batch_state_kwargs(batch, next_state=False),
-            )
+            twin_logits = self.qnet(batch["critic_observations"], q_action)
             twin_expected = (F.softmax(twin_logits, dim=-1) * self.qnet.support).sum(
                 dim=-1
             )
@@ -1827,21 +2011,23 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 # head to its expected return before fitting the two Gaussian
                 # action-value distributions.  Sequential forwards keep peak
                 # memory lower than concatenating a doubled Actor batch.
-                policy_online_logits = self._q_forward(
-                    self.qnet,
+                policy_online_logits = self.qnet(
                     batch["critic_observations"],
-                    self._q_action_input(prediction_action.detach()),
-                    **self._q_batch_state_kwargs(batch, next_state=False),
+                    self._q_action_features(
+                        prediction_action.detach(),
+                        batch.get(Q_ACTUATOR_CONTEXT_KEY),
+                    ),
                 )
                 policy_online_q = (
                     F.softmax(policy_online_logits, dim=-1) * self.qnet.support
                 ).sum(dim=-1)
                 del policy_online_logits
-                teacher_online_logits = self._q_forward(
-                    self.qnet,
+                teacher_online_logits = self.qnet(
                     batch["critic_observations"],
-                    self._q_action_input(safe_teacher_actions.detach()),
-                    **self._q_batch_state_kwargs(batch, next_state=False),
+                    self._q_action_features(
+                        safe_teacher_actions.detach(),
+                        batch.get(Q_ACTUATOR_CONTEXT_KEY),
+                    ),
                 )
                 teacher_online_q = (
                     F.softmax(teacher_online_logits, dim=-1) * self.qnet.support
@@ -2049,6 +2235,41 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         """Reuse raw replay/prefill orchestration and publish SAC-native logs."""
         self._fastsac_rollout_critic_metrics: list[dict[str, torch.Tensor]] = []
         self._fastsac_rollout_actor_metrics: list[dict[str, torch.Tensor]] = []
+        prefill_teacher_noise_q_rms = 0.0
+        prefill_teacher_noise_physical_rms = 0.0
+        prefill_teacher_projection_fraction = 0.0
+        if (
+            self._teacher_prefill_active()
+            and FASTSAC_PREFILL_TEACHER_NOISE_KEY
+            in tensordict.keys(True, True)
+            and DAGGER_IS_STUDENT_ACTION_KEY in tensordict.keys(True, True)
+        ):
+            teacher_rows = ~tensordict[DAGGER_IS_STUDENT_ACTION_KEY].reshape(-1).bool()
+            if bool(teacher_rows.any()):
+                q_noise = tensordict[FASTSAC_PREFILL_TEACHER_NOISE_KEY].reshape(
+                    -1, self.action_dim
+                )[teacher_rows]
+                prefill_teacher_noise_q_rms = float(
+                    q_noise.float().square().mean().sqrt().item()
+                )
+                physical_noise = (
+                    q_noise
+                    / float(self.cfg.q_action_input_gain)
+                    * self._fastsac_q_action_scale.to(q_noise)
+                )
+                prefill_teacher_noise_physical_rms = float(
+                    physical_noise.float().square().mean().sqrt().item()
+                )
+                if (
+                    FASTSAC_PREFILL_TEACHER_PROJECTION_KEY
+                    in tensordict.keys(True, True)
+                ):
+                    projection = tensordict[
+                        FASTSAC_PREFILL_TEACHER_PROJECTION_KEY
+                    ].reshape(-1).bool()
+                    prefill_teacher_projection_fraction = float(
+                        projection[teacher_rows].float().mean().item()
+                    )
         if self._uses_ppo_physical_gaussian():
             self._project_physical_actor_std_()
             self._physical_std_rollout_reference = (
@@ -2100,12 +2321,26 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 continue
             info[f"fastsac/{replacements.get(suffix, suffix)}"] = value
 
+        info["fastsac/prefill_teacher_ppo_noise_enabled"] = float(
+            bool(getattr(self.cfg, "teacher_prefill_use_ppo_noise", False))
+        )
+        info["fastsac/prefill_teacher_ppo_noise_q_rms"] = (
+            prefill_teacher_noise_q_rms
+        )
+        info["fastsac/prefill_teacher_ppo_noise_physical_rms"] = (
+            prefill_teacher_noise_physical_rms
+        )
+        info["fastsac/prefill_teacher_action_projection_fraction"] = (
+            prefill_teacher_projection_fraction
+        )
+
         critic_keys = (
             "target_sample_action_abs_mean",
             "target_log_prob_mean",
             "entropy_tax_mean",
             "entropy_tax_abs_mean",
             "entropy_tax_reward_abs_ratio",
+            "effective_n_steps_mean",
             "alpha_update_due_fraction",
             "alpha_update_performed_fraction",
             "q1_left_support_clip_fraction",
@@ -2318,6 +2553,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "eta_sac",
                     "lambda_bc",
                     "use_q_filtered_bc",
+                    "teacher_prefill_use_ppo_noise",
+                    "q_condition_on_actuator_state",
+                    "q_use_predicted_effect",
+                    "q_use_residual_film",
+                    "q_residual_film_scale",
                     "sac_actor_lr",
                     "sac_action_distribution",
                     "sac_physical_std_lr",
@@ -2430,6 +2670,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "q_rng_state": self.q_rng.get_state(),
             "sac_action_rng_state": self.sac_action_rng.get_state(),
             "sac_rollout_rng_state": self.sac_rollout_rng.get_state(),
+            "teacher_prefill_action_rng_state": (
+                self.teacher_prefill_action_rng.get_state()
+            ),
             "teacher_perception_rng_state": self.teacher_perception_rng.get_state(),
             "last_fastsac_diagnostics": copy.deepcopy(self._last_fastsac_diagnostics),
         }
@@ -2576,6 +2819,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.q_rng.set_state(state["q_rng_state"])
         self.sac_action_rng.set_state(state["sac_action_rng_state"])
         self.sac_rollout_rng.set_state(state["sac_rollout_rng_state"])
+        teacher_prefill_rng_state = state.get("teacher_prefill_action_rng_state")
+        if teacher_prefill_rng_state is None:
+            self.teacher_prefill_action_rng.manual_seed(int(self.cfg.q_seed) + 4)
+        else:
+            self.teacher_prefill_action_rng.set_state(teacher_prefill_rng_state)
         self.teacher_perception_rng.set_state(state["teacher_perception_rng_state"])
         self._last_fastsac_diagnostics = copy.deepcopy(
             state.get("last_fastsac_diagnostics", {})
@@ -2785,6 +3033,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.q_rng.manual_seed(int(self.cfg.q_seed))
         self.sac_action_rng.manual_seed(int(self.cfg.q_seed) + 1)
         self.sac_rollout_rng.manual_seed(int(self.cfg.q_seed) + 2)
+        self.teacher_prefill_action_rng.manual_seed(int(self.cfg.q_seed) + 4)
         self.teacher_perception_rng.manual_seed(int(self.cfg.q_seed) + 3)
         # Drop deterministic-only streams after the base loader is finished.
         if hasattr(self, "collector_exploration_rng"):
@@ -2819,6 +3068,8 @@ __all__ = [
     "ACTOR_MEAN_OPTIMIZER_SEMANTICS",
     "CHECKPOINT_VERSION",
     "FASTSAC_ACTION_PROJECTION_KEY",
+    "FASTSAC_PREFILL_TEACHER_NOISE_KEY",
+    "FASTSAC_PREFILL_TEACHER_PROJECTION_KEY",
     "FastSACPhysicalNormal",
     "NORMALIZED_TANH_ACTION_DISTRIBUTION",
     "PHYSICAL_STD_BOUND_MODES",

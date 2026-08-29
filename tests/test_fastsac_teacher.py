@@ -35,6 +35,7 @@ from active_adaptation.learning.ppo.fastsac_vel import (
     _reference_awac_weights,
     _reduce_actor_q_values,
     _q_action_hidden_dim,
+    _q_state_hidden_dim,
     _sac_bootstrap_mask,
     _select_c51_twin_target,
     _Stage1NStepAccumulator,
@@ -135,6 +136,15 @@ def test_teacher_transitions_keep_timeout_final_state_alignment():
     assert policy._last_truncation_finals_used == 1
     assert policy._truncation_final_batches == []
     assert policy._rollout_final_batch is None
+
+
+def test_teacher_transition_chunks_reject_missing_timeout_final_capture():
+    policy = _teacher_transition_policy()
+    rollout = _teacher_rollout()
+    policy._truncation_final_batches = []
+
+    with pytest.raises(RuntimeError, match="exactly match.*pure time-limit"):
+        list(policy._teacher_transition_chunks(rollout))
 
 
 def test_teacher_replay_reconstructs_timeout_next_reference():
@@ -294,13 +304,14 @@ def test_interleaved_teacher_uses_pre_reset_timeout_final_observation():
     assert policy._last_truncation_finals_used == 1
 
 
-def test_command_completion_ends_teacher_return_without_bootstrap():
+def test_command_completion_is_a_teacher_replay_terminal_cut():
     policy = _teacher_transition_policy()
     policy._prepare_teacher_final_state = lambda td: {
         "next_critic_observations": td["marker"].clone(),
     }
     current = TensorDict(
         {
+            "marker": torch.tensor([[2.0]]),
             "critic": torch.tensor([[2.0]]),
             ACTION_KEY: torch.tensor([[12.0]]),
             "step_count": torch.tensor([[2]]),
@@ -338,7 +349,8 @@ def test_command_completion_ends_teacher_return_without_bootstrap():
         ),
         torch.zeros(1),
     )
-    # The reset carry is harmless because the stored bootstrap mask is zero.
+    # The successor is irrelevant because bootstrap is zero, but replay must
+    # not invent a current-state self-loop for this finite episode terminal.
     assert torch.equal(
         transition["next_critic_observations"], torch.tensor([[202.0]])
     )
@@ -962,6 +974,35 @@ def test_explicit_legacy_early_q_fusion_preserves_exact_module_topology():
         "net.9.weight", "net.9.bias",
     ]
     assert q(torch.randn(4, 7), torch.randn(4, 3)).shape == (4, 5)
+
+
+def test_balanced_q_fusion_uses_exact_448_by_448_stems_and_action_gradient():
+    q = DistributionalQNetwork(
+        obs_dim=2341,
+        action_dim=29,
+        hidden_dim=768,
+        num_atoms=501,
+        layer_norm=True,
+        action_fusion="balanced",
+    )
+
+    assert _q_state_hidden_dim(768, "balanced") == 448
+    assert _q_action_hidden_dim(768, "balanced") == 448
+    assert q.state_hidden_dim == 448
+    assert q.action_hidden_dim == 448
+    assert q.obs_net[0].in_features == 2341
+    assert q.obs_net[0].out_features == 448
+    assert q.action_net[0].in_features == 29
+    assert q.action_net[0].out_features == 448
+    assert q.net[0].in_features == 896
+    assert q.net[0].out_features == 384
+
+    observations = torch.randn(2, 2341)
+    actions = torch.randn(2, 29, requires_grad=True)
+    q(observations, actions).sum().backward()
+    assert actions.grad is not None
+    assert torch.isfinite(actions.grad).all()
+    assert torch.count_nonzero(actions.grad) > 0
 
 
 @pytest.mark.parametrize("action_fusion", ["early", "late"])

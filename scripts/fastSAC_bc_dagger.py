@@ -708,6 +708,9 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
         "q_teacher_buffer_capacity",
     ):
         _positive_int(f"algo.{name}", cfg.algo.get(name, None))
+    for name in ("q_n_step", "q_teacher_n_step"):
+        if cfg.algo.get(name, None) is not None:
+            _positive_int(f"algo.{name}", cfg.algo.get(name))
     _finite_nonnegative("algo.sac_tau", cfg.algo.get("sac_tau", None))
     if not 0.0 < float(cfg.algo.sac_tau) <= 1.0:
         raise ValueError("algo.sac_tau must be in (0, 1]")
@@ -811,8 +814,10 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError("distributional FastSAC requires q_v_min=-20")
     if not math.isclose(float(cfg.algo.get("q_v_max", math.nan)), 20.0):
         raise ValueError("distributional FastSAC requires q_v_max=20")
-    if cfg.algo.get("q_action_fusion") != "late":
-        raise ValueError("distributional FastSAC requires late Q-action fusion")
+    if cfg.algo.get("q_action_fusion") not in ("late", "balanced"):
+        raise ValueError(
+            "distributional FastSAC requires late or balanced Q-action fusion"
+        )
     if cfg.algo.get("q_layer_norm") is not True:
         raise ValueError("distributional FastSAC requires LayerNorm Q Critics")
     if cfg.algo.get("q_action_coordinates") != "raw_joint_command":

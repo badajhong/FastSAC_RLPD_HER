@@ -1,0 +1,35 @@
+# Read-only full-episode critic action/state causality probe.
+defaults:
+  - eval
+  - override /task: G1/vaic/skateboard_general_tracking_stu
+  - override /algo: tvkd_fastsac_bc_dagger_finetune
+  - _self_
+
+checkpoint_path: null
+vecnorm: eval
+headless: true
+eval_render: false
+app:
+  # The Student perception path needs the configured depth camera even though
+  # this diagnostic does not render RGB output.
+  enable_cameras: true
+
+task:
+  num_envs: 64
+
+critic_probe:
+  # 21 * 32 = 672 steps after one warm-up transition, enough to cover the
+  # 622-state skateboard motion without repeatedly sampling its first 32 rows.
+  max_chunks: 21
+  rows_per_source: 1024
+  num_phase_bins: 10
+  collection_seed: 0
+  sample_seed: 1701
+  finite_difference_epsilon: 0.05
+  output_path: fastsac_critic_probe.json
+
+hydra:
+  run:
+    dir: ./outputs_probe/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

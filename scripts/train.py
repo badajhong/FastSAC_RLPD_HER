@@ -113,6 +113,8 @@ _PROFILE_ALGO_INVARIANTS = (
     "num_minibatches",
     "q_updates_per_rollout",
     "q_update_to_data_ratio",
+    "q_n_step",
+    "q_teacher_n_step",
     "sac_policy_frequency",
     "td3_learning_starts",
     "sac_learning_starts",
@@ -919,14 +921,6 @@ def run_training(cfg: DictConfig):
                     # completed rows. Snapshot the Q-only context while it still
                     # belongs to the action and transition being collected.
                     actuator_context = policy.capture_q_actuator_context()
-                termination_counter_context = None
-                if hasattr(policy, "capture_q_termination_counter_context"):
-                    # This is the current pre-action counter state. The matching
-                    # next state is read from each termination's post-update
-                    # snapshot after step/reset below, never from reset carry.
-                    termination_counter_context = (
-                        policy.capture_q_termination_counter_context()
-                    )
                 if not interleaved_updates and hasattr(
                     policy, "record_rollout_q_actuator_context"
                 ):
@@ -936,20 +930,6 @@ def run_training(cfg: DictConfig):
                         td, carry = env.step_and_maybe_reset(carry)
                 else:
                     td, carry = env.step_and_maybe_reset(carry)
-                next_termination_counter_context = None
-                if hasattr(policy, "capture_q_termination_counter_context"):
-                    next_termination_counter_context = (
-                        policy.capture_q_termination_counter_context(
-                            after_last_update=True
-                        )
-                    )
-                if not interleaved_updates and hasattr(
-                    policy, "record_rollout_q_termination_counter_context"
-                ):
-                    policy.record_rollout_q_termination_counter_context(
-                        termination_counter_context,
-                        next_termination_counter_context,
-                    )
                 if interleaved_updates:
                     update_start = time.perf_counter()
                     # Replay tensors are ordinary device tensors, so gradients
@@ -961,9 +941,9 @@ def run_training(cfg: DictConfig):
                 elif hasattr(policy, "capture_truncation_final_observations"):
                     # The first return still owns the transformed pre-reset
                     # timeout observation; ``carry`` has already reset that
-                    # row. The environment also labels command completion as
-                    # truncated, but FastSAC treats it as a non-bootstrapping
-                    # task terminal and therefore needs no final-state capture.
+                    # row. FastSAC treats command completion as the end of the
+                    # finite tracking task, so only a pure time limit needs a
+                    # pre-reset bootstrap state.
                     policy.capture_truncation_final_observations(td, step)
                 if interleaved_updates:
                     td = td.exclude("_fastsac_raw", ("next", "_fastsac_raw"))

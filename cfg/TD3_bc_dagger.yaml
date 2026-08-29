@@ -113,6 +113,9 @@ algo:
   q_action_coordinates: raw_joint_command
   q_normalize_actions: true
   q_action_input_gain: 1.0
+  q_use_predicted_effect: false
+  q_use_residual_film: false
+  q_residual_film_scale: 0.1
   q_lr: 3.0e-5
   q_weight_decay: 1.0e-3
   q_seed: 0

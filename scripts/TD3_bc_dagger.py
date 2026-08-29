@@ -765,8 +765,10 @@ def validate_td3_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError("distributional TD3 requires q_v_min=-20")
     if not math.isclose(float(cfg.algo.get("q_v_max", math.nan)), 20.0):
         raise ValueError("distributional TD3 requires q_v_max=20")
-    if cfg.algo.get("q_action_fusion") != "late":
-        raise ValueError("distributional TD3 requires late Q-action fusion")
+    if cfg.algo.get("q_action_fusion") not in ("late", "balanced"):
+        raise ValueError(
+            "distributional TD3 requires late or balanced Q-action fusion"
+        )
     if cfg.algo.get("q_layer_norm") is not True:
         raise ValueError("distributional TD3 requires LayerNorm Q Critics")
     if cfg.algo.get("q_action_coordinates") != "raw_joint_command":

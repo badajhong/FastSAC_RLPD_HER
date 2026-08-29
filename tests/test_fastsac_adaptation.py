@@ -230,6 +230,53 @@ def test_student_transition_chunks_keep_timeout_final_state():
     assert policy._last_truncation_finals_used == 1
 
 
+def test_student_transition_chunks_reject_missing_timeout_final_capture():
+    policy = FastSACVelFinetune.__new__(FastSACVelFinetune)
+    torch.nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(train_every=1)
+    policy.q_actor_keys = ["actor"]
+    policy.q_critic_keys = ["critic"]
+    policy._q_actor_dim = 1
+    policy._q_critic_dim = 1
+    policy.action_dim = 1
+    policy.reward_scales = torch.ones(1)
+    policy._last_truncation_finals_used = 0
+    policy._rollout_final_batch = {
+        "next_observations": torch.tensor([[90.0]]),
+        "next_critic_observations": torch.tensor([[91.0]]),
+    }
+    policy._truncation_final_batches = []
+    done = torch.ones(1, 1, 1, dtype=torch.bool)
+    rollout = TensorDict(
+        {
+            "actor": torch.tensor([[[1.0]]]),
+            "critic": torch.tensor([[[2.0]]]),
+            ACTION_KEY: torch.tensor([[[3.0]]]),
+            "step_count": torch.tensor([[[6]]]),
+            "next": TensorDict(
+                {
+                    "reward": torch.ones(1, 1, 1),
+                    "done": done,
+                    "terminated": torch.zeros_like(done),
+                    "discount": torch.ones(1, 1, 1),
+                    "stats": TensorDict(
+                        {
+                            "episode_time_limit": done.clone(),
+                            "command_finished": torch.zeros_like(done),
+                        },
+                        batch_size=[1, 1],
+                    ),
+                },
+                batch_size=[1, 1],
+            ),
+        },
+        batch_size=[1, 1],
+    )
+
+    with pytest.raises(RuntimeError, match="exactly match.*pure time-limit"):
+        list(policy._student_transition_chunks(rollout))
+
+
 @pytest.mark.parametrize(
     ("q_action_coordinates", "q_reference_dueling"),
     (("reference_residual", False), ("absolute", True)),
