@@ -622,7 +622,7 @@ def test_inherited_td3_noise_must_remain_zero(field):
         ("q_num_atoms", 51, "501"),
         ("q_action_coordinates", "absolute", "raw_joint_command"),
         ("q_updates_per_rollout", 0, "positive"),
-        ("q_update_to_data_ratio", 0.5, "row-level Q UTD=1"),
+        ("q_update_to_data_ratio", 0.0, "finite positive number"),
     ),
 )
 def test_invalid_fastsac_controls_fail_before_training(field, value, message):

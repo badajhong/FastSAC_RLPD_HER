@@ -1223,15 +1223,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         if (
             q_update_to_data_ratio is None
             or isinstance(q_update_to_data_ratio, bool)
-            or not math.isclose(
-                float(q_update_to_data_ratio),
-                1.0,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
+            or not math.isfinite(float(q_update_to_data_ratio))
+            or float(q_update_to_data_ratio) <= 0.0
         ):
             raise ValueError(
-                "FastSAC requires q_update_to_data_ratio=1 for row-level Q UTD=1"
+                "q_update_to_data_ratio must be finite and positive"
             )
 
     def _uses_ppo_physical_gaussian(self) -> bool:

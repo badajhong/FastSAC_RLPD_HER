@@ -120,11 +120,9 @@ algo:
   q_tau: 0.005
   q_max_grad_norm: 1.0
   q_batch_size: 512
-  # Spend one total Q sample row per newly accepted Student replay row.  The
-  # row-credit scheduler gives 32 Q updates for a 512-env x 32-step rollout,
-  # 16 for 256 envs, and preserves fractional credit for arbitrary chunking.
-  # q_updates_per_rollout remains serialized for compatibility with the shared
-  # TD3 base; this dedicated FastSAC entrypoint locks the row ratio to 1.0.
+  # Spend this many total Q sample rows per newly accepted Student replay row.
+  # The row-credit scheduler preserves fractional credit for arbitrary rollout
+  # chunking. q_updates_per_rollout is used only when this ratio is null.
   q_updates_per_rollout: 32
   q_update_to_data_ratio: 1.0
   # Fraction of each Q batch drawn from frozen Teacher replay; the remainder

@@ -795,14 +795,15 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     _validate_sac_controls(cfg)
     _validate_online_student_perception_contract(cfg)
 
-    if not math.isclose(
-        float(cfg.algo.get("q_update_to_data_ratio", math.nan)),
-        1.0,
-        rel_tol=0.0,
-        abs_tol=1e-12,
+    q_update_to_data_ratio = cfg.algo.get("q_update_to_data_ratio", None)
+    if (
+        q_update_to_data_ratio is None
+        or isinstance(q_update_to_data_ratio, bool)
+        or not math.isfinite(float(q_update_to_data_ratio))
+        or float(q_update_to_data_ratio) <= 0.0
     ):
         raise ValueError(
-            "FastSAC requires q_update_to_data_ratio=1 for row-level Q UTD=1"
+            "algo.q_update_to_data_ratio must be finite and positive"
         )
     if int(cfg.algo.q_teacher_buffer_capacity) < int(cfg.algo.sac_learning_starts):
         raise ValueError(

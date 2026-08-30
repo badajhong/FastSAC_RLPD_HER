@@ -490,11 +490,10 @@ def test_backend_locks_live_perception_to_pure_student_control(field, value):
         DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
-def test_backend_locks_row_level_q_utd_to_one():
-    cfg = DistributionalFastSACTeacherBCConfig(q_update_to_data_ratio=0.5)
+def test_backend_accepts_positive_row_level_q_utd():
+    cfg = DistributionalFastSACTeacherBCConfig(q_update_to_data_ratio=4.0)
 
-    with pytest.raises(ValueError, match="row-level Q UTD=1"):
-        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+    DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
 def test_tanh_normal_is_bounded_reparameterized_and_has_exact_log_prob():
