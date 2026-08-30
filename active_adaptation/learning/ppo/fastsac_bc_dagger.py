@@ -135,6 +135,10 @@ ACTOR_MEAN_OPTIMIZER_SEMANTICS = (
 SPRED_P_BC_SEMANTICS = (
     "online_twin_sample_std_gaussian_cdf_teacher_superiority_detached_v1"
 )
+CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS = (
+    "same_state_valid_teacher_strict_both_online_heads_positive_within_head_"
+    "policy_minus_teacher_gate_for_actor_q_term_entropy_and_bc_ungated_v1"
+)
 _SPRED_P_SOURCE_METRIC_KEYS = (
     "spred_p_source_metadata_available",
     "spred_p_teacher_source_valid_fraction",
@@ -513,6 +517,10 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
 
     q_updates_per_rollout: int = 32
     q_update_to_data_ratio: float | None = 1.0
+    # FastSAC Actor/BC work is row-scheduled independently from Q.  With the
+    # default 4096 Actor batch this exactly reproduces the former 512-Q-batch,
+    # policy-frequency-8 cadence, while remaining stable when Q batching changes.
+    actor_update_to_data_ratio: float | None = 1.0
 
 
 ConfigStore.instance().store(
@@ -1247,7 +1255,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         else:
             semantics = PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
         if getattr(self.cfg, "use_q_filtered_bc", False):
-            return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
+            semantics = f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
+        if self._q_uses_causal_hold_advantage():
+            semantics = (
+                f"{semantics}_with_{CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS}"
+            )
         return semantics
 
     def _entropy_semantics(self) -> str:
@@ -1698,12 +1710,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         entropy_tax = effective_discount * bootstrap * alpha * next_log_prob
         soft_reward = batch["rewards"] - entropy_tax
 
-        target_logits = self.qnet_target(
+        target_logits = self._q_forward(
+            self.qnet_target,
             batch["next_critic_observations"],
-            self._q_action_features(
-                next_action,
-                batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
-            ),
+            next_action,
+            batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
         )
         target_probabilities = F.softmax(target_logits, dim=-1)
         raw_expected_heads = (target_probabilities * self.qnet_target.support).sum(
@@ -1842,12 +1853,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         projected_target, target_metrics, target_log_prob = (
             self._distributional_fastsac_target(batch)
         )
-        logits = self.qnet(
-            batch["critic_observations"],
-            self._q_action_features(
-                batch["actions"],
-                batch.get(Q_ACTUATOR_CONTEXT_KEY),
-            ),
+        logits, causal_components = self._q_td_logits(
+            batch, return_causal_components=True
         )
         log_probabilities = F.log_softmax(logits, dim=-1)
         per_head = (
@@ -1855,7 +1862,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             .sum(dim=-1)
             .mean(dim=-1)
         )
-        critic_loss = per_head.sum()
+        ranking_loss, ranking_metrics = self._causal_expert_advantage_ranking(
+            batch, causal_components
+        )
+        critic_loss = per_head.sum() + ranking_loss
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         critic_grad = torch.nn.utils.clip_grad_norm_(
@@ -1877,14 +1887,17 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "FastSAC alpha bootstrap mask and target log-probability "
                 "population are misaligned"
             )
-        # Baseline temperature and Actor see the same policy-update timescale.
-        # Cadence is evaluated after incrementing ``critic_update_count``, so
-        # an Actor-cadence update adjusts alpha immediately before the matching
-        # Actor update in the inherited replay loop. TVKD checkpoints keep the
-        # historical every-Critic cadence for resume compatibility.
+        # Legacy checkpoints keep their Critic-coupled temperature cadence.
+        # With a finite Actor row ratio, `_actor_update` instead updates alpha
+        # from the same current-state policy sample exactly once per Actor step.
         alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
+        decoupled_actor_scheduler = (
+            getattr(self.cfg, "actor_update_to_data_ratio", None) is not None
+        )
         alpha_update_due = alpha_update_cadence == "critic" or (
-            self.critic_update_count % int(self.cfg.sac_policy_frequency) == 0
+            alpha_update_cadence == "actor"
+            and not decoupled_actor_scheduler
+            and self.critic_update_count % int(self.cfg.sac_policy_frequency) == 0
         )
         alpha_update_count_before = int(getattr(self, "alpha_update_count", 0))
         if alpha_update_due:
@@ -1922,6 +1935,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "twin_expected_q_disagreement": (expected_heads[0] - expected_heads[1])
             .abs()
             .mean(),
+            **ranking_metrics,
             **target_metrics,
             **alpha_metrics,
         }
@@ -1943,11 +1957,31 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             generator=self.sac_action_rng
         )
         normalized_log_prob = self._normalized_action_log_prob(raw_log_prob)
-        q_action = self._q_action_features(
-            sampled_action,
-            batch.get(Q_ACTUATOR_CONTEXT_KEY),
+        teacher_actions = batch[DAGGER_REPLAY_TEACHER_ACTIONS]
+        teacher_valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
+        if prediction_action.shape != teacher_actions.shape:
+            raise ValueError("Actor Student and Teacher action shapes must match")
+        if prediction_action.shape[0] != teacher_valid.numel():
+            raise ValueError("Actor Teacher validity mask does not match batch rows")
+        safe_teacher_actions = torch.where(
+            teacher_valid.unsqueeze(-1),
+            teacher_actions,
+            prediction_action.detach(),
         )
-
+        actor_scheduled_alpha = (
+            getattr(self.cfg, "actor_update_to_data_ratio", None) is not None
+            and str(getattr(self.cfg, "sac_alpha_update_cadence", "actor"))
+            == "actor"
+        )
+        alpha_update_count_before = int(getattr(self, "alpha_update_count", 0))
+        actor_alpha_metrics = self._alpha_update(
+            normalized_log_prob.reshape(-1)
+            if actor_scheduled_alpha
+            else normalized_log_prob.reshape(-1)[:0]
+        )
+        actor_alpha_performed = (
+            int(getattr(self, "alpha_update_count", 0)) > alpha_update_count_before
+        )
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.actor_optimizer.zero_grad(set_to_none=True)
         original_requires_grad = [
@@ -1957,22 +1991,82 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             for parameter in self.qnet.parameters():
                 parameter.requires_grad_(False)
                 parameter.grad = None
-            twin_logits = self.qnet(batch["critic_observations"], q_action)
+            twin_logits = self._q_forward(
+                self.qnet,
+                batch["critic_observations"],
+                sampled_action,
+                batch.get(Q_ACTUATOR_CONTEXT_KEY),
+            )
             twin_expected = (F.softmax(twin_logits, dim=-1) * self.qnet.support).sum(
                 dim=-1
             )
             minimum_expected = _reduce_actor_q_values(twin_expected, True)
-            sac_actor_loss = (
-                self.log_alpha.exp().detach() * normalized_log_prob - minimum_expected
+            entropy_objective = (
+                self.log_alpha.exp().detach() * normalized_log_prob
             ).mean()
+            if self._q_uses_causal_hold_advantage():
+                # A random or merely disagreeing Critic must not move the
+                # pretrained mean. Admit Q ascent only when the lower policy
+                # within-head policy-minus-Teacher delta is positive for both
+                # heads. This cancels each head's state/value offset exactly.
+                # Entropy/std and exact BC remain fully ungated.
+                with torch.no_grad():
+                    teacher_logits = self._q_forward(
+                        self.qnet,
+                        batch["critic_observations"],
+                        safe_teacher_actions,
+                        batch.get(Q_ACTUATOR_CONTEXT_KEY),
+                    )
+                    teacher_expected = (
+                        F.softmax(teacher_logits, dim=-1) * self.qnet.support
+                    ).sum(dim=-1)
+                    policy_teacher_margin = (
+                        twin_expected.detach() - teacher_expected
+                    ).min(dim=0).values
+                    actor_q_gate = teacher_valid & (
+                        policy_teacher_margin > 0.0
+                    )
+                actor_q_gate_float = actor_q_gate.to(minimum_expected)
+                trusted_q = (
+                    minimum_expected * actor_q_gate_float
+                ).sum() / actor_q_gate_float.sum().clamp_min(1.0)
+                sac_actor_loss = entropy_objective - trusted_q
+                valid_float = teacher_valid.to(policy_teacher_margin)
+                valid_count = valid_float.sum().clamp_min(1.0)
+                actor_q_gate_metrics = {
+                    "actor_q_confidence_gate_enabled": (
+                        prediction_action.new_ones(())
+                    ),
+                    "actor_q_confidence_gate_active_fraction": (
+                        actor_q_gate_float.mean()
+                    ),
+                    "actor_q_confidence_policy_teacher_margin": (
+                        (policy_teacher_margin * valid_float).sum() / valid_count
+                    ),
+                    "actor_q_confidence_trusted_q_mean": trusted_q.detach(),
+                }
+            else:
+                sac_actor_loss = entropy_objective - minimum_expected.mean()
+                actor_q_gate_metrics = {
+                    "actor_q_confidence_gate_enabled": (
+                        prediction_action.new_zeros(())
+                    ),
+                    "actor_q_confidence_gate_active_fraction": (
+                        prediction_action.new_ones(())
+                    ),
+                    "actor_q_confidence_policy_teacher_margin": (
+                        prediction_action.new_zeros(())
+                    ),
+                    "actor_q_confidence_trusted_q_mean": (
+                        minimum_expected.detach().mean()
+                    ),
+                }
         finally:
             for parameter, requires_grad in zip(
                 self.qnet.parameters(), original_requires_grad
             ):
                 parameter.requires_grad_(requires_grad)
 
-        teacher_actions = batch[DAGGER_REPLAY_TEACHER_ACTIONS]
-        teacher_valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
         q_filter_metrics = {
             # Compatibility alias: under continuous SPReD-P this is the mean
             # effective BC weight, not a fraction of binary-active rows.
@@ -1990,40 +2084,29 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             },
         }
         if getattr(self.cfg, "use_q_filtered_bc", False):
-            if prediction_action.shape != teacher_actions.shape:
-                raise ValueError("SPReD-P Student and Teacher action shapes must match")
-            if prediction_action.shape[0] != teacher_valid.numel():
-                raise ValueError("SPReD-P validity mask does not match batch rows")
             # Invalid replay labels may contain NaN. Substitute a finite action
             # before the online-Q forward, then exclude those rows from both
             # the probability statistics and BC normalization below.
-            safe_teacher_actions = torch.where(
-                teacher_valid.unsqueeze(-1),
-                teacher_actions,
-                prediction_action.detach(),
-            )
             with torch.no_grad():
                 # SPReD-P uses the current online ensemble.  Collapse each C51
                 # head to its expected return before fitting the two Gaussian
                 # action-value distributions.  Sequential forwards keep peak
                 # memory lower than concatenating a doubled Actor batch.
-                policy_online_logits = self.qnet(
+                policy_online_logits = self._q_forward(
+                    self.qnet,
                     batch["critic_observations"],
-                    self._q_action_features(
-                        prediction_action.detach(),
-                        batch.get(Q_ACTUATOR_CONTEXT_KEY),
-                    ),
+                    prediction_action.detach(),
+                    batch.get(Q_ACTUATOR_CONTEXT_KEY),
                 )
                 policy_online_q = (
                     F.softmax(policy_online_logits, dim=-1) * self.qnet.support
                 ).sum(dim=-1)
                 del policy_online_logits
-                teacher_online_logits = self.qnet(
+                teacher_online_logits = self._q_forward(
+                    self.qnet,
                     batch["critic_observations"],
-                    self._q_action_features(
-                        safe_teacher_actions.detach(),
-                        batch.get(Q_ACTUATOR_CONTEXT_KEY),
-                    ),
+                    safe_teacher_actions.detach(),
+                    batch.get(Q_ACTUATOR_CONTEXT_KEY),
                 )
                 teacher_online_q = (
                     F.softmax(teacher_online_logits, dim=-1) * self.qnet.support
@@ -2198,6 +2281,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_std_min": self._policy_log_std().detach().exp().min(),
             "actor_std_max": self._policy_log_std().detach().exp().max(),
             "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
+            **{
+                key: value.detach()
+                for key, value in actor_q_gate_metrics.items()
+            },
             **{key: value.detach() for key, value in q_filter_metrics.items()},
             "actor_failure_phase_teacher_fraction": batch.get(
                 FAILURE_PHASE_TEACHER_SOURCE_KEY,
@@ -2214,18 +2301,31 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             .mean()
             .detach(),
             "alpha": self.log_alpha.exp().detach(),
+            "actor_alpha_loss": actor_alpha_metrics["alpha_loss"].detach(),
+            "actor_alpha_grad_norm": actor_alpha_metrics[
+                "alpha_grad_norm"
+            ].detach(),
+            "actor_alpha_update_due_fraction": prediction_action.new_tensor(
+                float(actor_scheduled_alpha)
+            ),
+            "actor_alpha_update_performed_fraction": prediction_action.new_tensor(
+                float(actor_alpha_performed)
+            ),
             **std_metrics,
         }
         if hasattr(self, "_fastsac_rollout_actor_metrics"):
             self._fastsac_rollout_actor_metrics.append(metrics)
         return metrics
 
+    def _actor_and_targets_update(self, actor_batch: dict[str, torch.Tensor]):
+        # SAC has no target Actor.  Q target Polyak is performed on every
+        # Critic update, independently of the Actor scheduler.
+        return self._actor_update(actor_batch)
+
     def _maybe_delayed_actor_and_targets(self, actor_batch: dict[str, torch.Tensor]):
         if self.critic_update_count % int(self.cfg.sac_policy_frequency):
             return None
-        # SAC has no target Actor.  Q target Polyak is performed on every
-        # Critic update, not on this delayed policy cadence.
-        return self._actor_update(actor_batch)
+        return self._actor_and_targets_update(actor_batch)
 
     def train_op(self, tensordict):
         """Reuse raw replay/prefill orchestration and publish SAC-native logs."""
@@ -2305,7 +2405,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             ),
             "td3_actor_loss": "sac_actor_loss",
             "weighted_td3_actor_loss": "weighted_sac_actor_loss",
-            "collector_exploration_noise_norm": ("behavior_sample_q_deviation_norm"),
+            "collector_exploration_noise_norm": (
+                "behavior_sample_action_deviation_qcoord_norm"
+            ),
         }
         info = {}
         for key, value in td3_info.items():
@@ -2359,6 +2461,14 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_raw_log_std_mean",
             "actor_std_min",
             "actor_std_max",
+            "actor_alpha_loss",
+            "actor_alpha_grad_norm",
+            "actor_alpha_update_due_fraction",
+            "actor_alpha_update_performed_fraction",
+            "actor_q_confidence_gate_enabled",
+            "actor_q_confidence_gate_active_fraction",
+            "actor_q_confidence_policy_teacher_margin",
+            "actor_q_confidence_trusted_q_mean",
             "q_filtered_bc_active_fraction",
             "q_filtered_bc_policy_better_fraction",
             "spred_p_bc_weight_mean",
@@ -2406,6 +2516,24 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # rather than the within-rollout mean of stale and updated values.
         critic["alpha"] = self.log_alpha.detach().exp().item()
         actor = self._mean_metric_dict(self._fastsac_rollout_actor_metrics, actor_keys)
+        if (
+            getattr(self.cfg, "actor_update_to_data_ratio", None) is not None
+            and str(getattr(self.cfg, "sac_alpha_update_cadence", "actor"))
+            == "actor"
+        ):
+            critic.update(
+                {
+                    "alpha_loss": actor["actor_alpha_loss"],
+                    "alpha_grad_norm": actor["actor_alpha_grad_norm"],
+                    "alpha_update_due_fraction": actor[
+                        "actor_alpha_update_due_fraction"
+                    ],
+                    "alpha_update_performed_fraction": actor[
+                        "actor_alpha_update_performed_fraction"
+                    ],
+                }
+            )
+            critic["alpha"] = self.log_alpha.detach().exp().item()
         actor.update(physical_rollout_std_metrics)
         info.update({f"fastsac/{key}": value for key, value in critic.items()})
         info.update({f"fastsac/{key}": value for key, value in actor.items()})
@@ -2471,6 +2599,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
     def _q_backend_metadata(self):
         metadata = DistributionalTD3TeacherBC._q_backend_metadata(self)
         alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
+        decoupled_actor_scheduler = (
+            getattr(self.cfg, "actor_update_to_data_ratio", None) is not None
+        )
         metadata.update(
             {
                 "target_semantics": CRITIC_SEMANTICS,
@@ -2482,6 +2613,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     if getattr(self.cfg, "use_q_filtered_bc", False)
                     else "fixed_unweighted_valid_teacher_bc"
                 ),
+                "actor_q_confidence_gate_semantics": (
+                    CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS
+                    if self._q_uses_causal_hold_advantage()
+                    else "disabled"
+                ),
                 "actor_target": False,
                 "stochastic_actor": True,
                 "action_distribution": _fastsac_action_distribution(self.cfg),
@@ -2491,14 +2627,26 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 ),
                 "target_entropy": float(self.target_entropy),
                 "temperature_update_cadence": (
-                    "delayed_actor_update"
+                    "row_scheduled_actor_update"
+                    if alpha_update_cadence == "actor"
+                    and decoupled_actor_scheduler
+                    else "delayed_actor_update"
                     if alpha_update_cadence == "actor"
                     else "every_critic_update"
                 ),
                 "temperature_update_frequency_critic_steps": (
-                    int(self.cfg.sac_policy_frequency)
+                    0
+                    if alpha_update_cadence == "actor"
+                    and decoupled_actor_scheduler
+                    else int(self.cfg.sac_policy_frequency)
                     if alpha_update_cadence == "actor"
                     else 1
+                ),
+                "temperature_update_frequency_actor_steps": (
+                    1
+                    if alpha_update_cadence == "actor"
+                    and decoupled_actor_scheduler
+                    else 0
                 ),
             }
         )
@@ -2650,6 +2798,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "critic_update_count": int(self.critic_update_count),
             "alpha_update_count": int(self.alpha_update_count),
             "q_update_row_credit": float(getattr(self, "q_update_row_credit", 0.0)),
+            "actor_update_row_credit": float(
+                getattr(self, "actor_update_row_credit", 0.0)
+            ),
             "dagger_rollout_count": int(self.dagger_rollout_count),
             "dagger_environment_steps": int(self.dagger_environment_steps),
             "teacher_prefill_rollout_count": int(self.teacher_prefill_rollout_count),
@@ -2805,6 +2956,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         q_batch_size = int(getattr(self.cfg, "q_batch_size", 512))
         if not 0.0 <= self.q_update_row_credit < q_batch_size:
             raise ValueError("FastSAC checkpoint Q UTD row credit is invalid")
+        self.actor_update_row_credit = float(
+            state.get("actor_update_row_credit", 0.0)
+        )
+        actor_batch_size = int(getattr(self.cfg, "dagger_batch_size", 4096))
+        if not 0.0 <= self.actor_update_row_credit < actor_batch_size:
+            raise ValueError("FastSAC checkpoint Actor UTD row credit is invalid")
         self._teacher_perception_warmup_complete = bool(
             state.get("teacher_perception_warmup_complete", False)
         )
@@ -3021,6 +3178,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.critic_update_count = 0
         self.alpha_update_count = 0
         self.q_update_row_credit = 0.0
+        self.actor_update_row_credit = 0.0
         self.dagger_rollout_count = 0
         self.dagger_environment_steps = 0
         self.teacher_prefill_rollout_count = 0

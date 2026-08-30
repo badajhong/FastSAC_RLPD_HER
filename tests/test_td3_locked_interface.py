@@ -168,15 +168,15 @@ EXPECTED_AST_FINGERPRINTS = {
     (
         "active_adaptation/learning/ppo/fastsac_vel.py",
         "DistributionalQNetwork",
-    ): "01bfbc4bdaa372bb2a666449aa55329f860b23d8e1fa69767aad314724d33a6a",
+    ): "02f70b6a776f4693ea0e4d6f36bcac76fe73b6cec66e8e08f6906851feb40078",
     (
         "active_adaptation/learning/ppo/fastsac_vel.py",
         "TwinDistributionalQ",
-    ): "9b80adf422ff8270e1fce09098dee672f88a5762d53397816c83876ab8f593ed",
+    ): "6faf214e8a8fe82eafc8793e109a0b4173eab9e82b5b4b9e5038006cb3114d96",
     (
         "active_adaptation/learning/ppo/fastsac_vel.py",
         "_build_isolated_q_network",
-    ): "10766437204559825001307038f9141f3a0ee076469e2a2b410cbca1d692265c",
+    ): "19b33401e1fb5232d31f334aaeed6d86b30539283a357ef45bbdd54b18d1f0b3",
     (
         "active_adaptation/learning/ppo/ppo_bc_dagger.py",
         "_linear_teacher_probability",

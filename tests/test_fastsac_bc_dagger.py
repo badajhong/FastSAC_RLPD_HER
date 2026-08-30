@@ -249,6 +249,7 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.sac_physical_std_normalized_max == pytest.approx(0.11)
     assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
+    assert cfg.actor_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
     assert cfg.perception_replay_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
     assert cfg.teacher_perception_replay_fraction == 0.0
@@ -494,6 +495,16 @@ def test_backend_accepts_positive_row_level_q_utd():
     cfg = DistributionalFastSACTeacherBCConfig(q_update_to_data_ratio=4.0)
 
     DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize("ratio", (0.0, -1.0, math.inf, math.nan, True))
+def test_backend_rejects_invalid_row_level_actor_utd(ratio):
+    cfg = DistributionalFastSACTeacherBCConfig(
+        actor_update_to_data_ratio=ratio
+    )
+
+    with pytest.raises(ValueError, match="actor_update_to_data_ratio"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
 def test_tanh_normal_is_bounded_reparameterized_and_has_exact_log_prob():
@@ -1147,6 +1158,42 @@ def test_physical_gradient_probe_reports_sac_q_and_entropy_but_no_bc_std():
     assert std_group["unweighted_norms"]["sac"] > 0.0
 
 
+def test_causal_gradient_probe_mirrors_empty_teacher_confidence_gate():
+    policy = _tiny_physical_policy(q_slope=1.0)
+    policy.cfg.q_use_causal_hold_advantage = True
+    policy.qnet = _ActionSensitiveTwinC51(first_slope=1.0, second_slope=2.0)
+
+    def direct_q_forward(owner, qnet, observations, action, context):
+        del owner
+        assert context is None
+        return qnet(observations, action)
+
+    policy._q_forward = MethodType(direct_q_forward, policy)
+    batch = _tiny_physical_batch()
+    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.full((3, 1), 10.0)
+    batch[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(3, dtype=torch.bool)
+
+    result = diagnose_fastsac_actor_gradients(
+        policy,
+        batch,
+        sample_seed=313,
+        source_gradients=False,
+    )
+
+    assert result["actor_q_confidence_gate"]["enabled"] is True
+    assert result["actor_q_confidence_gate"]["active_rows"] == 0
+    assert result["actor_q_confidence_gate"]["active_fraction"] == 0.0
+    assert result["strata"]["all"][
+        "actor_q_confidence_policy_teacher_margin"
+    ] < 0.0
+    assert result["gradients"]["all"]["losses"]["negative_q"] == 0.0
+    for group in result["gradients"]["all"]["groups"].values():
+        assert group["unweighted_norms"]["q"] == 0.0
+    assert result["gradients"]["all"]["groups"]["global_log_std"][
+        "unweighted_norms"
+    ]["entropy"] > 0.0
+
+
 def test_physical_actor_update_applies_ordinary_sac_gradient_to_direct_std():
     policy = _tiny_physical_policy(q_slope=1.0)
     with torch.no_grad():
@@ -1328,6 +1375,102 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
     assert metrics["actor_teacher_replay_fraction"].item() == pytest.approx(2 / 3)
     assert all(parameter.grad is None for parameter in policy.qnet.parameters())
     assert all(parameter.requires_grad for parameter in policy.qnet.parameters())
+
+
+def test_causal_teacher_confidence_gate_blocks_untrusted_actor_q_gradient():
+    policy = _tiny_physical_policy(q_slope=1.0)
+    policy.cfg.q_use_causal_hold_advantage = True
+    policy.cfg.lambda_bc = 0.0
+    policy.cfg.eta_sac = 1.0
+    policy.qnet = _ActionSensitiveTwinC51(
+        first_slope=1.0, second_slope=2.0
+    )
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
+
+    def direct_q_forward(owner, qnet, observations, action, context):
+        del owner
+        assert context is None
+        return qnet(observations, action)
+
+    policy._q_forward = MethodType(direct_q_forward, policy)
+    batch = _tiny_physical_batch()
+    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.full((3, 1), 10.0)
+    batch[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(3, dtype=torch.bool)
+    mean_before = policy.actor_adapt.mean_weight.detach().clone()
+
+    metrics = policy._actor_update(batch)
+
+    assert torch.equal(policy.actor_adapt.mean_weight, mean_before)
+    assert metrics["actor_q_confidence_gate_enabled"].item() == 1.0
+    assert metrics["actor_q_confidence_gate_active_fraction"].item() == 0.0
+    assert metrics["actor_q_confidence_policy_teacher_margin"].item() < 0.0
+    assert metrics["exact_bc_loss"].item() > 0.0
+    assert all(parameter.grad is None for parameter in policy.qnet.parameters())
+    assert all(parameter.requires_grad for parameter in policy.qnet.parameters())
+
+
+def test_causal_teacher_confidence_gate_accepts_agreed_rows_and_ignores_nan_label():
+    policy = _tiny_physical_policy(q_slope=1.0)
+    policy.cfg.q_use_causal_hold_advantage = True
+    policy.cfg.lambda_bc = 0.0
+    policy.cfg.eta_sac = 1.0
+    policy.qnet = _ActionSensitiveTwinC51(
+        first_slope=1.0, second_slope=2.0
+    )
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
+
+    def direct_q_forward(owner, qnet, observations, action, context):
+        del owner
+        assert context is None
+        return qnet(observations, action)
+
+    policy._q_forward = MethodType(direct_q_forward, policy)
+    batch = _tiny_physical_batch()
+    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.tensor(
+        [[-10.0], [-10.0], [float("nan")]]
+    )
+    batch[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.tensor(
+        [True, True, False]
+    )
+    mean_before = policy.actor_adapt.mean_weight.detach().clone()
+
+    metrics = policy._actor_update(batch)
+
+    assert not torch.equal(policy.actor_adapt.mean_weight, mean_before)
+    assert metrics["actor_q_confidence_gate_active_fraction"].item() == (
+        pytest.approx(2.0 / 3.0)
+    )
+    assert metrics["actor_q_confidence_policy_teacher_margin"].item() > 0.0
+    assert torch.isfinite(metrics["actor_q_confidence_trusted_q_mean"])
+    assert all(parameter.grad is None for parameter in policy.qnet.parameters())
+    assert all(parameter.requires_grad for parameter in policy.qnet.parameters())
+
+
+def test_causal_teacher_confidence_gate_rejects_when_one_twin_disagrees():
+    policy = _tiny_physical_policy(q_slope=1.0)
+    policy.cfg.q_use_causal_hold_advantage = True
+    policy.cfg.lambda_bc = 0.0
+    policy.cfg.eta_sac = 1.0
+    # Q1 increases with action while Q2 decreases.  A low Teacher action is
+    # beaten by the policy in Q1 only, so the within-head twin agreement gate
+    # must remain closed.
+    policy.qnet = _ActionSensitiveTwinC51(first_slope=1.0, second_slope=-2.0)
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
+
+    def direct_q_forward(owner, qnet, observations, action, context):
+        del owner
+        assert context is None
+        return qnet(observations, action)
+
+    policy._q_forward = MethodType(direct_q_forward, policy)
+    batch = _tiny_physical_batch()
+    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.full((3, 1), -10.0)
+    batch[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(3, dtype=torch.bool)
+
+    metrics = policy._actor_update(batch)
+
+    assert metrics["actor_q_confidence_gate_active_fraction"].item() == 0.0
+    assert metrics["actor_q_confidence_policy_teacher_margin"].item() < 0.0
 
 
 def test_bc_only_actor_step_does_not_update_global_log_std():
@@ -2214,6 +2357,42 @@ def test_critic_temperature_population_excludes_true_terminals_but_keeps_timeout
     assert terminal_due["alpha_update_performed_fraction"].item() == 0.0
 
 
+def test_row_scheduled_temperature_updates_only_with_actual_actor_steps():
+    policy = _tiny_physical_policy()
+    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.cfg.sac_use_autotune = True
+    policy.cfg.sac_alpha_update_cadence = "actor"
+    policy.cfg.actor_update_to_data_ratio = 1.0
+    policy.cfg.sac_policy_frequency = 1
+    policy.cfg.sac_tau = 0.0
+    policy.alpha_optimizer = _CountingSGD([policy.log_alpha], lr=0.1)
+    policy.target_entropy = -1.0
+    policy.critic_update_count = 0
+    policy.alpha_update_count = 0
+    policy.sac_alpha_update_count = 0
+    target = torch.full((3, 3), 1.0 / 3.0)
+    policy._distributional_fastsac_target = MethodType(
+        lambda owner, batch: (target, {}, torch.full((3,), 2.0)), policy
+    )
+    critic_batch = {
+        "critic_observations": torch.zeros(3, 1),
+        "actions": torch.zeros(3, 1),
+        "dones": torch.zeros(3, dtype=torch.bool),
+        "truncations": torch.zeros(3, dtype=torch.bool),
+    }
+
+    critic_metrics = policy._critic_update(critic_batch)
+
+    assert policy.alpha_optimizer.step_calls == 0
+    assert policy.alpha_update_count == 0
+    assert critic_metrics["alpha_update_due_fraction"].item() == 0.0
+    actor_metrics = policy._actor_update(_tiny_physical_batch())
+    assert policy.alpha_optimizer.step_calls == 1
+    assert policy.alpha_update_count == 1
+    assert actor_metrics["actor_alpha_update_due_fraction"].item() == 1.0
+    assert actor_metrics["actor_alpha_update_performed_fraction"].item() == 1.0
+
+
 def test_fixed_temperature_skips_optimizer_but_remains_in_soft_target():
     policy = _bare_policy(sac_use_autotune=False)
     policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.25)))
@@ -2366,6 +2545,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     source.critic_update_count = 11
     source.alpha_update_count = 13
     source.q_update_row_credit = 123.0
+    source.actor_update_row_credit = 321.0
     source.dagger_rollout_count = 17
     source.dagger_environment_steps = 19
     source.teacher_prefill_rollout_count = 3
@@ -2422,6 +2602,7 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     assert restored.critic_update_count == 11
     assert restored.alpha_update_count == 13
     assert restored.q_update_row_credit == pytest.approx(123.0)
+    assert restored.actor_update_row_credit == pytest.approx(321.0)
     assert restored.dagger_rollout_count == 17
     assert restored.dagger_environment_steps == 19
     assert restored.teacher_prefill_rollout_count == 3

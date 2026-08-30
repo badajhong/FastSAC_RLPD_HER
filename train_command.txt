@@ -36,7 +36,11 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.policy_delay=8 \
   > ./logs/fastSAC_bc_dagger_eta1e-2_H2p5_actor_cadence.log 2>&1 < /dev/null &
 
-# TVKD
+# TVKD delay-aware causal run (fresh-only): replay carries the full pre-shift
+# command queue, applied command, delay, and alpha in Q's Markov state. Only the
+# newly issued command enters the hold-referenced causal advantage branch; its
+# direction is identified by the same-state DAgger Teacher label. The zero-focus
+# aliases resolve to Q/Actor US/FS/UT/FT = 0.5/0/0.5/0 before construction.
 nohup env PYTHONUNBUFFERED=1 \
   python scripts/TVKD_fasSAC_bc_dagger.py \
   task=G1/vaic/skateboard_general_tracking_stu \
@@ -79,7 +83,6 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.q_weight_decay=1e-4 \
   algo.q_n_step=3 \
   algo.q_teacher_n_step=1 \
-  algo.q_updates_per_rollout=64 \
   algo.use_phase_faded_teacher_potential=false \
   algo.tvkd_lambda=0.5 \
   algo.tvkd_potential_clip=null \
@@ -94,17 +97,20 @@ nohup env PYTHONUNBUFFERED=1 \
   algo.bottleneck_include_unsuccessful_timeouts=false \
   task.num_envs=512 \
   save_interval=200 \
-  algo.q_batch_size=8192 \
-  algo.dagger_batch_size=8192 \
+  algo.q_batch_size=1024 \
+  algo.dagger_batch_size=1024 \
+  algo.actor_update_to_data_ratio=1.0 \
+  algo.q_update_to_data_ratio=1.0 \
   algo.q_condition_on_actuator_state=true \
   algo.q_use_predicted_effect=false \
+  algo.q_use_delay_aware_mdp=true \
+  algo.q_use_causal_hold_advantage=false \
   algo.q_use_residual_film=false \
   algo.q_residual_film_scale=0.1 \
   algo.q_action_fusion=balanced \
   algo.q_teacher_buffer_capacity=131072 \
   algo.dagger_buffer_capacity=131072 \
   algo.sac_alpha_update_cadence=actor \
-  algo.q_update_to_data_ratio=4.0 \
   algo.sac_policy_frequency=1 \
   algo.policy_delay=1 \
   > ./logs/skateboard_general_tracking_stu_TVKD_fasSAC_bc_dagger.log 2>&1 < /dev/null &

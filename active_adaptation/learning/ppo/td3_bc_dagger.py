@@ -31,6 +31,7 @@ from tensordict import TensorDict
 
 from .common import (
     ACTION_KEY,
+    Actor,
     CMD_KEY,
     DONE_KEY,
     OBS_KEY,
@@ -44,7 +45,12 @@ from .common import (
 from .fastsac_vel import (
     FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS,
     FASTSAC_Q_BALANCED_FUSION_SEMANTICS,
+    FASTSAC_Q_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS,
+    FASTSAC_Q_CAUSAL_HOLD_CONTEXT_SEMANTICS,
     FASTSAC_Q_DEFAULT_ACTION_FUSION,
+    FASTSAC_Q_DELAY_AWARE_ARCHITECTURE_SEMANTICS,
+    FASTSAC_Q_DELAY_AWARE_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS,
+    FASTSAC_Q_DELAY_AWARE_CONTEXT_SEMANTICS,
     FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
     FASTSAC_Q_LATE_FUSION_SEMANTICS,
     FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS,
@@ -197,6 +203,23 @@ Q_PREDICTED_EFFECT_ACTION_FEATURE_SEMANTICS = (
     "normalized_issued_command_plus_normalized_command_delta_plus_three_"
     "control_interval_mean_counterfactual_actuator_effects_plus_detached_"
     "delay_one_hot_centered_alpha_action_branch_v1"
+)
+Q_DELAY_AWARE_ACTION_FEATURE_SEMANTICS = (
+    "normalized_issued_command_jointly_encoded_with_detached_delay_one_hot_"
+    "centered_alpha_normalized_applied_command_and_full_pre_shift_command_"
+    "queue_standard_all_source_c51_v1"
+)
+Q_CAUSAL_HOLD_ACTION_FEATURE_SEMANTICS = (
+    "normalized_candidate_command_with_delay_alpha_in_state_and_pre_shift_"
+    "hold_reference_monotone_scalar_advantage_v1"
+)
+Q_DELAY_AWARE_CAUSAL_HOLD_ACTION_FEATURE_SEMANTICS = (
+    "normalized_candidate_minus_pre_shift_queue_slot_zero_innovation_action_"
+    "branch_with_full_normalized_actuator_markov_state_and_zero_hold_v1"
+)
+Q_CAUSAL_EXPERT_RANKING_SEMANTICS = (
+    "valid_student_same_state_teacher_over_factual_bounded_normalized_"
+    "action_distance_hinge_v1"
 )
 TEACHER_EPISODE_UID_KEY = "teacher_episode_uid"
 TEACHER_EPISODE_STEP_KEY = "teacher_episode_step"
@@ -833,6 +856,7 @@ def _td3_actor_q1_loss(
     qnet: nn.Module,
     critic_observations: torch.Tensor,
     q_action: torch.Tensor,
+    reference_q_action: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute ``-E[Q1]`` while retaining dQ/da but no Q-parameter graph."""
     q1 = qnet.qnets[0] if hasattr(qnet, "qnets") else None
@@ -844,11 +868,20 @@ def _td3_actor_q1_loss(
         for parameter in frozen_module.parameters():
             parameter.requires_grad_(False)
             parameter.grad = None
-        logits = (
-            q1(critic_observations, q_action)
-            if q1 is not None
-            else qnet(critic_observations, q_action)[0]
-        )
+        if reference_q_action is None:
+            logits = (
+                q1(critic_observations, q_action)
+                if q1 is not None
+                else qnet(critic_observations, q_action)[0]
+            )
+        else:
+            logits = (
+                q1(critic_observations, q_action, reference_q_action)
+                if q1 is not None
+                else qnet(
+                    critic_observations, q_action, reference_q_action
+                )[0]
+            )
         expected_q1 = _categorical_expected_value(logits, qnet.support)
         return -expected_q1.mean(), expected_q1
     finally:
@@ -1154,6 +1187,7 @@ def _prefetch_td3_replay_sample_plans(
     critic_update_count: int,
     q_teacher_replay_ratio: float = 0.5,
     teacher_actor_replay_fraction: float = 0.0,
+    include_actor: bool = True,
     output_device,
     generator: torch.Generator,
 ) -> tuple[_TD3ReplaySamplePlan, ...]:
@@ -1175,6 +1209,8 @@ def _prefetch_td3_replay_sample_plans(
         raise ValueError("q_batch_size must be a positive integer")
     if actor_batch_size < 1 or update_count < 0 or policy_delay < 1:
         raise ValueError("TD3 sample-plan sizes and policy_delay are invalid")
+    if not isinstance(include_actor, bool):
+        raise ValueError("include_actor must be boolean")
     for name, value in (
         ("q_teacher_replay_ratio", q_teacher_replay_ratio),
         ("teacher_actor_replay_fraction", teacher_actor_replay_fraction),
@@ -1204,7 +1240,7 @@ def _prefetch_td3_replay_sample_plans(
     actor_main_count, actor_teacher_count, _ = _source_counts(
         actor_batch_size, teacher_actor_replay_fraction, 0.0
     )
-    actor_update_scheduled = any(
+    actor_update_scheduled = include_actor and any(
         (int(critic_update_count) + update_index + 1) % policy_delay == 0
         for update_index in range(update_count)
     )
@@ -1256,7 +1292,9 @@ def _prefetch_td3_replay_sample_plans(
         )
         actor_draw = None
         actor_teacher_draw = None
-        if (int(critic_update_count) + update_index + 1) % policy_delay == 0:
+        if include_actor and (
+            int(critic_update_count) + update_index + 1
+        ) % policy_delay == 0:
             if actor_teacher_count:
                 actor_teacher_draw = len(index_draws)
                 index_draws.append(
@@ -1332,6 +1370,32 @@ def _prefetch_td3_replay_sample_plans(
     return tuple(plans)
 
 
+def _interleaved_actor_update_counts(
+    critic_updates: int, actor_updates: int
+) -> tuple[int, ...]:
+    """Evenly place independent Actor steps after Critic steps.
+
+    The cumulative floor schedule reproduces ordinary Q-then-Actor ordering
+    when the counts match and delayed-policy ordering when Critic work is more
+    frequent.  Actor-only bursts (zero Critic steps) are handled by the caller.
+    """
+    for name, value in (
+        ("critic_updates", critic_updates),
+        ("actor_updates", actor_updates),
+    ):
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    critic_updates = int(critic_updates)
+    actor_updates = int(actor_updates)
+    if critic_updates == 0:
+        return ()
+    return tuple(
+        ((index + 1) * actor_updates) // critic_updates
+        - (index * actor_updates) // critic_updates
+        for index in range(critic_updates)
+    )
+
+
 @dataclass
 class DistributionalTD3TeacherBCConfig(PPOConfig):
     _target_: str = (
@@ -1360,6 +1424,12 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     dagger_buffer_capacity: int = 131_072
     dagger_buffer_device: str = "cpu"
     dagger_batch_size: int = 4096
+    # Optional row-level Actor scheduler.  When configured, newly accepted
+    # Student rows earn Actor sample-row credit independently of the Critic.
+    # This prevents q_batch_size, Q UTD, and policy_delay from silently changing
+    # the Actor optimization timescale.  None preserves the historical TD3
+    # Critic-coupled cadence.
+    actor_update_to_data_ratio: float | None = None
     # Optional GA-DDPG-style expert-row share in every Actor update.  Teacher
     # rows come from q_teacher_replay and use their executed action as the exact
     # BC label; zero preserves the original main-DAgger-only Actor sampling.
@@ -1440,6 +1510,18 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     # This reuses the Q-only delay/alpha context and previous issued command;
     # it never changes Actor observations, rewards, or environment dynamics.
     q_use_predicted_effect: bool = False
+    # Exact delayed-MDP command-value critic. Replay carries the complete
+    # pre-shift command queue, smoothed applied command, delay, and alpha; the
+    # Q action remains the newly issued command. This does not alter the Actor
+    # observation, reward, or simulator dynamics.
+    q_use_delay_aware_mdp: bool = False
+    # Identify delayed action advantages structurally. Q's scalar action score
+    # is anchored to the pre-shift held command and receives a same-state
+    # DAgger expert ordering target. With q_use_delay_aware_mdp, the complete
+    # applied-command/queue Markov state moves to Q's state branch instead of
+    # being mixed with the candidate command. This is Q-only: official
+    # observations, rewards, and environment actions stay exactly unchanged.
+    q_use_causal_hold_advantage: bool = False
     # Delay/actuator-alpha conditioned residual FiLM on the Q action stem.
     # The zero-initialized bounded modulation is exactly identity at startup.
     q_use_residual_film: bool = False
@@ -1680,6 +1762,24 @@ class _DeterministicTD3StudentEvalPolicy(nn.Module):
 class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     """Deterministic C51 TD3 with a single combined Teacher-BC Actor step."""
 
+    def _preserve_frozen_teacher_std_on_source_load(self) -> None:
+        """Keep the privileged Teacher's checkpointed PPO exploration scale.
+
+        ``load_noise_scale`` is a finetune reset for the Student actor only.
+        Leaving it on the frozen Teacher silently overwrites the source's
+        joint-wise ``actor_std`` and makes successful prefill replay use a
+        different behavior policy than the checkpoint that is being cloned.
+        """
+        teacher_cores = tuple(
+            module for module in self.actor.modules() if isinstance(module, Actor)
+        )
+        if len(teacher_cores) != 1:
+            raise RuntimeError(
+                "TD3 Teacher-BC requires exactly one privileged Teacher Actor "
+                f"core; found {len(teacher_cores)}"
+            )
+        teacher_cores[0].load_noise_scale = None
+
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         self._validate_td3_config(cfg)
         # Bypass PPOBCDaggerFinetune.__init__: it constructs a stochastic
@@ -1688,6 +1788,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         PPOVEL.__init__(
             self, cfg, observation_spec, action_spec, reward_spec, device, env
         )
+        self._preserve_frozen_teacher_std_on_source_load()
         nominal_low, nominal_high, offset_low, offset_high = (
             _vaic_nominal_action_coordinates(env, device)
         )
@@ -1748,7 +1849,22 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if self._q_conditions_on_actuator_state()
             else 0
         )
-        if self._q_uses_predicted_effect():
+        causal_actuator_state_dim = (
+            self._q_actuator_context_dim
+            if (
+                self._q_uses_causal_hold_advantage()
+                and self._q_uses_delay_aware_mdp()
+            )
+            else self._q_actuator_parameter_context_dim
+        )
+        self._q_network_observation_dim = self._q_critic_dim + (
+            causal_actuator_state_dim
+            if self._q_uses_causal_hold_advantage()
+            else 0
+        )
+        if self._q_uses_causal_hold_advantage():
+            self._q_action_input_dim = self.action_dim
+        elif self._q_uses_predicted_effect():
             self._q_action_input_dim = (
                 (2 + Q_PREDICTED_EFFECT_INTERVALS) * self.action_dim
                 + self._q_actuator_parameter_context_dim
@@ -1756,7 +1872,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         else:
             self._q_action_input_dim = self.action_dim + self._q_actuator_context_dim
         self.qnet = _build_isolated_q_network(
-            self._q_critic_dim,
+            self._q_network_observation_dim,
             self._q_action_input_dim,
             cfg.q_hidden_dim,
             cfg.q_num_atoms,
@@ -1766,12 +1882,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             device,
             cfg.q_seed,
             cfg.q_action_fusion,
+            reference_dueling=self._q_uses_causal_hold_advantage(),
             residual_film_condition_dim=(
                 self._q_actuator_parameter_context_dim
                 if self._q_uses_residual_film()
                 else 0
             ),
             residual_film_scale=float(cfg.q_residual_film_scale),
+            scalar_reference_advantage=self._q_uses_causal_hold_advantage(),
         )
         self.qnet_target = copy.deepcopy(self.qnet).requires_grad_(False)
         self.actor_target = None
@@ -1910,6 +2028,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self.critic_update_count = 0
         self.actor_update_count = 0
         self.q_update_row_credit = 0.0
+        self.actor_update_row_credit = 0.0
         self._perception_optimizer = self.opt_adapt
         self._perception_initialization = {
             "semantics": PERCEPTION_WARMSTART_SEMANTICS,
@@ -2029,14 +2148,48 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError("q_condition_on_actuator_state must be a boolean")
         if not isinstance(getattr(cfg, "q_use_predicted_effect", False), bool):
             raise ValueError("q_use_predicted_effect must be a boolean")
+        if not isinstance(getattr(cfg, "q_use_delay_aware_mdp", False), bool):
+            raise ValueError("q_use_delay_aware_mdp must be a boolean")
+        if bool(getattr(cfg, "q_use_delay_aware_mdp", False)):
+            if not bool(getattr(cfg, "q_condition_on_actuator_state", False)):
+                raise ValueError(
+                    "q_use_delay_aware_mdp requires "
+                    "q_condition_on_actuator_state=true"
+                )
+            if bool(getattr(cfg, "q_use_predicted_effect", False)):
+                raise ValueError(
+                    "q_use_delay_aware_mdp replaces q_use_predicted_effect"
+                )
+            if bool(getattr(cfg, "q_use_residual_film", False)):
+                raise ValueError(
+                    "q_use_delay_aware_mdp replaces q_use_residual_film"
+                )
         if bool(getattr(cfg, "q_use_predicted_effect", False)) and not bool(
             getattr(cfg, "q_condition_on_actuator_state", False)
         ):
             raise ValueError(
                 "q_use_predicted_effect requires q_condition_on_actuator_state=true"
             )
+        if not isinstance(
+            getattr(cfg, "q_use_causal_hold_advantage", False), bool
+        ):
+            raise ValueError("q_use_causal_hold_advantage must be a boolean")
         if not isinstance(getattr(cfg, "q_use_residual_film", False), bool):
             raise ValueError("q_use_residual_film must be a boolean")
+        if bool(getattr(cfg, "q_use_causal_hold_advantage", False)):
+            if not bool(getattr(cfg, "q_condition_on_actuator_state", False)):
+                raise ValueError(
+                    "q_use_causal_hold_advantage requires "
+                    "q_condition_on_actuator_state=true"
+                )
+            if bool(getattr(cfg, "q_use_predicted_effect", False)):
+                raise ValueError(
+                    "q_use_causal_hold_advantage replaces q_use_predicted_effect"
+                )
+            if bool(getattr(cfg, "q_use_residual_film", False)):
+                raise ValueError(
+                    "q_use_causal_hold_advantage replaces q_use_residual_film"
+                )
         if bool(getattr(cfg, "q_use_residual_film", False)):
             if not bool(getattr(cfg, "q_condition_on_actuator_state", False)):
                 raise ValueError(
@@ -2159,6 +2312,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError(
                 "q_update_to_data_ratio must be null or finite and positive"
             )
+        actor_update_to_data_ratio = getattr(
+            cfg, "actor_update_to_data_ratio", None
+        )
+        if actor_update_to_data_ratio is not None and (
+            isinstance(actor_update_to_data_ratio, bool)
+            or not math.isfinite(float(actor_update_to_data_ratio))
+            or float(actor_update_to_data_ratio) <= 0.0
+        ):
+            raise ValueError(
+                "actor_update_to_data_ratio must be null or finite and positive"
+            )
         prefill_max_rollouts = cfg.teacher_prefill_max_rollouts
         if isinstance(prefill_max_rollouts, bool) or int(prefill_max_rollouts) < 1:
             raise ValueError("teacher_prefill_max_rollouts must be a positive integer")
@@ -2214,6 +2378,20 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 or not 0.0 <= float(fraction) <= 1.0
             ):
                 raise ValueError(f"{name} must be in [0,1]")
+        if bool(getattr(cfg, "q_use_causal_hold_advantage", False)):
+            q_student_fraction = (
+                sum(
+                    float(getattr(cfg, f"q_{source}_fraction"))
+                    for source in ("uniform_student", "failure_student")
+                )
+                if present_canonical
+                else 1.0 - float(cfg.q_teacher_replay_ratio)
+            )
+            if q_student_fraction <= 0.0:
+                raise ValueError(
+                    "q_use_causal_hold_advantage requires a positive Student "
+                    "Q replay fraction to identify its action advantage"
+                )
         if (
             int(cfg.failure_phase_samples_per_failure)
             > int(cfg.failure_phase_lookback_steps) + 1
@@ -2507,6 +2685,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _q_uses_predicted_effect(self) -> bool:
         return bool(getattr(self.cfg, "q_use_predicted_effect", False))
 
+    def _q_uses_delay_aware_mdp(self) -> bool:
+        return bool(getattr(self.cfg, "q_use_delay_aware_mdp", False))
+
+    def _q_uses_causal_hold_advantage(self) -> bool:
+        return bool(
+            getattr(self.cfg, "q_use_causal_hold_advantage", False)
+        )
+
+    def _q_requires_previous_action_context(self) -> bool:
+        return (
+            self._q_uses_predicted_effect()
+            or (
+                self._q_uses_causal_hold_advantage()
+                and not self._q_uses_delay_aware_mdp()
+            )
+        )
+
     def _q_uses_residual_film(self) -> bool:
         return bool(getattr(self.cfg, "q_use_residual_film", False))
 
@@ -2557,6 +2752,74 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "delay_range": [delay_min, delay_max],
             "alpha_range": [alpha_low, alpha_high],
         }
+        if (
+            self._q_uses_causal_hold_advantage()
+            and not self._q_uses_delay_aware_mdp()
+        ):
+            action_buf = getattr(manager, "action_buf", None)
+            if (
+                not isinstance(action_buf, torch.Tensor)
+                or action_buf.ndim != 3
+                or int(action_buf.shape[1]) != int(self.action_dim)
+                or int(action_buf.shape[2]) < 1
+            ):
+                raise ValueError(
+                    "q_use_causal_hold_advantage requires the delayed action "
+                    "manager's pre-shift command buffer"
+                )
+            metadata.update(
+                {
+                    "semantics": FASTSAC_Q_CAUSAL_HOLD_CONTEXT_SEMANTICS,
+                    "dimension": delay_max - delay_min + 2 + int(self.action_dim),
+                    "previous_action_dim": int(self.action_dim),
+                }
+            )
+        if self._q_uses_delay_aware_mdp():
+            decimation = getattr(self.env, "decimation", None)
+            if (
+                isinstance(decimation, bool)
+                or not isinstance(decimation, Integral)
+                or int(decimation) < 1
+            ):
+                raise ValueError(
+                    "q_use_delay_aware_mdp requires a positive integer env decimation"
+                )
+            action_buf = getattr(manager, "action_buf", None)
+            if (
+                not isinstance(action_buf, torch.Tensor)
+                or action_buf.ndim != 3
+                or int(action_buf.shape[1]) != int(self.action_dim)
+                or int(action_buf.shape[2]) < 1
+            ):
+                raise ValueError(
+                    "q_use_delay_aware_mdp requires the delayed action manager's "
+                    "full pre-shift command buffer"
+                )
+            applied_action = getattr(manager, "applied_action", None)
+            if (
+                not isinstance(applied_action, torch.Tensor)
+                or applied_action.ndim != 2
+                or tuple(applied_action.shape) != tuple(action_buf.shape[:2])
+            ):
+                raise ValueError(
+                    "q_use_delay_aware_mdp requires the delayed action manager's "
+                    "smoothed applied_action"
+                )
+            queue_depth = int(action_buf.shape[2])
+            metadata.update(
+                {
+                    "semantics": FASTSAC_Q_DELAY_AWARE_CONTEXT_SEMANTICS,
+                    "dimension": (
+                        delay_max
+                        - delay_min
+                        + 2
+                        + int(self.action_dim) * (queue_depth + 1)
+                    ),
+                    "action_dim": int(self.action_dim),
+                    "queue_depth": queue_depth,
+                    "control_decimation": int(decimation),
+                }
+            )
         if self._q_uses_predicted_effect():
             decimation = getattr(self.env, "decimation", None)
             if (
@@ -2603,6 +2866,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         alpha: torch.Tensor,
         previous_action: torch.Tensor | None = None,
         *,
+        applied_action: torch.Tensor | None = None,
+        action_queue: torch.Tensor | None = None,
         validate_values: bool = True,
     ) -> torch.Tensor:
         metadata = self._q_actuator_context_metadata_value
@@ -2650,12 +2915,69 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 2.0 * (alpha.float() - alpha_low) / (alpha_high - alpha_low) - 1.0
             )
         context = torch.cat((delay_one_hot, alpha_centered), dim=-1)
-        if self._q_uses_predicted_effect():
+        if not self._q_uses_delay_aware_mdp() and (
+            applied_action is not None or action_queue is not None
+        ):
+            raise ValueError(
+                "Applied command and command queue are valid only for delay-aware Q"
+            )
+        if self._q_uses_delay_aware_mdp():
+            action_dim = int(metadata["action_dim"])
+            queue_depth = int(metadata["queue_depth"])
+            expected_applied_shape = (*delay.shape[:-1], action_dim)
+            expected_queue_shape = (
+                *delay.shape[:-1],
+                action_dim,
+                queue_depth,
+            )
+            if previous_action is not None:
+                raise ValueError(
+                    "Previous issued command is not a separate delay-aware Q field"
+                )
+            if applied_action is None or action_queue is None:
+                raise ValueError(
+                    "Delay-aware Q context requires applied_action and full "
+                    "pre-shift action_queue"
+                )
+            if tuple(applied_action.shape) != expected_applied_shape:
+                raise ValueError(
+                    "Applied command shape does not match delay-aware context: "
+                    f"got {tuple(applied_action.shape)}, expected "
+                    f"{expected_applied_shape}"
+                )
+            if tuple(action_queue.shape) != expected_queue_shape:
+                raise ValueError(
+                    "Command queue shape does not match delay-aware context: "
+                    f"got {tuple(action_queue.shape)}, expected "
+                    f"{expected_queue_shape}"
+                )
+            for name, value in (
+                ("applied_action", applied_action),
+                ("action_queue", action_queue),
+            ):
+                if value.device != delay.device:
+                    raise ValueError(
+                        f"{name} and actuator parameters must share a device"
+                    )
+                if not value.is_floating_point():
+                    raise ValueError(f"{name} must be floating point")
+                if validate_values and not torch.isfinite(value).all():
+                    raise ValueError(f"{name} contains non-finite values")
+            # Slot-major storage mirrors q_t=[c_(t-1),c_(t-2),...] and keeps
+            # every joint of one pending command contiguous in replay.
+            queue_slot_major = action_queue.transpose(-2, -1).flatten(-2)
+            context = torch.cat(
+                (
+                    context,
+                    applied_action.float(),
+                    queue_slot_major.float(),
+                ),
+                dim=-1,
+            )
+        elif self._q_requires_previous_action_context():
             expected_previous_shape = (*delay.shape[:-1], self.action_dim)
             if previous_action is None:
-                raise ValueError(
-                    "Q predicted effect requires the previous issued command"
-                )
+                raise ValueError("Q causal context requires the previous command")
             if tuple(previous_action.shape) != expected_previous_shape:
                 raise ValueError(
                     "Previous issued command shape does not match actuator context: "
@@ -2673,7 +2995,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             context = torch.cat((context, previous_action.float()), dim=-1)
         elif previous_action is not None:
             raise ValueError(
-                "Previous issued command is only valid when predicted effect is enabled"
+                "Previous issued command is not valid for this Q context"
             )
         if context.shape[-1] != self._q_actuator_context_dim:
             raise RuntimeError("Encoded Q actuator-context dimension is inconsistent")
@@ -2690,7 +3012,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             manager.alpha,
             (
                 manager.action_buf[:, :, 0]
-                if self._q_uses_predicted_effect()
+                if self._q_requires_previous_action_context()
+                else None
+            ),
+            applied_action=(
+                manager.applied_action
+                if self._q_uses_delay_aware_mdp()
+                else None
+            ),
+            action_queue=(
+                manager.action_buf
+                if self._q_uses_delay_aware_mdp()
                 else None
             ),
             validate_values=False,
@@ -2772,9 +3104,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             return int(cached)
         metadata = getattr(self, "_q_actuator_context_metadata_value", None)
         if metadata is None:
-            if self._q_uses_predicted_effect():
+            if self._q_requires_previous_action_context():
                 raise RuntimeError(
-                    "Q predicted effect requires actuator-context metadata"
+                    "Q previous-action context requires actuator metadata"
                 )
             return int(self._q_actuator_context_dim)
         if not metadata["enabled"]:
@@ -2810,14 +3142,93 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         )
         previous_action = (
             actuator_context[..., parameter_dim:].detach().to(dtype=action.dtype)
-            if self._q_uses_predicted_effect()
+            if self._q_requires_previous_action_context()
             else None
         )
-        if self._q_uses_predicted_effect() and previous_action.shape[-1] != self.action_dim:
+        if (
+            self._q_requires_previous_action_context()
+            and previous_action.shape[-1] != self.action_dim
+        ):
             raise RuntimeError(
-                "Q predicted-effect context has an invalid previous-action width"
+                "Q causal context has an invalid previous-action width"
             )
         return parameters, previous_action
+
+    def _split_delay_aware_q_actuator_context(
+        self,
+        action: torch.Tensor,
+        actuator_context: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return dynamics parameters, applied command, and full queue.
+
+        Commands remain in physical coordinates in replay. The queue result is
+        ``[..., action_dim, queue_depth]``, matching ``JointPosition.action_buf``.
+        """
+        if not self._q_uses_delay_aware_mdp():
+            raise RuntimeError("delay-aware actuator split requested while disabled")
+        if actuator_context is None:
+            raise ValueError(
+                "q_use_delay_aware_mdp requires context for every Q call"
+            )
+        expected = (*action.shape[:-1], self._q_actuator_context_dim)
+        if tuple(actuator_context.shape) != expected:
+            raise ValueError(
+                "Delay-aware Q actuator-context shape does not match action: got "
+                f"{tuple(actuator_context.shape)}, expected {expected}"
+            )
+        if actuator_context.device != action.device:
+            raise ValueError("Q action and actuator context must share a device")
+        torch._assert_async(
+            torch.isfinite(actuator_context).all(),
+            "Delay-aware Q actuator context contains NaN/Inf",
+        )
+        metadata = self._q_actuator_context_metadata_value
+        parameter_dim = self._q_actuator_parameter_dim()
+        action_dim = int(metadata["action_dim"])
+        queue_depth = int(metadata["queue_depth"])
+        if action_dim != int(self.action_dim):
+            raise RuntimeError("Delay-aware Q metadata action width is inconsistent")
+        context = actuator_context.detach().to(dtype=action.dtype)
+        parameters = context[..., :parameter_dim]
+        applied_end = parameter_dim + action_dim
+        applied_action = context[..., parameter_dim:applied_end]
+        queue_slot_major = context[..., applied_end:]
+        expected_queue_width = action_dim * queue_depth
+        if int(queue_slot_major.shape[-1]) != expected_queue_width:
+            raise RuntimeError("Delay-aware Q queue width is inconsistent")
+        action_queue = queue_slot_major.unflatten(
+            -1, (queue_depth, action_dim)
+        ).transpose(-2, -1)
+        return parameters, applied_action, action_queue
+
+    def _delay_aware_q_action_features(
+        self,
+        q_action: torch.Tensor,
+        actuator_context: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Jointly encode the new command with the exact actuator state.
+
+        Keeping this compact Markov state beside the command gives it a
+        dedicated late/balanced Q stem instead of relying on the same values
+        being rediscovered inside the much wider task observation.
+        """
+        parameters, applied_action, action_queue = (
+            self._split_delay_aware_q_actuator_context(
+                q_action, actuator_context
+            )
+        )
+        applied_q = self._q_action_input(applied_action)
+        queue_slot_major = action_queue.transpose(-2, -1)
+        queue_q = self._q_action_input(queue_slot_major).flatten(-2)
+        features = torch.cat(
+            (q_action, parameters, applied_q, queue_q), dim=-1
+        )
+        if int(features.shape[-1]) != int(self._q_action_input_dim):
+            raise RuntimeError(
+                "Delay-aware Q action feature dimension is inconsistent: got "
+                f"{int(features.shape[-1])}, expected {self._q_action_input_dim}"
+            )
+        return features
 
     def _append_q_actuator_context(
         self,
@@ -2831,6 +3242,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     "Received Q actuator context while conditioning is disabled"
                 )
             return q_action
+        if self._q_uses_delay_aware_mdp():
+            return self._delay_aware_q_action_features(
+                q_action, actuator_context
+            )
         if self._q_uses_predicted_effect():
             raise RuntimeError(
                 "Predicted-effect Q inputs must be built with _q_action_features"
@@ -2908,6 +3323,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         actuator_context: torch.Tensor | None,
     ) -> torch.Tensor:
         """Build features from an already normalized executable command."""
+        if self._q_uses_causal_hold_advantage():
+            # All actuator values belong to the state/value side of the causal
+            # architecture. Validate the matching context here while keeping
+            # the candidate action branch purely action-valued.
+            if self._q_uses_delay_aware_mdp():
+                self._split_delay_aware_q_actuator_context(
+                    q_action, actuator_context
+                )
+            else:
+                self._split_q_actuator_context(q_action, actuator_context)
+            return q_action
         if not self._q_uses_predicted_effect():
             return self._append_q_actuator_context(q_action, actuator_context)
         parameters, previous_action = self._split_q_actuator_context(
@@ -2929,19 +3355,335 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             )
         return features
 
+    def _causal_q_inputs_from_q_action(
+        self,
+        critic_observations: torch.Tensor,
+        q_action: torch.Tensor,
+        actuator_context: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build Q-only Markov state, candidate, and pre-shift hold anchor."""
+        if not self._q_uses_causal_hold_advantage():
+            raise RuntimeError("causal Q inputs requested for the direct critic")
+        if int(critic_observations.shape[-1]) != int(self._q_critic_dim):
+            raise ValueError(
+                "Causal Q critic observation width is inconsistent: got "
+                f"{int(critic_observations.shape[-1])}, expected "
+                f"{int(self._q_critic_dim)}"
+            )
+        if self._q_uses_delay_aware_mdp():
+            parameters, applied_action, action_queue = (
+                self._split_delay_aware_q_actuator_context(
+                    q_action, actuator_context
+                )
+            )
+            # The complete actuator state is Markov but exogenous to the
+            # candidate being differentiated. Keep it in the state/value
+            # branch. The hold reference is the previous issued command in the
+            # pre-shift queue, not the smoothed applied command.
+            applied_q = self._q_action_input(applied_action)
+            queue_slot_major = action_queue.transpose(-2, -1)
+            queue_q = self._q_action_input(queue_slot_major).flatten(-2)
+            actuator_state = torch.cat(
+                (parameters, applied_q, queue_q), dim=-1
+            )
+            hold_action = action_queue[..., :, 0]
+            hold_q_action = self._q_action_input(hold_action)
+            candidate_action = q_action - hold_q_action
+            reference_action = torch.zeros_like(candidate_action)
+        else:
+            actuator_state, hold_action = self._split_q_actuator_context(
+                q_action, actuator_context
+            )
+            if hold_action is None:
+                raise RuntimeError("Causal Q context lacks its hold command")
+            candidate_action = q_action
+            reference_action = self._q_action_input(hold_action)
+        state = torch.cat((critic_observations, actuator_state), dim=-1)
+        if int(state.shape[-1]) != int(self._q_network_observation_dim):
+            raise RuntimeError("Causal Q state width is inconsistent")
+        return state, candidate_action, reference_action
+
+    def _q_forward_from_q_input(
+        self,
+        qnet: nn.Module,
+        critic_observations: torch.Tensor,
+        q_action: torch.Tensor,
+        actuator_context: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run either the legacy direct Q or the causal hold-dueling Q."""
+        if not self._q_uses_causal_hold_advantage():
+            return qnet(
+                critic_observations,
+                self._q_action_features_from_q_input(q_action, actuator_context),
+            )
+        state, candidate, hold = self._causal_q_inputs_from_q_action(
+            critic_observations, q_action, actuator_context
+        )
+        return qnet(state, candidate, hold)
+
+    def _q_forward(
+        self,
+        qnet: nn.Module,
+        critic_observations: torch.Tensor,
+        action: torch.Tensor,
+        actuator_context: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return self._q_forward_from_q_input(
+            qnet,
+            critic_observations,
+            self._q_action_input(action),
+            actuator_context,
+        )
+
+    def _q_td_logits(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        return_causal_components: bool = False,
+    ):
+        """Route Teacher Bellman rows to V and Student rows to V+A.
+
+        Forward logits remain identical to ordinary causal Q.  Only the
+        advantage gradient is stopped on one-step successful-Teacher replay;
+        Student gradient is rescaled to a Student-row mean so the configured
+        Teacher replay share cannot silently flatten its learning rate.
+        """
+        if not self._q_uses_causal_hold_advantage():
+            logits = self._q_forward(
+                self.qnet,
+                batch["critic_observations"],
+                batch["actions"],
+                batch.get(Q_ACTUATOR_CONTEXT_KEY),
+            )
+            return (logits, None) if return_causal_components else logits
+        teacher_source = batch.get(DAGGER_Q_TEACHER_SOURCE_KEY)
+        if teacher_source is None:
+            raise KeyError("Causal Q TD requires replay-source provenance")
+        teacher_source = teacher_source.reshape(-1).bool()
+        q_action = self._q_action_input(batch["actions"])
+        state, candidate, hold = self._causal_q_inputs_from_q_action(
+            batch["critic_observations"],
+            q_action,
+            batch.get(Q_ACTUATOR_CONTEXT_KEY),
+        )
+        value_logits = self.qnet.value_logits(state)
+        candidate_score, hold_score = self.qnet.advantage_scores_for_actions(
+            state, candidate, hold
+        )
+        advantage_delta = candidate_score - hold_score
+        student = ~teacher_source
+        student_count = student.sum()
+        row_count = int(student.numel())
+        gradient_scale = student.to(advantage_delta) * (
+            float(row_count) / student_count.clamp_min(1).to(advantage_delta)
+        )
+        routed_delta = advantage_delta.detach() + gradient_scale.unsqueeze(0) * (
+            advantage_delta - advantage_delta.detach()
+        )
+        logits = self.qnet.logits_from_value_and_advantage_delta(
+            value_logits, routed_delta
+        )
+        if not return_causal_components:
+            return logits
+        return logits, {
+            "state": state,
+            "candidate": candidate,
+            "hold": hold,
+            "value_logits": value_logits,
+            "factual_score": candidate_score,
+            "hold_score": hold_score,
+        }
+
+    def _causal_expert_advantage_ranking(
+        self,
+        batch: dict[str, torch.Tensor],
+        causal_components: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Identify Student action direction from the same-state DAgger label."""
+        reference = batch["actions"]
+        zero = reference.new_zeros(())
+        empty_metrics = {
+            "causal_rank_loss": zero,
+            "causal_rank_eligible_fraction": zero,
+            "causal_rank_violation_fraction": zero,
+            "causal_teacher_factual_score_margin": zero,
+            "causal_teacher_factual_q_margin": zero,
+            "causal_action_margin": zero,
+            "causal_hold_anchor_error": zero,
+        }
+        if not self._q_uses_causal_hold_advantage():
+            return zero, empty_metrics
+
+        required = (
+            DAGGER_REPLAY_TEACHER_ACTIONS,
+            DAGGER_TEACHER_ACTION_VALID_KEY,
+            DAGGER_IS_STUDENT_ACTION_KEY,
+            DAGGER_Q_TEACHER_SOURCE_KEY,
+        )
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise KeyError(
+                f"Causal expert ranking lacks replay fields {missing}"
+            )
+        factual_action = batch["actions"]
+        teacher_source = batch[DAGGER_Q_TEACHER_SOURCE_KEY].reshape(-1).bool()
+        valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
+        factual_student = batch[DAGGER_IS_STUDENT_ACTION_KEY].reshape(-1).bool()
+        eligible = (~teacher_source) & valid & factual_student
+        teacher_action = torch.where(
+            eligible.unsqueeze(-1),
+            batch[DAGGER_REPLAY_TEACHER_ACTIONS],
+            factual_action.detach(),
+        )
+
+        teacher_q_action = self._q_action_input(teacher_action)
+        factual_q_action = self._q_action_input(factual_action)
+        _, teacher_candidate, _ = (
+            self._causal_q_inputs_from_q_action(
+                batch["critic_observations"],
+                teacher_q_action,
+                batch.get(Q_ACTUATOR_CONTEXT_KEY),
+            )
+        )
+        if causal_components is None:
+            state, factual_candidate, hold = self._causal_q_inputs_from_q_action(
+                batch["critic_observations"],
+                factual_q_action,
+                batch.get(Q_ACTUATOR_CONTEXT_KEY),
+            )
+            factual_score, teacher_score, hold_score = (
+                self.qnet.advantage_scores_for_actions(
+                    state, factual_candidate, teacher_candidate, hold
+                )
+            )
+            value_logits = self.qnet.value_logits(state)
+        else:
+            state = causal_components["state"]
+            factual_candidate = causal_components["candidate"]
+            hold = causal_components["hold"]
+            value_logits = causal_components["value_logits"]
+            factual_score = causal_components["factual_score"]
+            hold_score = causal_components["hold_score"]
+            teacher_score = self.qnet.advantage_scores(
+                state, teacher_candidate
+            )
+        score_margin = teacher_score - factual_score
+        action_margin = (teacher_candidate - factual_candidate).square().mean(
+            dim=-1
+        ).sqrt().clamp_(0.0, 1.0)
+        violations = F.relu(action_margin.unsqueeze(0) - score_margin)
+        eligible_float = eligible.to(score_margin)
+        eligible_count = eligible_float.sum()
+        safe_count = eligible_count.clamp_min(1.0)
+        ranking_loss = (
+            violations * eligible_float.unsqueeze(0)
+        ).sum() / (float(score_margin.shape[0]) * safe_count)
+        violation_fraction = (
+            (score_margin < action_margin.unsqueeze(0)).to(score_margin)
+            * eligible_float.unsqueeze(0)
+        ).sum() / (float(score_margin.shape[0]) * safe_count)
+        score_margin_mean = (
+            score_margin * eligible_float.unsqueeze(0)
+        ).sum() / (float(score_margin.shape[0]) * safe_count)
+        action_margin_mean = (
+            action_margin * eligible_float
+        ).sum() / safe_count
+
+        with torch.no_grad():
+            factual_logits = self.qnet.logits_from_value_and_advantage_delta(
+                value_logits, factual_score - hold_score
+            )
+            teacher_logits = self.qnet.logits_from_value_and_advantage_delta(
+                value_logits, teacher_score - hold_score
+            )
+            factual_q = self.qnet.values(factual_logits)
+            teacher_q = self.qnet.values(teacher_logits)
+            q_margin = (
+                (teacher_q - factual_q) * eligible_float.unsqueeze(0)
+            ).sum() / (float(teacher_q.shape[0]) * safe_count)
+            anchor_error = self.qnet.logits_from_value_and_advantage_delta(
+                value_logits, torch.zeros_like(hold_score)
+            ).sub(value_logits).abs().max()
+
+        return ranking_loss, {
+            "causal_rank_loss": ranking_loss.detach(),
+            "causal_rank_eligible_fraction": eligible.float().mean(),
+            "causal_rank_violation_fraction": violation_fraction.detach(),
+            "causal_teacher_factual_score_margin": score_margin_mean.detach(),
+            "causal_teacher_factual_q_margin": q_margin.detach(),
+            "causal_action_margin": action_margin_mean.detach(),
+            "causal_hold_anchor_error": anchor_error.detach(),
+        }
+
     def _next_q_actuator_context(
         self,
         actuator_context: torch.Tensor,
         issued_action: torch.Tensor,
     ) -> torch.Tensor:
-        """Advance only the previous-command component to the successor state."""
-        if not self._q_uses_predicted_effect():
+        """Advance the replay actuator state to the pre-reset successor."""
+        if self._q_uses_delay_aware_mdp():
+            parameters, applied_action, action_queue = (
+                self._split_delay_aware_q_actuator_context(
+                    issued_action, actuator_context
+                )
+            )
+            issued = self._project_execution_action(issued_action).detach().to(
+                applied_action
+            )
+            next_queue = torch.cat(
+                (issued.unsqueeze(-1), action_queue[..., :-1]), dim=-1
+            )
+
+            metadata = self._q_actuator_context_metadata_value
+            delay_min, delay_max = metadata["delay_range"]
+            delay_classes = int(delay_max - delay_min + 1)
+            delay = (
+                parameters[..., :delay_classes]
+                .argmax(dim=-1, keepdim=True)
+                .add(int(delay_min))
+            )
+            alpha_centered = parameters[..., delay_classes:]
+            alpha_low, alpha_high = metadata["alpha_range"]
+            if alpha_high == alpha_low:
+                alpha = torch.full_like(alpha_centered, float(alpha_low))
+            else:
+                alpha = float(alpha_low) + 0.5 * (alpha_centered + 1.0) * (
+                    float(alpha_high) - float(alpha_low)
+                )
+
+            # Mirror JointPosition.apply_action exactly. At the first physics
+            # substep the simulator has already shifted in this issued command.
+            next_applied = applied_action
+            decimation = int(metadata["control_decimation"])
+            for substep in range(decimation):
+                selected_slot = (
+                    delay - substep + decimation - 1
+                ) // decimation
+                gather_index = selected_slot.unsqueeze(-2).expand(
+                    *selected_slot.shape[:-1], self.action_dim, 1
+                )
+                selected_command = next_queue.gather(
+                    -1, gather_index
+                ).squeeze(-1)
+                next_applied = (
+                    (1.0 - alpha) * next_applied
+                    + alpha * selected_command
+                )
+            return torch.cat(
+                (
+                    parameters,
+                    next_applied,
+                    next_queue.transpose(-2, -1).flatten(-2),
+                ),
+                dim=-1,
+            ).detach()
+        if not self._q_requires_previous_action_context():
             return actuator_context
         _, previous_action = self._split_q_actuator_context(
             issued_action, actuator_context
         )
         if previous_action is None:
-            raise RuntimeError("Q predicted effect lacks its previous command")
+            raise RuntimeError("Q causal context lacks its previous command")
         next_context = actuator_context.detach().clone()
         next_context[..., self._q_actuator_parameter_dim() :] = (
             self._project_execution_action(issued_action).detach().to(next_context)
@@ -4298,6 +5040,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 Q_ACTUATOR_CONTEXT_KEY,
                 NEXT_Q_ACTUATOR_CONTEXT_KEY,
             )
+        if self._q_uses_causal_hold_advantage():
+            fields = (
+                *fields,
+                DAGGER_REPLAY_TEACHER_ACTIONS,
+                DAGGER_TEACHER_ACTION_VALID_KEY,
+                DAGGER_IS_STUDENT_ACTION_KEY,
+            )
         if self._teacher_episode_cache_enabled():
             return tuple(
                 key for key in fields if key not in _PERCEPTION_REPLAY_FIELDS
@@ -5195,7 +5944,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     @torch.no_grad()
     def _prefetch_curriculum_sample_plans(
-        self, update_count: int
+        self, update_count: int, *, include_actor: bool = True
     ) -> tuple[_TD3ReplaySamplePlan, ...]:
         """Prefetch phase-aware CPU replay rows for one optimizer burst.
 
@@ -5207,6 +5956,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         update_count = int(update_count)
         if update_count < 0:
             raise ValueError("update_count must be non-negative")
+        if not isinstance(include_actor, bool):
+            raise ValueError("include_actor must be boolean")
         batch_size = int(self.cfg.q_batch_size)
         q_counts = self._replay_source_counts("q", batch_size)
         student_count = q_counts["uniform_student"] + q_counts["failure_student"]
@@ -5258,9 +6009,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             actor_teacher_draw = None
             actor_teacher_focused = None
             actor_student_focused = None
-            if (int(self.critic_update_count) + update_index + 1) % int(
-                self.cfg.policy_delay
-            ) == 0:
+            if include_actor and (
+                int(self.critic_update_count) + update_index + 1
+            ) % int(self.cfg.policy_delay) == 0:
                 if actor_teacher_count:
                     actor_teacher_indices, actor_teacher_focused = (
                         self._draw_teacher_indices(
@@ -6381,7 +7132,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         Baseline TD3 never enables this cache and follows its raw-window path.
         """
         prepared = PPOBCDaggerFinetune._prepare_dagger_learning_batch(self, batch)
-        include_current = DAGGER_REPLAY_TEACHER_ACTIONS in batch
+        # Causal Q batches also carry clean Teacher labels for their same-state
+        # ranking loss.  Factual ``actions`` distinguishes them from Actor
+        # batches and prevents an unnecessary/missing current-Actor cache read.
+        include_current = (
+            DAGGER_REPLAY_TEACHER_ACTIONS in batch and "actions" not in batch
+        )
         include_next = "next_critic_observations" in batch
         if not self._student_collection_actor_cache_enabled():
             encoded = self._reencode_perception_windows(
@@ -6461,12 +7217,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         smoothed_q_action, target_noise, next_action = self._smoothed_target_q_action(
             batch["next_observations"]
         )
-        target_logits = self.qnet_target(
+        target_logits = self._q_forward_from_q_input(
+            self.qnet_target,
             batch["next_critic_observations"],
-            self._q_action_features_from_q_input(
-                smoothed_q_action,
-                batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
-            ),
+            smoothed_q_action,
+            batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
         )
         selected_probability, target_expected_heads, selected_head = (
             _select_lower_expected_c51_distribution(
@@ -6513,11 +7268,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _critic_update(self, batch: dict[str, torch.Tensor]):
         """One independent twin-Q C51 update against a common detached target."""
         projected_target, target_metrics = self._distributional_td3_target(batch)
-        logits = self.qnet(
-            batch["critic_observations"],
-            self._q_action_features(
-                batch["actions"], batch.get(Q_ACTUATOR_CONTEXT_KEY)
-            ),
+        logits, causal_components = self._q_td_logits(
+            batch, return_causal_components=True
         )
         log_probabilities = F.log_softmax(logits, dim=-1)
         per_head = (
@@ -6525,7 +7277,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             .sum(dim=-1)
             .mean(dim=-1)
         )
-        critic_loss = per_head.sum()
+        ranking_loss, ranking_metrics = self._causal_expert_advantage_ranking(
+            batch, causal_components
+        )
+        critic_loss = per_head.sum() + ranking_loss
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         critic_grad = _measure_or_clip_grad_norm(
@@ -6547,6 +7302,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "twin_expected_q_disagreement": (expected_heads[0] - expected_heads[1])
             .abs()
             .mean(),
+            **ranking_metrics,
             **target_metrics,
         }
         return metrics
@@ -6557,14 +7313,24 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         if not torch.isfinite(raw_prediction).all():
             raise RuntimeError("TD3 Actor produced non-finite raw actions")
         prediction_action = self._bounded_actor_mean(raw_prediction)
-        q_action = self._q_action_features(
-            prediction_action, batch.get(Q_ACTUATOR_CONTEXT_KEY)
-        )
+        q_action = self._q_action_input(prediction_action)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.actor_optimizer.zero_grad(set_to_none=True)
+        if self._q_uses_causal_hold_advantage():
+            q_state, q_action, q_hold = self._causal_q_inputs_from_q_action(
+                batch["critic_observations"],
+                q_action,
+                batch.get(Q_ACTUATOR_CONTEXT_KEY),
+            )
+        else:
+            q_state = batch["critic_observations"]
+            q_action = self._q_action_features_from_q_input(
+                q_action, batch.get(Q_ACTUATOR_CONTEXT_KEY)
+            )
+            q_hold = None
         td3_actor_loss, expected_q1 = _td3_actor_q1_loss(
-            self.qnet, batch["critic_observations"], q_action
+            self.qnet, q_state, q_action, q_hold
         )
         exact_bc_loss = _exact_teacher_bc_loss(
             prediction_action,
@@ -6616,9 +7382,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             .detach(),
         }
 
-    def _maybe_delayed_actor_and_targets(self, actor_batch: dict[str, torch.Tensor]):
-        if self.critic_update_count % int(self.cfg.policy_delay):
-            return None
+    def _actor_and_targets_update(self, actor_batch: dict[str, torch.Tensor]):
+        """Apply one Actor step and its Actor-cadence target updates."""
         if self.actor_target is None:
             raise RuntimeError("delayed update requires a loaded actor_target")
         actor_metrics = self._actor_update(actor_batch)
@@ -6628,12 +7393,38 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         self.qnet_target.requires_grad_(False).eval()
         return actor_metrics
 
+    def _maybe_delayed_actor_and_targets(self, actor_batch: dict[str, torch.Tensor]):
+        if self.critic_update_count % int(self.cfg.policy_delay):
+            return None
+        return self._actor_and_targets_update(actor_batch)
+
     def _q_action_feature_semantics(self) -> str:
+        if (
+            self._q_uses_causal_hold_advantage()
+            and self._q_uses_delay_aware_mdp()
+        ):
+            return Q_DELAY_AWARE_CAUSAL_HOLD_ACTION_FEATURE_SEMANTICS
+        if self._q_uses_causal_hold_advantage():
+            return Q_CAUSAL_HOLD_ACTION_FEATURE_SEMANTICS
+        if self._q_uses_delay_aware_mdp():
+            return Q_DELAY_AWARE_ACTION_FEATURE_SEMANTICS
         if self._q_uses_predicted_effect():
             return Q_PREDICTED_EFFECT_ACTION_FEATURE_SEMANTICS
         if self._q_conditions_on_actuator_state():
             return Q_ACTUATOR_ACTION_FEATURE_SEMANTICS
         return "normalized_issued_command_only_v1"
+
+    def _q_architecture_semantics(self) -> str:
+        if (
+            self._q_uses_causal_hold_advantage()
+            and self._q_uses_delay_aware_mdp()
+        ):
+            return FASTSAC_Q_DELAY_AWARE_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS
+        if self._q_uses_causal_hold_advantage():
+            return FASTSAC_Q_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS
+        if self._q_uses_delay_aware_mdp():
+            return FASTSAC_Q_DELAY_AWARE_ARCHITECTURE_SEMANTICS
+        return FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS
 
     def _q_predicted_effect_metadata(self) -> dict:
         if not self._q_uses_predicted_effect():
@@ -6681,6 +7472,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "critic_obs_keys": list(self.q_critic_keys),
             "actor_obs_dim": self._q_actor_dim,
             "critic_obs_dim": self._q_critic_dim,
+            "q_network_observation_dim": int(
+                getattr(self, "_q_network_observation_dim", self._q_critic_dim)
+            ),
             "action_dim": self.action_dim,
             "q_action_input_dim": self._q_action_input_dim,
             "q_actuator_context": copy.deepcopy(
@@ -6688,6 +7482,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             ),
             "q_action_feature_semantics": self._q_action_feature_semantics(),
             "q_predicted_effect": self._q_predicted_effect_metadata(),
+            "q_delay_aware_mdp": self._q_uses_delay_aware_mdp(),
             "q_residual_film": self._q_residual_film_metadata(),
             "hidden_dim": int(self.cfg.q_hidden_dim),
             "q_action_fusion": str(self.cfg.q_action_fusion),
@@ -6702,7 +7497,18 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 if str(self.cfg.q_action_fusion) == "balanced"
                 else FASTSAC_Q_LATE_FUSION_SEMANTICS
             ),
-            "q_architecture_semantics": FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
+            "q_architecture_semantics": self._q_architecture_semantics(),
+            "q_causal_hold_advantage": self._q_uses_causal_hold_advantage(),
+            "q_causal_expert_ranking_semantics": (
+                Q_CAUSAL_EXPERT_RANKING_SEMANTICS
+                if self._q_uses_causal_hold_advantage()
+                else None
+            ),
+            "q_teacher_td_advantage_gradient": (
+                "stopped_value_calibration_only_student_rows_mean_normalized_v1"
+                if self._q_uses_causal_hold_advantage()
+                else "ordinary_all_source_c51_td"
+            ),
             "num_atoms": int(self.cfg.q_num_atoms),
             "v_min": float(self.cfg.q_v_min),
             "v_max": float(self.cfg.q_v_max),
@@ -6793,6 +7599,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "dagger_buffer_capacity",
             "dagger_buffer_device",
             "dagger_batch_size",
+            "actor_update_to_data_ratio",
             "teacher_actor_replay_fraction",
             "teacher_perception_replay_fraction",
             "failure_phase_teacher_fraction",
@@ -6819,6 +7626,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "q_action_input_gain",
             "q_condition_on_actuator_state",
             "q_use_predicted_effect",
+            "q_use_delay_aware_mdp",
+            "q_use_causal_hold_advantage",
             "q_use_residual_film",
             "q_residual_film_scale",
             "q_lr",
@@ -8134,6 +8943,49 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise RuntimeError("Q UTD row credit escaped its batch range")
         return updates
 
+    def _actor_updates_due(self, accepted_student_rows: int) -> int | None:
+        """Return independently row-scheduled Actor updates, or legacy mode.
+
+        A finite ``actor_update_to_data_ratio`` means one unit of credit for one
+        sampled Actor row.  Dividing by ``dagger_batch_size`` makes Actor data
+        consumption invariant to rollout chunking without tying its optimizer
+        step count to the Critic batch or UTD schedule.  ``None`` deliberately
+        retains the historical one-Actor-per-``policy_delay``-Critic-steps path.
+        """
+        if (
+            isinstance(accepted_student_rows, bool)
+            or not isinstance(accepted_student_rows, Integral)
+            or int(accepted_student_rows) < 0
+        ):
+            raise ValueError("accepted_student_rows must be a non-negative integer")
+
+        ratio = getattr(self.cfg, "actor_update_to_data_ratio", None)
+        if ratio is None:
+            return None
+        if (
+            isinstance(ratio, bool)
+            or not math.isfinite(float(ratio))
+            or float(ratio) <= 0.0
+        ):
+            raise ValueError(
+                "actor_update_to_data_ratio must be finite and positive"
+            )
+
+        batch_size = int(self.cfg.dagger_batch_size)
+        self.actor_update_row_credit = float(
+            getattr(self, "actor_update_row_credit", 0.0)
+        ) + int(accepted_student_rows) * float(ratio)
+        updates = int(self.actor_update_row_credit // batch_size)
+        self.actor_update_row_credit -= updates * batch_size
+        if self.actor_update_row_credit < 0.0:
+            if self.actor_update_row_credit > -1e-9:
+                self.actor_update_row_credit = 0.0
+            else:
+                raise RuntimeError("Actor UTD row credit became negative")
+        if not 0.0 <= self.actor_update_row_credit < batch_size:
+            raise RuntimeError("Actor UTD row credit escaped its batch range")
+        return updates
+
     def train_op(self, tensordict):
         """Collect locked transitions and run Phase-1 TD3/BC updates only."""
         self._reset_replay_mix_rollout_metrics()
@@ -8327,6 +9179,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "td3/q_update_row_credit": float(
                     getattr(self, "q_update_row_credit", 0.0)
                 ),
+                "td3/actor_update_to_data_ratio_config": (
+                    -1.0
+                    if getattr(self.cfg, "actor_update_to_data_ratio", None) is None
+                    else float(self.cfg.actor_update_to_data_ratio)
+                ),
+                "td3/actor_update_row_credit": float(
+                    getattr(self, "actor_update_row_credit", 0.0)
+                ),
                 "td3/q_teacher_replay_fraction_config": float(
                     self._replay_mix_fractions("q")["uniform_teacher"]
                     + self._replay_mix_fractions("q")["failure_teacher"]
@@ -8388,15 +9248,53 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if teacher_replay_required:
                 self._ensure_teacher_actor_cache_current()
             q_updates = self._q_updates_due(appended)
+            scheduled_actor_updates = self._actor_updates_due(appended)
+            decoupled_actor_scheduler = scheduled_actor_updates is not None
+            actor_updates_after_critic = (
+                _interleaved_actor_update_counts(
+                    q_updates, int(scheduled_actor_updates)
+                )
+                if decoupled_actor_scheduler
+                else ()
+            )
+            actor_prefetch_matches_q_plan = (
+                decoupled_actor_scheduler
+                and all(count <= 1 for count in actor_updates_after_critic)
+                and all(
+                    bool(count)
+                    == (
+                        (int(self.critic_update_count) + update_index + 1)
+                        % int(self.cfg.policy_delay)
+                        == 0
+                    )
+                    for update_index, count in enumerate(
+                        actor_updates_after_critic
+                    )
+                )
+            )
+            include_actor_in_q_plans = (
+                not decoupled_actor_scheduler
+                or actor_prefetch_matches_q_plan
+            )
+            completed_scheduled_actor_updates = 0
             sample_plans = None
+            # Coalesce CPU replay indices only when the prefetch helper's
+            # Actor slots exactly match the independent schedule. Otherwise
+            # live interleaved sampling preserves Q/Actor q_rng draw order.
             if (
                 isinstance(self.dagger_replay, _TD3DeviceReplay)
                 and isinstance(self.q_teacher_replay, _TD3DeviceReplay)
                 and self.dagger_replay.device.type == "cpu"
                 and self.q_teacher_replay.device.type == "cpu"
+                and (
+                    not decoupled_actor_scheduler
+                    or actor_prefetch_matches_q_plan
+                )
             ):
                 sample_plans = (
-                    self._prefetch_curriculum_sample_plans(q_updates)
+                    self._prefetch_curriculum_sample_plans(
+                        q_updates, include_actor=include_actor_in_q_plans
+                    )
                     if self._has_canonical_replay_mix()
                     or hasattr(self.cfg, "failure_phase_teacher_fraction")
                     else _prefetch_td3_replay_sample_plans(
@@ -8411,6 +9309,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         teacher_actor_replay_fraction=float(
                             self.cfg.teacher_actor_replay_fraction
                         ),
+                        include_actor=include_actor_in_q_plans,
                         output_device=self.device,
                         generator=self.q_rng,
                     )
@@ -8425,7 +9324,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 )
                 q_batch = self._prepare_dagger_learning_batch(q_batch)
                 critic_metrics.append(self._critic_update(q_batch))
-                if self.critic_update_count % int(self.cfg.policy_delay) == 0:
+                if (
+                    not decoupled_actor_scheduler
+                    and self.critic_update_count % int(self.cfg.policy_delay) == 0
+                ):
                     actor_indices = (
                         None if sample_plan is None else sample_plan.actor_indices
                     )
@@ -8463,7 +9365,66 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     if delayed is None:
                         raise RuntimeError("scheduled delayed Actor update was skipped")
                     actor_metrics.append(delayed)
+                if decoupled_actor_scheduler:
+                    for _ in range(actor_updates_after_critic[update_index]):
+                        actor_indices = (
+                            sample_plan.actor_indices
+                            if sample_plan is not None
+                            and actor_prefetch_matches_q_plan
+                            else None
+                        )
+                        actor_teacher_indices = (
+                            sample_plan.actor_teacher_indices
+                            if sample_plan is not None
+                            and actor_prefetch_matches_q_plan
+                            else None
+                        )
+                        if (
+                            sample_plan is not None
+                            and actor_prefetch_matches_q_plan
+                            and actor_indices is None
+                            and actor_teacher_indices is None
+                        ):
+                            raise RuntimeError(
+                                "interleaved Actor replay plan is missing"
+                            )
+                        actor_batch = self._sample_actor_batch(
+                            actor_indices,
+                            actor_teacher_indices,
+                            (
+                                sample_plan.actor_teacher_focused
+                                if sample_plan is not None
+                                and actor_prefetch_matches_q_plan
+                                else None
+                            ),
+                            (
+                                sample_plan.actor_student_focused
+                                if sample_plan is not None
+                                and actor_prefetch_matches_q_plan
+                                else None
+                            ),
+                        )
+                        actor_staleness_age_batches.append(
+                            self._student_replay_ema_ages(actor_batch)
+                        )
+                        actor_metrics.append(
+                            self._actor_and_targets_update(actor_batch)
+                        )
+                        completed_scheduled_actor_updates += 1
             del sample_plans
+            if decoupled_actor_scheduler:
+                remaining_actor_updates = (
+                    int(scheduled_actor_updates)
+                    - completed_scheduled_actor_updates
+                )
+                for _ in range(remaining_actor_updates):
+                    actor_batch = self._sample_actor_batch(None, None, None, None)
+                    actor_staleness_age_batches.append(
+                        self._student_replay_ema_ages(actor_batch)
+                    )
+                    actor_metrics.append(
+                        self._actor_and_targets_update(actor_batch)
+                    )
 
         perception_four_way = (
             str(getattr(self.cfg, "perception_replay_mode", "legacy_online_student"))
@@ -8545,6 +9506,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "right_support_projection_clipping_fraction",
             "target_smoothing_noise_norm",
             "target_noise_free_action_abs_mean",
+            "causal_rank_loss",
+            "causal_rank_eligible_fraction",
+            "causal_rank_violation_fraction",
+            "causal_teacher_factual_score_margin",
+            "causal_teacher_factual_q_margin",
+            "causal_action_margin",
+            "causal_hold_anchor_error",
         )
         actor_keys = (
             "td3_actor_loss",
@@ -8657,6 +9625,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "right_support_projection_clipping_fraction"
             ],
             "td3/target_smoothing_noise_norm": critic["target_smoothing_noise_norm"],
+            "td3/causal_rank_loss": critic["causal_rank_loss"],
+            "td3/causal_rank_eligible_fraction": critic[
+                "causal_rank_eligible_fraction"
+            ],
+            "td3/causal_rank_violation_fraction": critic[
+                "causal_rank_violation_fraction"
+            ],
+            "td3/causal_teacher_factual_score_margin": critic[
+                "causal_teacher_factual_score_margin"
+            ],
+            "td3/causal_teacher_factual_q_margin": critic[
+                "causal_teacher_factual_q_margin"
+            ],
+            "td3/causal_action_margin": critic["causal_action_margin"],
+            "td3/causal_hold_anchor_error": critic[
+                "causal_hold_anchor_error"
+            ],
             "td3/collector_exploration_noise_norm": collector_noise_norm,
             "td3/actor_update_count": self.actor_update_count,
             "td3/critic_update_count": self.critic_update_count,
@@ -8666,6 +9651,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 else float(self.cfg.q_update_to_data_ratio)
             ),
             "td3/q_update_row_credit": float(getattr(self, "q_update_row_credit", 0.0)),
+            "td3/actor_update_to_data_ratio_config": (
+                -1.0
+                if getattr(self.cfg, "actor_update_to_data_ratio", None) is None
+                else float(self.cfg.actor_update_to_data_ratio)
+            ),
+            "td3/actor_update_row_credit": float(
+                getattr(self, "actor_update_row_credit", 0.0)
+            ),
             "td3/q_teacher_replay_fraction_config": float(
                 self._replay_mix_fractions("q")["uniform_teacher"]
                 + self._replay_mix_fractions("q")["failure_teacher"]
@@ -8680,6 +9673,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 len(critic_metrics) * q_student_count
             ),
             "td3/actor_updates_this_rollout": len(actor_metrics),
+            "td3/actor_sampled_rows_this_rollout": (
+                len(actor_metrics) * int(self.cfg.dagger_batch_size)
+            ),
             "td3/critic_updates_this_rollout": len(critic_metrics),
             "td3/replay_ready": float(replay_ready),
             "td3/perception_replay_ready": float(perception_replay_ready),
@@ -8784,6 +9780,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "actor_update_count": int(self.actor_update_count),
             "critic_update_count": int(self.critic_update_count),
             "q_update_row_credit": float(getattr(self, "q_update_row_credit", 0.0)),
+            "actor_update_row_credit": float(
+                getattr(self, "actor_update_row_credit", 0.0)
+            ),
             "dagger_rollout_count": int(self.dagger_rollout_count),
             "dagger_environment_steps": int(self.dagger_environment_steps),
             "teacher_prefill_rollout_count": int(self.teacher_prefill_rollout_count),
@@ -8841,6 +9840,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         q_batch_size = int(getattr(self.cfg, "q_batch_size", 512))
         if not 0.0 <= self.q_update_row_credit < q_batch_size:
             raise ValueError("TD3 checkpoint Q UTD row credit is invalid")
+        self.actor_update_row_credit = float(
+            state.get("actor_update_row_credit", 0.0)
+        )
+        actor_batch_size = int(getattr(self.cfg, "dagger_batch_size", 4096))
+        if not 0.0 <= self.actor_update_row_credit < actor_batch_size:
+            raise ValueError("TD3 checkpoint Actor UTD row credit is invalid")
         self.dagger_rollout_count = int(state["dagger_rollout_count"])
         self.dagger_environment_steps = int(state["dagger_environment_steps"])
         self.teacher_prefill_rollout_count = int(state["teacher_prefill_rollout_count"])
@@ -9046,6 +10051,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             self.actor_update_count = 0
             self.critic_update_count = 0
             self.q_update_row_credit = 0.0
+            self.actor_update_row_credit = 0.0
             self.dagger_rollout_count = 0
             self.dagger_environment_steps = 0
             self.teacher_prefill_rollout_count = 0

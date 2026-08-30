@@ -374,6 +374,24 @@ FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS = (
 FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS = (
     "delay_one_hot_centered_alpha_plus_previous_physical_command_q_only_v1"
 )
+FASTSAC_Q_DELAY_AWARE_CONTEXT_SEMANTICS = (
+    "delay_one_hot_centered_alpha_plus_applied_command_plus_full_pre_shift_"
+    "command_queue_q_only_v1"
+)
+FASTSAC_Q_DELAY_AWARE_ARCHITECTURE_SEMANTICS = (
+    "task_state_stem_plus_full_actuator_state_candidate_command_joint_"
+    "stem_standard_all_source_c51_v1"
+)
+FASTSAC_Q_DELAY_AWARE_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS = (
+    "task_plus_full_actuator_markov_state_c51_value_plus_hold_relative_"
+    "innovation_monotone_scalar_zero_referenced_advantage_v1"
+)
+FASTSAC_Q_CAUSAL_HOLD_CONTEXT_SEMANTICS = (
+    "delay_one_hot_centered_alpha_plus_pre_shift_hold_command_q_only_v1"
+)
+FASTSAC_Q_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS = (
+    "state_c51_logits_plus_monotone_scalar_hold_referenced_advantage_tilt_v1"
+)
 FASTSAC_DETERMINISTIC_ACTION_KEY = "_fastsac_deterministic_action"
 FASTSAC_REFERENCE_EPS = 1e-6
 FASTSAC_TEACHER_TRAINING_ALGORITHM = "vaic_fastsac_teacher_v13"
@@ -502,6 +520,8 @@ def _normalize_q_actuator_context_metadata(metadata=None) -> dict:
     }
     semantics = str(metadata.get("semantics", ""))
     predicted_effect = semantics == FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS
+    delay_aware = semantics == FASTSAC_Q_DELAY_AWARE_CONTEXT_SEMANTICS
+    causal_hold = semantics == FASTSAC_Q_CAUSAL_HOLD_CONTEXT_SEMANTICS
     required = set(base_required)
     if predicted_effect:
         required.update(
@@ -511,6 +531,16 @@ def _normalize_q_actuator_context_metadata(metadata=None) -> dict:
                 "effect_intervals",
             }
         )
+    elif delay_aware:
+        required.update(
+            {
+                "action_dim",
+                "queue_depth",
+                "control_decimation",
+            }
+        )
+    elif causal_hold:
+        required.add("previous_action_dim")
     if set(metadata) != required:
         raise ValueError(
             "Enabled Q actuator-context metadata fields do not match the current "
@@ -519,6 +549,8 @@ def _normalize_q_actuator_context_metadata(metadata=None) -> dict:
     if semantics not in {
         FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS,
         FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS,
+        FASTSAC_Q_DELAY_AWARE_CONTEXT_SEMANTICS,
+        FASTSAC_Q_CAUSAL_HOLD_CONTEXT_SEMANTICS,
     }:
         raise ValueError(
             f"Unsupported Q actuator-context semantics {semantics!r}"
@@ -550,23 +582,55 @@ def _normalize_q_actuator_context_metadata(metadata=None) -> dict:
     previous_action_dim = 0
     control_decimation = 0
     effect_intervals = 0
-    if predicted_effect:
+    action_dim = 0
+    queue_depth = 0
+    if predicted_effect or causal_hold:
         previous_action_dim = metadata["previous_action_dim"]
+        values = [("previous_action_dim", previous_action_dim)]
+        if predicted_effect:
+            control_decimation = metadata["control_decimation"]
+            effect_intervals = metadata["effect_intervals"]
+            values.extend(
+                (
+                    ("control_decimation", control_decimation),
+                    ("effect_intervals", effect_intervals),
+                )
+            )
+        for name, value in values:
+            if isinstance(value, bool) or int(value) != value or int(value) < 1:
+                raise ValueError(
+                    f"Q previous-action context {name} must be a positive integer"
+                )
+        previous_action_dim = int(previous_action_dim)
+        if predicted_effect:
+            control_decimation = int(control_decimation)
+            effect_intervals = int(effect_intervals)
+    elif delay_aware:
+        action_dim = metadata["action_dim"]
+        queue_depth = metadata["queue_depth"]
         control_decimation = metadata["control_decimation"]
-        effect_intervals = metadata["effect_intervals"]
         for name, value in (
-            ("previous_action_dim", previous_action_dim),
+            ("action_dim", action_dim),
+            ("queue_depth", queue_depth),
             ("control_decimation", control_decimation),
-            ("effect_intervals", effect_intervals),
         ):
             if isinstance(value, bool) or int(value) != value or int(value) < 1:
                 raise ValueError(
-                    f"Q predicted-effect context {name} must be a positive integer"
+                    f"Delay-aware Q actuator context {name} must be a positive integer"
                 )
-        previous_action_dim = int(previous_action_dim)
+        action_dim = int(action_dim)
+        queue_depth = int(queue_depth)
         control_decimation = int(control_decimation)
-        effect_intervals = int(effect_intervals)
+        maximum_selected_slot = math.ceil(max(0, delay_max) / control_decimation)
+        if maximum_selected_slot >= queue_depth:
+            raise ValueError(
+                "Delay-aware Q command queue is too short for the configured "
+                f"delay: maximum selected slot {maximum_selected_slot}, queue "
+                f"depth {queue_depth}"
+            )
     expected_dimension = delay_max - delay_min + 2 + previous_action_dim
+    if delay_aware:
+        expected_dimension += action_dim * (queue_depth + 1)
     if dimension != expected_dimension:
         raise ValueError(
             "Q actuator-context dimension does not match its encoded fields: "
@@ -579,10 +643,19 @@ def _normalize_q_actuator_context_metadata(metadata=None) -> dict:
         "delay_range": [delay_min, delay_max],
         "alpha_range": [alpha_low, alpha_high],
     }
+    if predicted_effect or causal_hold:
+        normalized["previous_action_dim"] = previous_action_dim
+    if delay_aware:
+        normalized.update(
+            {
+                "action_dim": action_dim,
+                "queue_depth": queue_depth,
+                "control_decimation": control_decimation,
+            }
+        )
     if predicted_effect:
         normalized.update(
             {
-                "previous_action_dim": previous_action_dim,
                 "control_decimation": control_decimation,
                 "effect_intervals": effect_intervals,
             }
@@ -1970,11 +2043,19 @@ class DistributionalQNetwork(nn.Module):
         reference_dueling=False,
         residual_film_condition_dim=0,
         residual_film_scale=0.1,
+        scalar_reference_advantage=False,
     ):
         super().__init__()
         if not isinstance(reference_dueling, bool):
             raise ValueError("reference_dueling must be a boolean")
+        if not isinstance(scalar_reference_advantage, bool):
+            raise ValueError("scalar_reference_advantage must be a boolean")
+        if scalar_reference_advantage and not reference_dueling:
+            raise ValueError(
+                "scalar_reference_advantage requires reference_dueling"
+            )
         self.reference_dueling = reference_dueling
+        self.scalar_reference_advantage = scalar_reference_advantage
         self.action_fusion = str(action_fusion)
         self.state_hidden_dim = _q_state_hidden_dim(
             hidden_dim, self.action_fusion
@@ -2008,6 +2089,16 @@ class DistributionalQNetwork(nn.Module):
             else None
         )
         if self.reference_dueling:
+            if self.scalar_reference_advantage:
+                # Adding one scalar multiple of this standardized atom axis to
+                # the value logits is an exponential tilt.  Consequently the
+                # expected C51 value is strictly monotone in the scalar whenever
+                # the distribution has non-zero variance.  The action branch
+                # therefore cannot hide in a softmax-null logit direction.
+                atom_axis = torch.arange(num_atoms, dtype=torch.float32)
+                atom_axis = atom_axis - atom_axis.mean()
+                atom_axis = atom_axis / atom_axis.std(unbiased=False)
+                self.register_buffer("advantage_tilt", atom_axis)
             value_layers: list[nn.Module] = [nn.Linear(obs_dim, hidden_dim)]
             if layer_norm:
                 value_layers.append(nn.LayerNorm(hidden_dim))
@@ -2043,9 +2134,18 @@ class DistributionalQNetwork(nn.Module):
                 if layer_norm:
                     advantage_layers.append(nn.LayerNorm(hidden_dim // 4))
                 advantage_layers.extend(
-                    (nn.SiLU(), nn.Linear(hidden_dim // 4, num_atoms))
+                    (
+                        nn.SiLU(),
+                        nn.Linear(
+                            hidden_dim // 4,
+                            1 if self.scalar_reference_advantage else num_atoms,
+                        ),
+                    )
                 )
                 self.advantage_net = nn.Sequential(*advantage_layers)
+                if self.scalar_reference_advantage:
+                    nn.init.zeros_(self.advantage_net[-1].weight)
+                    nn.init.zeros_(self.advantage_net[-1].bias)
                 return
 
             advantage_obs_layers: list[nn.Module] = [
@@ -2082,9 +2182,21 @@ class DistributionalQNetwork(nn.Module):
             if layer_norm:
                 advantage_layers.append(nn.LayerNorm(hidden_dim // 4))
             advantage_layers.extend(
-                (nn.SiLU(), nn.Linear(hidden_dim // 4, num_atoms))
+                (
+                    nn.SiLU(),
+                    nn.Linear(
+                        hidden_dim // 4,
+                        1 if self.scalar_reference_advantage else num_atoms,
+                    ),
+                )
             )
             self.advantage_net = nn.Sequential(*advantage_layers)
+            if self.scalar_reference_advantage:
+                # A fresh causal critic must be action-neutral. Bellman/ranking
+                # gradients immediately train this layer, while the Actor can
+                # never exploit an arbitrary initial Q slope.
+                nn.init.zeros_(self.advantage_net[-1].weight)
+                nn.init.zeros_(self.advantage_net[-1].bias)
             return
 
         if self.action_fusion == "early":
@@ -2169,6 +2281,37 @@ class DistributionalQNetwork(nn.Module):
             torch.cat((obs_features, action_features), dim=-1)
         )
 
+    def advantage_score(self, obs, action):
+        """Return the identifiable scalar action score for causal dueling Q."""
+        if not self.scalar_reference_advantage:
+            raise RuntimeError(
+                "advantage_score requires scalar_reference_advantage"
+            )
+        return self.advantage_logits(obs, action)
+
+    def advantage_scores_for_actions(self, obs, *actions):
+        """Evaluate scalar scores while sharing the state stem when possible."""
+        if not self.scalar_reference_advantage:
+            raise RuntimeError(
+                "advantage_scores_for_actions requires scalar advantage"
+            )
+        if not actions:
+            raise ValueError("at least one action is required")
+        if self.action_fusion == "early":
+            return tuple(self.advantage_score(obs, action) for action in actions)
+        obs_features = self.advantage_obs_net(obs)
+        scores = []
+        for action in actions:
+            action_features = self._action_stem_features(
+                action, reference_dueling=True
+            )
+            scores.append(
+                self.advantage_net(
+                    torch.cat((obs_features, action_features), dim=-1)
+                )
+            )
+        return tuple(scores)
+
     def forward(self, obs, action, reference_action=None):
         if self.reference_dueling:
             if reference_action is None:
@@ -2185,6 +2328,16 @@ class DistributionalQNetwork(nn.Module):
             # actor output. Detaching its input preserves critic-parameter
             # gradients through A(s, a_ref) while making the actor derivative
             # come only from A(s, a).
+            if self.scalar_reference_advantage:
+                candidate_score, reference_score = (
+                    self.advantage_scores_for_actions(
+                        obs, action, reference_action.detach()
+                    )
+                )
+                advantage_delta = candidate_score - reference_score
+                return self.value_logits(obs) + (
+                    advantage_delta * self.advantage_tilt
+                )
             return (
                 self.value_logits(obs)
                 + self.advantage_logits(obs, action)
@@ -2211,6 +2364,7 @@ class TwinDistributionalQ(nn.Module):
         reference_dueling=False,
         residual_film_condition_dim=0,
         residual_film_scale=0.1,
+        scalar_reference_advantage=False,
     ):
         super().__init__()
         self.num_atoms = num_atoms
@@ -2219,6 +2373,7 @@ class TwinDistributionalQ(nn.Module):
         if not isinstance(reference_dueling, bool):
             raise ValueError("reference_dueling must be a boolean")
         self.reference_dueling = reference_dueling
+        self.scalar_reference_advantage = scalar_reference_advantage
         self.qnets = nn.ModuleList(
             DistributionalQNetwork(
                 obs_dim,
@@ -2230,6 +2385,7 @@ class TwinDistributionalQ(nn.Module):
                 reference_dueling,
                 residual_film_condition_dim,
                 residual_film_scale,
+                scalar_reference_advantage,
             )
             for _ in range(2)
         )
@@ -2245,6 +2401,53 @@ class TwinDistributionalQ(nn.Module):
 
     def values(self, logits):
         return (F.softmax(logits, dim=-1) * self.support).sum(dim=-1)
+
+    def value_logits(self, obs):
+        if not self.reference_dueling:
+            raise RuntimeError("value_logits requires reference-dueling Q")
+        return torch.stack([q.value_logits(obs) for q in self.qnets], dim=0)
+
+    def advantage_scores(self, obs, action):
+        if not self.scalar_reference_advantage:
+            raise RuntimeError(
+                "advantage_scores requires scalar_reference_advantage"
+            )
+        return torch.stack(
+            [q.advantage_score(obs, action) for q in self.qnets], dim=0
+        ).squeeze(-1)
+
+    def advantage_scores_for_actions(self, obs, *actions):
+        if not self.scalar_reference_advantage:
+            raise RuntimeError(
+                "advantage_scores_for_actions requires scalar advantage"
+            )
+        per_twin = [
+            q.advantage_scores_for_actions(obs, *actions) for q in self.qnets
+        ]
+        return tuple(
+            torch.stack(
+                [per_twin[twin][index] for twin in range(len(per_twin))],
+                dim=0,
+            ).squeeze(-1)
+            for index in range(len(actions))
+        )
+
+    def logits_from_value_and_advantage_delta(
+        self, value_logits, advantage_delta
+    ):
+        """Compose monotone-dueling C51 logits from explicit components."""
+        if not self.scalar_reference_advantage:
+            raise RuntimeError(
+                "explicit scalar composition requires scalar reference advantage"
+            )
+        expected_value = (*advantage_delta.shape, self.num_atoms)
+        if tuple(value_logits.shape) != expected_value:
+            raise ValueError(
+                "Value-logit/scalar-advantage shapes do not match: got "
+                f"{tuple(value_logits.shape)} and {tuple(advantage_delta.shape)}"
+            )
+        tilt = self.qnets[0].advantage_tilt.to(value_logits)
+        return value_logits + advantage_delta.unsqueeze(-1) * tilt
 
     @torch.no_grad()
     def projection(
@@ -2284,6 +2487,7 @@ def _build_isolated_q_network(
     reference_dueling=False,
     residual_film_condition_dim=0,
     residual_film_scale=0.1,
+    scalar_reference_advantage=False,
 ):
     """Build Q1/Q2 without advancing VAIC/environment default RNG streams."""
     device = torch.device(device)
@@ -2302,7 +2506,7 @@ def _build_isolated_q_network(
         qnet = TwinDistributionalQ(
             obs_dim, action_dim, hidden_dim, num_atoms, v_min, v_max, layer_norm,
             action_fusion, reference_dueling, residual_film_condition_dim,
-            residual_film_scale,
+            residual_film_scale, scalar_reference_advantage,
         ).to(device)
     return qnet
 

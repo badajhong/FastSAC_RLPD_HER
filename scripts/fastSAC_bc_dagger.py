@@ -805,6 +805,20 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError(
             "algo.q_update_to_data_ratio must be finite and positive"
         )
+    actor_update_to_data_ratio = cfg.algo.get(
+        "actor_update_to_data_ratio", None
+    )
+    if (
+        actor_update_to_data_ratio is not None
+        and (
+            isinstance(actor_update_to_data_ratio, bool)
+            or not math.isfinite(float(actor_update_to_data_ratio))
+            or float(actor_update_to_data_ratio) <= 0.0
+        )
+    ):
+        raise ValueError(
+            "algo.actor_update_to_data_ratio must be null or finite and positive"
+        )
     if int(cfg.algo.q_teacher_buffer_capacity) < int(cfg.algo.sac_learning_starts):
         raise ValueError(
             "algo.q_teacher_buffer_capacity must cover algo.sac_learning_starts"
@@ -903,6 +917,15 @@ def main(cfg: DictConfig):
     prepare_fresh_fastsac_bc_dagger_source(cfg)
     validate_fastsac_bc_dagger_config(cfg)
     schedule = fastsac_dagger_rollout_schedule(cfg)
+    actor_row_ratio = cfg.algo.get("actor_update_to_data_ratio", None)
+    actor_schedule = (
+        "legacy Critic-coupled cadence"
+        if actor_row_ratio is None
+        else (
+            f"row ratio {float(actor_row_ratio):g}, "
+            f"batch {int(cfg.algo.dagger_batch_size)}"
+        )
+    )
     print(
         "Distributional FastSAC + mean Teacher-BC schedule: "
         f"prefill=until {schedule['prefill_target_rows']} Teacher rows "
@@ -923,7 +946,8 @@ def main(cfg: DictConfig):
         f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "
         f"alpha_init={float(cfg.algo.sac_alpha_init):g}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence} "
-        f"(every {int(cfg.algo.sac_policy_frequency)} Critic updates); "
+        "(on each actual Actor update), "
+        f"actor_schedule={actor_schedule}; "
         "perception=live Student rollout only (PPOVEL finetune)"
     )
     return run_training(cfg)

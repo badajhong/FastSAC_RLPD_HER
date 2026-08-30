@@ -42,6 +42,7 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "dagger_buffer_capacity": 131_072,
                 "dagger_buffer_device": "cpu",
                 "dagger_batch_size": 4096,
+                "actor_update_to_data_ratio": 1.0,
                 "teacher_prefill_max_rollouts": 10,
                 "teacher_actor_replay_fraction": 0.5,
                 "teacher_perception_replay_fraction": 0.0,
@@ -776,7 +777,8 @@ def test_entrypoint_reuses_shared_training_engine(monkeypatch, capsys):
     assert sources == [cfg]
     assert received == [cfg]
     output = capsys.readouterr().out
-    assert "alpha_update_cadence=actor (every 8 Critic updates)" in output
+    assert "alpha_update_cadence=actor (on each actual Actor update)" in output
+    assert "actor_schedule=row ratio 1, batch 4096" in output
 
 
 @pytest.mark.parametrize(

@@ -1263,9 +1263,24 @@ def _prepare_tvkd_checkpoint(
     # Checkpoints before the analytic actuator-effect branch used the original
     # normalized-command-plus-delay/alpha Q input.
     source_algo_contract.setdefault("q_use_predicted_effect", False)
+    checkpoint_predates_delay_aware_mdp = (
+        "q_use_delay_aware_mdp" not in source_algo_contract
+    )
+    source_algo_contract.setdefault("q_use_delay_aware_mdp", False)
+    checkpoint_predates_causal_hold_advantage = (
+        "q_use_causal_hold_advantage" not in source_algo_contract
+    )
+    source_algo_contract.setdefault("q_use_causal_hold_advantage", False)
     # Older checkpoints predate delay/alpha-conditioned residual FiLM.
     source_algo_contract.setdefault("q_use_residual_film", False)
     source_algo_contract.setdefault("q_residual_film_scale", 0.1)
+    # Checkpoints written before the independent Actor row scheduler retain
+    # their exact Critic-coupled cadence. Opting into the new scheduler is a
+    # fresh-run algorithm change, not a silent same-stage resume migration.
+    checkpoint_predates_actor_row_scheduler = (
+        "actor_update_to_data_ratio" not in source_algo_contract
+    )
+    source_algo_contract.setdefault("actor_update_to_data_ratio", None)
     # Legacy v1 checkpoints predate this explicit provenance field but already
     # used one alpha update per Critic. v2+ checkpoints must contain it.
     if legacy:
@@ -1273,6 +1288,31 @@ def _prepare_tvkd_checkpoint(
     runtime_algo_contract = OmegaConf.to_container(
         cfg.algo, resolve=True, enum_to_str=True
     )
+    if (
+        checkpoint_predates_delay_aware_mdp
+        and runtime_algo_contract.get("q_use_delay_aware_mdp", False)
+    ):
+        raise ValueError(
+            "TVKD checkpoint predates the delay-aware MDP critic; "
+            "start a fresh run to enable the new architecture"
+        )
+    if (
+        checkpoint_predates_causal_hold_advantage
+        and runtime_algo_contract.get("q_use_causal_hold_advantage", False)
+    ):
+        raise ValueError(
+            "TVKD checkpoint predates the causal hold-advantage critic; "
+            "start a fresh run to enable the new architecture"
+        )
+    if (
+        checkpoint_predates_actor_row_scheduler
+        and runtime_algo_contract.get("actor_update_to_data_ratio") is not None
+    ):
+        raise ValueError(
+            "TVKD checkpoint predates the independent Actor row scheduler; "
+            "use algo.actor_update_to_data_ratio=null for an exact legacy "
+            "resume, or start a fresh run to enable the corrected scheduler"
+        )
     # Older checkpoints predate the joint-aware envelope and therefore used
     # the exact scalar physical interval.  Use fixed historical defaults here,
     # not runtime values, so an old std optimizer cannot be resumed silently

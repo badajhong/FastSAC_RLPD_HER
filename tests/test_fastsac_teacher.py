@@ -1043,6 +1043,74 @@ def test_reference_dueling_q_is_anchored_at_value_and_actor_gradient_is_advantag
     )[0] is None
 
 
+@pytest.mark.parametrize("action_fusion", ["early", "late", "balanced"])
+def test_scalar_reference_advantage_is_exactly_anchored_and_monotone(
+    action_fusion,
+):
+    q = TwinDistributionalQ(
+        obs_dim=7,
+        action_dim=3,
+        hidden_dim=24,
+        num_atoms=51,
+        v_min=-2.0,
+        v_max=2.0,
+        layer_norm=True,
+        action_fusion=action_fusion,
+        reference_dueling=True,
+        scalar_reference_advantage=True,
+    )
+    observations = torch.randn(8, 7)
+    hold = torch.randn(8, 3, requires_grad=True)
+
+    value_logits = q.value_logits(observations)
+    anchored = q(observations, hold, hold)
+    assert torch.equal(anchored, value_logits)
+
+    deltas = torch.tensor([-1.0, 0.0, 1.0]).view(1, 3).expand(2, -1)
+    repeated_values = value_logits[:, :1].expand(-1, 3, -1)
+    tilted = q.logits_from_value_and_advantage_delta(
+        repeated_values, deltas
+    )
+    expected = q.values(tilted)
+    assert torch.all(expected[:, 0] < expected[:, 1])
+    assert torch.all(expected[:, 1] < expected[:, 2])
+
+    # Fresh causal heads are deliberately action-neutral so an untrained Q
+    # cannot move the Actor. Mimic the first ranking update before checking the
+    # learned action derivative; anchoring/monotonic C51 composition is the
+    # invariant under test here, not random initialization.
+    generator = torch.Generator().manual_seed(812)
+    with torch.no_grad():
+        for head in q.qnets:
+            head.advantage_net[-1].weight.copy_(
+                torch.randn(
+                    head.advantage_net[-1].weight.shape,
+                    generator=generator,
+                )
+            )
+
+    action = torch.randn(8, 3, requires_grad=True)
+    expected_action_q = q.values(q(observations, action, hold)).sum()
+    action_gradient, hold_gradient = torch.autograd.grad(
+        expected_action_q, (action, hold), allow_unused=True
+    )
+    assert torch.isfinite(action_gradient).all()
+    assert torch.count_nonzero(action_gradient) > 0
+    assert hold_gradient is None
+
+
+def test_scalar_reference_advantage_requires_reference_dueling():
+    with pytest.raises(ValueError, match="requires reference_dueling"):
+        DistributionalQNetwork(
+            obs_dim=3,
+            action_dim=2,
+            hidden_dim=8,
+            num_atoms=5,
+            layer_norm=False,
+            scalar_reference_advantage=True,
+        )
+
+
 def test_reference_dueling_twin_state_is_incompatible_with_direct_twin():
     dueling = TwinDistributionalQ(
         11, 3, 24, 7, -2.0, 2.0, True, "early", True

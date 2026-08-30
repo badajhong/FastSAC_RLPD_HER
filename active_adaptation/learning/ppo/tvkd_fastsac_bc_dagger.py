@@ -41,6 +41,7 @@ from .common import CMD_KEY, DONE_KEY, OBS_KEY, OBS_PRIV_KEY, REWARD_KEY, TERM_K
 from .fastsac_bc_dagger import (
     ACTOR_BACKEND,
     ACTOR_LEARNING_SEMANTICS as BASE_NORMALIZED_ACTOR_LEARNING_SEMANTICS,
+    CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS,
     CHECKPOINT_VERSION as BASE_FASTSAC_CHECKPOINT_VERSION,
     NORMALIZED_TANH_ACTION_DISTRIBUTION,
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
@@ -54,7 +55,11 @@ from .fastsac_bc_dagger import (
     _fastsac_actor_backend,
     _q_target_discount_factors,
 )
-from .fastsac_vel import _Stage1NStepAccumulator, _vaic_truncation_mask
+from .fastsac_vel import (
+    FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
+    _Stage1NStepAccumulator,
+    _vaic_truncation_mask,
+)
 from .ppo_bc_dagger import (
     DAGGER_IS_STUDENT_ACTION_KEY,
     DAGGER_REPLAY_MIN_STEP_COUNT,
@@ -66,6 +71,7 @@ from .td3_bc_dagger import (
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     OBJECT_GEO_REPLAY_SEMANTICS,
+    Q_CAUSAL_EXPERT_RANKING_SEMANTICS,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
     NEXT_REFERENCE_PHASE_KEY,
@@ -175,7 +181,11 @@ def _tvkd_actor_learning_semantics(config) -> str:
     else:
         raise ValueError(f"unsupported FastSAC action distribution {distribution!r}")
     if getattr(config, "use_q_filtered_bc", False):
-        return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
+        semantics = f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
+    if bool(getattr(config, "q_use_causal_hold_advantage", False)):
+        semantics = (
+            f"{semantics}_with_{CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS}"
+        )
     return semantics
 
 
@@ -491,6 +501,15 @@ def _validate_tvkd_algorithm_config(cfg) -> None:
         }
         # The shared allocator is also the canonical strict fraction validator.
         allocate_source_counts(1, fractions)
+    if bool(getattr(cfg, "q_use_causal_hold_advantage", False)) and (
+        float(cfg.q_uniform_student_fraction)
+        + float(cfg.q_failure_student_fraction)
+        <= 0.0
+    ):
+        raise ValueError(
+            "q_use_causal_hold_advantage requires a positive Student Q replay "
+            "fraction to identify its action advantage"
+        )
 
     tvkd_lambda = _finite_scalar("tvkd_lambda", getattr(cfg, "tvkd_lambda"))
     if tvkd_lambda < 0.0:
@@ -1646,12 +1665,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         if not torch.isfinite(soft_reward).all():
             raise RuntimeError("TVKD soft C51 reward contains NaN/Inf")
 
-        target_logits = self.qnet_target(
+        target_logits = self._q_forward(
+            self.qnet_target,
             batch["next_critic_observations"],
-            self._q_action_features(
-                next_action,
-                batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
-            ),
+            next_action,
+            batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
         )
         target_probabilities = F.softmax(target_logits, dim=-1)
         raw_expected_heads = (target_probabilities * self.qnet_target.support).sum(
@@ -4070,6 +4088,22 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             if "q_use_predicted_effect" not in backend:
                 backend = dict(backend)
                 backend.setdefault("q_use_predicted_effect", False)
+            if "q_use_delay_aware_mdp" not in backend:
+                backend = dict(backend)
+                backend["q_use_delay_aware_mdp"] = False
+                if expected_backend.get("q_use_delay_aware_mdp", False):
+                    raise ValueError(
+                        "TVKD checkpoint predates the delay-aware MDP critic; "
+                        "start a fresh run for the new architecture"
+                    )
+            if "q_use_causal_hold_advantage" not in backend:
+                backend = dict(backend)
+                backend["q_use_causal_hold_advantage"] = False
+                if expected_backend.get("q_use_causal_hold_advantage", False):
+                    raise ValueError(
+                        "TVKD checkpoint predates the causal hold-advantage "
+                        "critic; start a fresh run for the new architecture"
+                    )
             if (
                 "q_use_residual_film" not in backend
                 or "q_residual_film_scale" not in backend
@@ -4077,6 +4111,21 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 backend = dict(backend)
                 backend.setdefault("q_use_residual_film", False)
                 backend.setdefault("q_residual_film_scale", 0.1)
+            # Preserve the exact historical Critic-coupled Actor clock for
+            # same-stage checkpoints that predate the row scheduler. A fresh
+            # run is required to opt into a finite Actor row ratio.
+            checkpoint_predates_actor_row_scheduler = (
+                "actor_update_to_data_ratio" not in backend
+            )
+            if checkpoint_predates_actor_row_scheduler:
+                backend = dict(backend)
+                backend["actor_update_to_data_ratio"] = None
+                if expected_backend.get("actor_update_to_data_ratio") is not None:
+                    raise ValueError(
+                        "TVKD checkpoint predates the independent Actor row "
+                        "scheduler; set actor_update_to_data_ratio=None for an "
+                        "exact legacy resume, or start a fresh corrected run"
+                    )
             # These knobs are measurement-only and were added after the first
             # v6 checkpoints.  They do not affect policy, critic, replay, or
             # optimizer semantics, so an older checkpoint may safely inherit
@@ -4222,14 +4271,27 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     getattr(self, "action_dim", 0),
                 )
             )
+            causal_hold_advantage = self._q_uses_causal_hold_advantage()
+            q_architecture_semantics = self._q_architecture_semantics()
             metadata_defaults = {
                 "bottleneck_selection_mode": "first",
                 "bc_weighting_semantics": "fixed_unweighted_valid_teacher_bc",
                 "q_action_input_dim": q_action_input_dim,
+                "q_network_observation_dim": int(
+                    getattr(
+                        self,
+                        "_q_network_observation_dim",
+                        getattr(self, "_q_critic_dim", 0),
+                    )
+                ),
                 "q_actuator_context": {"enabled": False},
                 "q_action_feature_semantics": "normalized_issued_command_only_v1",
                 "q_predicted_effect": {"enabled": False},
                 "q_residual_film": {"enabled": False},
+                "q_architecture_semantics": FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
+                "q_causal_hold_advantage": False,
+                "q_causal_expert_ranking_semantics": None,
+                "q_teacher_td_advantage_gradient": "ordinary_all_source_c51_td",
                 "q_n_step_semantics": Q_N_STEP_SEMANTICS,
                 "student_q_n_step": 1,
                 "teacher_q_n_step": 1,
@@ -4247,10 +4309,29 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             expected_q_metadata = {
                 "target_semantics": critic_semantics,
                 "q_action_input_dim": q_action_input_dim,
+                "q_network_observation_dim": int(
+                    getattr(
+                        self,
+                        "_q_network_observation_dim",
+                        getattr(self, "_q_critic_dim", 0),
+                    )
+                ),
                 "q_actuator_context": q_context_metadata,
                 "q_action_feature_semantics": self._q_action_feature_semantics(),
                 "q_predicted_effect": self._q_predicted_effect_metadata(),
                 "q_residual_film": self._q_residual_film_metadata(),
+                "q_architecture_semantics": q_architecture_semantics,
+                "q_causal_hold_advantage": causal_hold_advantage,
+                "q_causal_expert_ranking_semantics": (
+                    Q_CAUSAL_EXPERT_RANKING_SEMANTICS
+                    if causal_hold_advantage
+                    else None
+                ),
+                "q_teacher_td_advantage_gradient": (
+                    "stopped_value_calibration_only_student_rows_mean_normalized_v1"
+                    if causal_hold_advantage
+                    else "ordinary_all_source_c51_td"
+                ),
                 "teacher_value_potential_semantics": (
                     potential_semantics
                 ),
@@ -4291,6 +4372,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "sac_alpha_update_cadence",
                 "q_condition_on_actuator_state",
                 "q_use_predicted_effect",
+                "q_use_delay_aware_mdp",
+                "q_use_causal_hold_advantage",
                 "q_use_residual_film",
                 "q_residual_film_scale",
                 "perception_replay_mode",
@@ -4578,6 +4661,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         # The restored partial UTD debt belongs to rows in the discarded
         # rings. It must not combine with the first rows of the rebuilt rings.
         self.q_update_row_credit = 0.0
+        self.actor_update_row_credit = 0.0
         self._teacher_prefill_complete = False
         self.teacher_prefill_rollout_count = 0
         self.teacher_prefill_environment_steps = 0

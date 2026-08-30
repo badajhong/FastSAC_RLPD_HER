@@ -114,6 +114,14 @@ def _critic_checkpoint_runtime_config(cfg: DictConfig) -> DictConfig:
         runtime.algo.use_teacher_residual_critic = bool(
             backend.get("use_teacher_residual_critic", False)
         )
+    if "q_use_causal_hold_advantage" not in runtime.algo:
+        runtime.algo.q_use_causal_hold_advantage = bool(
+            backend.get("q_use_causal_hold_advantage", False)
+        )
+    if "q_use_delay_aware_mdp" not in runtime.algo:
+        runtime.algo.q_use_delay_aware_mdp = bool(
+            backend.get("q_use_delay_aware_mdp", False)
+        )
     runtime.checkpoint_path = checkpoint_path
     runtime.task.num_envs = requested_envs
     runtime.headless = requested_headless
@@ -132,8 +140,8 @@ def _expected_twin_q(
     actions,
     actuator_context: torch.Tensor | None,
 ):
-    logits = policy.qnet(
-        observations, policy._q_action_features(actions, actuator_context)
+    logits = policy._q_forward(
+        policy.qnet, observations, actions, actuator_context
     )
     expected = (F.softmax(logits, dim=-1) * policy.qnet.support).sum(dim=-1)
     return logits, expected, _reduce_actor_q_values(expected, True)
@@ -348,6 +356,9 @@ def _collect_contiguous_first_episodes(
                 )
                 if sent_context is not None:
                     expected_context = sent_context[env_indices, local_steps]
+                    expected_next_context = policy._next_q_actuator_context(
+                        expected_context, expected_action
+                    )
                     _assert_exact(
                         "replay current actuator context",
                         transitions[Q_ACTUATOR_CONTEXT_KEY],
@@ -356,7 +367,7 @@ def _collect_contiguous_first_episodes(
                     _assert_exact(
                         "replay next actuator context",
                         transitions[NEXT_Q_ACTUATOR_CONTEXT_KEY],
-                        expected_context,
+                        expected_next_context,
                     )
 
                 # Ordinary successors must be the next collected state.  True
@@ -522,27 +533,29 @@ def _local_action_gradient_report(policy, batch, policy_action, epsilon):
     # that the Actor can choose, so only the physical-action-width prefix is a
     # gradient leaf.
     q_action = policy._q_action_input(policy_action).detach().requires_grad_(True)
-    q_features = policy._q_action_features_from_q_input(q_action, actuator_context)
-    logits = policy.qnet(batch["critic_observations"], q_features)
+    logits = policy._q_forward_from_q_input(
+        policy.qnet,
+        batch["critic_observations"],
+        q_action,
+        actuator_context,
+    )
     expected = (F.softmax(logits, dim=-1) * policy.qnet.support).sum(dim=-1)
     minimum = _reduce_actor_q_values(expected, True)
     gradient = torch.autograd.grad(minimum.sum(), q_action)[0].detach().float()
     norm = gradient.norm(dim=-1)
     direction = gradient / norm.clamp_min(torch.finfo(gradient.dtype).eps).unsqueeze(-1)
     with torch.no_grad():
-        plus_logits = policy.qnet(
+        plus_logits = policy._q_forward_from_q_input(
+            policy.qnet,
             batch["critic_observations"],
-            policy._q_action_features_from_q_input(
-                q_action.detach() + float(epsilon) * direction,
-                actuator_context,
-            ),
+            q_action.detach() + float(epsilon) * direction,
+            actuator_context,
         )
-        minus_logits = policy.qnet(
+        minus_logits = policy._q_forward_from_q_input(
+            policy.qnet,
             batch["critic_observations"],
-            policy._q_action_features_from_q_input(
-                q_action.detach() - float(epsilon) * direction,
-                actuator_context,
-            ),
+            q_action.detach() - float(epsilon) * direction,
+            actuator_context,
         )
         plus = _reduce_actor_q_values(
             (F.softmax(plus_logits, dim=-1) * policy.qnet.support).sum(dim=-1),
@@ -591,11 +604,11 @@ def _residual_identity_report(policy, batch, continuation, rng_state):
     )
     next_log_prob = policy._normalized_action_log_prob(next_raw_log_prob)
     policy.sac_action_rng.set_state(rng_state)
-    next_logits = policy.qnet_target(
+    next_logits = policy._q_forward(
+        policy.qnet_target,
         batch["next_critic_observations"],
-        policy._q_action_features(
-            next_action, batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY)
-        ),
+        next_action,
+        batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
     )
     next_expected = (
         F.softmax(next_logits, dim=-1) * policy.qnet_target.support
@@ -684,6 +697,18 @@ def main(cfg: DictConfig):
         )
         selected = _index_batch(raw, selected_indices, policy.device)
         prepared = policy._prepare_dagger_learning_batch(selected)
+        # Q batches now legitimately carry Teacher labels for causal ranking,
+        # so their schema no longer implies a current Actor query.  This probe
+        # does query the current policy explicitly; install the collection-exact
+        # cache it already required and sampled above.
+        current_actor = selected[REPLAY_ACTOR_OBSERVATIONS_KEY]
+        if (
+            current_actor.ndim != 2
+            or int(current_actor.shape[-1]) != int(policy._q_actor_dim)
+            or not torch.isfinite(current_actor).all()
+        ):
+            raise RuntimeError("critic probe current Actor cache is invalid")
+        prepared["observations"] = current_actor
         expected_normalized = policy._normalize_replay_flat(
             selected["critic_observations"],
             policy.q_critic_keys,
@@ -746,28 +771,26 @@ def main(cfg: DictConfig):
                 prepared
             )
             policy.sac_action_rng.set_state(rng_state)
-            correct_logits = policy.qnet(
+            correct_logits = policy._q_forward(
+                policy.qnet,
                 prepared["critic_observations"],
-                policy._q_action_features(
-                    prepared["actions"], actuator_context
-                ),
+                prepared["actions"],
+                actuator_context,
             )
-            shuffled_action_logits = policy.qnet(
+            shuffled_action_logits = policy._q_forward(
+                policy.qnet,
                 prepared["critic_observations"],
-                policy._q_action_features(
-                    prepared["actions"].index_select(0, decoy),
-                    actuator_context,
-                ),
+                prepared["actions"].index_select(0, decoy),
+                actuator_context,
             )
-            shuffled_state_logits = policy.qnet(
+            shuffled_state_logits = policy._q_forward(
+                policy.qnet,
                 prepared["critic_observations"].index_select(0, decoy),
-                policy._q_action_features(
-                    prepared["actions"],
-                    (
-                        None
-                        if actuator_context is None
-                        else actuator_context.index_select(0, decoy)
-                    ),
+                prepared["actions"],
+                (
+                    None
+                    if actuator_context is None
+                    else actuator_context.index_select(0, decoy)
                 ),
             )
 

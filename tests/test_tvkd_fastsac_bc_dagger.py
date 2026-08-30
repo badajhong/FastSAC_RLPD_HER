@@ -34,6 +34,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     PERCEPTION_POLICY_RAW_KEY,
     PERCEPTION_VEL_COMMAND_RAW_KEY,
     NEXT_Q_ACTUATOR_CONTEXT_KEY,
+    Q_ACTUATOR_CONTEXT_KEY,
     NEXT_REFERENCE_PHASE_KEY,
     REFERENCE_PHASE_KEY,
     REPLAY_COMMAND_FINISHED_KEY,
@@ -4568,6 +4569,15 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
     with pytest.raises(ValueError, match="train_every"):
         policy._load_fastsac_checkpoint_state(drifted_cadence, load_modules=False)
 
+    predates_actor_scheduler = copy.deepcopy(state)
+    predates_actor_scheduler["dagger_backend_config"].pop(
+        "actor_update_to_data_ratio"
+    )
+    with pytest.raises(ValueError, match="predates the independent Actor row"):
+        policy._load_fastsac_checkpoint_state(
+            predates_actor_scheduler, load_modules=False
+        )
+
     drifted_semantics = copy.deepcopy(state)
     drifted_semantics["actor_learning_semantics"] = "wrong"
     with pytest.raises(ValueError, match="actor_learning_semantics"):
@@ -4888,6 +4898,44 @@ def test_tvkd_hydra_resolves_independent_q_and_actor_four_way_mixes():
         float(cfg.algo[f"perception_{source}_fraction"])
         for source in REPLAY_SOURCE_ORDER
     ) == pytest.approx((1.0, 0.0, 0.0, 0.0))
+
+
+def test_tvkd_zero_focus_alias_resolves_uniform_half_mix_for_q_and_actor():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    zero_focus_half_mix = [
+        "algo.q_teacher_replay_ratio=0.5",
+        "algo.teacher_actor_replay_fraction=0.5",
+        "algo.failure_phase_teacher_fraction=0.0",
+        "algo.failure_phase_student_fraction=0.0",
+    ]
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                *zero_focus_half_mix,
+            ],
+            return_hydra_config=True,
+        )
+
+    assert _apply_tvkd_cli_replay_mix_overrides(
+        cfg, cfg.hydra.overrides.task
+    )
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = cfg.algo
+    expected = {
+        "uniform_student": 512,
+        "failure_student": 0,
+        "uniform_teacher": 512,
+        "failure_teacher": 0,
+    }
+    assert policy._replay_source_counts("q", 1024) == expected
+    assert policy._replay_source_counts("actor", 1024) == expected
 
 
 def test_tvkd_hydra_legacy_cli_mix_translates_current_command():
@@ -5987,6 +6035,7 @@ def _student_q_n_step_test_chunk(
     markers,
     dones=None,
     discounts=None,
+    include_actuator_context=False,
 ):
     rewards = torch.tensor(rewards, dtype=torch.float32)
     markers = torch.tensor(markers, dtype=torch.float32)
@@ -5999,7 +6048,7 @@ def _student_q_n_step_test_chunk(
         discounts = torch.ones(count, dtype=torch.float32)
     else:
         discounts = torch.tensor(discounts, dtype=torch.float32)
-    return {
+    chunk = {
         "rewards": rewards,
         "dones": dones,
         "truncations": torch.zeros(count, dtype=torch.bool),
@@ -6010,6 +6059,12 @@ def _student_q_n_step_test_chunk(
         DAGGER_IS_STUDENT_ACTION_KEY: torch.ones(count, dtype=torch.bool),
         _PREFILL_ENV_INDEX_KEY: torch.arange(count, dtype=torch.long),
     }
+    if include_actuator_context:
+        # The causal context's suffix is the held command on the current
+        # state and the just-issued command on its successor.
+        chunk[Q_ACTUATOR_CONTEXT_KEY] = (markers - 1.0)[:, None]
+        chunk[NEXT_Q_ACTUATOR_CONTEXT_KEY] = markers[:, None]
+    return chunk
 
 
 def test_tvkd_student_q_n_step_aggregates_factual_vector_trajectories():
@@ -6021,15 +6076,27 @@ def test_tvkd_student_q_n_step_aggregates_factual_vector_trajectories():
     policy._student_q_n_step_accumulator = None
 
     first = policy._aggregate_student_q_n_step_chunk(
-        _student_q_n_step_test_chunk([1.0, 10.0], markers=[1.0, 10.0]),
+        _student_q_n_step_test_chunk(
+            [1.0, 10.0],
+            markers=[1.0, 10.0],
+            include_actuator_context=True,
+        ),
         num_envs=2,
     )
     second = policy._aggregate_student_q_n_step_chunk(
-        _student_q_n_step_test_chunk([2.0, 20.0], markers=[2.0, 20.0]),
+        _student_q_n_step_test_chunk(
+            [2.0, 20.0],
+            markers=[2.0, 20.0],
+            include_actuator_context=True,
+        ),
         num_envs=2,
     )
     result = policy._aggregate_student_q_n_step_chunk(
-        _student_q_n_step_test_chunk([3.0, 30.0], markers=[3.0, 30.0]),
+        _student_q_n_step_test_chunk(
+            [3.0, 30.0],
+            markers=[3.0, 30.0],
+            include_actuator_context=True,
+        ),
         num_envs=2,
     )
 
@@ -6040,6 +6107,12 @@ def test_tvkd_student_q_n_step_aggregates_factual_vector_trajectories():
     assert torch.equal(result["actions"], torch.tensor([[1.0], [10.0]]))
     assert torch.equal(
         result["next_critic_observations"], torch.tensor([[103.0], [130.0]])
+    )
+    assert torch.equal(
+        result[Q_ACTUATOR_CONTEXT_KEY], torch.tensor([[0.0], [9.0]])
+    )
+    assert torch.equal(
+        result[NEXT_Q_ACTUATOR_CONTEXT_KEY], torch.tensor([[3.0], [30.0]])
     )
     assert torch.equal(result["discounts"], torch.ones(2))
 
@@ -6275,6 +6348,20 @@ def test_tvkd_q_n_step_requires_a_positive_integer(invalid):
     cfg = TVKDDistributionalFastSACTeacherBCConfig()
     cfg.q_n_step = invalid
     with pytest.raises(ValueError, match="q_n_step"):
+        tvkd_module._validate_tvkd_algorithm_config(cfg)
+
+
+def test_tvkd_causal_q_rejects_teacher_only_q_mix():
+    cfg = TVKDDistributionalFastSACTeacherBCConfig(
+        q_condition_on_actuator_state=True,
+        q_use_causal_hold_advantage=True,
+        q_uniform_student_fraction=0.0,
+        q_failure_student_fraction=0.0,
+        q_uniform_teacher_fraction=0.5,
+        q_failure_teacher_fraction=0.5,
+    )
+
+    with pytest.raises(ValueError, match="positive Student Q replay fraction"):
         tvkd_module._validate_tvkd_algorithm_config(cfg)
 
 

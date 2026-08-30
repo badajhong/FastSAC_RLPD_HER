@@ -49,6 +49,9 @@ algo:
   dagger_buffer_capacity: 131_072
   dagger_buffer_device: cpu
   dagger_batch_size: 4096
+  # Actor/BC optimizer work has its own row-credit scheduler.  Q batch size,
+  # Q UTD, and policy_delay therefore cannot silently slow policy learning.
+  actor_update_to_data_ratio: 1.0
   # Keep collecting successful Teacher episodes until the frozen Teacher Q
   # ring reaches q_teacher_buffer_capacity. This is only a fail-fast safety
   # ceiling; failed and timed-out trajectories never reach frozen replay.
@@ -109,6 +112,17 @@ algo:
   # Requires q_condition_on_actuator_state=true. When enabled, Q additionally
   # receives delta-command and three exact queue/lerp effect intervals.
   q_use_predicted_effect: false
+  # Exact delayed-MDP state augmentation for the command-value critic. Replay
+  # stores delay, alpha, smoothed applied command, and the complete pre-shift
+  # command queue; the candidate remains the newly issued command. The compact
+  # actuator state and candidate share a dedicated Q branch. Fresh Q required.
+  q_use_delay_aware_mdp: false
+  # Structural delayed-action critic. It anchors a monotone scalar advantage
+  # to the pre-shift held command and identifies its direction from the
+  # same-state DAgger Teacher label. When delay-aware MDP is also enabled, the
+  # complete applied-command/queue state is kept in Q's state branch and only
+  # the new candidate command enters its action branch. Requires a fresh run.
+  q_use_causal_hold_advantage: false
   # Zero-initialized bounded FiLM of the Q action stem, conditioned only on
   # delay one-hot and centered actuator alpha. Requires actuator context and
   # late/balanced action fusion.
@@ -134,8 +148,8 @@ algo:
   # FastSAC owns exploration through its learned squashed Gaussian.  These
   # inherited TD3 controls are locked inert to prevent a second noise source.
   eta_td3: 0.0
-  # At the standard 512-env rollout this keeps four Actor updates while Q uses
-  # all 32 row-credit updates.  The Actor cadence scales with new data too.
+  # Legacy fallback only when actor_update_to_data_ratio is null. The explicit
+  # Actor row scheduler above owns policy cadence in normal FastSAC training.
   policy_delay: 8
   target_policy_noise_std: 0.0
   target_policy_noise_clip: 0.0
@@ -179,7 +193,7 @@ algo:
   sac_alpha_init: 1.0e-5
   sac_alpha_lr: 2.0e-5
   sac_use_autotune: true
-  # Lock autotune to the delayed Actor cadence, not every Critic update.
+  # Lock autotune to actual row-scheduled Actor updates, not Critic updates.
   sac_alpha_update_cadence: actor
   # Normalized target = -action_dim * ratio. Values above one intentionally
   # request lower entropy; the skateboard's 23 actions give -46 at ratio 2.
