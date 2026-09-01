@@ -275,6 +275,14 @@ def _validate_failure_phase_teacher_sampling(cfg: DictConfig) -> None:
         cfg.algo.get("q_teacher_replay_ratio", None),
     )
     _finite_fraction(
+        "algo.q_online_dagger_replay_fraction",
+        cfg.algo.get("q_online_dagger_replay_fraction", None),
+    )
+    _finite_fraction(
+        "algo.actor_online_dagger_replay_fraction",
+        cfg.algo.get("actor_online_dagger_replay_fraction", None),
+    )
+    _finite_fraction(
         "algo.failure_phase_teacher_fraction",
         cfg.algo.get("failure_phase_teacher_fraction", None),
     )
@@ -297,23 +305,25 @@ def _validate_failure_phase_teacher_sampling(cfg: DictConfig) -> None:
         )
 
 
-def _validate_online_student_perception_contract(cfg: DictConfig) -> None:
-    """Lock fresh FastSAC perception to PPOVEL's live-rollout optimizer."""
+def _validate_perception_training_contract(cfg: DictConfig) -> None:
+    """Validate FastSAC's live-rollout or explicit four-way perception mode."""
     mode = str(cfg.algo.get("perception_replay_mode", ""))
+    if mode == "four_way":
+        if bool(cfg.algo.get("train_dr_estimator", False)):
+            raise ValueError(
+                "FastSAC four_way perception replay has no DR-estimator target; "
+                "set algo.train_dr_estimator=false"
+            )
+        return
     if mode != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE:
         raise ValueError(
-            "FastSAC perception requires "
-            "algo.perception_replay_mode='online_student_rollout'"
+            "FastSAC perception requires algo.perception_replay_mode to be "
+            "'online_student_rollout' or 'four_way'"
         )
     if float(cfg.algo.get("teacher_perception_replay_fraction", math.nan)) != 0.0:
         raise ValueError(
             "FastSAC live-rollout perception requires "
             "algo.teacher_perception_replay_fraction=0"
-        )
-    if int(cfg.algo.get("teacher_perception_warmup_steps", -1)) != 0:
-        raise ValueError(
-            "FastSAC live-rollout perception requires "
-            "algo.teacher_perception_warmup_steps=0"
         )
     canonical = {
         "perception_uniform_student_fraction": 1.0,
@@ -578,6 +588,23 @@ def _validate_replay_contract(cfg: DictConfig) -> None:
 
 
 def _validate_sac_controls(cfg: DictConfig) -> None:
+    actor_observation_mode = str(
+        cfg.algo.get("sac_actor_observation_mode", "student_perception")
+    )
+    if actor_observation_mode not in ("student_perception", "privileged_oracle"):
+        raise ValueError(
+            "algo.sac_actor_observation_mode must be 'student_perception' or "
+            "'privileged_oracle'"
+        )
+    if (
+        actor_observation_mode == "privileged_oracle"
+        and str(cfg.algo.get("perception_replay_mode", ""))
+        != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+    ):
+        raise ValueError(
+            "algo.sac_actor_observation_mode=privileged_oracle requires "
+            "algo.perception_replay_mode=online_student_rollout"
+        )
     action_distribution = str(
         cfg.algo.get(
             "sac_action_distribution", NORMALIZED_TANH_ACTION_DISTRIBUTION
@@ -711,6 +738,11 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
     for name in ("q_n_step", "q_teacher_n_step"):
         if cfg.algo.get(name, None) is not None:
             _positive_int(f"algo.{name}", cfg.algo.get(name))
+            if int(cfg.algo.get(name)) != 1:
+                raise ValueError(
+                    f"algo.{name} is locked to 1 for factual one-step "
+                    "Expert/DAgger/Student SAC replay"
+                )
     _finite_nonnegative("algo.sac_tau", cfg.algo.get("sac_tau", None))
     if not 0.0 < float(cfg.algo.sac_tau) <= 1.0:
         raise ValueError("algo.sac_tau must be in (0, 1]")
@@ -770,10 +802,30 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     _reject_obsolete_bounded_action_controls(cfg)
     _validate_perception_training_controls(cfg)
 
+    dagger_env_fraction = _finite_fraction(
+        "algo.dagger_env_fraction",
+        cfg.algo.get("dagger_env_fraction", None),
+    )
+    if not 0.0 < dagger_env_fraction < 1.0:
+        raise ValueError(
+            "algo.dagger_env_fraction must be strictly between 0 and 1"
+        )
+    num_envs = _positive_int("task.num_envs", cfg.task.get("num_envs", None))
+    dagger_envs = min(
+        num_envs,
+        int(math.floor(num_envs * dagger_env_fraction + 0.5)),
+    )
+    if dagger_envs < 1 or dagger_envs >= num_envs:
+        raise ValueError(
+            "task.num_envs and algo.dagger_env_fraction must produce at least "
+            "one DAgger and one pure-Student environment"
+        )
+
     for name in (
         "dagger_safe_min_teacher_steps",
         "dagger_beta_decay_rollouts",
         "dagger_buffer_capacity",
+        "student_buffer_capacity",
         "dagger_batch_size",
         "perception_replay_burn_in",
         "perception_encode_microbatch_size",
@@ -793,7 +845,41 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     _validate_failure_phase_teacher_sampling(cfg)
     _validate_replay_contract(cfg)
     _validate_sac_controls(cfg)
-    _validate_online_student_perception_contract(cfg)
+    _validate_perception_training_contract(cfg)
+
+    learning_starts = int(cfg.algo.sac_learning_starts)
+    dagger_learning_starts = int(
+        math.floor(learning_starts * dagger_env_fraction + 0.5)
+    )
+    student_learning_starts = learning_starts - dagger_learning_starts
+    q_online_dagger_fraction = float(cfg.algo.q_online_dagger_replay_fraction)
+    actor_online_dagger_fraction = float(
+        cfg.algo.actor_online_dagger_replay_fraction
+    )
+    dagger_ring_required = (
+        q_online_dagger_fraction > 0.0
+        or actor_online_dagger_fraction > 0.0
+    )
+    student_ring_required = (
+        q_online_dagger_fraction < 1.0
+        or actor_online_dagger_fraction < 1.0
+    )
+    if (
+        dagger_ring_required
+        and int(cfg.algo.dagger_buffer_capacity) < dagger_learning_starts
+    ):
+        raise ValueError(
+            "algo.dagger_buffer_capacity must cover the DAgger cohort's "
+            "learning-start rows"
+        )
+    if (
+        student_ring_required
+        and int(cfg.algo.student_buffer_capacity) < student_learning_starts
+    ):
+        raise ValueError(
+            "algo.student_buffer_capacity must cover the pure-Student "
+            "cohort's learning-start rows"
+        )
 
     q_update_to_data_ratio = cfg.algo.get("q_update_to_data_ratio", None)
     if (
@@ -805,36 +891,35 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         raise ValueError(
             "algo.q_update_to_data_ratio must be finite and positive"
         )
-    actor_update_to_data_ratio = cfg.algo.get(
-        "actor_update_to_data_ratio", None
-    )
-    if (
-        actor_update_to_data_ratio is not None
-        and (
-            isinstance(actor_update_to_data_ratio, bool)
-            or not math.isfinite(float(actor_update_to_data_ratio))
-            or float(actor_update_to_data_ratio) <= 0.0
-        )
-    ):
-        raise ValueError(
-            "algo.actor_update_to_data_ratio must be null or finite and positive"
-        )
     if int(cfg.algo.q_teacher_buffer_capacity) < int(cfg.algo.sac_learning_starts):
         raise ValueError(
             "algo.q_teacher_buffer_capacity must cover algo.sac_learning_starts"
         )
-    if int(cfg.algo.get("q_num_atoms", -1)) != 501:
-        raise ValueError("distributional FastSAC requires exactly 501 C51 atoms")
-    if not math.isclose(float(cfg.algo.get("q_v_min", math.nan)), -20.0):
-        raise ValueError("distributional FastSAC requires q_v_min=-20")
-    if not math.isclose(float(cfg.algo.get("q_v_max", math.nan)), 20.0):
-        raise ValueError("distributional FastSAC requires q_v_max=20")
-    if cfg.algo.get("q_action_fusion") not in ("late", "balanced"):
+    q_critic_type = str(cfg.algo.get("q_critic_type", "c51"))
+    if q_critic_type not in ("c51", "scalar"):
+        raise ValueError("algo.q_critic_type must be c51 or scalar")
+    if q_critic_type == "c51":
+        if int(cfg.algo.get("q_num_atoms", -1)) != 501:
+            raise ValueError(
+                "distributional FastSAC requires exactly 501 C51 atoms"
+            )
+        if not math.isclose(float(cfg.algo.get("q_v_min", math.nan)), -20.0):
+            raise ValueError("distributional FastSAC requires q_v_min=-20")
+        if not math.isclose(float(cfg.algo.get("q_v_max", math.nan)), 20.0):
+            raise ValueError("distributional FastSAC requires q_v_max=20")
+        if cfg.algo.get("q_action_fusion") not in ("late", "balanced"):
+            raise ValueError(
+                "distributional FastSAC requires late or balanced "
+                "Q-action fusion"
+            )
+        if cfg.algo.get("q_layer_norm") is not True:
+            raise ValueError(
+                "distributional FastSAC requires LayerNorm Q Critics"
+            )
+    elif cfg.algo.get("q_use_residual_film", False) is not False:
         raise ValueError(
-            "distributional FastSAC requires late or balanced Q-action fusion"
+            "standard scalar Q requires algo.q_use_residual_film=false"
         )
-    if cfg.algo.get("q_layer_norm") is not True:
-        raise ValueError("distributional FastSAC requires LayerNorm Q Critics")
     if cfg.algo.get("q_action_coordinates") != "raw_joint_command":
         raise ValueError("distributional FastSAC requires raw_joint_command Q actions")
     if cfg.algo.get("q_normalize_actions") is not True:
@@ -917,15 +1002,6 @@ def main(cfg: DictConfig):
     prepare_fresh_fastsac_bc_dagger_source(cfg)
     validate_fastsac_bc_dagger_config(cfg)
     schedule = fastsac_dagger_rollout_schedule(cfg)
-    actor_row_ratio = cfg.algo.get("actor_update_to_data_ratio", None)
-    actor_schedule = (
-        "legacy Critic-coupled cadence"
-        if actor_row_ratio is None
-        else (
-            f"row ratio {float(actor_row_ratio):g}, "
-            f"batch {int(cfg.algo.dagger_batch_size)}"
-        )
-    )
     print(
         "Distributional FastSAC + mean Teacher-BC schedule: "
         f"prefill=until {schedule['prefill_target_rows']} Teacher rows "
@@ -934,20 +1010,30 @@ def main(cfg: DictConfig):
         f"frames/rollout={schedule['frames_per_rollout']}; "
         f"method={EXPECTED_TRAINING_ALGORITHM}"
     )
+    critic_type = str(cfg.algo.get("q_critic_type", "c51"))
+    critic_architecture = (
+        "balanced-state/action-stems->"
+        f"{int(cfg.algo.q_hidden_dim)}x{int(cfg.algo.q_hidden_dim)}->scalar"
+        if critic_type == "scalar"
+        else "split-action C51"
+    )
     print(
-        "Distributional FastSAC updates: "
-        f"atoms={int(cfg.algo.q_num_atoms)}, "
+        "FastSAC updates: "
+        f"critic={critic_type}, "
+        f"critic_architecture={critic_architecture}, "
+        f"outputs_per_head={1 if critic_type == 'scalar' else int(cfg.algo.q_num_atoms)}, "
         f"policy_frequency={int(cfg.algo.sac_policy_frequency)}, "
         f"tau={float(cfg.algo.sac_tau):g}, "
         f"eta_sac={float(cfg.algo.eta_sac):g}, "
         f"lambda_bc={float(cfg.algo.lambda_bc):g}, "
+        "actor_observation_mode="
+        f"{cfg.algo.get('sac_actor_observation_mode', 'student_perception')}, "
         "action_distribution="
         f"{cfg.algo.get('sac_action_distribution', NORMALIZED_TANH_ACTION_DISTRIBUTION)}, "
         f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "
         f"alpha_init={float(cfg.algo.sac_alpha_init):g}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence} "
-        "(on each actual Actor update), "
-        f"actor_schedule={actor_schedule}; "
+        f"(every {int(cfg.algo.sac_policy_frequency)} Critic updates); "
         "perception=live Student rollout only (PPOVEL finetune)"
     )
     return run_training(cfg)

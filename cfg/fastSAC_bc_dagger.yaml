@@ -25,9 +25,10 @@ save_interval: 100
 fastsac_bc_dagger_checkpoint: null
 
 algo:
-  # Main rollout defaults to the stochastic Student immediately.  The frozen
-  # Teacher Q ring is populated separately by the prefill below; Teacher labels
-  # are still queried during main rollout for the mean-action BC objective.
+  # Main rollout uses one fixed, seeded environment partition. DAgger envs
+  # alternate Student/Teacher execution from a Student first step after every
+  # reset; the complementary envs always execute Student. The frozen Expert Q
+  # ring is populated separately by the successful-only prefill below.
   dagger_control_mode: beta
   dagger_safe_takeover_rms: 0.006
   dagger_safe_release_rms: 0.004
@@ -38,6 +39,9 @@ algo:
   dagger_beta_zero_iteration: null
   dagger_beta_decay_rollouts: 500
   dagger_seed: 0
+  # Fraction of vector environments assigned to the fixed mixed-control DAgger
+  # cohort. Both cohorts must be non-empty; 0.5 gives 256/256 at num_envs=512.
+  dagger_env_fraction: 0.5
   # Shared finite raw-command support for behavior, targets, replay, BC, and Q.
   # Nominal per-joint limits remain normalization/entropy coordinates.
   action_support_clip: 20.0
@@ -46,21 +50,25 @@ algo:
   # One optimizer handles this term and the reparameterized SAC objective.
   dagger_bc_lr: 3.0e-4
   dagger_actor_huber_delta: 1.0
-  dagger_buffer_capacity: 131_072
+  # Explicit capacities for the two independent online rings. The DAgger ring
+  # stores every transition from the alternating Student/Teacher cohort; the
+  # Student ring stores only transitions from the pure-Student cohort. Keeping
+  # both at 65,536 preserves the former 131,072-row total online allocation.
+  dagger_buffer_capacity: 65_536
+  student_buffer_capacity: 65_536
   dagger_buffer_device: cpu
   dagger_batch_size: 4096
-  # Actor/BC optimizer work has its own row-credit scheduler.  Q batch size,
-  # Q UTD, and policy_delay therefore cannot silently slow policy learning.
-  actor_update_to_data_ratio: 1.0
   # Keep collecting successful Teacher episodes until the frozen Teacher Q
   # ring reaches q_teacher_buffer_capacity. This is only a fail-fast safety
   # ceiling; failed and timed-out trajectories never reach frozen replay.
   # Source fractions change sampling/loss weights, not this ring's allocation.
   teacher_prefill_max_rollouts: 1000
-  # Actor replay accepts an independent Teacher share. Perception is different:
-  # it follows PPOVEL finetune exactly and learns only from the current live
-  # recurrent Student rollout, never from either replay ring.
+  # Actor replay accepts an independent Expert share. Within its remaining
+  # online share, this conditional fraction comes from mixed-control DAgger;
+  # the complement comes from the pure-Student ring. Perception is different:
+  # it learns only from complete live sequences of the pure-Student cohort.
   teacher_actor_replay_fraction: 0.5
+  actor_online_dagger_replay_fraction: 0.5
   teacher_perception_replay_fraction: 0.0
   perception_replay_mode: online_student_rollout
   failure_phase_teacher_fraction: 0.3
@@ -98,31 +106,27 @@ algo:
   # Disable only to freeze a successfully loaded complete perception stack.
   train_perception: true
 
-  # Locked twin 501-atom distributional Critic with an independently
-  # configurable frozen-Teacher / main-Student replay mixture.
+  # ``c51`` preserves the engineered split-action distributional critic.
+  # ``scalar`` uses independent standard-SAC Q heads with balanced state/action
+  # stems, followed by two shared-width hidden layers and one scalar output.
+  q_critic_type: c51
+  # Locked C51 support (retained as inactive compatibility metadata in scalar
+  # mode) with an independently configurable Teacher/Student replay mixture.
   q_hidden_dim: 768
   q_num_atoms: 501
   q_v_min: -20.0
   q_v_max: 20.0
+  # These two topology knobs apply only to C51. Scalar always uses its fixed
+  # balanced state/action stems and no LayerNorm.
   q_layer_norm: true
   q_action_fusion: late
   q_action_coordinates: raw_joint_command
   q_normalize_actions: true
   q_action_input_gain: 1.0
-  # Requires q_condition_on_actuator_state=true. When enabled, Q additionally
-  # receives delta-command and three exact queue/lerp effect intervals.
+  # Requires q_condition_on_actuator_state=true. C51 receives engineered
+  # delta/effect features. Scalar uses this flag only to retain the normalized
+  # previous issued action as detached state context.
   q_use_predicted_effect: false
-  # Exact delayed-MDP state augmentation for the command-value critic. Replay
-  # stores delay, alpha, smoothed applied command, and the complete pre-shift
-  # command queue; the candidate remains the newly issued command. The compact
-  # actuator state and candidate share a dedicated Q branch. Fresh Q required.
-  q_use_delay_aware_mdp: false
-  # Structural delayed-action critic. It anchors a monotone scalar advantage
-  # to the pre-shift held command and identifies its direction from the
-  # same-state DAgger Teacher label. When delay-aware MDP is also enabled, the
-  # complete applied-command/queue state is kept in Q's state branch and only
-  # the new candidate command enters its action branch. Requires a fresh run.
-  q_use_causal_hold_advantage: false
   # Zero-initialized bounded FiLM of the Q action stem, conditioned only on
   # delay one-hot and centered actuator alpha. Requires actuator context and
   # late/balanced action fusion.
@@ -139,17 +143,18 @@ algo:
   # chunking. q_updates_per_rollout is used only when this ratio is null.
   q_updates_per_rollout: 32
   q_update_to_data_ratio: 1.0
-  # Fraction of each Q batch drawn from frozen Teacher replay; the remainder
-  # is sampled from Student-executed replay. Any finite value in [0, 1] is valid;
-  # the Teacher row count is floor(q_batch_size * ratio + 0.5).
+  # Fraction of each Q batch drawn from frozen Expert replay. The remainder is
+  # online data; its conditional DAgger/pure-Student split is controlled by the
+  # second value. Counts use deterministic half-up rounding.
   q_teacher_replay_ratio: 0.5
+  q_online_dagger_replay_fraction: 0.5
   q_teacher_buffer_capacity: 131_072
 
   # FastSAC owns exploration through its learned squashed Gaussian.  These
   # inherited TD3 controls are locked inert to prevent a second noise source.
   eta_td3: 0.0
-  # Legacy fallback only when actor_update_to_data_ratio is null. The explicit
-  # Actor row scheduler above owns policy cadence in normal FastSAC training.
+  # At the standard 512-env rollout this keeps four Actor updates while Q uses
+  # all 32 row-credit updates.  The Actor cadence scales with new data too.
   policy_delay: 8
   target_policy_noise_std: 0.0
   target_policy_noise_clip: 0.0
@@ -157,10 +162,14 @@ algo:
   collector_exploration_noise_clip: 0.0
   td3_learning_starts: 8192
 
-  # Policy distribution. ``normalized_tanh`` is the historical bounded
-  # FastSAC policy. ``ppo_physical_gaussian`` instead uses PPOVEL's raw
-  # physical-action mean and direct joint-wise actor_std, initialized uniformly
-  # from load_noise_scale. Fixed-temperature and autotuned SAC are both valid.
+  # Policy distribution. ``normalized_tanh`` is the bounded FastSAC policy:
+  # it uses the nominal per-joint action interval shared with Q normalization,
+  # so sampled, executed, replayed, and Actor-Q actions stay on one support.
+  # ``ppo_physical_gaussian`` uses PPOVEL's raw physical-action Normal and
+  # direct joint-wise actor_std. Teacher and Student then share physical action
+  # coordinates; the common execution clamp remains the final safety guard.
+  # Teacher BC, when enabled, uses the execution-valid physical label directly.
+  # Fixed-temperature and autotuned SAC are both valid.
   eta_sac: 1.0e-4
   lambda_bc: 1.0
   # Optional low-memory SPReD-P weighting: use the online twin Critic's
@@ -193,7 +202,7 @@ algo:
   sac_alpha_init: 1.0e-5
   sac_alpha_lr: 2.0e-5
   sac_use_autotune: true
-  # Lock autotune to actual row-scheduled Actor updates, not Critic updates.
+  # Lock autotune to the delayed Actor cadence, not every Critic update.
   sac_alpha_update_cadence: actor
   # Normalized target = -action_dim * ratio. Values above one intentionally
   # request lower entropy; the skateboard's 23 actions give -46 at ratio 2.

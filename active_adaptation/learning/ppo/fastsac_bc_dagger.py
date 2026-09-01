@@ -4,9 +4,8 @@ This backend deliberately reuses the Teacher-only
 prefill, DAgger source selection, timeout handling, and twin-C51 topology from
 ``td3_bc_dagger``.  The learning rule itself is SAC:
 
-* Student collection and Actor updates use either the historical bounded
-  Gaussian in nominal joint coordinates or an opt-in PPOVEL-compatible raw
-  physical-action Gaussian;
+* Student collection and Actor updates use either a nominal-joint bounded,
+  reparameterized tanh Gaussian or PPOVEL's raw physical-action Gaussian;
 * Teacher BC is applied only to the distribution's noise-free mean, optionally
   with a detached SPReD-P probability from the online twin Critic;
 * the soft Bellman target contains the next-policy entropy term;
@@ -18,14 +17,17 @@ Student replay keeps the exact carried-hidden Actor inputs seen at collection;
 successful Teacher episodes are re-encoded with the current EMA perception
 modules through a non-serialized sidecar.  Replay observations therefore remain
 input-authoritative for Q and Actor updates without a zero-hidden approximation.
-Perception itself is trained only from the current live Student rollout through
-the exact PPOVEL finetune path; it never samples the replay rings.  The
-duplicate Teacher H5 export remains disabled.
+Perception defaults to the current live Student rollout through the exact
+PPOVEL finetune path.  An explicit ``four_way`` configuration may instead
+sample the existing Student/Teacher replay strata.  The duplicate Teacher H5
+export remains disabled.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -38,6 +40,8 @@ from tensordict import TensorDict
 
 from .common import ACTION_KEY, CMD_KEY, OBS_KEY, OBS_PRIV_KEY, Actor, hard_copy_
 from .fastsac_vel import (
+    FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
+    FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
     FastSACTanhNormal,
     _BCDaggerSACAdapter,
     _fastsac_target_entropy,
@@ -70,13 +74,21 @@ from .ppo_vel import (
 )
 from .td3_bc_dagger import (
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
+    DAGGER_IS_DAGGER_ENV_KEY,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
+    ONLINE_STUDENT_ACTOR_WARMUP_SEMANTICS,
+    PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE,
+    SAC_ACTOR_OBSERVATION_MODES,
+    STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
     OBJECT_GEO_REPLAY_SEMANTICS,
+    PERCEPTION_PREFILL_WARMUP_SEMANTICS,
+    PERCEPTION_REPLAY_SEMANTICS,
     PERCEPTION_PREFILL_DISABLED_SEMANTICS,
     NEXT_Q_ACTUATOR_CONTEXT_KEY,
+    REPLAY_SOURCE_ORDER,
     REPLAY_MOTION_ID_KEY,
     Q_ACTUATOR_CONTEXT_KEY,
     STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY,
@@ -92,6 +104,7 @@ from .td3_bc_dagger import (
     _joint_normalized_action_discrepancy,
     _polyak_update_,
     _project_c51_probabilities,
+    _split_count,
     _valid_raw_action_rows,
 )
 
@@ -101,18 +114,22 @@ CHECKPOINT_VERSION = 7
 PREVIOUS_CHECKPOINT_VERSION = 6
 _PREVIOUS_PRE_PRIOR_CHECKPOINT_VERSION = 5
 _SMOOTH_BOUNDED_STD_CHECKPOINT_VERSION = 4
-ACTOR_BACKEND = "ppo_vel_smooth_bounded_normalized_std_tanh_fastsac_bc_v2"
+ACTOR_BACKEND = "ppo_vel_nominal_joint_bounded_tanh_fastsac_bc_v3"
 PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND = (
     "ppo_vel_raw_physical_joint_std_gaussian_fastsac_bc_v1"
 )
 NORMALIZED_TANH_ACTION_DISTRIBUTION = "normalized_tanh"
 PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION = "ppo_physical_gaussian"
+C51_Q_CRITIC_TYPE = "c51"
+SCALAR_Q_CRITIC_TYPE = "scalar"
+Q_CRITIC_TYPES = frozenset((C51_Q_CRITIC_TYPE, SCALAR_Q_CRITIC_TYPE))
 UNIFORM_PHYSICAL_STD_BOUND_MODE = "uniform_physical"
 Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE = "q_normalized"
 PHYSICAL_STD_BOUND_MODES = frozenset(
     (UNIFORM_PHYSICAL_STD_BOUND_MODE, Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE)
 )
 FASTSAC_ACTION_PROJECTION_KEY = "fastsac_action_projection"
+FASTSAC_DAGGER_ENV_KEY = DAGGER_IS_DAGGER_ENV_KEY
 FASTSAC_PREFILL_TEACHER_NOISE_KEY = "fastsac_prefill_teacher_ppo_noise_q"
 FASTSAC_PREFILL_TEACHER_PROJECTION_KEY = (
     "fastsac_prefill_teacher_action_projection"
@@ -125,19 +142,62 @@ _LEGACY_EFFECTIVE_LOG_STD_ACTOR_BACKEND = (
 ACTION_CONTRACT_SEMANTICS = (
     "finite_raw_joint_action_support_with_jointwise_normalized_q_bc_v1"
 )
+
+
+def _migrate_explicit_online_replay_capacities(contract: Mapping) -> dict:
+    """Split the former total online capacity for old three-source configs."""
+    migrated = dict(contract)
+    if "student_buffer_capacity" in migrated:
+        return migrated
+    if "dagger_buffer_capacity" not in migrated:
+        raise ValueError(
+            "checkpoint lacks dagger_buffer_capacity for online "
+            "replay-capacity migration"
+        )
+    if "dagger_env_fraction" not in migrated:
+        raise ValueError(
+            "checkpoint lacks dagger_env_fraction for online "
+            "replay-capacity migration"
+        )
+    total = migrated["dagger_buffer_capacity"]
+    fraction = migrated["dagger_env_fraction"]
+    if isinstance(total, bool) or not isinstance(total, int) or total < 2:
+        raise ValueError("checkpoint has invalid legacy total online capacity")
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not math.isfinite(float(fraction))
+        or not 0.0 < float(fraction) < 1.0
+    ):
+        raise ValueError(
+            "checkpoint has invalid dagger_env_fraction for online "
+            "replay-capacity migration"
+        )
+    dagger_capacity, student_capacity = _split_count(total, float(fraction))
+    if dagger_capacity < 1 or student_capacity < 1:
+        raise ValueError(
+            "legacy total capacity cannot populate both online replay rings"
+        )
+    migrated["dagger_buffer_capacity"] = dagger_capacity
+    migrated["student_buffer_capacity"] = student_capacity
+    return migrated
+
+
+STUDENT_ACTION_CONTRACT_SEMANTICS = (
+    "ppo_physical_mean_calibrated_nominal_joint_tanh_support_v1"
+)
 CRITIC_SEMANTICS = (
     "current_stochastic_actor_entropy_soft_target_lower_expected_complete_"
     "c51_distribution_projection_v1"
+)
+SCALAR_CRITIC_SEMANTICS = (
+    "current_stochastic_actor_entropy_soft_target_clipped_twin_scalar_q_mse_v1"
 )
 ACTOR_MEAN_OPTIMIZER_SEMANTICS = (
     "adamw_explicit_actor_mean_weight_decay_with_unregularized_variance_v1"
 )
 SPRED_P_BC_SEMANTICS = (
     "online_twin_sample_std_gaussian_cdf_teacher_superiority_detached_v1"
-)
-CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS = (
-    "same_state_valid_teacher_strict_both_online_heads_positive_within_head_"
-    "policy_minus_teacher_gate_for_actor_q_term_entropy_and_bc_ungated_v1"
 )
 _SPRED_P_SOURCE_METRIC_KEYS = (
     "spred_p_source_metadata_available",
@@ -153,8 +213,8 @@ _SPRED_P_SOURCE_METRIC_KEYS = (
     "q_filtered_bc_student_source_policy_better_fraction",
 )
 ACTOR_LEARNING_SEMANTICS = (
-    "reparameterized_normalized_std_bounded_alpha_logpi_minus_online_twin_min_plus_"
-    "joint_normalized_raw_teacher_mean_bc_v1"
+    "reparameterized_nominal_joint_tanh_normal_alpha_logpi_minus_online_twin_min_"
+    "plus_student_support_projected_teacher_mean_bc_v2"
 )
 PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS = (
     "reparameterized_ppo_physical_joint_std_gaussian_alpha_logpi_minus_online_"
@@ -184,6 +244,92 @@ _CRITIC_CADENCE_ENTROPY_SEMANTICS = (
     "smooth_bounded_log_std_tanh_normal_nominal_joint_coordinate_log_probability_"
     "auto_temperature_v2"
 )
+
+
+def _seeded_dagger_env_mask(
+    num_envs: int,
+    fraction: float,
+    seed: int,
+    *,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Return a fixed, auditable DAgger cohort without index-order bias."""
+    if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1:
+        raise ValueError("num_envs must be a positive integer")
+    if (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, (int, float))
+        or not math.isfinite(float(fraction))
+        or not 0.0 <= float(fraction) <= 1.0
+    ):
+        raise ValueError("dagger_env_fraction must be a finite number in [0,1]")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("dagger_seed must be an integer")
+
+    dagger_count = min(
+        num_envs,
+        int(math.floor(num_envs * float(fraction) + 0.5)),
+    )
+    # Draw on CPU with a private generator so the partition is independent of
+    # policy RNG consumption and identical on CPU/CUDA. Randomized fixed IDs
+    # avoid task, terrain, or motion ordering that may correlate with env index.
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    selected = torch.randperm(num_envs, generator=generator)[:dagger_count]
+    mask = torch.zeros(num_envs, dtype=torch.bool)
+    mask[selected] = True
+    return mask.to(device=device)
+
+
+def _student_action_contract_metadata(
+    joint_names,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    execution_contract: Mapping,
+) -> dict:
+    """Describe the Student policy support separately from Teacher safety.
+
+    PPOVEL Teacher actions retain the broad finite execution guard owned by the
+    inherited DAgger contract.  Student SAC actions instead use the nominal
+    soft-joint interval that also defines the Q action coordinates.  Keeping a
+    separate fingerprint prevents an older ``[-action_support_clip, +clip]``
+    tanh policy from being resumed under this materially different policy.
+    """
+    names = list(joint_names)
+    low = torch.as_tensor(action_low, dtype=torch.float32).detach().cpu()
+    high = torch.as_tensor(action_high, dtype=torch.float32).detach().cpu()
+    if low.shape != (len(names),) or high.shape != low.shape:
+        raise ValueError("Student SAC action bounds must match the joint order")
+    if (
+        not torch.isfinite(low).all()
+        or not torch.isfinite(high).all()
+        or not torch.all(high > low)
+    ):
+        raise ValueError("Student SAC action bounds must be finite and ordered")
+    if not torch.all((low < 0.0) & (high > 0.0)):
+        raise ValueError("Student SAC action zero must be inside every joint bound")
+    execution_fingerprint = execution_contract.get("fingerprint")
+    if not isinstance(execution_fingerprint, str) or not execution_fingerprint:
+        raise ValueError("Student SAC contract requires an execution fingerprint")
+    center = (low + high) * 0.5
+    scale = (high - low) * 0.5
+    payload = {
+        "semantics": STUDENT_ACTION_CONTRACT_SEMANTICS,
+        "source": "soft_joint_limits_at_default_pose",
+        "joint_names": names,
+        "action_low": low.tolist(),
+        "action_high": high.tolist(),
+        "action_center": center.tolist(),
+        "action_scale": scale.tolist(),
+        "ppo_mean_calibration": (
+            "zero_action_exact_unit_local_physical_jacobian_affine_latent"
+        ),
+        "execution_safety_fingerprint": execution_fingerprint,
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    payload["fingerprint"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return payload
 
 
 def _q_target_discount_factors(cfg, batch: Mapping[str, torch.Tensor]):
@@ -254,6 +400,11 @@ def _fastsac_action_distribution(cfg) -> str:
     return str(
         getattr(cfg, "sac_action_distribution", NORMALIZED_TANH_ACTION_DISTRIBUTION)
     )
+
+
+def _fastsac_q_critic_type(cfg) -> str:
+    """Return the critic family, defaulting historical configs to C51."""
+    return str(getattr(cfg, "q_critic_type", C51_Q_CRITIC_TYPE))
 
 
 def _fastsac_actor_backend(cfg) -> str:
@@ -435,6 +586,15 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     dagger_control_mode: str = "beta"
     dagger_beta_start: float = 0.0
     dagger_beta_end: float = 0.0
+    # Fixed seeded cohort used only after Teacher prefill. DAgger environments
+    # alternate Student/Teacher control every step and reset their phase to
+    # Student on ``is_init``; the complement always executes the Student.
+    dagger_env_fraction: float = 0.5
+    # Independent online replay allocations. ``dagger_buffer_capacity`` owns
+    # only mixed-control DAgger rows; ``student_buffer_capacity`` owns only
+    # pure-Student rows. The defaults preserve the prior 131072-row total.
+    dagger_buffer_capacity: int = 65_536
+    student_buffer_capacity: int = 65_536
 
     # During successful-only Teacher prefill, reproduce PPOVEL's diagonal
     # physical-action Gaussian.  Q receives the factual noisy command while
@@ -454,12 +614,21 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # Process larger replay chunks on the target 5090 so the increased Q UTD
     # does not multiply small depth-encoder launches.
     perception_encode_microbatch_size: int = 512
-    # Match PPOVEL finetune exactly for perception: every main iteration uses
-    # only its live recurrent Student rollout (for the production setup,
-    # [512, 32]), with no Teacher/Student perception replay or prefill warm-up.
+    # The default matches PPOVEL finetune during main training: every main
+    # iteration uses only its live recurrent Student rollout (for the
+    # production setup, [512, 32]).  An optional one-shot Teacher-replay
+    # post-prefill frozen-Actor Student rollout warm-up can train live
+    # perception and the configured mixed-source Critic before Actor learning.
+    # ``four_way`` instead opts into the raw replay sampler during main training.
     teacher_perception_replay_fraction: float = 0.0
     perception_replay_mode: str = ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
     teacher_perception_warmup_steps: int = 0
+
+    # Diagnostic observation isolation. ``student_perception`` is the
+    # deployable PPOVEL path. ``privileged_oracle`` keeps the same Student SAC
+    # Actor but substitutes the frozen Teacher encoder's GT latent for
+    # ``priv_pred`` in rollout, replay, targets, and evaluation.
+    sac_actor_observation_mode: str = STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE
 
     eta_sac: float = 1e-4
     lambda_bc: float = 1.0
@@ -467,8 +636,13 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # the online twin Critic.  The legacy option name is retained so existing
     # Hydra commands do not need another migration.
     use_q_filtered_bc: bool = False
-    # Give Q the episode-constant delayed-actuator parameters as action-side
-    # execution metadata. Actor and Critic observations remain unchanged.
+    # Opt-in standard scalar Bellman critic. The default preserves C51. Scalar
+    # uses two independent balanced state/action-stem MLPs; C51 retains the
+    # engineered split action branch and categorical heads.
+    q_critic_type: str = C51_Q_CRITIC_TYPE
+    # Give Q episode-constant delayed-actuator parameters. C51 consumes them
+    # in its engineered action branch; scalar consumes them as state context.
+    # Actor observations and environment execution remain unchanged.
     q_condition_on_actuator_state: bool = False
     # Add the exact queue/lerp counterfactual response of each candidate action.
     q_use_predicted_effect: bool = False
@@ -517,10 +691,6 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
 
     q_updates_per_rollout: int = 32
     q_update_to_data_ratio: float | None = 1.0
-    # FastSAC Actor/BC work is row-scheduled independently from Q.  With the
-    # default 4096 Actor batch this exactly reproduces the former 512-Q-batch,
-    # policy-frequency-8 cadence, while remaining stable when Q batching changes.
-    actor_update_to_data_ratio: float | None = 1.0
 
 
 ConfigStore.instance().store(
@@ -541,7 +711,107 @@ ConfigStore.instance().store(
 
 
 class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
-    """Locked DAgger selection with stochastic Student-only execution."""
+    """Stochastic Student collection with a fixed alternating DAgger cohort."""
+
+    def __init__(self, owner: "DistributionalFastSACTeacherBC"):
+        super().__init__(owner)
+        # False means the next action is Student. This transient collector state
+        # deliberately restarts at Student after a fresh env reset or process
+        # resume and is never part of the model checkpoint.
+        self._dagger_teacher_turn: torch.Tensor | None = None
+        self._fixed_dagger_env_mask: torch.Tensor | None = None
+        self._fixed_dagger_env_mask_key: tuple[int, torch.device] | None = None
+
+    def dagger_env_mask(
+        self,
+        num_envs: int | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Expose the exact fixed cohort used by this rollout policy."""
+        owner = self._owner
+        resolve_count = getattr(owner, "_parallel_env_count", None)
+        if callable(resolve_count):
+            num_envs = resolve_count(num_envs)
+        elif num_envs is None:
+            env = getattr(owner, "env", None)
+            num_envs = getattr(env, "num_envs", None)
+        if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1:
+            raise ValueError("num_envs must be a positive integer")
+        if device is None:
+            device = getattr(owner, "device", torch.device("cpu"))
+        target_device = torch.device(device)
+        if target_device.type == "cuda" and target_device.index is None:
+            target_device = torch.device("cuda", torch.cuda.current_device())
+        key = (int(num_envs), target_device)
+        if (
+            self._fixed_dagger_env_mask is not None
+            and self._fixed_dagger_env_mask_key == key
+        ):
+            return self._fixed_dagger_env_mask
+
+        owner_mask = getattr(owner, "dagger_env_mask", None)
+        if callable(owner_mask):
+            mask = owner_mask(num_envs=int(num_envs), device=target_device)
+        else:
+            mask = _seeded_dagger_env_mask(
+                int(num_envs),
+                float(getattr(owner.cfg, "dagger_env_fraction", 1.0)),
+                int(getattr(owner.cfg, "dagger_seed", 0)),
+                device=target_device,
+            )
+        mask = torch.as_tensor(mask, device=target_device)
+        if mask.dtype != torch.bool or mask.shape != (int(num_envs),):
+            raise RuntimeError("fixed DAgger environment mask has an invalid schema")
+        if hasattr(owner.cfg, "dagger_env_fraction") and (
+            not bool(mask.any()) or bool(mask.all())
+        ):
+            raise ValueError(
+                "three-source collection requires at least one DAgger and one "
+                "Student-only vector environment"
+            )
+        self._fixed_dagger_env_mask = mask
+        self._fixed_dagger_env_mask_key = key
+        return mask
+
+    def student_only_env_mask(
+        self,
+        num_envs: int | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Expose the fixed pure-Student cohort used for masked metrics."""
+        return ~self.dagger_env_mask(num_envs=num_envs, device=device)
+
+    def _dagger_env_mask(self, reference: torch.Tensor) -> torch.Tensor:
+        owner = self._owner
+        fraction = getattr(owner.cfg, "dagger_env_fraction", None)
+        if fraction is None:
+            # Compact legacy/unit seams predate the partition and retain their
+            # historical all-DAgger beta/SafeDAgger behavior.
+            return torch.ones_like(reference, dtype=torch.bool)
+        mask = self.dagger_env_mask(
+            num_envs=reference.numel(), device=reference.device
+        )
+        if mask.shape != (reference.numel(),):
+            raise RuntimeError("fixed DAgger environment mask has an invalid shape")
+        return mask.reshape(reference.shape)
+
+    def _current_dagger_teacher_turn(
+        self,
+        dagger_env: torch.Tensor,
+        reset: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return this step's source phase without advancing a failed issue."""
+        state = self._dagger_teacher_turn
+        if (
+            state is None
+            or state.shape != dagger_env.shape
+            or state.device != dagger_env.device
+        ):
+            state = torch.zeros_like(dagger_env)
+        # The first action of every reset episode is always Student, independent
+        # for each environment. The phase then alternates on every control step.
+        current = torch.where(reset, torch.zeros_like(state), state) & dagger_env
+        return current
 
     @torch.no_grad()
     def forward(self, td: TensorDict):
@@ -637,6 +907,8 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
             if reset is None
             else reset.reshape(valid.shape).bool()
         )
+        dagger_env = self._dagger_env_mask(valid)
+        partition_enabled = hasattr(owner.cfg, "dagger_env_fraction")
 
         control_mode = owner._effective_control_mode()
         safe_teacher_mask = torch.zeros_like(valid)
@@ -647,7 +919,18 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
             # Prefill always selects a valid Teacher. Its optional PPOVEL draw
             # owns a separate RNG, so collection duration cannot shift either
             # Student SAC sampling stream.
+            self._dagger_teacher_turn = None
             choose_teacher = valid
+            beta_teacher = torch.zeros_like(valid)
+        elif partition_enabled:
+            teacher_turn = self._current_dagger_teacher_turn(dagger_env, reset)
+            # Scheduled Teacher turns fall back to the finite Student action if
+            # the Teacher label is invalid. Conversely, only DAgger-cohort
+            # Student turns may use a valid Teacher as a non-finite-Student
+            # safety fallback. The Student-only cohort never executes Teacher.
+            choose_teacher = (teacher_turn & valid) | (
+                dagger_env & ~student_valid & valid
+            )
             beta_teacher = torch.zeros_like(valid)
         elif control_mode in ("safe", "hybrid"):
             if owner._safe_teacher_control_enabled():
@@ -669,32 +952,50 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
 
         scheduled_beta = owner._teacher_mixture_probability()
         if not teacher_prefill_active:
-            beta_teacher = torch.zeros_like(valid)
-            if control_mode in ("beta", "hybrid"):
-                beta_teacher = (
-                    (
-                        torch.rand(
-                            valid.shape,
-                            device=valid.device,
-                            generator=owner.dagger_rng,
+            if not partition_enabled:
+                beta_teacher = torch.zeros_like(valid)
+                if control_mode in ("beta", "hybrid"):
+                    beta_teacher = (
+                        (
+                            torch.rand(
+                                valid.shape,
+                                device=valid.device,
+                                generator=owner.dagger_rng,
+                            )
+                            < scheduled_beta
                         )
-                        < scheduled_beta
+                        & valid
+                        & ~safe_teacher_mask
                     )
-                    & valid
-                    & ~safe_teacher_mask
-                )
-            choose_teacher = safe_teacher_mask | beta_teacher
+                choose_teacher = safe_teacher_mask | beta_teacher
             sampled_student_action, _ = student_dist.rsample_with_log_prob(
                 generator=owner.sac_rollout_rng
+            )
+            # A non-finite raw Student proposal remains auditable as invalid,
+            # but the pure-Student cohort must still execute a finite Student
+            # command rather than silently switching sources. Use the sanitized
+            # distribution mean as the deterministic safety fallback.
+            sampled_student_action = torch.where(
+                student_valid.unsqueeze(-1),
+                sampled_student_action,
+                mean_student_action,
             )
         else:
             sampled_student_action = mean_student_action
 
-        if (~valid & ~student_valid).any():
+        invalid_both = ~valid & ~student_valid
+        if teacher_prefill_active and invalid_both.any():
             raise RuntimeError(
                 "Neither Teacher nor FastSAC Student produced a finite raw action"
             )
-        choose_teacher = choose_teacher | (valid & ~student_valid)
+        if not teacher_prefill_active and partition_enabled:
+            if (invalid_both & dagger_env).any():
+                raise RuntimeError(
+                    "Neither Teacher nor FastSAC Student produced a finite raw "
+                    "action in a DAgger environment"
+                )
+        else:
+            choose_teacher = choose_teacher | (valid & ~student_valid)
         if not torch.isfinite(sampled_student_action).all():
             raise RuntimeError("FastSAC sampled a non-finite raw action")
 
@@ -709,6 +1010,11 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
             bounded_prefill_teacher_action,
             projected_student_action,
         )
+        if not teacher_prefill_active and partition_enabled:
+            # Advance only once a finite command has actually been selected.
+            # Each DAgger row flips independently; reset rows selected Student
+            # above and therefore correctly schedule Teacher on their next step.
+            self._dagger_teacher_turn = dagger_env & ~teacher_turn
         # Both branches have already passed through the authoritative execution
         # projection. Selecting between them cannot leave that finite support,
         # so projecting the combined tensor again only repeats the same kernels.
@@ -725,6 +1031,7 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
         )
 
         td[ACTION_KEY] = issued_action
+        td[FASTSAC_DAGGER_ENV_KEY] = dagger_env
         td[DAGGER_TEACHER_ACTION_KEY] = bounded_teacher_action
         td[DAGGER_TEACHER_ACTION_VALID_KEY] = valid
         td[DAGGER_IS_STUDENT_ACTION_KEY] = ~choose_teacher
@@ -773,10 +1080,16 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         super().__init__(cfg, observation_spec, action_spec, reward_spec, device, env)
+        # Transient device-local cohort cache. It is intentionally excluded
+        # from checkpoints: the fixed mask is reproducible from config alone.
+        self._fixed_dagger_env_mask_cache: dict[
+            tuple[int, torch.device], torch.Tensor
+        ] = {}
         # SAC owns no target Actor.  The TD3 base initializes this to None; keep
         # that explicit invariant for checkpoint and runtime inspection.
         self.actor_target = None
         self.actor_backend = _fastsac_actor_backend(cfg)
+        self._configure_student_action_support()
 
         self._fastsac_entropy_reference_log_scale_sum = float(
             torch.log(self._fastsac_q_action_scale).sum().item()
@@ -926,6 +1239,30 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.actor_std_update_count = 0
         self._last_fastsac_diagnostics: dict[str, float] = {}
 
+    def _configure_student_action_support(self) -> None:
+        """Use nominal joint coordinates as the one Student SAC action Box."""
+        center = self._fastsac_q_action_center.detach()
+        scale = self._fastsac_q_action_scale.detach()
+        low = center - scale
+        high = center + scale
+        if (
+            not torch.isfinite(low).all()
+            or not torch.isfinite(high).all()
+            or not torch.all(high > low)
+            or not torch.all((low < 0.0) & (high > 0.0))
+        ):
+            raise ValueError("FastSAC Student nominal action support is invalid")
+        self._fastsac_student_action_low = low
+        self._fastsac_student_action_high = high
+        self._fastsac_student_action_center = center
+        self._fastsac_student_action_scale = scale
+        self._fastsac_student_action_contract = _student_action_contract_metadata(
+            self.joint_names,
+            low,
+            high,
+            self._fastsac_action_contract,
+        )
+
     def _q_replay_prefill_storage_fields(self) -> tuple[str, ...]:
         """Keep noisy Q actions and clean Teacher BC labels side by side."""
         fields = super()._q_replay_storage_fields()
@@ -983,6 +1320,64 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             getattr(self.cfg, "perception_replay_mode", "legacy_online_student")
         ) == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
 
+    def _parallel_env_count(self, num_envs: int | None) -> int:
+        """Resolve the vector width for public fixed-cohort mask consumers."""
+        if num_envs is None:
+            env = getattr(self, "env", None)
+            num_envs = getattr(env, "num_envs", None)
+            if num_envs is None:
+                batch_size = getattr(env, "batch_size", None)
+                if batch_size is not None and len(batch_size):
+                    num_envs = int(batch_size[0])
+        if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1:
+            raise ValueError(
+                "num_envs must be supplied when the policy environment does not "
+                "expose a positive vector width"
+            )
+        return int(num_envs)
+
+    def dagger_env_mask(
+        self,
+        num_envs: int | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Return the fixed seeded DAgger cohort for logging and collection."""
+        num_envs = self._parallel_env_count(num_envs)
+        if device is None:
+            device = self.device
+        target_device = torch.device(device)
+        if target_device.type == "cuda" and target_device.index is None:
+            target_device = torch.device("cuda", torch.cuda.current_device())
+        key = (num_envs, target_device)
+        cache = getattr(self, "_fixed_dagger_env_mask_cache", None)
+        if cache is None:
+            cache = {}
+            self._fixed_dagger_env_mask_cache = cache
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        mask = _seeded_dagger_env_mask(
+            num_envs,
+            float(self.cfg.dagger_env_fraction),
+            int(self.cfg.dagger_seed),
+            device=target_device,
+        )
+        if not bool(mask.any()) or bool(mask.all()):
+            raise ValueError(
+                "three-source collection requires at least one DAgger and one "
+                "Student-only vector environment"
+            )
+        cache[key] = mask
+        return mask
+
+    def student_only_env_mask(
+        self,
+        num_envs: int | None = None,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Return the fixed complement used for pure Student metrics."""
+        return ~self.dagger_env_mask(num_envs=num_envs, device=device)
+
     @staticmethod
     def _validate_td3_config(cfg) -> None:
         # Preserve every locked observation/action/replay/C51 check in the raw
@@ -990,26 +1385,60 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # eta_sac to the base's generic "at least one Actor objective" check so
         # a deliberate pure-SAC (lambda_bc=0) ablation remains expressible even
         # though the inherited eta_td3 field is correctly locked to zero.
+        critic_type = _fastsac_q_critic_type(cfg)
+        if critic_type not in Q_CRITIC_TYPES:
+            raise ValueError("q_critic_type must be 'c51' or 'scalar'")
         base_cfg = copy.copy(cfg)
         base_cfg.eta_td3 = float(cfg.eta_sac)
         DistributionalTD3TeacherBC._validate_td3_config(base_cfg)
         if not isinstance(cfg.teacher_prefill_use_ppo_noise, bool):
             raise ValueError("teacher_prefill_use_ppo_noise must be a boolean")
-        if str(cfg.perception_replay_mode) != (
-            ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+        dagger_env_fraction = getattr(cfg, "dagger_env_fraction", 0.5)
+        if (
+            isinstance(dagger_env_fraction, bool)
+            or not isinstance(dagger_env_fraction, (int, float))
+            or not math.isfinite(float(dagger_env_fraction))
+            or not 0.0 < float(dagger_env_fraction) < 1.0
         ):
             raise ValueError(
-                "FastSAC perception is locked to online_student_rollout"
+                "dagger_env_fraction must be a finite number strictly between 0 and 1"
             )
-        if float(cfg.teacher_perception_replay_fraction) != 0.0:
+        perception_mode = str(cfg.perception_replay_mode)
+        if perception_mode not in (
+            ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
+            "four_way",
+        ):
+            raise ValueError(
+                "FastSAC perception_replay_mode must be "
+                "'online_student_rollout' or 'four_way'"
+            )
+        actor_observation_mode = str(
+            getattr(
+                cfg,
+                "sac_actor_observation_mode",
+                STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+            )
+        )
+        if actor_observation_mode not in SAC_ACTOR_OBSERVATION_MODES:
+            raise ValueError(
+                "sac_actor_observation_mode must be 'student_perception' or "
+                "'privileged_oracle'"
+            )
+        if (
+            actor_observation_mode == PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE
+            and perception_mode != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+        ):
+            raise ValueError(
+                "privileged_oracle Actor diagnostics require "
+                "perception_replay_mode='online_student_rollout'"
+            )
+        if (
+            perception_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+            and float(cfg.teacher_perception_replay_fraction) != 0.0
+        ):
             raise ValueError(
                 "FastSAC online Student perception requires "
                 "teacher_perception_replay_fraction=0"
-            )
-        if int(cfg.teacher_perception_warmup_steps) != 0:
-            raise ValueError(
-                "FastSAC online Student perception requires "
-                "teacher_perception_warmup_steps=0"
             )
         if (
             str(cfg.dagger_control_mode) != "beta"
@@ -1227,6 +1656,61 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             right = float(getattr(cfg, sac_name))
             if not math.isclose(left, right, rel_tol=0.0, abs_tol=1e-12):
                 raise ValueError(f"{legacy} must equal {sac_name} in this backend")
+
+        # Each independently sampled online ring must be able to retain its
+        # complete cohort share at the common learning-start boundary. Without
+        # this check a too-small ring wraps before ``replay_ready`` can ever be
+        # true. Keep this invariant in the backend as well as the Hydra
+        # entrypoint so direct/programmatic construction is equally safe.
+        learning_starts = int(cfg.sac_learning_starts)
+        dagger_learning_starts, student_learning_starts = _split_count(
+            learning_starts, float(dagger_env_fraction)
+        )
+        canonical_mix = all(
+            hasattr(cfg, f"{purpose}_{source}_fraction")
+            for purpose in ("q", "actor", "perception")
+            for source in REPLAY_SOURCE_ORDER
+        )
+
+        def _online_fraction(purpose: str) -> float:
+            if canonical_mix:
+                return float(
+                    getattr(cfg, f"{purpose}_uniform_student_fraction")
+                ) + float(
+                    getattr(cfg, f"{purpose}_failure_student_fraction")
+                )
+            teacher_fraction_field = {
+                "q": "q_teacher_replay_ratio",
+                "actor": "teacher_actor_replay_fraction",
+            }[purpose]
+            return 1.0 - float(getattr(cfg, teacher_fraction_field))
+
+        q_online = _online_fraction("q") > 0.0
+        actor_online = _online_fraction("actor") > 0.0
+        q_dagger_fraction = float(cfg.q_online_dagger_replay_fraction)
+        actor_dagger_fraction = float(cfg.actor_online_dagger_replay_fraction)
+        dagger_ring_required = (
+            q_online and q_dagger_fraction > 0.0
+        ) or (actor_online and actor_dagger_fraction > 0.0)
+        student_ring_required = (
+            q_online and q_dagger_fraction < 1.0
+        ) or (actor_online and actor_dagger_fraction < 1.0)
+        if (
+            dagger_ring_required
+            and int(cfg.dagger_buffer_capacity) < dagger_learning_starts
+        ):
+            raise ValueError(
+                "dagger_buffer_capacity must cover the DAgger cohort's "
+                "learning-start rows"
+            )
+        if (
+            student_ring_required
+            and int(cfg.student_buffer_capacity) < student_learning_starts
+        ):
+            raise ValueError(
+                "student_buffer_capacity must cover the pure-Student cohort's "
+                "learning-start rows"
+            )
         q_update_to_data_ratio = getattr(cfg, "q_update_to_data_ratio", None)
         if (
             q_update_to_data_ratio is None
@@ -1255,11 +1739,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         else:
             semantics = PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
         if getattr(self.cfg, "use_q_filtered_bc", False):
-            semantics = f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
-        if self._q_uses_causal_hold_advantage():
-            semantics = (
-                f"{semantics}_with_{CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS}"
-            )
+            return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
         return semantics
 
     def _entropy_semantics(self) -> str:
@@ -1628,10 +2108,86 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         inward = 4.0 * torch.finfo(normalized.dtype).eps
         return torch.atanh(normalized.clamp(-1.0 + inward, 1.0 - inward))
 
+    def _student_action_support(
+        self, reference: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return nominal Student bounds independently of the Teacher guard."""
+        q_center = self._fastsac_q_action_center.to(reference)
+        q_scale = self._fastsac_q_action_scale.to(reference)
+        low = getattr(
+            self, "_fastsac_student_action_low", q_center - q_scale
+        ).to(reference)
+        high = getattr(
+            self, "_fastsac_student_action_high", q_center + q_scale
+        ).to(reference)
+        center = getattr(
+            self, "_fastsac_student_action_center", (low + high) * 0.5
+        ).to(reference)
+        scale = getattr(
+            self, "_fastsac_student_action_scale", (high - low) * 0.5
+        ).to(reference)
+        return low, high, center, scale
+
+    def _project_student_policy_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Put a Teacher label on the configured Student's executable support."""
+        if self._uses_ppo_physical_gaussian():
+            # Teacher collection already records an execution-valid physical
+            # command. Keep that exact coordinate for physical-Gaussian BC and
+            # Q filtering; the shared execution projection is only a defensive
+            # finite-support guard for synthetic or legacy batches.
+            bounded = self._project_execution_action(action)
+            # Do not let the execution sanitizer hide a corrupt valid replay
+            # label; the BC/Q paths retain their existing fail-closed checks.
+            return torch.where(torch.isfinite(action), bounded, action)
+        low, high, _, _ = self._student_action_support(action)
+        return torch.maximum(torch.minimum(action, high), low)
+
+    def _normalized_tanh_dist_from_mean(
+        self,
+        mean: torch.Tensor,
+        *,
+        normalized_std: float | None = None,
+    ) -> FastSACTanhNormal:
+        """Calibrate a PPO physical mean into a nominal bounded SAC policy.
+
+        PPOVEL's final head emits an unbounded physical joint command.  A fixed
+        affine calibration converts that proposal into the pre-tanh latent. At
+        the neutral PPO command ``mean=0``, the transformed deterministic
+        action is exactly zero and its physical Jacobian with respect to the
+        PPO output is exactly one.  Unlike a clipped inverse tanh, the affine
+        map remains differentiable for every finite Actor output.
+        """
+        if not torch.isfinite(mean).all():
+            raise RuntimeError("FastSAC Actor proposal contains non-finite actions")
+        low, high, center, scale = self._student_action_support(mean)
+        normalized_zero = -center / scale
+        if not torch.all(normalized_zero.abs() < 1.0):
+            raise RuntimeError("Student SAC support does not contain action zero")
+        latent_zero = torch.atanh(normalized_zero)
+        inverse_slope = (
+            scale * (1.0 - normalized_zero.square())
+        ).reciprocal()
+        latent_loc = latent_zero + inverse_slope * mean
+        if normalized_std is None:
+            latent_std = self._bounded_log_std().exp().to(mean)
+        else:
+            value = float(normalized_std)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError("normalized SAC action std must be finite and positive")
+            latent_std = mean.new_full((mean.shape[-1],), value)
+        latent_scale = latent_std.expand_as(mean)
+        return FastSACTanhNormal(
+            latent_loc,
+            latent_scale,
+            low=low,
+            high=high,
+            event_dims=1,
+        )
+
     def _sac_dist_from_mean(
         self, mean: torch.Tensor
     ) -> FastSACTanhNormal | FastSACPhysicalNormal:
-        """Build the configured stochastic policy from a physical-action mean."""
+        """Build the configured stochastic policy from a PPO physical mean."""
         if not torch.isfinite(mean).all():
             raise RuntimeError("FastSAC Actor proposal contains non-finite raw actions")
         if self._uses_ppo_physical_gaussian():
@@ -1640,22 +2196,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             # remains only as a far-tail finite-safety guard.
             action_std = self._bounded_physical_actor_std()
             return FastSACPhysicalNormal(mean, action_std.expand_as(mean))
-        log_std = self._bounded_log_std()
-        actor_center = self._fastsac_actor_action_center.to(mean)
-        actor_scale = self._fastsac_actor_action_scale.to(mean)
-        q_scale = self._fastsac_q_action_scale.to(mean)
-        latent_loc = (mean - actor_center) / actor_scale
-        # log_std is dimensionless in nominal Q coordinates. Converting it to
-        # pre-tanh coordinates makes the unsquashed physical proposal noise
-        # exactly q_scale * exp(log_std) for every joint.
-        latent_scale = (log_std.exp() * q_scale / actor_scale).expand_as(mean)
-        return FastSACTanhNormal(
-            latent_loc,
-            latent_scale,
-            low=self._fastsac_action_low.to(mean),
-            high=self._fastsac_action_high.to(mean),
-            event_dims=1,
-        )
+        return self._normalized_tanh_dist_from_mean(mean)
 
     def _actor_mean_from_flat(self, actor_obs: torch.Tensor) -> torch.Tensor:
         # Lightweight unit policies may expose the mean module directly.  The
@@ -1681,17 +2222,25 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
     @torch.no_grad()
     def _student_mean_action(self, td: TensorDict) -> torch.Tensor:
         """Use the distribution-consistent deterministic Student action."""
-        if not self._uses_ppo_physical_gaussian():
-            return DistributionalTD3TeacherBC._student_mean_action(self, td)
         raw_mean = self._student_raw_action_proposal(td)
         if not torch.isfinite(raw_mean).all():
             raise RuntimeError("FastSAC evaluation Actor produced non-finite actions")
-        return self._project_execution_action(raw_mean)
+        if self._uses_ppo_physical_gaussian():
+            return self._project_execution_action(raw_mean)
+        return self._normalized_tanh_dist_from_mean(raw_mean).mean
 
     def get_rollout_policy(self, mode="train"):
         if mode == "train":
             return _DistributionalFastSACDaggerRolloutPolicy(self)
         return _DeterministicFastSACStudentEvalPolicy(self)
+
+    def _q_output_values(self, qnet: nn.Module, outputs: torch.Tensor):
+        """Convert either configured critic representation to twin scalars."""
+        if _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE:
+            if outputs.ndim != 2 or outputs.shape[0] != 2:
+                raise ValueError("scalar twin-Q outputs must have shape [2, batch]")
+            return outputs
+        return (F.softmax(outputs, dim=-1) * qnet.support).sum(dim=-1)
 
     @torch.no_grad()
     def _distributional_fastsac_target(
@@ -1716,6 +2265,48 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             next_action,
             batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
         )
+        if _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE:
+            if target_logits.ndim != 2 or target_logits.shape[0] != 2:
+                raise RuntimeError(
+                    "FastSAC scalar target must have shape [2, batch]"
+                )
+            selected_head = target_logits.argmin(dim=0)
+            selected_next_q = target_logits.gather(
+                0, selected_head.unsqueeze(0)
+            ).squeeze(0)
+            scalar_target = soft_reward + (
+                effective_discount * bootstrap * selected_next_q
+            )
+            zero = scalar_target.new_zeros(())
+            reward_abs = batch["rewards"].abs().mean()
+            metrics = {
+                "target_expected_q1_mean": target_logits[0].mean(),
+                "target_expected_q2_mean": target_logits[1].mean(),
+                "projected_target_mean": scalar_target.mean(),
+                "selected_target_expected_mean": selected_next_q.mean(),
+                "target_distribution_entropy": zero,
+                "target_select_q1_fraction": (selected_head == 0).float().mean(),
+                "target_select_q2_fraction": (selected_head == 1).float().mean(),
+                "q1_left_support_clip_fraction": zero,
+                "q1_right_support_clip_fraction": zero,
+                "q2_left_support_clip_fraction": zero,
+                "q2_right_support_clip_fraction": zero,
+                "support_clip_fraction_mean": zero,
+                "support_clip_fraction_max": zero,
+                "left_support_projection_clipping_fraction": zero,
+                "right_support_projection_clipping_fraction": zero,
+                "target_smoothing_noise_norm": zero,
+                "target_noise_free_action_abs_mean": next_dist.mean.abs().mean(),
+                "target_sample_action_abs_mean": next_action.abs().mean(),
+                "target_log_prob_mean": next_log_prob.mean(),
+                "entropy_tax_mean": entropy_tax.mean(),
+                "entropy_tax_abs_mean": entropy_tax.abs().mean(),
+                "entropy_tax_reward_abs_ratio": entropy_tax.abs().mean()
+                / reward_abs.clamp_min(torch.finfo(reward_abs.dtype).eps),
+                "effective_n_steps_mean": effective_n_steps.float().mean(),
+                "alpha": alpha.detach(),
+            }
+            return scalar_target.detach(), metrics, next_log_prob.detach()
         target_probabilities = F.softmax(target_logits, dim=-1)
         raw_expected_heads = (target_probabilities * self.qnet_target.support).sum(
             dim=-1
@@ -1849,23 +2440,36 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         }
 
     def _critic_update(self, batch: dict[str, torch.Tensor]):
-        """One twin-C51 update and a configured-cadence temperature update."""
+        """One configured twin-Q update and temperature-cadence update."""
         projected_target, target_metrics, target_log_prob = (
             self._distributional_fastsac_target(batch)
         )
-        logits, causal_components = self._q_td_logits(
-            batch, return_causal_components=True
+        q_outputs = self._q_forward(
+            self.qnet,
+            batch["critic_observations"],
+            batch["actions"],
+            batch.get(Q_ACTUATOR_CONTEXT_KEY),
         )
-        log_probabilities = F.log_softmax(logits, dim=-1)
-        per_head = (
-            -(projected_target.unsqueeze(0) * log_probabilities)
-            .sum(dim=-1)
-            .mean(dim=-1)
-        )
-        ranking_loss, ranking_metrics = self._causal_expert_advantage_ranking(
-            batch, causal_components
-        )
-        critic_loss = per_head.sum() + ranking_loss
+        if _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE:
+            if q_outputs.ndim != 2 or q_outputs.shape[0] != 2:
+                raise RuntimeError(
+                    "FastSAC scalar critic must output shape [2, batch]"
+                )
+            per_head = torch.stack(
+                [F.mse_loss(head, projected_target) for head in q_outputs]
+            )
+            expected_heads = q_outputs.detach()
+        else:
+            log_probabilities = F.log_softmax(q_outputs, dim=-1)
+            per_head = (
+                -(projected_target.unsqueeze(0) * log_probabilities)
+                .sum(dim=-1)
+                .mean(dim=-1)
+            )
+            expected_heads = self._q_output_values(
+                self.qnet, q_outputs.detach()
+            )
+        critic_loss = per_head.sum()
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         critic_grad = torch.nn.utils.clip_grad_norm_(
@@ -1887,17 +2491,16 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "FastSAC alpha bootstrap mask and target log-probability "
                 "population are misaligned"
             )
-        # Legacy checkpoints keep their Critic-coupled temperature cadence.
-        # With a finite Actor row ratio, `_actor_update` instead updates alpha
-        # from the same current-state policy sample exactly once per Actor step.
+        # Baseline temperature and Actor see the same policy-update timescale.
+        # Cadence is evaluated after incrementing ``critic_update_count``, so
+        # an Actor-cadence update adjusts alpha immediately before the matching
+        # Actor update in the inherited replay loop. TVKD checkpoints keep the
+        # historical every-Critic cadence for resume compatibility.
         alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
-        decoupled_actor_scheduler = (
-            getattr(self.cfg, "actor_update_to_data_ratio", None) is not None
-        )
-        alpha_update_due = alpha_update_cadence == "critic" or (
-            alpha_update_cadence == "actor"
-            and not decoupled_actor_scheduler
-            and self.critic_update_count % int(self.cfg.sac_policy_frequency) == 0
+        critic_warmup_active = self._student_actor_warmup_active()
+        alpha_update_due = not critic_warmup_active and (
+            alpha_update_cadence == "critic"
+            or self.critic_update_count % int(self.cfg.sac_policy_frequency) == 0
         )
         alpha_update_count_before = int(getattr(self, "alpha_update_count", 0))
         if alpha_update_due:
@@ -1921,10 +2524,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         _polyak_update_(self.qnet_target, self.qnet, float(self.cfg.sac_tau))
         self.qnet_target.requires_grad_(False).eval()
-        with torch.no_grad():
-            expected_heads = (log_probabilities.detach().exp() * self.qnet.support).sum(
-                dim=-1
-            )
         metrics = {
             "critic_loss": critic_loss.detach(),
             "critic_loss_1": per_head[0].detach(),
@@ -1935,7 +2534,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "twin_expected_q_disagreement": (expected_heads[0] - expected_heads[1])
             .abs()
             .mean(),
-            **ranking_metrics,
             **target_metrics,
             **alpha_metrics,
         }
@@ -1957,31 +2555,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             generator=self.sac_action_rng
         )
         normalized_log_prob = self._normalized_action_log_prob(raw_log_prob)
-        teacher_actions = batch[DAGGER_REPLAY_TEACHER_ACTIONS]
-        teacher_valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
-        if prediction_action.shape != teacher_actions.shape:
-            raise ValueError("Actor Student and Teacher action shapes must match")
-        if prediction_action.shape[0] != teacher_valid.numel():
-            raise ValueError("Actor Teacher validity mask does not match batch rows")
-        safe_teacher_actions = torch.where(
-            teacher_valid.unsqueeze(-1),
-            teacher_actions,
-            prediction_action.detach(),
+        q_state, q_action = self._q_network_inputs(
+            batch["critic_observations"],
+            sampled_action,
+            batch.get(Q_ACTUATOR_CONTEXT_KEY),
         )
-        actor_scheduled_alpha = (
-            getattr(self.cfg, "actor_update_to_data_ratio", None) is not None
-            and str(getattr(self.cfg, "sac_alpha_update_cadence", "actor"))
-            == "actor"
-        )
-        alpha_update_count_before = int(getattr(self, "alpha_update_count", 0))
-        actor_alpha_metrics = self._alpha_update(
-            normalized_log_prob.reshape(-1)
-            if actor_scheduled_alpha
-            else normalized_log_prob.reshape(-1)[:0]
-        )
-        actor_alpha_performed = (
-            int(getattr(self, "alpha_update_count", 0)) > alpha_update_count_before
-        )
+
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.actor_optimizer.zero_grad(set_to_none=True)
         original_requires_grad = [
@@ -1991,82 +2570,32 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             for parameter in self.qnet.parameters():
                 parameter.requires_grad_(False)
                 parameter.grad = None
-            twin_logits = self._q_forward(
-                self.qnet,
-                batch["critic_observations"],
-                sampled_action,
-                batch.get(Q_ACTUATOR_CONTEXT_KEY),
-            )
-            twin_expected = (F.softmax(twin_logits, dim=-1) * self.qnet.support).sum(
-                dim=-1
-            )
+            twin_outputs = self.qnet(q_state, q_action)
+            twin_expected = self._q_output_values(self.qnet, twin_outputs)
             minimum_expected = _reduce_actor_q_values(twin_expected, True)
-            entropy_objective = (
-                self.log_alpha.exp().detach() * normalized_log_prob
+            sac_actor_loss = (
+                self.log_alpha.exp().detach() * normalized_log_prob - minimum_expected
             ).mean()
-            if self._q_uses_causal_hold_advantage():
-                # A random or merely disagreeing Critic must not move the
-                # pretrained mean. Admit Q ascent only when the lower policy
-                # within-head policy-minus-Teacher delta is positive for both
-                # heads. This cancels each head's state/value offset exactly.
-                # Entropy/std and exact BC remain fully ungated.
-                with torch.no_grad():
-                    teacher_logits = self._q_forward(
-                        self.qnet,
-                        batch["critic_observations"],
-                        safe_teacher_actions,
-                        batch.get(Q_ACTUATOR_CONTEXT_KEY),
-                    )
-                    teacher_expected = (
-                        F.softmax(teacher_logits, dim=-1) * self.qnet.support
-                    ).sum(dim=-1)
-                    policy_teacher_margin = (
-                        twin_expected.detach() - teacher_expected
-                    ).min(dim=0).values
-                    actor_q_gate = teacher_valid & (
-                        policy_teacher_margin > 0.0
-                    )
-                actor_q_gate_float = actor_q_gate.to(minimum_expected)
-                trusted_q = (
-                    minimum_expected * actor_q_gate_float
-                ).sum() / actor_q_gate_float.sum().clamp_min(1.0)
-                sac_actor_loss = entropy_objective - trusted_q
-                valid_float = teacher_valid.to(policy_teacher_margin)
-                valid_count = valid_float.sum().clamp_min(1.0)
-                actor_q_gate_metrics = {
-                    "actor_q_confidence_gate_enabled": (
-                        prediction_action.new_ones(())
-                    ),
-                    "actor_q_confidence_gate_active_fraction": (
-                        actor_q_gate_float.mean()
-                    ),
-                    "actor_q_confidence_policy_teacher_margin": (
-                        (policy_teacher_margin * valid_float).sum() / valid_count
-                    ),
-                    "actor_q_confidence_trusted_q_mean": trusted_q.detach(),
-                }
-            else:
-                sac_actor_loss = entropy_objective - minimum_expected.mean()
-                actor_q_gate_metrics = {
-                    "actor_q_confidence_gate_enabled": (
-                        prediction_action.new_zeros(())
-                    ),
-                    "actor_q_confidence_gate_active_fraction": (
-                        prediction_action.new_ones(())
-                    ),
-                    "actor_q_confidence_policy_teacher_margin": (
-                        prediction_action.new_zeros(())
-                    ),
-                    "actor_q_confidence_trusted_q_mean": (
-                        minimum_expected.detach().mean()
-                    ),
-                }
         finally:
             for parameter, requires_grad in zip(
                 self.qnet.parameters(), original_requires_grad
             ):
                 parameter.requires_grad_(requires_grad)
 
+        raw_teacher_actions = batch[DAGGER_REPLAY_TEACHER_ACTIONS]
+        teacher_valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
+        # Teacher replay/Q keeps the factual PPO command. A bounded tanh Actor
+        # needs its closest nominal-support target; a physical Gaussian can
+        # represent the same execution-valid physical command without that
+        # lossy projection.
+        teacher_actions = self._project_student_policy_action(raw_teacher_actions)
+        teacher_bc_projection = teacher_valid & (
+            teacher_actions != raw_teacher_actions
+        ).any(dim=-1)
+        teacher_bc_projection_fraction = (
+            teacher_bc_projection.float().sum()
+            / teacher_valid.float().sum().clamp_min(1.0)
+        )
         q_filter_metrics = {
             # Compatibility alias: under continuous SPReD-P this is the mean
             # effective BC weight, not a fraction of binary-active rows.
@@ -2084,33 +2613,41 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             },
         }
         if getattr(self.cfg, "use_q_filtered_bc", False):
+            if prediction_action.shape != teacher_actions.shape:
+                raise ValueError("SPReD-P Student and Teacher action shapes must match")
+            if prediction_action.shape[0] != teacher_valid.numel():
+                raise ValueError("SPReD-P validity mask does not match batch rows")
             # Invalid replay labels may contain NaN. Substitute a finite action
             # before the online-Q forward, then exclude those rows from both
             # the probability statistics and BC normalization below.
+            safe_teacher_actions = torch.where(
+                teacher_valid.unsqueeze(-1),
+                teacher_actions,
+                prediction_action.detach(),
+            )
             with torch.no_grad():
-                # SPReD-P uses the current online ensemble.  Collapse each C51
-                # head to its expected return before fitting the two Gaussian
-                # action-value distributions.  Sequential forwards keep peak
-                # memory lower than concatenating a doubled Actor batch.
-                policy_online_logits = self._q_forward(
+                # SPReD-P uses the current online ensemble. C51 heads collapse
+                # to expectations while scalar heads pass through unchanged.
+                # Sequential forwards keep peak memory below a doubled batch.
+                policy_online_outputs = self._q_forward(
                     self.qnet,
                     batch["critic_observations"],
                     prediction_action.detach(),
                     batch.get(Q_ACTUATOR_CONTEXT_KEY),
                 )
-                policy_online_q = (
-                    F.softmax(policy_online_logits, dim=-1) * self.qnet.support
-                ).sum(dim=-1)
-                del policy_online_logits
-                teacher_online_logits = self._q_forward(
+                policy_online_q = self._q_output_values(
+                    self.qnet, policy_online_outputs
+                )
+                del policy_online_outputs
+                teacher_online_outputs = self._q_forward(
                     self.qnet,
                     batch["critic_observations"],
                     safe_teacher_actions.detach(),
                     batch.get(Q_ACTUATOR_CONTEXT_KEY),
                 )
-                teacher_online_q = (
-                    F.softmax(teacher_online_logits, dim=-1) * self.qnet.support
-                ).sum(dim=-1)
+                teacher_online_q = self._q_output_values(
+                    self.qnet, teacher_online_outputs
+                )
                 (
                     teacher_probability,
                     teacher_advantage,
@@ -2281,10 +2818,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_std_min": self._policy_log_std().detach().exp().min(),
             "actor_std_max": self._policy_log_std().detach().exp().max(),
             "actor_teacher_replay_fraction": (actor_teacher_replay_fraction.detach()),
-            **{
-                key: value.detach()
-                for key, value in actor_q_gate_metrics.items()
-            },
+            "teacher_bc_student_support_projection_fraction": (
+                teacher_bc_projection_fraction.detach()
+            ),
             **{key: value.detach() for key, value in q_filter_metrics.items()},
             "actor_failure_phase_teacher_fraction": batch.get(
                 FAILURE_PHASE_TEACHER_SOURCE_KEY,
@@ -2301,31 +2837,18 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             .mean()
             .detach(),
             "alpha": self.log_alpha.exp().detach(),
-            "actor_alpha_loss": actor_alpha_metrics["alpha_loss"].detach(),
-            "actor_alpha_grad_norm": actor_alpha_metrics[
-                "alpha_grad_norm"
-            ].detach(),
-            "actor_alpha_update_due_fraction": prediction_action.new_tensor(
-                float(actor_scheduled_alpha)
-            ),
-            "actor_alpha_update_performed_fraction": prediction_action.new_tensor(
-                float(actor_alpha_performed)
-            ),
             **std_metrics,
         }
         if hasattr(self, "_fastsac_rollout_actor_metrics"):
             self._fastsac_rollout_actor_metrics.append(metrics)
         return metrics
 
-    def _actor_and_targets_update(self, actor_batch: dict[str, torch.Tensor]):
-        # SAC has no target Actor.  Q target Polyak is performed on every
-        # Critic update, independently of the Actor scheduler.
-        return self._actor_update(actor_batch)
-
     def _maybe_delayed_actor_and_targets(self, actor_batch: dict[str, torch.Tensor]):
         if self.critic_update_count % int(self.cfg.sac_policy_frequency):
             return None
-        return self._actor_and_targets_update(actor_batch)
+        # SAC has no target Actor.  Q target Polyak is performed on every
+        # Critic update, not on this delayed policy cadence.
+        return self._actor_update(actor_batch)
 
     def train_op(self, tensordict):
         """Reuse raw replay/prefill orchestration and publish SAC-native logs."""
@@ -2372,6 +2895,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 self._bounded_physical_actor_std(detach=True).clone()
             )
         action_projection_fraction = 0.0
+        student_nominal_bound_violation_fraction = 0.0
+        student_support_saturation_fraction = 0.0
+        student_q_action_abs_max = 0.0
         if (
             FASTSAC_ACTION_PROJECTION_KEY in tensordict.keys(True, True)
             and DAGGER_IS_STUDENT_ACTION_KEY in tensordict.keys(True, True)
@@ -2381,6 +2907,24 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             if bool(student.any()):
                 action_projection_fraction = float(
                     projected[student].float().mean().item()
+                )
+                sampled = tensordict[TD3_EXPLORATORY_STUDENT_ACTION_KEY].reshape(
+                    -1, self.action_dim
+                )[student]
+                low, high, _, _ = self._student_action_support(sampled)
+                violations = ((sampled < low) | (sampled > high)).any(dim=-1)
+                student_nominal_bound_violation_fraction = float(
+                    violations.float().mean().item()
+                )
+                endpoint_tolerance = (high - low) * 1.0e-6
+                saturated = ((sampled - low) <= endpoint_tolerance) | (
+                    (high - sampled) <= endpoint_tolerance
+                )
+                student_support_saturation_fraction = float(
+                    saturated.float().mean().item()
+                )
+                student_q_action_abs_max = float(
+                    self._q_action_input(sampled).abs().amax().item()
                 )
         td3_info = DistributionalTD3TeacherBC.train_op(self, tensordict)
         physical_rollout_std_metrics = {}
@@ -2405,9 +2949,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             ),
             "td3_actor_loss": "sac_actor_loss",
             "weighted_td3_actor_loss": "weighted_sac_actor_loss",
-            "collector_exploration_noise_norm": (
-                "behavior_sample_action_deviation_qcoord_norm"
-            ),
+            "collector_exploration_noise_norm": ("behavior_sample_q_deviation_norm"),
         }
         info = {}
         for key, value in td3_info.items():
@@ -2461,14 +3003,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_raw_log_std_mean",
             "actor_std_min",
             "actor_std_max",
-            "actor_alpha_loss",
-            "actor_alpha_grad_norm",
-            "actor_alpha_update_due_fraction",
-            "actor_alpha_update_performed_fraction",
-            "actor_q_confidence_gate_enabled",
-            "actor_q_confidence_gate_active_fraction",
-            "actor_q_confidence_policy_teacher_margin",
-            "actor_q_confidence_trusted_q_mean",
+            "teacher_bc_student_support_projection_fraction",
             "q_filtered_bc_active_fraction",
             "q_filtered_bc_policy_better_fraction",
             "spred_p_bc_weight_mean",
@@ -2516,28 +3051,17 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # rather than the within-rollout mean of stale and updated values.
         critic["alpha"] = self.log_alpha.detach().exp().item()
         actor = self._mean_metric_dict(self._fastsac_rollout_actor_metrics, actor_keys)
-        if (
-            getattr(self.cfg, "actor_update_to_data_ratio", None) is not None
-            and str(getattr(self.cfg, "sac_alpha_update_cadence", "actor"))
-            == "actor"
-        ):
-            critic.update(
-                {
-                    "alpha_loss": actor["actor_alpha_loss"],
-                    "alpha_grad_norm": actor["actor_alpha_grad_norm"],
-                    "alpha_update_due_fraction": actor[
-                        "actor_alpha_update_due_fraction"
-                    ],
-                    "alpha_update_performed_fraction": actor[
-                        "actor_alpha_update_performed_fraction"
-                    ],
-                }
-            )
-            critic["alpha"] = self.log_alpha.detach().exp().item()
         actor.update(physical_rollout_std_metrics)
         info.update({f"fastsac/{key}": value for key, value in critic.items()})
         info.update({f"fastsac/{key}": value for key, value in actor.items()})
         info["fastsac/action_projection_fraction"] = action_projection_fraction
+        info["fastsac/student_nominal_bound_violation_fraction"] = (
+            student_nominal_bound_violation_fraction
+        )
+        info["fastsac/student_support_saturation_fraction"] = (
+            student_support_saturation_fraction
+        )
+        info["fastsac/student_q_action_abs_max"] = student_q_action_abs_max
         info["fastsac/alpha_update_count"] = self.alpha_update_count
         info["fastsac/actor_std_update_count"] = int(
             getattr(self, "actor_std_update_count", 0)
@@ -2589,6 +3113,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             info["fastsac/physical_entropy_bound_min"] = entropy_min
             info["fastsac/physical_entropy_bound_max"] = entropy_max
         info["fastsac/target_entropy"] = float(self.target_entropy)
+        info["fastsac/privileged_oracle_actor_observation_mode"] = float(
+            self._uses_privileged_oracle_actor_observations()
+        )
         self._last_fastsac_diagnostics = {
             key: float(value)
             for key, value in info.items()
@@ -2599,12 +3126,39 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
     def _q_backend_metadata(self):
         metadata = DistributionalTD3TeacherBC._q_backend_metadata(self)
         alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
-        decoupled_actor_scheduler = (
-            getattr(self.cfg, "actor_update_to_data_ratio", None) is not None
-        )
+        critic_type = _fastsac_q_critic_type(self.cfg)
         metadata.update(
             {
-                "target_semantics": CRITIC_SEMANTICS,
+                "q_critic_type": critic_type,
+                "target_semantics": (
+                    SCALAR_CRITIC_SEMANTICS
+                    if critic_type == SCALAR_Q_CRITIC_TYPE
+                    else CRITIC_SEMANTICS
+                ),
+                "num_atoms": (
+                    1
+                    if critic_type == SCALAR_Q_CRITIC_TYPE
+                    else int(self.cfg.q_num_atoms)
+                ),
+                "clipped_double_distribution": (
+                    critic_type == C51_Q_CRITIC_TYPE
+                ),
+                "critic_loss": (
+                    "twin_scalar_bellman_mse"
+                    if critic_type == SCALAR_Q_CRITIC_TYPE
+                    else "twin_c51_cross_entropy"
+                ),
+                "categorical": critic_type == C51_Q_CRITIC_TYPE,
+                "v_min": (
+                    None
+                    if critic_type == SCALAR_Q_CRITIC_TYPE
+                    else float(self.cfg.q_v_min)
+                ),
+                "v_max": (
+                    None
+                    if critic_type == SCALAR_Q_CRITIC_TYPE
+                    else float(self.cfg.q_v_max)
+                ),
                 "actor_q_reduction": "minimum_online_twin_expectations",
                 "actor_mean_optimizer_semantics": ACTOR_MEAN_OPTIMIZER_SEMANTICS,
                 "actor_mean_weight_decay": _fastsac_actor_weight_decay(self.cfg),
@@ -2613,40 +3167,35 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     if getattr(self.cfg, "use_q_filtered_bc", False)
                     else "fixed_unweighted_valid_teacher_bc"
                 ),
-                "actor_q_confidence_gate_semantics": (
-                    CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS
-                    if self._q_uses_causal_hold_advantage()
-                    else "disabled"
-                ),
                 "actor_target": False,
                 "stochastic_actor": True,
                 "action_distribution": _fastsac_action_distribution(self.cfg),
+                "actor_observation_mode": str(
+                    getattr(
+                        self.cfg,
+                        "sac_actor_observation_mode",
+                        STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+                    )
+                ),
+                "student_action_contract": (
+                    None
+                    if self._uses_ppo_physical_gaussian()
+                    else copy.deepcopy(self._fastsac_student_action_contract)
+                ),
                 "entropy_semantics": self._entropy_semantics(),
                 "entropy_reference_log_scale_sum": (
                     self._fastsac_entropy_reference_log_scale_sum
                 ),
                 "target_entropy": float(self.target_entropy),
                 "temperature_update_cadence": (
-                    "row_scheduled_actor_update"
-                    if alpha_update_cadence == "actor"
-                    and decoupled_actor_scheduler
-                    else "delayed_actor_update"
+                    "delayed_actor_update"
                     if alpha_update_cadence == "actor"
                     else "every_critic_update"
                 ),
                 "temperature_update_frequency_critic_steps": (
-                    0
-                    if alpha_update_cadence == "actor"
-                    and decoupled_actor_scheduler
-                    else int(self.cfg.sac_policy_frequency)
+                    int(self.cfg.sac_policy_frequency)
                     if alpha_update_cadence == "actor"
                     else 1
-                ),
-                "temperature_update_frequency_actor_steps": (
-                    1
-                    if alpha_update_cadence == "actor"
-                    and decoupled_actor_scheduler
-                    else 0
                 ),
             }
         )
@@ -2697,7 +3246,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "eta_sac",
                     "lambda_bc",
                     "use_q_filtered_bc",
+                    "q_critic_type",
                     "teacher_prefill_use_ppo_noise",
+                    "dagger_env_fraction",
+                    "student_buffer_capacity",
                     "q_condition_on_actuator_state",
                     "q_use_predicted_effect",
                     "q_use_residual_film",
@@ -2728,6 +3280,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             }
         )
         common["sac_actor_weight_decay"] = _fastsac_actor_weight_decay(self.cfg)
+        common["sac_actor_observation_mode"] = str(
+            getattr(
+                self.cfg,
+                "sac_actor_observation_mode",
+                STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+            )
+        )
         common.update(
             {
                 "method": TRAINING_ALGORITHM,
@@ -2735,7 +3294,17 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "raw_physical_joint_std_gaussian_with_bounded_std_and_finite_"
                     "action_safety_projection"
                     if self._uses_ppo_physical_gaussian()
-                    else "smooth_tanh_bounded_normalized_std_raw_action_normal"
+                    else (
+                        "ppo_physical_mean_calibrated_to_nominal_joint_bounded_"
+                        "tanh_normal"
+                    )
+                ),
+                "actor_observation_mode": str(
+                    getattr(
+                        self.cfg,
+                        "sac_actor_observation_mode",
+                        STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+                    )
                 ),
                 "bc_loss": (
                     "detached_spred_p_weighted_joint_normalized_raw_mean_teacher_"
@@ -2763,12 +3332,29 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_backend": getattr(
                 self, "actor_backend", _fastsac_actor_backend(self.cfg)
             ),
-            "critic_learning_semantics": CRITIC_SEMANTICS,
+            "q_critic_type": _fastsac_q_critic_type(self.cfg),
+            "critic_learning_semantics": (
+                SCALAR_CRITIC_SEMANTICS
+                if _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE
+                else CRITIC_SEMANTICS
+            ),
             "actor_learning_semantics": self._actor_learning_semantics(),
             "actor_mean_optimizer_semantics": ACTOR_MEAN_OPTIMIZER_SEMANTICS,
             "actor_mean_weight_decay": _fastsac_actor_weight_decay(self.cfg),
             "entropy_semantics": self._entropy_semantics(),
             "action_distribution": _fastsac_action_distribution(self.cfg),
+            "actor_observation_mode": str(
+                getattr(
+                    self.cfg,
+                    "sac_actor_observation_mode",
+                    STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+                )
+            ),
+            "student_action_contract": (
+                None
+                if self._uses_ppo_physical_gaussian()
+                else copy.deepcopy(self._fastsac_student_action_contract)
+            ),
             "actor_adapt": self.actor_adapt.state_dict(),
             "bc_dagger_sac_adapter": self.bc_dagger_sac_adapter.state_dict(),
             "qnet": self.qnet.state_dict(),
@@ -2798,9 +3384,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "critic_update_count": int(self.critic_update_count),
             "alpha_update_count": int(self.alpha_update_count),
             "q_update_row_credit": float(getattr(self, "q_update_row_credit", 0.0)),
-            "actor_update_row_credit": float(
-                getattr(self, "actor_update_row_credit", 0.0)
-            ),
             "dagger_rollout_count": int(self.dagger_rollout_count),
             "dagger_environment_steps": int(self.dagger_environment_steps),
             "teacher_prefill_rollout_count": int(self.teacher_prefill_rollout_count),
@@ -2824,6 +3407,87 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "last_fastsac_diagnostics": copy.deepcopy(self._last_fastsac_diagnostics),
         }
 
+    def _validate_scalar_q_checkpoint_architecture(
+        self,
+        state: Mapping,
+        *,
+        context: str,
+    ) -> None:
+        """Reject scalar checkpoints from an incompatible Q topology.
+
+        ``q_critic_type=scalar`` existed briefly with the C51 state/action
+        trunk and later with an early-concat MLP. Their tensors and optimizer
+        moments are not compatible with the balanced split-stem scalar critic,
+        so critic type alone is not a sufficient checkpoint contract.
+        """
+        if _fastsac_q_critic_type(self.cfg) != SCALAR_Q_CRITIC_TYPE:
+            return
+        backend = state.get("q_backend_config")
+        if not isinstance(backend, Mapping):
+            raise ValueError(
+                f"{context} scalar Q checkpoint lacks architecture metadata"
+            )
+        architecture = backend.get("q_architecture_semantics")
+        if architecture != FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS:
+            raise ValueError(
+                f"{context} scalar Q architecture is incompatible: expected "
+                f"{FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS!r}, got "
+                f"{architecture!r}. Legacy one-atom C51-shaped and early-concat "
+                "scalar critics cannot be resumed as the balanced split-stem "
+                "scalar critic."
+            )
+        state_hidden_dim = int(self.cfg.q_hidden_dim) // 2
+        expected_dimensions = {
+            "q_state_input_dim": int(self._q_state_input_dim),
+            "q_action_input_dim": int(self._q_action_input_dim),
+            "q_state_hidden_dim": state_hidden_dim,
+            "q_action_hidden_dim": int(self.cfg.q_hidden_dim) - state_hidden_dim,
+        }
+        for name, expected in expected_dimensions.items():
+            saved = backend.get(name)
+            if isinstance(saved, bool) or not isinstance(saved, int):
+                raise ValueError(
+                    f"{context} scalar Q checkpoint lacks integer {name}"
+                )
+            if int(saved) != expected:
+                raise ValueError(
+                    f"{context} scalar Q {name} mismatch: "
+                    f"checkpoint={int(saved)}, runtime={expected}"
+                )
+        expected_fusion = {
+            "q_action_fusion": "balanced_split_stems",
+            "q_action_fusion_semantics": (
+                FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS
+            ),
+        }
+        for name, expected in expected_fusion.items():
+            saved = backend.get(name)
+            if saved != expected:
+                raise ValueError(
+                    f"{context} scalar Q {name} mismatch: "
+                    f"checkpoint={saved!r}, runtime={expected!r}"
+                )
+
+    def _validate_student_action_checkpoint_contract(
+        self, state: Mapping, *, context: str
+    ) -> None:
+        saved = state.get("student_action_contract")
+        if self._uses_ppo_physical_gaussian():
+            if saved is not None:
+                raise ValueError(
+                    f"{context} physical Gaussian unexpectedly has a bounded "
+                    "Student action contract"
+                )
+            return
+        if not isinstance(saved, Mapping):
+            raise ValueError(f"{context} lacks its Student action contract")
+        current = self._fastsac_student_action_contract
+        for key in ("semantics", "joint_names", "fingerprint"):
+            if saved.get(key) != current.get(key):
+                raise ValueError(
+                    f"{context} Student action contract mismatch at {key!r}"
+                )
+
     def _load_fastsac_checkpoint_state(self, state, *, load_modules=True):
         if state.get("training_algorithm") != TRAINING_ALGORITHM:
             raise ValueError("not a distributional FastSAC Teacher-BC checkpoint")
@@ -2831,6 +3495,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise ValueError("distributional FastSAC checkpoint version mismatch")
         if state.get("actor_backend") != _fastsac_actor_backend(self.cfg):
             raise ValueError("distributional FastSAC actor backend mismatch")
+        if str(state.get("q_critic_type", C51_Q_CRITIC_TYPE)) != (
+            _fastsac_q_critic_type(self.cfg)
+        ):
+            raise ValueError("FastSAC checkpoint Q critic type mismatch")
+        self._validate_scalar_q_checkpoint_architecture(
+            state, context="FastSAC resume"
+        )
         saved_distribution = state.get(
             "action_distribution", NORMALIZED_TANH_ACTION_DISTRIBUTION
         )
@@ -2838,6 +3509,24 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise ValueError(
                 "distributional FastSAC action distribution mismatch"
             )
+        saved_actor_observation_mode = str(
+            state.get(
+                "actor_observation_mode",
+                STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+            )
+        )
+        runtime_actor_observation_mode = str(
+            getattr(
+                self.cfg,
+                "sac_actor_observation_mode",
+                STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+            )
+        )
+        if saved_actor_observation_mode != runtime_actor_observation_mode:
+            raise ValueError("FastSAC checkpoint Actor observation mode mismatch")
+        self._validate_student_action_checkpoint_contract(
+            state, context="FastSAC resume"
+        )
         has_actor_decay_contract = "actor_mean_weight_decay" in state
         saved_actor_decay = state.get("actor_mean_weight_decay", 0.0)
         if (
@@ -2956,12 +3645,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         q_batch_size = int(getattr(self.cfg, "q_batch_size", 512))
         if not 0.0 <= self.q_update_row_credit < q_batch_size:
             raise ValueError("FastSAC checkpoint Q UTD row credit is invalid")
-        self.actor_update_row_credit = float(
-            state.get("actor_update_row_credit", 0.0)
-        )
-        actor_batch_size = int(getattr(self.cfg, "dagger_batch_size", 4096))
-        if not 0.0 <= self.actor_update_row_credit < actor_batch_size:
-            raise ValueError("FastSAC checkpoint Actor UTD row credit is invalid")
         self._teacher_perception_warmup_complete = bool(
             state.get("teacher_perception_warmup_complete", False)
         )
@@ -3004,6 +3687,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
         if state_dict.get("actor_backend") != expected_actor_backend:
             raise ValueError("distributional FastSAC actor backend mismatch")
+        if str(state_dict.get("q_critic_type", C51_Q_CRITIC_TYPE)) != (
+            _fastsac_q_critic_type(self.cfg)
+        ):
+            raise ValueError("FastSAC inference checkpoint Q critic type mismatch")
+        self._validate_scalar_q_checkpoint_architecture(
+            state_dict, context="FastSAC inference"
+        )
         saved_distribution = state_dict.get(
             "action_distribution", NORMALIZED_TANH_ACTION_DISTRIBUTION
         )
@@ -3011,6 +3701,26 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             raise ValueError(
                 "distributional FastSAC action distribution mismatch"
             )
+        saved_actor_observation_mode = str(
+            state_dict.get(
+                "actor_observation_mode",
+                STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+            )
+        )
+        runtime_actor_observation_mode = str(
+            getattr(
+                self.cfg,
+                "sac_actor_observation_mode",
+                STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+            )
+        )
+        if saved_actor_observation_mode != runtime_actor_observation_mode:
+            raise ValueError(
+                "FastSAC inference Actor observation mode mismatch"
+            )
+        self._validate_student_action_checkpoint_contract(
+            state_dict, context="FastSAC inference"
+        )
         saved_action_contract = state_dict.get("action_contract")
         if not isinstance(saved_action_contract, Mapping):
             raise ValueError("FastSAC inference checkpoint lacks its action contract")
@@ -3120,18 +3830,32 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 ),
                 "perception_replay_semantics": (
                     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                    if self._student_collection_actor_cache_enabled()
+                    else PERCEPTION_REPLAY_SEMANTICS
                 ),
                 "actor_replay_observation_semantics": (
                     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
                 ),
                 "teacher_episode_sidecar_semantics": (
                     TEACHER_EPISODE_SIDECAR_SEMANTICS
+                    if self._teacher_episode_cache_enabled()
+                    else "disabled"
                 ),
                 "perception_training_semantics": (
                     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                    if str(self.cfg.perception_replay_mode)
+                    == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+                    else PERCEPTION_REPLAY_SEMANTICS
                 ),
                 "perception_prefill_warmup_semantics": (
                     PERCEPTION_PREFILL_DISABLED_SEMANTICS
+                    if int(self.cfg.teacher_perception_warmup_steps) == 0
+                    else (
+                        ONLINE_STUDENT_ACTOR_WARMUP_SEMANTICS
+                        if str(self.cfg.perception_replay_mode)
+                        == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+                        else PERCEPTION_PREFILL_WARMUP_SEMANTICS
+                    )
                 ),
                 "teacher_prefill_semantics": FASTSAC_TEACHER_PREFILL_SEMANTICS,
                 "object_geo_replay_semantics": OBJECT_GEO_REPLAY_SEMANTICS,
@@ -3169,6 +3893,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # while leaving every source-owned module subject to strict loading.
         padded_source = dict(state_dict)
         padded_source["bc_dagger_sac_adapter"] = self.bc_dagger_sac_adapter.state_dict()
+        # A raw PPO Teacher source never owns the Student SAC critic. Preserve
+        # the freshly seeded configured critic explicitly instead of asking
+        # PPOVEL's compatibility loader to interpret absent/C51 Q tensors.
+        padded_source["qnet"] = self.qnet.state_dict()
+        padded_source["qnet_target"] = self.qnet_target.state_dict()
         failed = DistributionalTD3TeacherBC.load_state_dict(self, padded_source, strict)
         self.actor_target = None
         self.bc_dagger_sac_adapter.log_std.data.copy_(self._fastsac_initial_raw_log_std)
@@ -3178,7 +3907,6 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.critic_update_count = 0
         self.alpha_update_count = 0
         self.q_update_row_credit = 0.0
-        self.actor_update_row_credit = 0.0
         self.dagger_rollout_count = 0
         self.dagger_environment_steps = 0
         self.teacher_prefill_rollout_count = 0
@@ -3221,7 +3949,9 @@ __all__ = [
     "ACTOR_BACKEND",
     "ACTOR_MEAN_OPTIMIZER_SEMANTICS",
     "CHECKPOINT_VERSION",
+    "C51_Q_CRITIC_TYPE",
     "FASTSAC_ACTION_PROJECTION_KEY",
+    "FASTSAC_DAGGER_ENV_KEY",
     "FASTSAC_PREFILL_TEACHER_NOISE_KEY",
     "FASTSAC_PREFILL_TEACHER_PROJECTION_KEY",
     "FastSACPhysicalNormal",
@@ -3230,6 +3960,9 @@ __all__ = [
     "PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION",
     "PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND",
     "Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE",
+    "Q_CRITIC_TYPES",
+    "SCALAR_Q_CRITIC_TYPE",
+    "SCALAR_CRITIC_SEMANTICS",
     "SPRED_P_BC_SEMANTICS",
     "UNIFORM_PHYSICAL_STD_BOUND_MODE",
     "PREVIOUS_CHECKPOINT_VERSION",
@@ -3238,5 +3971,6 @@ __all__ = [
     "DistributionalFastSACTeacherBCConfig",
     "_DeterministicFastSACStudentEvalPolicy",
     "_DistributionalFastSACDaggerRolloutPolicy",
+    "_fastsac_q_critic_type",
     "_spred_p_teacher_probability",
 ]

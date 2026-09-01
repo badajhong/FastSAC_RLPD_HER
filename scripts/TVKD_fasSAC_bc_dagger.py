@@ -32,7 +32,9 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     LEGACY_ADAPTIVE_BC_CONFIG_FIELDS,
     LEGACY_CHECKPOINT_VERSION,
     LEGACY_TRAINING_ALGORITHM,
+    ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
+    PERCEPTION_REPLAY_SEMANTICS,
     PREVIOUS_CHECKPOINT_VERSION,
     PREVIOUS_TRAINING_ALGORITHM,
     REPLAY_RESUME_SEMANTICS,
@@ -62,6 +64,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     TeacherValueBottleneckDetector,
     TVKDDistributionalFastSACTeacherBC,
     TVKDDistributionalFastSACTeacherBCConfig,
+    _lambda_bc_fork_override_active,
+    _migrate_explicit_online_replay_capacities,
     _same_verified_histogram_state,
     _tvkd_actor_learning_semantics,
     _tvkd_critic_learning_semantics,
@@ -99,6 +103,15 @@ except ImportError:
 
 FILE_PATH = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
+
+
+def _perception_training_semantics(algo) -> str:
+    return (
+        ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+        if str(algo.perception_replay_mode)
+        == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+        else PERCEPTION_REPLAY_SEMANTICS
+    )
 
 
 def _resolved_fingerprint(value) -> str:
@@ -612,12 +625,15 @@ _LEGACY_MIX_FIELDS_BY_PURPOSE = {
     "actor": frozenset(
         {"teacher_actor_replay_fraction", *_SHARED_FOCUS_MIX_FIELDS}
     ),
+    "perception": frozenset(
+        {"teacher_perception_replay_fraction", *_SHARED_FOCUS_MIX_FIELDS}
+    ),
 }
 _CANONICAL_MIX_FIELDS_BY_PURPOSE = {
     purpose: frozenset(f"{purpose}_{source}_fraction" for source in _FOUR_WAY_SUFFIXES)
-    for purpose in ("q", "actor")
+    for purpose in ("q", "actor", "perception")
 }
-_ALL_Q_ACTOR_MIX_FIELDS = frozenset().union(
+_ALL_REPLAY_MIX_FIELDS = frozenset().union(
     *_LEGACY_MIX_FIELDS_BY_PURPOSE.values(),
     *_CANONICAL_MIX_FIELDS_BY_PURPOSE.values(),
 )
@@ -640,9 +656,9 @@ def _apply_tvkd_cli_replay_mix_overrides(
     cfg: DictConfig,
     task_overrides: Iterable[str],
     *,
-    purposes: Iterable[str] = ("q", "actor"),
+    purposes: Iterable[str] = ("q", "actor", "perception"),
 ) -> bool:
-    """Resolve fresh-run Q/Actor aliases into the canonical four-way mixes.
+    """Resolve fresh-run replay aliases into the canonical four-way mixes.
 
     The structured TVKD config always contains canonical fields, so the shared
     sampler cannot infer whether a user deliberately supplied a legacy-style
@@ -651,14 +667,25 @@ def _apply_tvkd_cli_replay_mix_overrides(
     total/focus surface or its four canonical fields, never both.
     """
     selected_purposes = tuple(dict.fromkeys(str(purpose) for purpose in purposes))
-    if any(purpose not in ("q", "actor") for purpose in selected_purposes):
-        raise ValueError("TVKD replay mix purpose must be 'q' or 'actor'")
+    if any(purpose not in ("q", "actor", "perception") for purpose in selected_purposes):
+        raise ValueError("TVKD replay mix purpose must be 'q', 'actor', or 'perception'")
     explicit_fields = _explicit_algo_override_fields(task_overrides)
     legacy_by_purpose = {
         purpose: explicit_fields.intersection(fields)
         for purpose, fields in _LEGACY_MIX_FIELDS_BY_PURPOSE.items()
         if purpose in selected_purposes
     }
+    online_student_perception = (
+        str(cfg.algo.perception_replay_mode)
+        == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+    )
+    if online_student_perception and "perception" in legacy_by_purpose:
+        # The shared failure-focus aliases configure Q and Actor replay. Live
+        # Student perception never samples replay, so those aliases must not
+        # silently turn its canonical US-only metadata into an FS mixture.
+        legacy_by_purpose["perception"] = explicit_fields.intersection(
+            {"teacher_perception_replay_fraction"}
+        )
     canonical_by_purpose = {
         purpose: explicit_fields.intersection(fields)
         for purpose, fields in _CANONICAL_MIX_FIELDS_BY_PURPOSE.items()
@@ -697,16 +724,28 @@ def _apply_tvkd_cli_replay_mix_overrides(
             "teacher_actor_replay_fraction",
             cfg.algo.teacher_actor_replay_fraction,
         ),
+        "perception": _cli_replay_fraction(
+            "teacher_perception_replay_fraction",
+            cfg.algo.teacher_perception_replay_fraction,
+        ),
     }
     with open_dict(cfg.algo):
         for purpose, explicit_legacy in legacy_by_purpose.items():
             if not explicit_legacy:
                 continue
-            mix = _legacy_four_way_mix(
-                teacher_fraction=teacher_fractions[purpose],
-                teacher_focus=teacher_focus,
-                student_focus=student_focus,
-            )
+            if purpose == "perception" and online_student_perception:
+                mix = {
+                    "uniform_student": 1.0,
+                    "failure_student": 0.0,
+                    "uniform_teacher": 0.0,
+                    "failure_teacher": 0.0,
+                }
+            else:
+                mix = _legacy_four_way_mix(
+                    teacher_fraction=teacher_fractions[purpose],
+                    teacher_focus=teacher_focus,
+                    student_focus=student_focus,
+                )
             for source, fraction in mix.items():
                 cfg.algo[f"{purpose}_{source}_fraction"] = fraction
     return True
@@ -761,9 +800,7 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
             else _tvkd_actor_learning_semantics(cfg.algo)
         ),
         "perception_replay_mode": str(cfg.algo.perception_replay_mode),
-        "perception_training_semantics": (
-            ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
-        ),
+        "perception_training_semantics": _perception_training_semantics(cfg.algo),
         "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
         "bottleneck_fallback_mode": str(cfg.algo.bottleneck_fallback_mode),
         "bottleneck_selection_mode": str(
@@ -1061,7 +1098,7 @@ def _prepare_tvkd_checkpoint(
     current = algorithm == TRAINING_ALGORITHM and version == CHECKPOINT_VERSION
     same_scientific_contract = current
     explicitly_changed_mix = frozenset(explicit_replay_mix_fields).intersection(
-        _ALL_Q_ACTOR_MIX_FIELDS
+        _ALL_REPLAY_MIX_FIELDS
     )
     if (legacy or previous or v3) and explicitly_changed_mix:
         names = ", ".join(
@@ -1184,20 +1221,14 @@ def _prepare_tvkd_checkpoint(
     backend = policy_state.get("dagger_backend_config")
     if not isinstance(backend, Mapping):
         raise ValueError("TVKD resume checkpoint lacks backend config")
+    if current and "student_buffer_capacity" not in backend:
+        backend = _migrate_explicit_online_replay_capacities(backend)
     saved_lambda_bc = backend.get("lambda_bc")
-    if (
-        isinstance(saved_lambda_bc, bool)
-        or not isinstance(saved_lambda_bc, (int, float))
-        or not math.isfinite(float(saved_lambda_bc))
-        or float(saved_lambda_bc) < 0.0
-        or not math.isclose(
-            float(saved_lambda_bc),
-            float(cfg.algo.lambda_bc),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-    ):
-        raise ValueError("TVKD resume fixed BC coefficient mismatch")
+    lambda_bc_fork = _lambda_bc_fork_override_active(
+        cfg.algo,
+        policy_state,
+        saved_lambda_bc,
+    )
     migration_fields: dict[str, object] = {}
     if legacy or previous or v3:
         migration_fields = _install_legacy_v5_replay_contract(
@@ -1242,10 +1273,21 @@ def _prepare_tvkd_checkpoint(
         resolve=True,
         enum_to_str=True,
     )
+    if (
+        same_scientific_contract
+        and "student_buffer_capacity" not in source_algo_contract
+    ):
+        source_algo_contract = _migrate_explicit_online_replay_capacities(
+            source_algo_contract
+        )
     # Checkpoints written before the explicit distribution selector all used
     # the normalized-tanh backend named in their actor_backend sentinel.
     source_algo_contract.setdefault(
         "sac_action_distribution", "normalized_tanh"
+    )
+    # Older checkpoints always used the deployable Student perception latent.
+    source_algo_contract.setdefault(
+        "sac_actor_observation_mode", "student_perception"
     )
     # Older FastSAC/TVKD checkpoints accidentally reused q_weight_decay for the
     # Actor optimizer and therefore had no independent Actor-decay field.  The
@@ -1254,33 +1296,20 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault("sac_actor_weight_decay", 0.0)
     # Older checkpoints used unconditional Teacher BC.
     source_algo_contract.setdefault("use_q_filtered_bc", False)
+    # Checkpoints before the selectable critic family are exactly C51.
+    source_algo_contract.setdefault("q_critic_type", "c51")
     # Older checkpoints used the ordinary shaped-Q parameterization.
     source_algo_contract.setdefault("use_teacher_residual_critic", False)
-    # V9 checkpoints written before selectable Student n-step replay were
-    # exactly the mixed-horizon default: both sources one-step.
+    # Older V9 checkpoints that predate explicit horizon fields already used
+    # the same factual one-step contract. Both values are now production locks.
     source_algo_contract.setdefault("q_n_step", 1)
     source_algo_contract.setdefault("q_teacher_n_step", 1)
     # Checkpoints before the analytic actuator-effect branch used the original
     # normalized-command-plus-delay/alpha Q input.
     source_algo_contract.setdefault("q_use_predicted_effect", False)
-    checkpoint_predates_delay_aware_mdp = (
-        "q_use_delay_aware_mdp" not in source_algo_contract
-    )
-    source_algo_contract.setdefault("q_use_delay_aware_mdp", False)
-    checkpoint_predates_causal_hold_advantage = (
-        "q_use_causal_hold_advantage" not in source_algo_contract
-    )
-    source_algo_contract.setdefault("q_use_causal_hold_advantage", False)
     # Older checkpoints predate delay/alpha-conditioned residual FiLM.
     source_algo_contract.setdefault("q_use_residual_film", False)
     source_algo_contract.setdefault("q_residual_film_scale", 0.1)
-    # Checkpoints written before the independent Actor row scheduler retain
-    # their exact Critic-coupled cadence. Opting into the new scheduler is a
-    # fresh-run algorithm change, not a silent same-stage resume migration.
-    checkpoint_predates_actor_row_scheduler = (
-        "actor_update_to_data_ratio" not in source_algo_contract
-    )
-    source_algo_contract.setdefault("actor_update_to_data_ratio", None)
     # Legacy v1 checkpoints predate this explicit provenance field but already
     # used one alpha update per Critic. v2+ checkpoints must contain it.
     if legacy:
@@ -1288,31 +1317,12 @@ def _prepare_tvkd_checkpoint(
     runtime_algo_contract = OmegaConf.to_container(
         cfg.algo, resolve=True, enum_to_str=True
     )
-    if (
-        checkpoint_predates_delay_aware_mdp
-        and runtime_algo_contract.get("q_use_delay_aware_mdp", False)
-    ):
-        raise ValueError(
-            "TVKD checkpoint predates the delay-aware MDP critic; "
-            "start a fresh run to enable the new architecture"
-        )
-    if (
-        checkpoint_predates_causal_hold_advantage
-        and runtime_algo_contract.get("q_use_causal_hold_advantage", False)
-    ):
-        raise ValueError(
-            "TVKD checkpoint predates the causal hold-advantage critic; "
-            "start a fresh run to enable the new architecture"
-        )
-    if (
-        checkpoint_predates_actor_row_scheduler
-        and runtime_algo_contract.get("actor_update_to_data_ratio") is not None
-    ):
-        raise ValueError(
-            "TVKD checkpoint predates the independent Actor row scheduler; "
-            "use algo.actor_update_to_data_ratio=null for an exact legacy "
-            "resume, or start a fresh run to enable the corrected scheduler"
-        )
+    # This opt-in controls only how the current checkpoint is interpreted; it
+    # is not part of either the saved or newly forked learning contract.
+    source_algo_contract.pop("resume_allow_lambda_bc_override", None)
+    runtime_algo_contract.pop("resume_allow_lambda_bc_override", None)
+    if lambda_bc_fork:
+        source_algo_contract["lambda_bc"] = runtime_algo_contract["lambda_bc"]
     # Older checkpoints predate the joint-aware envelope and therefore used
     # the exact scalar physical interval.  Use fixed historical defaults here,
     # not runtime values, so an old std optimizer cannot be resumed silently
@@ -1385,6 +1395,8 @@ def _prepare_tvkd_checkpoint(
     for name, saved_value in backend.items():
         if name in metadata_only or name not in cfg.algo:
             continue
+        if lambda_bc_fork and name == "lambda_bc":
+            continue
         if (legacy or previous or v3) and name in migration_fields:
             # These fields are the explicit, versioned migration from replay
             # perception to the PPOVEL live Student rollout contract.
@@ -1416,17 +1428,24 @@ def _prepare_tvkd_checkpoint(
         cfg.checkpoint_path = resolved
         cfg._tvkd_model_only_resume = True
         # Suppress generic H5 discovery: this continuation deliberately
-        # rebuilds the two raw online rings with a fresh Teacher prefill.
+        # rebuilds both raw online rings after a fresh Expert prefill.
         cfg._bc_dagger_fresh_source = True
         cfg.tvkd_resume_rollout_count = int(rollout_count)
     print(
         "TVKD model-state continuation: restored checkpoint at main rollout "
         f"{rollout_count}, last_iter={policy_state['last_iter']}, "
         f"next_iter={policy_state['next_iter']}, "
-        f"phase={policy_state['last_phase']!r}; the Teacher/Student replay rings "
-        "and Teacher cache sidecars will be rebuilt, and saved Q row credit "
+        f"phase={policy_state['last_phase']!r}; the Expert, DAgger, and pure-Student "
+        "replay rings plus Teacher cache sidecars will be rebuilt, and saved Q row credit "
         f"{float(policy_state['q_update_row_credit']):g} will reset to 0."
     )
+    if lambda_bc_fork:
+        print(
+            "TVKD pre-Actor fork: retained perception/Critic/model state and "
+            f"changed lambda_bc from {float(saved_lambda_bc):g} to "
+            f"{float(cfg.algo.lambda_bc):g}; Actor/std/alpha optimizer state "
+            "was verified pristine."
+        )
     return {
         "path": resolved,
         "rollout_count": int(rollout_count),
@@ -1539,7 +1558,8 @@ def main(cfg: DictConfig):
         )
 
     print(
-        "TVKD Distributional FastSAC + fixed BC + value-bottleneck replay: "
+        "TVKD FastSAC + fixed BC + value-bottleneck replay: "
+        f"critic={str(cfg.algo.get('q_critic_type', 'c51'))}, "
         f"prefill=until {schedule['prefill_target_rows']} Teacher rows, "
         f"main_additional={schedule['main_rollouts']}, "
         f"main_range=[{start_rollout}, "
@@ -1547,6 +1567,8 @@ def main(cfg: DictConfig):
         f"frames/rollout={schedule['frames_per_rollout']}; "
         f"tvkd_lambda={float(cfg.algo.tvkd_lambda):g}, "
         f"bottleneck={bool(cfg.algo.use_teacher_value_bottleneck_replay)}, "
+        "actor_observation_mode="
+        f"{cfg.algo.get('sac_actor_observation_mode', 'student_perception')}, "
         f"action_distribution={cfg.algo.get('sac_action_distribution', 'normalized_tanh')}, "
         f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence}, "

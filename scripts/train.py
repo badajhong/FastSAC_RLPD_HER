@@ -44,7 +44,9 @@ try:
         copy_frozen_teacher_replay,
         evaluate,
         make_env_policy,
+        resolve_student_only_env_mask,
         teacher_replay_storage_dir,
+        validate_student_only_rollout_provenance,
     )
 except ImportError:
     from helpers import (
@@ -54,7 +56,9 @@ except ImportError:
         copy_frozen_teacher_replay,
         evaluate,
         make_env_policy,
+        resolve_student_only_env_mask,
         teacher_replay_storage_dir,
+        validate_student_only_rollout_provenance,
     )
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -115,10 +119,14 @@ _PROFILE_ALGO_INVARIANTS = (
     "q_update_to_data_ratio",
     "q_n_step",
     "q_teacher_n_step",
+    "dagger_env_fraction",
+    "q_online_dagger_replay_fraction",
+    "actor_online_dagger_replay_fraction",
     "sac_policy_frequency",
     "td3_learning_starts",
     "sac_learning_starts",
     "dagger_buffer_capacity",
+    "student_buffer_capacity",
     "q_teacher_buffer_capacity",
     "perception_replay_mode",
     "use_tvkd_value_shaping",
@@ -224,6 +232,9 @@ def _profile_window_start_state(policy) -> dict:
         "dagger_replay": _profile_replay_state(
             getattr(policy, "dagger_replay", None)
         ),
+        "student_replay": _profile_replay_state(
+            getattr(policy, "student_replay", None)
+        ),
         "q_teacher_replay": _profile_replay_state(
             getattr(policy, "q_teacher_replay", None)
         ),
@@ -254,6 +265,22 @@ def _base_training_env(env):
             break
         current = next_env
     return current
+
+
+def _set_environment_stats_ema_mask(
+    env,
+    env_mask: torch.Tensor | None,
+) -> None:
+    """Install the optional task-metric cohort on the physical environment."""
+    base_env = _base_training_env(env)
+    setter = getattr(base_env, "set_stats_ema_env_mask", None)
+    if not callable(setter):
+        if env_mask is None:
+            return
+        raise RuntimeError(
+            "Student-only reward logging requires set_stats_ema_env_mask()"
+        )
+    setter(env_mask)
 
 
 def _set_teacher_prefill_nominal_reset(env, enabled: bool) -> bool:
@@ -804,6 +831,27 @@ def run_training(cfg: DictConfig):
         hasattr(policy, "uses_interleaved_updates")
         and policy.uses_interleaved_updates()
     )
+    N = env.num_envs
+    T = cfg.algo.train_every
+    device = env.device
+    student_only_metric_env_mask = resolve_student_only_env_mask(
+        policy,
+        num_envs=N,
+        device=device,
+    )
+    # Prefill collection is deliberately unchanged and its EMAs are erased at
+    # the phase boundary. Otherwise install the mask before the shape probe so
+    # even an unreset warm-up prefix has the correct metric provenance.
+    _set_environment_stats_ema_mask(
+        env,
+        None if teacher_prefill_active_at_start else student_only_metric_env_mask,
+    )
+    if student_only_metric_env_mask is not None:
+        logging.info(
+            "Task metrics use %d/%d fixed Student-only environments",
+            int(student_only_metric_env_mask.sum().item()),
+            int(N),
+        )
 
     with torch.inference_mode():
         tmp_carry = rollout_policy(carry.clone(False))
@@ -827,10 +875,6 @@ def run_training(cfg: DictConfig):
             "adapt_hx",
             strict=False,
         )
-
-    N = env.num_envs
-    T = cfg.algo.train_every
-    device = env.device
 
     data_buf = TensorDict({}, batch_size=[N, T], device=device)
     for key, value in tmp_td.items(include_nested=True, leaves_only=True):
@@ -989,7 +1033,11 @@ def run_training(cfg: DictConfig):
             # Dynamic Teacher prefill is a collection-only phase, not main
             # policy training.  Excluding it keeps train/stats/* (especially
             # success) a clean main-policy metric from its first window.
-            episode_stats.add(data_buf)
+            validate_student_only_rollout_provenance(
+                data_buf,
+                student_only_metric_env_mask,
+            )
+            episode_stats.add(data_buf, env_mask=student_only_metric_env_mask)
         env_frames += data_buf.numel()
         if profile_active:
             wallclock_profiler.increment("environment_states", data_buf.numel())
@@ -1021,13 +1069,19 @@ def run_training(cfg: DictConfig):
             # also resets recurrent carry/is_init state, so a main-policy
             # episode can never inherit a Teacher-controlled prefix.
             carry = _reset_after_teacher_prefill(env, episode_stats)
+            _set_environment_stats_ema_mask(env, student_only_metric_env_mask)
         training_time = time.perf_counter() - training_start + interleaved_training_time
         info.update(env.extra)
         if not prefill_active_before_rollout:
             # Environment reward/performance EMAs are intentionally absent
             # during prefill.  After the boundary reset, their first values
             # therefore contain main-policy steps only.
-            info.update(env.stats_ema)
+            environment_stats = env.stats_ema
+            if student_only_metric_env_mask is not None:
+                student_envs = int(student_only_metric_env_mask.sum().item())
+                info["train/student_only_metric_env_count"] = student_envs
+                info["train/student_only_metric_env_fraction"] = student_envs / N
+            info.update(environment_stats)
 
         if hasattr(policy, "step_schedule"):
             schedule_progress = i / total_iters

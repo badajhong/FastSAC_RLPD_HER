@@ -30,6 +30,9 @@ except ImportError:
 from active_adaptation.learning.ppo.fastsac_gradient_probe import (
     diagnose_fastsac_actor_gradients,
 )
+from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+    _migrate_explicit_online_replay_capacities,
+)
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_IS_STUDENT_ACTION_KEY,
     DAGGER_Q_TEACHER_SOURCE_KEY,
@@ -63,6 +66,22 @@ def _checkpoint_runtime_config(cfg: DictConfig) -> DictConfig:
 
     runtime = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
     OmegaConf.set_struct(runtime, False)
+    if (
+        "dagger_env_fraction" in runtime.algo
+        and "student_buffer_capacity" not in runtime.algo
+    ):
+        capacities = _migrate_explicit_online_replay_capacities(
+            {
+                "dagger_buffer_capacity": runtime.algo.dagger_buffer_capacity,
+                "dagger_env_fraction": runtime.algo.dagger_env_fraction,
+            }
+        )
+        runtime.algo.dagger_buffer_capacity = capacities[
+            "dagger_buffer_capacity"
+        ]
+        runtime.algo.student_buffer_capacity = capacities[
+            "student_buffer_capacity"
+        ]
     runtime.checkpoint_path = checkpoint_path
     runtime.task.num_envs = requested_envs
     runtime.headless = requested_headless

@@ -9,9 +9,9 @@ defaults:
 
 # Optional TVKD checkpoint for model/optimizer/policy-RNG/bottleneck continuation.
 # fastsac_dagger_iterations is the number of additional main rollouts. The
-# raw Student and Teacher learning rings are intentionally rebuilt: the frozen
-# Teacher ring is refilled before main collection and the Student ring warms up
-# again, avoiding multi-gigabyte replay tensors in every periodic checkpoint.
+# raw DAgger, pure-Student, and Expert learning rings are intentionally rebuilt:
+# the frozen Expert ring is refilled before main collection and both online rings
+# warm up again, avoiding multi-gigabyte replay tensors in periodic checkpoints.
 fastsac_bc_dagger_checkpoint: null
 _tvkd_model_only_resume: false
 
@@ -20,6 +20,14 @@ algo:
   # update. A resumed v3 checkpoint may explicitly retain its saved Critic
   # cadence as a legacy compatibility contract.
   sac_alpha_update_cadence: actor
+
+  # All three factual Q sources use the standard one-step SAC Bellman target.
+  # This prevents a Student action in the alternating DAgger cohort from being
+  # credited with a later Teacher rescue. Delayed actuation is represented in
+  # the Critic observation/action history and propagated through bootstrapping.
+  # Both fields are production locks: values other than 1 fail validation.
+  q_n_step: 1
+  q_teacher_n_step: 1
 
   # Resolved Q/Actor four-way replay mixtures. Each replay objective owns an
   # independent distribution whose four entries sum to exactly one. On a

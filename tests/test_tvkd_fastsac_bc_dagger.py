@@ -16,7 +16,11 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     DistributionalFastSACTeacherBC,
 )
 from active_adaptation.learning.ppo.common import Actor
-from active_adaptation.learning.ppo.fastsac_vel import _BCDaggerSACAdapter
+from active_adaptation.learning.ppo.fastsac_vel import (
+    FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
+    FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
+    _BCDaggerSACAdapter,
+)
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_IS_STUDENT_ACTION_KEY,
     DAGGER_Q_TEACHER_SOURCE_KEY,
@@ -34,7 +38,6 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     PERCEPTION_POLICY_RAW_KEY,
     PERCEPTION_VEL_COMMAND_RAW_KEY,
     NEXT_Q_ACTUATOR_CONTEXT_KEY,
-    Q_ACTUATOR_CONTEXT_KEY,
     NEXT_REFERENCE_PHASE_KEY,
     REFERENCE_PHASE_KEY,
     REPLAY_COMMAND_FINISHED_KEY,
@@ -84,6 +87,7 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     TRAINING_ALGORITHM as TVKD_TRAINING_ALGORITHM,
     TVKDDistributionalFastSACTeacherBC,
     TVKDDistributionalFastSACTeacherBCConfig,
+    _migrate_explicit_online_replay_capacities,
     compute_continuation_coefficient,
     compute_teacher_value_continuation,
     compute_teacher_value_terms,
@@ -111,6 +115,19 @@ fastsac_module = importlib.import_module(
     "active_adaptation.learning.ppo.fastsac_bc_dagger"
 )
 tvkd_entry = importlib.import_module("scripts.TVKD_fasSAC_bc_dagger")
+
+
+def test_tvkd_v9_legacy_total_online_capacity_migrates_to_explicit_rings():
+    legacy = {
+        "dagger_buffer_capacity": 10,
+        "dagger_env_fraction": 0.3,
+    }
+
+    migrated = _migrate_explicit_online_replay_capacities(legacy)
+
+    assert migrated["dagger_buffer_capacity"] == 3
+    assert migrated["student_buffer_capacity"] == 7
+    assert "student_buffer_capacity" not in legacy
 
 
 class _DeviceMoveCounter:
@@ -174,6 +191,22 @@ class _TableTwin(nn.Module):
         del actions
         count = observations.shape[0]
         return torch.stack((self.first[:count], self.second[:count]), dim=0)
+
+
+class _TableTwinScalar(nn.Module):
+    def __init__(self, first: torch.Tensor, second: torch.Tensor):
+        super().__init__()
+        self.register_buffer("first", first)
+        self.register_buffer("second", second)
+
+    def forward(self, observations, actions):
+        del actions
+        count = observations.shape[0]
+        return torch.stack((self.first[:count], self.second[:count]), dim=0)
+
+    @staticmethod
+    def values(outputs):
+        return outputs
 
 
 class _RecordingTableTwin(_TableTwin):
@@ -2567,6 +2600,109 @@ def test_disabled_tvkd_target_delegates_to_exact_baseline_path(monkeypatch):
     assert metrics["tvkd_shaped_reward_std"].item() == pytest.approx(2.0)
 
 
+def test_tvkd_scalar_target_preserves_residual_shaping_and_terminal_cut():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        gamma=0.9,
+        q_n_step=1,
+        q_critic_type="scalar",
+        use_tvkd_value_shaping=True,
+        use_teacher_residual_critic=True,
+        use_phase_faded_teacher_potential=False,
+        tvkd_lambda=0.5,
+    )
+    policy.qnet_target = _TableTwinScalar(
+        torch.tensor([3.0, 4.0]), torch.tensor([2.0, 5.0])
+    )
+    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.2)))
+    policy.sac_action_rng = torch.Generator().manual_seed(3)
+    policy._actor_dist_from_flat = lambda observations: _FixedDist(
+        observations.shape[0], action=0.25, log_prob=-0.5
+    )
+    policy._normalized_action_log_prob = lambda value: value
+    policy._q_forward = lambda qnet, observations, action, context: qnet(
+        observations, action
+    )
+    terms = SimpleNamespace(
+        teacher_v=torch.tensor([0.0, 0.0]),
+        teacher_v_next=torch.tensor([0.0, 0.0]),
+        teacher_potential=torch.tensor([0.0, 0.0]),
+        teacher_potential_next=torch.tensor([0.0, 0.0]),
+        potential_delta=torch.tensor([0.5, -0.25]),
+        shaped_reward=torch.tensor([1.25, 1.875]),
+    )
+    policy._teacher_value_terms_from_batch = lambda *args, **kwargs: terms
+    batch = {
+        "next_observations": torch.zeros(2, 1),
+        "next_critic_observations": torch.zeros(2, 1),
+        "rewards": torch.tensor([1.0, 2.0]),
+        "dones": torch.tensor([False, True]),
+        "truncations": torch.zeros(2, dtype=torch.bool),
+        "discounts": torch.ones(2),
+        REPLAY_TERMINATED_KEY: torch.tensor([False, True]),
+        REPLAY_COMMAND_FINISHED_KEY: torch.zeros(2, dtype=torch.bool),
+        REPLAY_TIME_LIMIT_KEY: torch.zeros(2, dtype=torch.bool),
+        REFERENCE_PHASE_KEY: torch.zeros(2),
+        NEXT_REFERENCE_PHASE_KEY: torch.zeros(2),
+    }
+
+    target, metrics, _ = policy._distributional_fastsac_target(batch)
+
+    # Residual rewards are [1.5, 1.75]. On the continuing row the entropy
+    # contribution is +.09 and clipped next-Q contributes .9 * 2.
+    assert torch.allclose(target, torch.tensor([3.39, 1.75]))
+    assert metrics["tvkd_residual_reward_mean"].item() == pytest.approx(1.625)
+    assert metrics["target_select_q2_fraction"].item() == pytest.approx(0.5)
+    assert metrics["support_clip_fraction_mean"].item() == 0.0
+    assert metrics["target_distribution_entropy"].item() == 0.0
+
+
+def test_tvkd_scalar_checkpoint_metadata_uses_balanced_split_stems():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = TVKDDistributionalFastSACTeacherBCConfig(
+        q_critic_type="scalar",
+        q_hidden_dim=768,
+    )
+    policy.action_dim = 23
+    policy._q_state_input_dim = 2370
+    policy._q_action_input_dim = 23
+    policy._q_actuator_context_dim = 29
+
+    metadata = policy._checkpoint_q_backend_metadata()
+
+    assert metadata["q_architecture_semantics"] == (
+        FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
+    )
+    assert metadata["q_action_fusion"] == "balanced_split_stems"
+    assert metadata["q_state_hidden_dim"] == 384
+    assert metadata["q_action_hidden_dim"] == 384
+    assert metadata["q_action_fusion_semantics"] == (
+        FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS
+    )
+    assert metadata["q_n_step_semantics"] == tvkd_module.Q_N_STEP_SEMANTICS
+    assert metadata["student_q_n_step"] == 1
+    assert metadata["teacher_q_n_step"] == 1
+    state = {"q_backend_config": metadata}
+    policy._validate_scalar_q_checkpoint_architecture(
+        state, context="TVKD unit test"
+    )
+
+    stale_state = copy.deepcopy(state)
+    stale_state["q_backend_config"]["q_architecture_semantics"] = (
+        "twin_independent_normalized_state_action_concat_scalar_mlp_v1"
+    )
+    with pytest.raises(ValueError, match="balanced split-stem scalar"):
+        policy._validate_scalar_q_checkpoint_architecture(
+            stale_state, context="TVKD unit test"
+        )
+
+
 @pytest.mark.parametrize("variant", ("baseline", "tvkd"))
 def test_c51_support_metrics_preserve_both_q_heads_and_aggregate_head_totals(
     monkeypatch,
@@ -3390,10 +3526,22 @@ def test_tvkd_logging_surface_is_finite_without_any_optimizer_update(monkeypatch
             "fastsac/student_replay_rows_this_rollout": 0.0,
             "fastsac/student_source_fraction": 0.0,
             "fastsac/teacher_source_fraction": 1.0,
+            "fastsac/student_actor_warmup_active": 1.0,
+            "fastsac/student_actor_warmup_completed_rollouts": 5.0,
+            "fastsac/student_actor_warmup_target_rollouts": 10.0,
+            "fastsac/student_actor_warmup_complete": 0.0,
         },
     )
 
     info = policy.train_op(TensorDict({}, batch_size=[]))
+    assert info["warmup/active"] == pytest.approx(1.0)
+    assert info["warmup/completed_rollouts"] == pytest.approx(5.0)
+    assert info["warmup/target_rollouts"] == pytest.approx(10.0)
+    assert info["warmup/complete"] == pytest.approx(0.0)
+    assert not any(
+        key.startswith("fastsac/student_actor_warmup")
+        for key in info
+    )
     required = {
         "tvkd/teacher_value_mean",
         "tvkd/teacher_next_value_mean",
@@ -3858,6 +4006,50 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     assert cfg._tvkd_model_only_resume is True
     assert cfg._bc_dagger_fresh_source is True
     assert cfg.algo.value_norm is False
+
+    # Early v9 checkpoints already had the three-source collector but stored
+    # the combined online allocation in dagger_buffer_capacity. Exercise the
+    # complete entrypoint contract (saved algo + backend metadata), not only
+    # the migration helper, and prove it resumes under the explicit two-ring
+    # schema without changing the original total allocation.
+    legacy_capacity_path = checkpoint_path.with_name(
+        "checkpoint_v9_legacy_total_capacity.pt"
+    )
+    legacy_capacity_cfg = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    online_total = int(legacy_capacity_cfg.algo.dagger_buffer_capacity) + int(
+        legacy_capacity_cfg.algo.student_buffer_capacity
+    )
+    legacy_capacity_cfg.algo.dagger_buffer_capacity = online_total
+    del legacy_capacity_cfg.algo.student_buffer_capacity
+    legacy_capacity_policy = copy.deepcopy(policy_state)
+    legacy_capacity_backend = copy.deepcopy(
+        legacy_capacity_policy["dagger_backend_config"]
+    )
+    legacy_capacity_backend["dagger_buffer_capacity"] = online_total
+    legacy_capacity_backend.pop("student_buffer_capacity")
+    legacy_capacity_policy["dagger_backend_config"] = legacy_capacity_backend
+    torch.save(
+        {
+            "policy": legacy_capacity_policy,
+            "vecnorm": {},
+            "cfg": legacy_capacity_cfg,
+        },
+        legacy_capacity_path,
+    )
+    legacy_capacity_runtime = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    legacy_capacity_runtime.fastsac_bc_dagger_checkpoint = str(
+        legacy_capacity_path
+    )
+
+    legacy_capacity_result = _prepare_tvkd_checkpoint(legacy_capacity_runtime)
+
+    assert legacy_capacity_result["path"] == str(legacy_capacity_path.resolve())
+    assert legacy_capacity_runtime.algo.dagger_buffer_capacity == 65_536
+    assert legacy_capacity_runtime.algo.student_buffer_capacity == 65_536
 
     v5_policy_state = {
         "training_algorithm": TVKD_V5_TRAINING_ALGORITHM,
@@ -4481,6 +4673,42 @@ def test_public_tvkd_resume_rebuilds_rings_and_teacher_sidecars(
     assert freezes == [1]
 
 
+def test_lambda_bc_fork_requires_explicit_pristine_pre_actor_checkpoint():
+    config = SimpleNamespace(
+        lambda_bc=0.0,
+        resume_allow_lambda_bc_override=False,
+    )
+    state = {
+        "training_algorithm": TVKD_TRAINING_ALGORITHM,
+        "checkpoint_version": TVKD_CHECKPOINT_VERSION,
+        "actor_update_count": 0,
+        "actor_std_update_count": 0,
+        "alpha_update_count": 0,
+        "sac_actor_update_count": 0,
+        "sac_alpha_update_count": 0,
+        "optimizer_resume_state": {
+            name: {"state": {}, "param_groups": []}
+            for name in (
+                "actor_optimizer",
+                "actor_std_optimizer",
+                "alpha_optimizer",
+            )
+        },
+    }
+
+    with pytest.raises(ValueError, match="fixed BC coefficient mismatch"):
+        tvkd_module._lambda_bc_fork_override_active(config, state, 1.0)
+
+    config.resume_allow_lambda_bc_override = True
+    assert tvkd_module._lambda_bc_fork_override_active(config, state, 1.0)
+    assert not tvkd_module._lambda_bc_fork_override_active(config, state, 0.0)
+
+    dirty = copy.deepcopy(state)
+    dirty["actor_update_count"] = 1
+    with pytest.raises(ValueError, match="pre-Actor checkpoint"):
+        tvkd_module._lambda_bc_fork_override_active(config, dirty, 1.0)
+
+
 def test_private_resume_configures_frozen_perception_before_optimizer_load(
     monkeypatch,
 ):
@@ -4569,15 +4797,6 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
     with pytest.raises(ValueError, match="train_every"):
         policy._load_fastsac_checkpoint_state(drifted_cadence, load_modules=False)
 
-    predates_actor_scheduler = copy.deepcopy(state)
-    predates_actor_scheduler["dagger_backend_config"].pop(
-        "actor_update_to_data_ratio"
-    )
-    with pytest.raises(ValueError, match="predates the independent Actor row"):
-        policy._load_fastsac_checkpoint_state(
-            predates_actor_scheduler, load_modules=False
-        )
-
     drifted_semantics = copy.deepcopy(state)
     drifted_semantics["actor_learning_semantics"] = "wrong"
     with pytest.raises(ValueError, match="actor_learning_semantics"):
@@ -4598,6 +4817,28 @@ def test_private_resume_configures_frozen_perception_before_optimizer_load(
     assert policy._perception_initialization["trainable"] is False
     assert not hasattr(policy, "student_bc_scheduler")
     assert freezes == [1]
+
+    forked = copy.deepcopy(state)
+    forked.update(
+        {
+            "actor_update_count": 0,
+            "alpha_update_count": 0,
+        }
+    )
+    forked["optimizer_resume_state"].update(
+        {
+            "actor_optimizer": {"state": {}, "param_groups": []},
+            "alpha_optimizer": {"state": {}, "param_groups": []},
+        }
+    )
+    policy.cfg.lambda_bc = 0.0
+    with pytest.raises(ValueError, match="fixed BC coefficient mismatch"):
+        policy._load_fastsac_checkpoint_state(forked, load_modules=False)
+
+    policy.cfg.resume_allow_lambda_bc_override = True
+    observed.clear()
+    policy._load_fastsac_checkpoint_state(forked, load_modules=False)
+    assert observed == [(None, False)]
 
 
 def test_v1_resume_discards_scheduler_state_and_starts_fresh_detector(monkeypatch):
@@ -4900,42 +5141,57 @@ def test_tvkd_hydra_resolves_independent_q_and_actor_four_way_mixes():
     ) == pytest.approx((1.0, 0.0, 0.0, 0.0))
 
 
-def test_tvkd_zero_focus_alias_resolves_uniform_half_mix_for_q_and_actor():
+def test_tvkd_hydra_allows_teacher_perception_four_way_alias():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
-    zero_focus_half_mix = [
-        "algo.q_teacher_replay_ratio=0.5",
-        "algo.teacher_actor_replay_fraction=0.5",
+    overrides = [
+        "task=G1/vaic/skateboard_stu",
+        "checkpoint_path=/tmp/fresh_ppo.pt",
+        "fastsac_dagger_iterations=10",
+        "algo.perception_replay_mode=four_way",
+        "algo.teacher_perception_replay_fraction=0.5",
         "algo.failure_phase_teacher_fraction=0.0",
         "algo.failure_phase_student_fraction=0.0",
     ]
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg = compose(
             config_name="TVKD_fasSAC_bc_dagger",
-            overrides=[
-                "task=G1/vaic/skateboard_stu",
-                "checkpoint_path=/tmp/fresh_ppo.pt",
-                "fastsac_dagger_iterations=10",
-                *zero_focus_half_mix,
-            ],
+            overrides=overrides,
             return_hydra_config=True,
         )
 
     assert _apply_tvkd_cli_replay_mix_overrides(
         cfg, cfg.hydra.overrides.task
     )
-    policy = TVKDDistributionalFastSACTeacherBC.__new__(
-        TVKDDistributionalFastSACTeacherBC
+    assert tuple(
+        float(cfg.algo[f"perception_{source}_fraction"])
+        for source in REPLAY_SOURCE_ORDER
+    ) == pytest.approx((0.5, 0.0, 0.5, 0.0))
+    validate_tvkd_fastsac_bc_dagger_config(cfg)
+
+
+def test_tvkd_hydra_allows_teacher_perception_warmup_before_live_student_mode():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    overrides = [
+        "task=G1/vaic/skateboard_stu",
+        "checkpoint_path=/tmp/fresh_ppo.pt",
+        "fastsac_dagger_iterations=10",
+        "algo.perception_replay_mode=online_student_rollout",
+        "algo.teacher_perception_replay_fraction=0.0",
+        "algo.teacher_perception_warmup_steps=5000",
+        "algo.failure_phase_teacher_fraction=0.0",
+        "algo.failure_phase_student_fraction=0.0",
+    ]
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=overrides,
+            return_hydra_config=True,
+        )
+
+    assert _apply_tvkd_cli_replay_mix_overrides(
+        cfg, cfg.hydra.overrides.task
     )
-    nn.Module.__init__(policy)
-    policy.cfg = cfg.algo
-    expected = {
-        "uniform_student": 512,
-        "failure_student": 0,
-        "uniform_teacher": 512,
-        "failure_teacher": 0,
-    }
-    assert policy._replay_source_counts("q", 1024) == expected
-    assert policy._replay_source_counts("actor", 1024) == expected
+    validate_tvkd_fastsac_bc_dagger_config(cfg)
 
 
 def test_tvkd_hydra_legacy_cli_mix_translates_current_command():
@@ -5822,6 +6078,10 @@ def test_v4_replay_perception_uses_failure_student_raw_windows_not_live_rollout(
     result = policy.train_adapt(object())
 
     assert result["adapt/perception_four_way"] == 1.0
+    assert result["adapt/perception_teacher_priv_loss"] == pytest.approx(0.0)
+    assert result["adapt/perception_teacher_object_loss"] == pytest.approx(0.0)
+    assert result["adapt/perception_student_priv_loss"] > 0.0
+    assert result["adapt/perception_student_object_loss"] > 0.0
     assert any(not torch.equal(old, new) for old, new in zip(before, parameters))
     assert len(policy.temporal_depth_gru.seen_policy_windows) == 2
     for seen in policy.temporal_depth_gru.seen_policy_windows:
@@ -6035,7 +6295,6 @@ def _student_q_n_step_test_chunk(
     markers,
     dones=None,
     discounts=None,
-    include_actuator_context=False,
 ):
     rewards = torch.tensor(rewards, dtype=torch.float32)
     markers = torch.tensor(markers, dtype=torch.float32)
@@ -6048,7 +6307,7 @@ def _student_q_n_step_test_chunk(
         discounts = torch.ones(count, dtype=torch.float32)
     else:
         discounts = torch.tensor(discounts, dtype=torch.float32)
-    chunk = {
+    return {
         "rewards": rewards,
         "dones": dones,
         "truncations": torch.zeros(count, dtype=torch.bool),
@@ -6059,12 +6318,6 @@ def _student_q_n_step_test_chunk(
         DAGGER_IS_STUDENT_ACTION_KEY: torch.ones(count, dtype=torch.bool),
         _PREFILL_ENV_INDEX_KEY: torch.arange(count, dtype=torch.long),
     }
-    if include_actuator_context:
-        # The causal context's suffix is the held command on the current
-        # state and the just-issued command on its successor.
-        chunk[Q_ACTUATOR_CONTEXT_KEY] = (markers - 1.0)[:, None]
-        chunk[NEXT_Q_ACTUATOR_CONTEXT_KEY] = markers[:, None]
-    return chunk
 
 
 def test_tvkd_student_q_n_step_aggregates_factual_vector_trajectories():
@@ -6076,27 +6329,15 @@ def test_tvkd_student_q_n_step_aggregates_factual_vector_trajectories():
     policy._student_q_n_step_accumulator = None
 
     first = policy._aggregate_student_q_n_step_chunk(
-        _student_q_n_step_test_chunk(
-            [1.0, 10.0],
-            markers=[1.0, 10.0],
-            include_actuator_context=True,
-        ),
+        _student_q_n_step_test_chunk([1.0, 10.0], markers=[1.0, 10.0]),
         num_envs=2,
     )
     second = policy._aggregate_student_q_n_step_chunk(
-        _student_q_n_step_test_chunk(
-            [2.0, 20.0],
-            markers=[2.0, 20.0],
-            include_actuator_context=True,
-        ),
+        _student_q_n_step_test_chunk([2.0, 20.0], markers=[2.0, 20.0]),
         num_envs=2,
     )
     result = policy._aggregate_student_q_n_step_chunk(
-        _student_q_n_step_test_chunk(
-            [3.0, 30.0],
-            markers=[3.0, 30.0],
-            include_actuator_context=True,
-        ),
+        _student_q_n_step_test_chunk([3.0, 30.0], markers=[3.0, 30.0]),
         num_envs=2,
     )
 
@@ -6107,12 +6348,6 @@ def test_tvkd_student_q_n_step_aggregates_factual_vector_trajectories():
     assert torch.equal(result["actions"], torch.tensor([[1.0], [10.0]]))
     assert torch.equal(
         result["next_critic_observations"], torch.tensor([[103.0], [130.0]])
-    )
-    assert torch.equal(
-        result[Q_ACTUATOR_CONTEXT_KEY], torch.tensor([[0.0], [9.0]])
-    )
-    assert torch.equal(
-        result[NEXT_Q_ACTUATOR_CONTEXT_KEY], torch.tensor([[3.0], [30.0]])
     )
     assert torch.equal(result["discounts"], torch.ones(2))
 
@@ -6343,59 +6578,28 @@ def test_tvkd_n_step_target_shares_endpoint_discount_with_pbrs_and_c51(
     assert metrics["effective_n_steps_mean"].item() == pytest.approx(2.0)
 
 
+@pytest.mark.parametrize("field", ["q_n_step", "q_teacher_n_step"])
 @pytest.mark.parametrize("invalid", [0, -1, 1.5, True])
-def test_tvkd_q_n_step_requires_a_positive_integer(invalid):
+def test_tvkd_q_horizon_requires_a_positive_integer(field, invalid):
     cfg = TVKDDistributionalFastSACTeacherBCConfig()
-    cfg.q_n_step = invalid
-    with pytest.raises(ValueError, match="q_n_step"):
-        tvkd_module._validate_tvkd_algorithm_config(cfg)
-
-
-def test_tvkd_causal_q_rejects_teacher_only_q_mix():
-    cfg = TVKDDistributionalFastSACTeacherBCConfig(
-        q_condition_on_actuator_state=True,
-        q_use_causal_hold_advantage=True,
-        q_uniform_student_fraction=0.0,
-        q_failure_student_fraction=0.0,
-        q_uniform_teacher_fraction=0.5,
-        q_failure_teacher_fraction=0.5,
-    )
-
-    with pytest.raises(ValueError, match="positive Student Q replay fraction"):
-        tvkd_module._validate_tvkd_algorithm_config(cfg)
-
-
-def test_tvkd_q_n_step_five_is_selectable_but_teacher_horizon_stays_one():
-    cfg = TVKDDistributionalFastSACTeacherBCConfig(q_n_step=5)
-    tvkd_module._validate_tvkd_algorithm_config(cfg)
-    assert cfg.q_n_step == 5
-    assert cfg.q_teacher_n_step == 1
-
-    cfg.q_teacher_n_step = 2
-    with pytest.raises(ValueError, match="q_teacher_n_step is currently locked"):
-        tvkd_module._validate_tvkd_algorithm_config(cfg)
-
-
-def test_tvkd_multi_step_rejects_teacher_takeover_inside_student_horizon():
-    cfg = TVKDDistributionalFastSACTeacherBCConfig(
-        q_n_step=5,
-        dagger_beta_start=0.1,
-    )
-    with pytest.raises(ValueError, match="Student-only main rollouts"):
+    setattr(cfg, field, invalid)
+    with pytest.raises(ValueError, match=field):
         tvkd_module._validate_tvkd_algorithm_config(cfg)
 
 
 @pytest.mark.parametrize(
-    "mode", ["dagger_staging_enabled", "dagger_finalization_enabled"]
+    ("field", "value"),
+    [("q_n_step", 2), ("q_n_step", 5), ("q_teacher_n_step", 2)],
 )
-def test_tvkd_multi_step_rejects_calibration_that_reenables_teacher(mode):
-    cfg = TVKDDistributionalFastSACTeacherBCConfig(q_n_step=5)
-    setattr(cfg, mode, True)
-    with pytest.raises(ValueError, match="replay-Q calibration"):
+def test_tvkd_q_horizons_are_locked_to_one(field, value):
+    cfg = TVKDDistributionalFastSACTeacherBCConfig()
+    setattr(cfg, field, value)
+
+    with pytest.raises(ValueError, match=rf"{field} is locked to 1"):
         tvkd_module._validate_tvkd_algorithm_config(cfg)
 
 
-def test_tvkd_hydra_accepts_selectable_student_q_n_step_override():
+def test_tvkd_hydra_exposes_one_step_q_contract():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
         cfg = compose(
@@ -6404,15 +6608,50 @@ def test_tvkd_hydra_accepts_selectable_student_q_n_step_override():
                 "task=G1/vaic/skateboard_stu",
                 "checkpoint_path=/tmp/fresh_ppo.pt",
                 "fastsac_dagger_iterations=10",
-                "algo.q_n_step=5",
+                "algo.q_n_step=1",
                 "algo.q_teacher_n_step=1",
             ],
             return_hydra_config=True,
         )
 
     tvkd_module._validate_tvkd_algorithm_config(cfg.algo)
-    assert cfg.algo.q_n_step == 5
+    assert cfg.algo.q_n_step == 1
     assert cfg.algo.q_teacher_n_step == 1
+
+
+def test_tvkd_hydra_inherits_explicit_equal_online_ring_capacities():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=["task=G1/vaic/skateboard_stu"],
+        )
+
+    assert cfg.algo.dagger_buffer_capacity == 65_536
+    assert cfg.algo.student_buffer_capacity == 65_536
+    assert (
+        cfg.algo.dagger_buffer_capacity + cfg.algo.student_buffer_capacity
+        == 131_072
+    )
+
+
+@pytest.mark.parametrize("field", ["q_n_step", "q_teacher_n_step"])
+def test_tvkd_hydra_rejects_non_one_q_horizon(field):
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                f"algo.{field}=2",
+            ],
+            return_hydra_config=True,
+        )
+
+    with pytest.raises(ValueError, match=rf"{field} is locked to 1"):
+        tvkd_module._validate_tvkd_algorithm_config(cfg.algo)
 
 
 def test_tvkd_n_step_rematches_cross_rollout_pending_start_to_focus_event(

@@ -6,8 +6,7 @@ live diagnostic collection or a focused unit seam.  It mirrors the production
 Actor objective while keeping its three causes separate:
 
 * exact mean-action Teacher BC;
-* the negative pessimistic twin-C51 expectation, restricted to
-  Teacher-beating rows when the causal confidence gate is active; and
+* the negative pessimistic twin-C51 expectation; and
 * the temperature-weighted policy log probability.
 
 Only :func:`torch.autograd.grad` is used.  No optimizer is zeroed or stepped,
@@ -26,10 +25,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .fastsac_bc_dagger import (
-    CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS,
-    _spred_p_teacher_probability,
-)
+from .fastsac_bc_dagger import _spred_p_teacher_probability
 from .fastsac_vel import _reduce_actor_q_values
 from .ppo_bc_dagger import (
     DAGGER_Q_TEACHER_SOURCE_KEY,
@@ -189,22 +185,13 @@ def _expected_twin_q(
     actions,
     actuator_context: torch.Tensor | None,
 ):
-    # Production delayed-action policies own the architecture-aware router.
-    # Retain the direct path for small diagnostic policies and old fixtures
-    # that expose only the historical action-feature transform.
-    if hasattr(policy, "_q_forward"):
-        logits = policy._q_forward(
-            policy.qnet,
-            critic_observations,
-            actions,
-            actuator_context,
-        )
-    else:
-        logits = policy.qnet(
-            critic_observations,
-            policy._q_action_features(actions, actuator_context),
-        )
-    expected = (F.softmax(logits, dim=-1) * policy.qnet.support).sum(dim=-1)
+    outputs = policy._q_forward(
+        policy.qnet,
+        critic_observations,
+        actions,
+        actuator_context,
+    )
+    expected = policy._q_output_values(policy.qnet, outputs)
     minimum = _reduce_actor_q_values(expected, True)
     return expected, minimum
 
@@ -401,7 +388,8 @@ def diagnose_fastsac_actor_gradients(
     observations = batch["observations"]
     critic_observations = batch["critic_observations"]
     actuator_context = batch.get(Q_ACTUATOR_CONTEXT_KEY)
-    teacher_action = batch[DAGGER_REPLAY_TEACHER_ACTIONS]
+    raw_teacher_action = batch[DAGGER_REPLAY_TEACHER_ACTIONS]
+    teacher_action = policy._project_student_policy_action(raw_teacher_action)
     teacher_valid = batch[DAGGER_TEACHER_ACTION_VALID_KEY].reshape(-1).bool()
     row_count = int(observations.shape[0])
     if row_count < 1:
@@ -471,24 +459,6 @@ def diagnose_fastsac_actor_gradients(
                 finite_teacher_action,
                 actuator_context,
             )
-            causal_q_gate_enabled = bool(
-                getattr(
-                    policy,
-                    "_q_uses_causal_hold_advantage",
-                    lambda: False,
-                )()
-            )
-            if causal_q_gate_enabled:
-                # Mirror production exactly: compare policy and Teacher within
-                # each twin head, then trust Q ascent only when both differences
-                # are positive.  Head-specific value offsets therefore cancel.
-                policy_teacher_margin = (
-                    twin_sample_q.detach() - twin_teacher_q
-                ).min(dim=0).values
-                actor_q_gate = teacher_valid & (policy_teacher_margin > 0.0)
-            else:
-                policy_teacher_margin = torch.zeros_like(minimum_sample_q)
-                actor_q_gate = torch.ones_like(teacher_valid)
             (
                 spred_p_teacher_probability,
                 spred_p_teacher_advantage,
@@ -568,30 +538,6 @@ def diagnose_fastsac_actor_gradients(
                 action_scale=policy._fastsac_q_action_scale,
             )
             valid = mask & teacher_valid
-            trusted = mask & actor_q_gate
-            scalar_reports[name].update(
-                {
-                    "actor_q_confidence_gate_enabled": int(
-                        causal_q_gate_enabled
-                    ),
-                    "actor_q_confidence_gate_active_rows": int(
-                        trusted.sum().item()
-                    ),
-                    "actor_q_confidence_gate_active_fraction": _finite_float(
-                        trusted.float().sum() / mask.float().sum()
-                    ),
-                    "actor_q_confidence_policy_teacher_margin": (
-                        _finite_float(policy_teacher_margin[valid].mean())
-                        if bool(valid.any())
-                        else None
-                    ),
-                    "actor_q_confidence_trusted_q_mean": (
-                        _finite_float(minimum_sample_q.detach()[trusted].mean())
-                        if bool(trusted.any())
-                        else 0.0
-                    ),
-                }
-            )
             if bool(valid.any()):
                 candidate_weights = spred_p_teacher_probability[valid]
                 effective_weights = (
@@ -644,17 +590,7 @@ def diagnose_fastsac_actor_gradients(
                 )
             if name not in gradient_masks:
                 continue
-            if causal_q_gate_enabled:
-                # The zero-valued graph is important: production keeps entropy
-                # and BC live while an empty confidence gate contributes exactly
-                # zero Q gradient to every Actor parameter.
-                q_loss = (
-                    -_masked_mean(minimum_sample_q, trusted)
-                    if bool(trusted.any())
-                    else minimum_sample_q.sum() * 0.0
-                )
-            else:
-                q_loss = -_masked_mean(minimum_sample_q, mask)
+            q_loss = -_masked_mean(minimum_sample_q, mask)
             entropy_loss = alpha * _masked_mean(normalized_log_prob, mask)
             gradients = {
                 "bc": _gradient_tuple(bc_loss, all_parameters),
@@ -865,16 +801,6 @@ def diagnose_fastsac_actor_gradients(
                 if q_filter_enabled
                 else "uniform_valid_teacher_rows"
             ),
-        },
-        "actor_q_confidence_gate": {
-            "enabled": causal_q_gate_enabled,
-            "semantics": (
-                CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS
-                if causal_q_gate_enabled
-                else "disabled_direct_unconditional_pessimistic_q"
-            ),
-            "active_rows": int(actor_q_gate.sum().item()),
-            "active_fraction": _finite_float(actor_q_gate.float().mean()),
         },
         "coefficients": {
             "lambda_bc": lambda_bc,

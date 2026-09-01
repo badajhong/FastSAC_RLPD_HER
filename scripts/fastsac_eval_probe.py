@@ -32,7 +32,6 @@ from tqdm import tqdm
 try:
     from ._isaaclab_bootstrap import AppLauncher
     from .fastsac_eval_probe_utils import (
-        fixed_std_latent_parameters,
         paired_against_deterministic,
         summarize_condition,
         terminal_stats_to_records,
@@ -42,7 +41,6 @@ try:
 except ImportError:
     from _isaaclab_bootstrap import AppLauncher
     from fastsac_eval_probe_utils import (
-        fixed_std_latent_parameters,
         paired_against_deterministic,
         summarize_condition,
         terminal_stats_to_records,
@@ -51,7 +49,6 @@ except ImportError:
     from helpers import _load_policy_checkpoint, make_env_policy
 
 from active_adaptation.learning.ppo.common import ACTION_KEY
-from active_adaptation.learning.ppo.fastsac_vel import FastSACTanhNormal
 from active_adaptation.learning.ppo.ppo_vel import PRIV_FEATURE_KEY, PRIV_PRED_KEY
 
 
@@ -80,15 +77,14 @@ class FixedStdFastSACStudentPolicy(nn.Module):
         super().__init__()
         required = (
             "_student_raw_action_proposal",
-            "_bounded_actor_mean",
             "_sac_dist_from_mean",
+            "_normalized_tanh_dist_from_mean",
             "_project_execution_action",
             "_q_action_input",
-            "_fastsac_actor_action_center",
-            "_fastsac_actor_action_scale",
-            "_fastsac_q_action_scale",
             "_fastsac_action_low",
             "_fastsac_action_high",
+            "_fastsac_student_action_low",
+            "_fastsac_student_action_high",
         )
         missing = [name for name in required if not hasattr(owner, name)]
         if missing:
@@ -144,6 +140,7 @@ class FixedStdFastSACStudentPolicy(nn.Module):
     @torch.no_grad()
     def forward(self, td: TensorDict):
         owner = self._owner
+        mean_distribution = None
         if self.policy_source == "student":
             raw_mean = owner._student_raw_action_proposal(td)
         elif self.policy_source == "oracle_latent":
@@ -162,28 +159,28 @@ class FixedStdFastSACStudentPolicy(nn.Module):
             raw_mean = owner._teacher_action(td)
         if not torch.isfinite(raw_mean).all():
             raise RuntimeError("FastSAC evaluation Actor produced a non-finite mean")
-        mean_action = owner._project_execution_action(
-            owner._sac_dist_from_mean(raw_mean).mean
-        )
+        if self.policy_source == "teacher":
+            # The frozen PPO Teacher owns physical, unsquashed commands.  Its
+            # deterministic diagnostic must retain that behavior inside the
+            # shared execution guard rather than passing through the Student's
+            # nominal tanh support.
+            mean_action = owner._project_execution_action(raw_mean)
+        else:
+            mean_distribution = owner._sac_dist_from_mean(raw_mean)
+            mean_action = owner._project_execution_action(mean_distribution.mean)
         if self.normalized_std is None and not self.use_checkpoint_std:
             action = mean_action
         else:
             if self.use_checkpoint_std:
-                distribution = owner._sac_dist_from_mean(raw_mean)
+                if mean_distribution is None:
+                    raise RuntimeError(
+                        "Teacher diagnostics do not own a Student SAC distribution"
+                    )
+                distribution = mean_distribution
             else:
-                latent_loc, latent_scale = fixed_std_latent_parameters(
+                distribution = owner._normalized_tanh_dist_from_mean(
                     raw_mean,
-                    owner._fastsac_actor_action_center,
-                    owner._fastsac_actor_action_scale,
-                    owner._fastsac_q_action_scale,
-                    self.normalized_std,
-                )
-                distribution = FastSACTanhNormal(
-                    latent_loc,
-                    latent_scale,
-                    low=owner._fastsac_action_low.to(raw_mean),
-                    high=owner._fastsac_action_high.to(raw_mean),
-                    event_dims=1,
+                    normalized_std=self.normalized_std,
                 )
             action, _ = distribution.rsample_with_log_prob(
                 generator=self.action_generator
@@ -193,8 +190,15 @@ class FixedStdFastSACStudentPolicy(nn.Module):
             raise RuntimeError("FastSAC evaluation sampled a non-finite action")
 
         q_delta = owner._q_action_input(action) - owner._q_action_input(mean_action)
-        low = owner._fastsac_action_low.to(action)
-        high = owner._fastsac_action_high.to(action)
+        uses_physical_gaussian = bool(
+            getattr(owner, "_uses_ppo_physical_gaussian", lambda: False)()
+        )
+        if self.policy_source == "teacher" or uses_physical_gaussian:
+            low = owner._fastsac_action_low.to(action)
+            high = owner._fastsac_action_high.to(action)
+        else:
+            low = owner._fastsac_student_action_low.to(action)
+            high = owner._fastsac_student_action_high.to(action)
         endpoint_tolerance = (high - low) * 1.0e-6
         saturated = ((action - low) <= endpoint_tolerance) | (
             (high - action) <= endpoint_tolerance

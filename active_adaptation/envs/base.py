@@ -268,6 +268,9 @@ class _Env(EnvBase):
         self._stats_ema = {}
         self._perf_ema_reward = {}
         self._stats_ema_decay = 0.99
+        # Optional task-metric cohort. Environment dynamics and returned rewards
+        # always retain all rows; only reward.* EMA sums/counts consume this mask.
+        self._stats_ema_env_mask = None
 
         self.reward_groups: Dict[str, RewardGroup] = OrderedDict()
         for group_name, func_specs in self.cfg.reward.items():
@@ -378,6 +381,19 @@ class _Env(EnvBase):
         result["performance/update_time"] = self.update_time / self.ema_cnt
         result["performance/simulation_time"] = self.simulation_time / self.ema_cnt
         return result
+
+    def set_stats_ema_env_mask(self, env_mask: torch.Tensor | None) -> None:
+        """Restrict reward-component EMAs to a fixed environment cohort."""
+        if env_mask is None:
+            self._stats_ema_env_mask = None
+            return
+        mask = torch.as_tensor(env_mask, device=self.device)
+        if mask.dtype != torch.bool or mask.shape != (self.num_envs,):
+            raise ValueError(
+                "stats EMA environment mask must have shape bool[num_envs]; "
+                f"got dtype={mask.dtype}, shape={tuple(mask.shape)}"
+            )
+        self._stats_ema_env_mask = mask.detach().clone()
     
     def setup_scene(self):
         raise NotImplementedError
@@ -649,7 +665,9 @@ class RewardGroup:
             self.env.stats[self.name, key].add_(reward)
 
             sum, cnt = self.env._stats_ema[self.name][key]
-            sum.mul_(self.env._stats_ema_decay).add_(reward.sum())
+            metric_mask = self.env._stats_ema_env_mask
+            metric_reward = reward if metric_mask is None else reward[metric_mask]
+            sum.mul_(self.env._stats_ema_decay).add_(metric_reward.sum())
             cnt.mul_(self.env._stats_ema_decay).add_(count)
 
             sum_perf, cnt_perf = self.env._perf_ema_reward[self.name][key]

@@ -218,12 +218,20 @@ class Reward(Generic[CT], _RegistryMixin):
 
     def __call__(self) -> torch.Tensor:
         result = self.compute()
+        metric_mask = getattr(self.env, "_stats_ema_env_mask", None)
         if isinstance(result, torch.Tensor):
-            rew, count = result, result.numel()
+            rew = result
+            count = result.numel() if metric_mask is None else result[metric_mask].numel()
         elif isinstance(result, tuple):
             rew, is_active = result
             rew = rew * is_active.float()
-            count = is_active.sum().item()
+            metric_active = is_active.bool()
+            if metric_mask is not None:
+                mask_shape = (metric_mask.shape[0],) + (1,) * (
+                    metric_active.ndim - 1
+                )
+                metric_active = metric_active & metric_mask.reshape(mask_shape)
+            count = metric_active.sum().item()
         return self.weight * rew, count 
 
     @abc.abstractmethod

@@ -6,6 +6,7 @@ from active_adaptation.learning.ppo.fastsac_critic_probe import (
     phase_balanced_sample_indices,
     phase_bin_indices,
     summarize_distributional_critic_conditions,
+    summarize_scalar_critic_conditions,
 )
 from active_adaptation.learning.ppo.fastsac_gradient_probe import (
     _action_q_gradients,
@@ -32,6 +33,16 @@ class _ContextProbePolicy:
     def _q_action_features(action, actuator_context):
         assert actuator_context is not None
         return torch.cat((action, actuator_context.detach()), dim=-1)
+
+    def _q_forward(self, qnet, observations, action, actuator_context):
+        return qnet(
+            observations,
+            self._q_action_features(action, actuator_context),
+        )
+
+    @staticmethod
+    def _q_output_values(qnet, outputs):
+        return (outputs.softmax(dim=-1) * qnet.support).sum(dim=-1)
 
 
 def test_phase_balanced_sample_covers_sources_and_bins_without_replacement():
@@ -95,6 +106,32 @@ def test_distributional_summary_detects_action_and_state_decoy_degradation():
     assert report["all"]["correct"]["kl_twin_mean"] < 1.0e-6
     assert (
         report["all"]["shuffled_action_minus_correct"]["kl_delta_twin_mean"]
+        > 0.0
+    )
+    assert (
+        report["all"]["shuffled_state_minus_correct"]["positive_fraction"]
+        == 1.0
+    )
+
+
+def test_scalar_summary_detects_action_and_state_decoy_degradation():
+    target = torch.tensor([1.0, -2.0, 0.5])
+    correct = target.unsqueeze(0).repeat(2, 1)
+    bad = torch.zeros_like(correct)
+
+    report = summarize_scalar_critic_conditions(
+        correct_values=correct,
+        shuffled_action_values=bad,
+        shuffled_state_values=bad,
+        target=target,
+        masks={"all": torch.ones(3, dtype=torch.bool)},
+    )
+
+    assert report["all"]["correct"]["mse_twin_mean"] == 0.0
+    assert (
+        report["all"]["shuffled_action_minus_correct"][
+            "mse_delta_twin_mean"
+        ]
         > 0.0
     )
     assert (

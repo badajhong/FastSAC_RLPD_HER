@@ -10,10 +10,13 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from active_adaptation.learning.ppo.common import ACTION_KEY, Actor
+from active_adaptation.learning.ppo.common import ACTION_KEY, OBS_KEY, Actor
 from active_adaptation.learning.ppo.fastsac_vel import (
+    FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
+    FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
     FastSACTanhNormal,
     _BCDaggerSACAdapter,
+    _build_isolated_scalar_q_network,
     _fastsac_target_entropy,
 )
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
@@ -21,15 +24,24 @@ from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_IS_STUDENT_ACTION_KEY,
     DAGGER_Q_TEACHER_SOURCE_KEY,
     DAGGER_REPLAY_TEACHER_ACTIONS,
+    DAGGER_STUDENT_ACTION_VALID_KEY,
     DAGGER_TEACHER_ACTION_KEY,
     DAGGER_TEACHER_ACTION_VALID_KEY,
 )
-from active_adaptation.learning.ppo.ppo_vel import PPOVEL
+from active_adaptation.learning.ppo.ppo_vel import (
+    PPOVEL,
+    PRIV_FEATURE_KEY,
+    PRIV_PRED_KEY,
+)
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     NEXT_Q_ACTUATOR_CONTEXT_KEY,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     PRETRAINED_PERCEPTION_MODULES,
+    PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE,
     Q_ACTUATOR_CONTEXT_KEY,
+    REPLAY_ACTOR_OBSERVATIONS_KEY,
+    REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY,
+    STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
     TD3_COLLECTOR_NOISE_KEY,
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
     TD3_NOISE_FREE_STUDENT_ACTION_KEY,
@@ -43,6 +55,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
+    FASTSAC_DAGGER_ENV_KEY,
     FASTSAC_PREFILL_TEACHER_NOISE_KEY,
     FASTSAC_PREFILL_TEACHER_PROJECTION_KEY,
     FastSACPhysicalNormal,
@@ -57,6 +70,7 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     DistributionalFastSACTeacherBCConfig,
     _DeterministicFastSACStudentEvalPolicy,
     _DistributionalFastSACDaggerRolloutPolicy,
+    _seeded_dagger_env_mask,
     _spred_p_teacher_probability,
 )
 from active_adaptation.learning.ppo.fastsac_gradient_probe import (
@@ -85,6 +99,30 @@ class _LatentActor(nn.Module):
 
     def get_dist(self, td: TensorDict):
         return SimpleNamespace(mean=td["actor_input"] @ self.weight)
+
+
+class _TensorDictWrite(nn.Module):
+    """Write a fixed value while preserving the TensorDict module contract."""
+
+    def __init__(self, key, value: torch.Tensor, *, next_key=None):
+        super().__init__()
+        self.key = key
+        self.next_key = next_key
+        self.register_buffer("value", value)
+        self.calls = 0
+
+    def forward(self, td: TensorDict):
+        self.calls += 1
+        value = self.value.to(td[OBS_KEY]).expand(*td.batch_size, -1).clone()
+        td[self.key] = value
+        if self.next_key is not None:
+            td[self.next_key] = value.clone()
+        return td
+
+
+class _PrivilegedLatentActor(nn.Module):
+    def get_dist(self, td: TensorDict):
+        return SimpleNamespace(mean=td[PRIV_PRED_KEY])
 
 
 class _ActionSensitiveC51Head(nn.Module):
@@ -116,6 +154,22 @@ class _ActionSensitiveTwinC51(nn.Module):
 
     def values(self, logits):
         return _categorical_expected_value(logits, self.support)
+
+
+class _FixedTwinScalarQ(nn.Module):
+    def __init__(self, values: torch.Tensor):
+        super().__init__()
+        self.register_buffer("fixed_values", values)
+
+    def forward(self, observations, actions):
+        del actions
+        if observations.shape[0] != self.fixed_values.shape[1]:
+            raise ValueError("fixed scalar-Q batch size mismatch")
+        return self.fixed_values
+
+    @staticmethod
+    def values(outputs):
+        return outputs
 
 
 class _RecordingActionSensitiveTwinC51(_ActionSensitiveTwinC51):
@@ -195,6 +249,10 @@ class _CountingAdam(torch.optim.Adam):
 def _install_unit_action_contract(policy) -> None:
     policy._fastsac_q_action_center = torch.tensor([0.0])
     policy._fastsac_q_action_scale = torch.tensor([1.0])
+    policy._fastsac_student_action_low = torch.tensor([-1.0])
+    policy._fastsac_student_action_high = torch.tensor([1.0])
+    policy._fastsac_student_action_center = torch.tensor([0.0])
+    policy._fastsac_student_action_scale = torch.tensor([1.0])
     policy._fastsac_action_low = torch.tensor([-20.0])
     policy._fastsac_action_high = torch.tensor([20.0])
     policy._fastsac_actor_action_center = torch.tensor([0.0])
@@ -249,12 +307,101 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.sac_physical_std_normalized_max == pytest.approx(0.11)
     assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
-    assert cfg.actor_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
     assert cfg.perception_replay_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
     assert cfg.teacher_perception_replay_fraction == 0.0
     assert cfg.teacher_perception_warmup_steps == 0
     assert cfg.teacher_prefill_use_ppo_noise is True
+    assert cfg.dagger_env_fraction == pytest.approx(0.5)
+    assert (
+        cfg.sac_actor_observation_mode
+        == STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE
+    )
+
+
+def test_privileged_oracle_actor_observation_mode_is_validated_and_live_only():
+    valid = DistributionalFastSACTeacherBCConfig(
+        sac_actor_observation_mode=PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE,
+    )
+    DistributionalFastSACTeacherBC._validate_td3_config(valid)
+
+    invalid = DistributionalFastSACTeacherBCConfig()
+    invalid.sac_actor_observation_mode = "teacher_action"
+    with pytest.raises(ValueError, match="sac_actor_observation_mode"):
+        DistributionalFastSACTeacherBC._validate_td3_config(invalid)
+
+    four_way = DistributionalFastSACTeacherBCConfig(
+        sac_actor_observation_mode=PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE,
+        perception_replay_mode="four_way",
+    )
+    for purpose in ("q", "actor", "perception"):
+        for source in (
+            "uniform_student",
+            "failure_student",
+            "uniform_teacher",
+            "failure_teacher",
+        ):
+            setattr(four_way, f"{purpose}_{source}_fraction", 0.25)
+    with pytest.raises(ValueError, match="online_student_rollout"):
+        DistributionalFastSACTeacherBC._validate_td3_config(four_way)
+
+
+def test_privileged_oracle_replaces_only_actor_latent_and_advances_perception():
+    policy = _bare_policy(
+        sac_actor_observation_mode=PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE,
+        use_object_adapt=True,
+    )
+    policy.depth_feature_dim = 3
+    predicted = torch.tensor([[-7.0, -8.0, -9.0]])
+    oracle = torch.tensor([[1.0, 2.0, 3.0]])
+    policy.temporal_depth_gru_ema = _TensorDictWrite(
+        "_depth_feature", torch.zeros(1, 3), next_key=("next", "depth_hx")
+    )
+    policy.object_adapt_ema = _TensorDictWrite(
+        "object_pred", torch.zeros(1, 2)
+    )
+    policy.object_pred_transform = _TensorDictWrite(
+        "object_pred_trans", torch.zeros(1, 2)
+    )
+    policy.adapt_ema = _TensorDictWrite(
+        PRIV_PRED_KEY, predicted, next_key=("next", "adapt_hx")
+    )
+    policy.object_transform = _TensorDictWrite(
+        "object_trans", torch.zeros(1, 2)
+    )
+    policy.encoder_priv = _TensorDictWrite(PRIV_FEATURE_KEY, oracle)
+    policy.actor_adapt = _PrivilegedLatentActor()
+    td = TensorDict(
+        {OBS_KEY: torch.zeros(2, 4)}, batch_size=(2,), device="cpu"
+    )
+
+    action = policy._student_raw_action_proposal(td)
+
+    assert torch.equal(action, oracle.expand(2, -1))
+    assert torch.equal(td[PRIV_PRED_KEY], oracle.expand(2, -1))
+    assert policy.temporal_depth_gru_ema.calls == 1
+    assert policy.object_adapt_ema.calls == 1
+    assert policy.adapt_ema.calls == 1
+    assert ("next", "depth_hx") in td.keys(True, True)
+    assert ("next", "adapt_hx") in td.keys(True, True)
+
+
+def test_privileged_oracle_teacher_fifo_stores_current_and_next_actor_inputs():
+    cfg = DistributionalFastSACTeacherBCConfig(
+        sac_actor_observation_mode=PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE,
+    )
+    policy = _bare_policy(**vars(cfg))
+
+    fields = policy._q_replay_storage_fields()
+
+    assert REPLAY_ACTOR_OBSERVATIONS_KEY in fields
+    assert REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY in fields
+
+    default_cfg = DistributionalFastSACTeacherBCConfig()
+    default_policy = _bare_policy(**vars(default_cfg))
+    default_fields = default_policy._q_replay_storage_fields()
+    assert REPLAY_ACTOR_OBSERVATIONS_KEY not in default_fields
+    assert REPLAY_NEXT_ACTOR_OBSERVATIONS_KEY not in default_fields
 
 
 def test_teacher_prefill_ppo_noise_flag_must_be_boolean():
@@ -263,6 +410,70 @@ def test_teacher_prefill_ppo_noise_flag_must_be_boolean():
 
     with pytest.raises(ValueError, match="teacher_prefill_use_ppo_noise"):
         DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "fraction", (0.0, 1.0, -0.1, 1.1, math.inf, math.nan, True)
+)
+def test_three_source_config_requires_strict_dagger_env_fraction(fraction):
+    cfg = DistributionalFastSACTeacherBCConfig(dagger_env_fraction=fraction)
+
+    with pytest.raises(ValueError, match="dagger_env_fraction"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("field", "required"),
+    (
+        ("dagger_buffer_capacity", 4096),
+        ("student_buffer_capacity", 4096),
+    ),
+)
+def test_backend_online_ring_capacity_covers_cohort_learning_start(field, required):
+    cfg = DistributionalFastSACTeacherBCConfig()
+    setattr(cfg, field, required - 1)
+
+    with pytest.raises(ValueError, match=field):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+def test_backend_allows_small_online_ring_when_q_and_actor_never_sample_it():
+    dagger_unused = DistributionalFastSACTeacherBCConfig(
+        q_online_dagger_replay_fraction=0.0,
+        actor_online_dagger_replay_fraction=0.0,
+        dagger_buffer_capacity=1,
+    )
+    DistributionalFastSACTeacherBC._validate_td3_config(dagger_unused)
+
+    student_unused = DistributionalFastSACTeacherBCConfig(
+        q_online_dagger_replay_fraction=1.0,
+        actor_online_dagger_replay_fraction=1.0,
+        student_buffer_capacity=1,
+    )
+    DistributionalFastSACTeacherBC._validate_td3_config(student_unused)
+
+
+def test_fixed_dagger_partition_is_seeded_exact_rounded_and_cached():
+    policy = _bare_policy(dagger_env_fraction=0.5, dagger_seed=17)
+
+    first = policy.dagger_env_mask(num_envs=5, device="cpu")
+    second = policy.dagger_env_mask(num_envs=5, device=torch.device("cpu"))
+    expected = torch.zeros(5, dtype=torch.bool)
+    expected[torch.tensor([4, 2, 0])] = True
+
+    assert first.data_ptr() == second.data_ptr()
+    assert torch.equal(first, expected)
+    assert first.sum().item() == 3
+    assert torch.equal(policy.student_only_env_mask(5, "cpu"), ~first)
+    assert not torch.equal(first, torch.tensor([True, True, True, False, False]))
+    with pytest.raises(ValueError, match="at least one DAgger"):
+        policy.dagger_env_mask(num_envs=1, device="cpu")
+
+    # The low-level deterministic constructor remains useful for audit tooling
+    # at the mathematical boundary even though runtime three-source configs are
+    # deliberately strict and nonempty.
+    assert not _seeded_dagger_env_mask(4, 0.0, 17, device="cpu").any()
+    assert _seeded_dagger_env_mask(4, 1.0, 17, device="cpu").all()
 
 
 def test_physical_gaussian_config_allows_autotune_and_requires_ppo_load_scale():
@@ -354,8 +565,18 @@ def test_ppo_finetune_fresh_load_resets_saved_joint_std_to_load_noise_scale():
     assert torch.equal(actor.actor_std, torch.tensor([0.5, 0.5]))
 
 
-def test_config_allows_explicit_pure_sac_ablation_without_inherited_td3_eta():
-    cfg = DistributionalFastSACTeacherBCConfig(lambda_bc=0.0, eta_sac=1.0)
+@pytest.mark.parametrize(
+    "action_distribution",
+    (NORMALIZED_TANH_ACTION_DISTRIBUTION, PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION),
+)
+def test_config_allows_explicit_pure_sac_ablation_without_inherited_td3_eta(
+    action_distribution,
+):
+    cfg = DistributionalFastSACTeacherBCConfig(
+        lambda_bc=0.0,
+        eta_sac=1.0,
+        sac_action_distribution=action_distribution,
+    )
 
     DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
@@ -457,7 +678,7 @@ def test_backend_accepts_configurable_teacher_source_fractions(field, fraction):
 
 
 @pytest.mark.parametrize("fraction", (0.1, 0.5, 1.0))
-def test_backend_rejects_teacher_perception_replay(fraction):
+def test_backend_rejects_teacher_perception_replay_in_live_rollout_mode(fraction):
     cfg = DistributionalFastSACTeacherBCConfig(
         teacher_perception_replay_fraction=fraction
     )
@@ -466,8 +687,18 @@ def test_backend_rejects_teacher_perception_replay(fraction):
         DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
-@pytest.mark.parametrize("mode", ("legacy_online_student", "four_way"))
-def test_backend_locks_perception_to_live_student_rollout(mode):
+def test_backend_accepts_teacher_only_prefill_warmup_in_live_rollout_mode():
+    cfg = DistributionalFastSACTeacherBCConfig(
+        perception_replay_mode=ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
+        teacher_perception_replay_fraction=0.0,
+        teacher_perception_warmup_steps=5000,
+    )
+
+    DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+def test_backend_rejects_unsupported_perception_mode():
+    mode = "legacy_online_student"
     cfg = DistributionalFastSACTeacherBCConfig(perception_replay_mode=mode)
 
     with pytest.raises(ValueError, match="online_student_rollout|four_way"):
@@ -497,37 +728,53 @@ def test_backend_accepts_positive_row_level_q_utd():
     DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
-@pytest.mark.parametrize("ratio", (0.0, -1.0, math.inf, math.nan, True))
-def test_backend_rejects_invalid_row_level_actor_utd(ratio):
-    cfg = DistributionalFastSACTeacherBCConfig(
-        actor_update_to_data_ratio=ratio
-    )
-
-    with pytest.raises(ValueError, match="actor_update_to_data_ratio"):
-        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
-
-
 def test_tanh_normal_is_bounded_reparameterized_and_has_exact_log_prob():
     loc = torch.tensor([[0.0, 1.25], [-1.55, 0.05]], requires_grad=True)
     scale = torch.tensor([[0.01, 0.02], [0.01, 0.02]], requires_grad=True)
+    action_low = torch.tensor([-2.0, -6.0])
+    action_high = torch.tensor([4.0, 2.0])
     dist = FastSACTanhNormal(
         loc,
         scale,
-        low=torch.tensor([-20.0, -20.0]),
-        high=torch.tensor([20.0, 20.0]),
+        low=action_low,
+        high=action_high,
         event_dims=1,
     )
 
+    sample_generator = torch.Generator().manual_seed(71)
+    oracle_generator = torch.Generator().manual_seed(71)
     first, first_log_prob = dist.rsample_with_log_prob(
-        generator=torch.Generator().manual_seed(71)
+        generator=sample_generator
     )
+    oracle_noise = torch.randn(loc.shape, generator=oracle_generator)
+    oracle_latent = loc + scale * oracle_noise
+    action_scale = (action_high - action_low) * 0.5
+    action_center = (action_high + action_low) * 0.5
+    expected_action = (
+        torch.tanh(oracle_latent) * action_scale + action_center
+    )
+    log_tanh_jacobian = 2.0 * (
+        math.log(2.0)
+        - oracle_latent
+        - torch.nn.functional.softplus(-2.0 * oracle_latent)
+    )
+    expected_log_prob = (
+        torch.distributions.Normal(loc, scale).log_prob(oracle_latent)
+        - log_tanh_jacobian
+        - torch.log(action_scale)
+    ).sum(dim=-1)
+
     second, second_log_prob = dist.rsample_with_log_prob(
         generator=torch.Generator().manual_seed(72)
     )
     assert not torch.equal(first, second)
+    assert torch.allclose(first, expected_action, rtol=0.0, atol=1.0e-7)
+    assert torch.allclose(
+        first_log_prob, expected_log_prob, rtol=1.0e-6, atol=1.0e-6
+    )
     assert torch.isfinite(first_log_prob).all()
     assert torch.isfinite(second_log_prob).all()
-    assert torch.all(first >= -20.0) and torch.all(first <= 20.0)
+    assert torch.all(first >= action_low) and torch.all(first <= action_high)
     assert torch.allclose(
         first_log_prob, dist.log_prob_for_action(first), rtol=2e-5, atol=2e-5
     )
@@ -536,9 +783,13 @@ def test_tanh_normal_is_bounded_reparameterized_and_has_exact_log_prob():
     assert scale.grad is not None and torch.isfinite(scale.grad).all()
 
 
-def test_backend_distribution_maps_normalized_std_to_joint_scaled_bounded_policy():
+def test_backend_distribution_uses_calibrated_nominal_student_support():
     policy = _bare_policy(
-        sac_log_std_min=-8.0, sac_log_std_max=-1.0, action_support_clip=20.0
+        sac_action_distribution=NORMALIZED_TANH_ACTION_DISTRIBUTION,
+        sac_log_std_min=-8.0,
+        sac_log_std_max=-1.0,
+        action_support_clip=20.0,
+        q_action_input_gain=1.0,
     )
     expected_log_std = torch.log(torch.tensor([0.1, 0.2]))
     initial_raw_log_std = policy._inverse_smooth_log_std(
@@ -551,24 +802,66 @@ def test_backend_distribution_maps_normalized_std_to_joint_scaled_bounded_policy
         initial_log_std=initial_raw_log_std,
         device="cpu",
     )
-    policy._fastsac_q_action_scale = torch.tensor([2.0, 4.0])
+    # Teacher/replay execution retains the legacy finite safety envelope. The
+    # Student policy itself uses the asymmetric nominal joint coordinates.
     policy._fastsac_action_low = torch.tensor([-20.0, -20.0])
     policy._fastsac_action_high = torch.tensor([20.0, 20.0])
     policy._fastsac_actor_action_center = torch.tensor([0.0, 0.0])
     policy._fastsac_actor_action_scale = torch.tensor([20.0, 20.0])
-    raw_mean = torch.tensor([[0.0, 25.0], [-31.0, 1.0]])
+    policy._fastsac_student_action_low = torch.tensor([-1.0, -6.0])
+    policy._fastsac_student_action_high = torch.tensor([3.0, 2.0])
+    policy._fastsac_student_action_center = torch.tensor([1.0, -2.0])
+    policy._fastsac_student_action_scale = torch.tensor([2.0, 4.0])
+    policy._fastsac_q_action_center = policy._fastsac_student_action_center.clone()
+    policy._fastsac_q_action_scale = policy._fastsac_student_action_scale.clone()
 
-    dist = policy._sac_dist_from_mean(raw_mean)
+    zero_mean = torch.zeros(3, 2, requires_grad=True)
+    zero_dist = policy._normalized_tanh_dist_from_mean(zero_mean)
+    assert torch.equal(zero_dist.mean, torch.zeros_like(zero_mean))
+    zero_slope = torch.autograd.grad(zero_dist.mean.sum(), zero_mean)[0]
+    assert torch.allclose(zero_slope, torch.ones_like(zero_slope), atol=1.0e-6)
 
-    assert torch.allclose(dist.loc, raw_mean / 20.0)
-    assert torch.allclose(
-        dist.scale,
-        (
-            expected_log_std.exp() * torch.tensor([2.0, 4.0]) / 20.0
-        ).expand_as(raw_mean),
+    raw_mean = torch.tensor(
+        [[0.0, 0.0], [0.4, -0.3], [100.0, -100.0]],
+        requires_grad=True,
     )
-    assert torch.allclose(dist.mean, 20.0 * torch.tanh(raw_mean / 20.0))
-    assert torch.all(dist.mean >= -20.0) and torch.all(dist.mean <= 20.0)
+    dist = policy._normalized_tanh_dist_from_mean(raw_mean)
+    normalized_zero = (
+        -policy._fastsac_student_action_center
+        / policy._fastsac_student_action_scale
+    )
+    latent_zero = torch.atanh(normalized_zero)
+    inverse_local_slope = 1.0 / (
+        policy._fastsac_student_action_scale
+        * (1.0 - normalized_zero.square())
+    )
+    expected_loc = latent_zero + raw_mean * inverse_local_slope
+
+    assert torch.allclose(dist.loc, expected_loc)
+    assert torch.allclose(dist.scale, expected_log_std.exp().expand_as(raw_mean))
+    assert torch.equal(dist.low, policy._fastsac_student_action_low)
+    assert torch.equal(dist.high, policy._fastsac_student_action_high)
+    assert torch.all(dist.mean >= policy._fastsac_student_action_low)
+    assert torch.all(dist.mean <= policy._fastsac_student_action_high)
+
+    sampled_action, _ = dist.rsample_with_log_prob(
+        generator=torch.Generator().manual_seed(91)
+    )
+    assert torch.all(sampled_action >= policy._fastsac_student_action_low)
+    assert torch.all(sampled_action <= policy._fastsac_student_action_high)
+    # Student samples are already executable. The +/-20 projection is only a
+    # final finite-safety guard and must not alter the Actor/Q action.
+    assert torch.equal(
+        policy._project_execution_action(sampled_action), sampled_action
+    )
+    normalized_q_action = policy._q_action_input(sampled_action)
+    assert torch.all(normalized_q_action >= -1.0)
+    assert torch.all(normalized_q_action <= 1.0)
+
+    delegated = policy._sac_dist_from_mean(raw_mean)
+    assert torch.equal(delegated.loc, dist.loc)
+    assert torch.equal(delegated.scale, dist.scale)
+    assert torch.equal(delegated.mean, dist.mean)
 
 
 def _install_ppo_physical_std(policy, values=(0.5, 0.5)):
@@ -676,6 +969,33 @@ def test_physical_deterministic_eval_uses_raw_mean_before_only_safety_projection
     )
 
 
+def test_teacher_bc_target_uses_distribution_specific_student_support():
+    teacher_action = torch.tensor([[2.0, 25.0]])
+
+    physical = _bare_policy(
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
+    )
+    physical._fastsac_action_low = torch.tensor([-20.0, -20.0])
+    physical._fastsac_action_high = torch.tensor([20.0, 20.0])
+    physical.cfg.action_support_clip = 20.0
+    assert torch.equal(
+        physical._project_student_policy_action(teacher_action),
+        torch.tensor([[2.0, 20.0]]),
+    )
+
+    bounded = _bare_policy(
+        sac_action_distribution=NORMALIZED_TANH_ACTION_DISTRIBUTION
+    )
+    bounded._fastsac_q_action_center = torch.zeros(2)
+    bounded._fastsac_q_action_scale = torch.ones(2)
+    bounded._fastsac_student_action_low = torch.full((2,), -1.0)
+    bounded._fastsac_student_action_high = torch.ones(2)
+    assert torch.equal(
+        bounded._project_student_policy_action(teacher_action),
+        torch.tensor([[1.0, 1.0]]),
+    )
+
+
 def test_smooth_log_std_stays_bounded_and_keeps_gradient_past_old_hard_cap():
     policy = _bare_policy(
         sac_log_std_min=-8.0, sac_log_std_max=-1.0, action_support_clip=20.0
@@ -687,11 +1007,7 @@ def test_smooth_log_std_stays_bounded_and_keeps_gradient_past_old_hard_cap():
         initial_log_std=torch.tensor(3.0),
         device="cpu",
     )
-    policy._fastsac_q_action_scale = torch.tensor([1.0])
-    policy._fastsac_action_low = torch.tensor([-20.0])
-    policy._fastsac_action_high = torch.tensor([20.0])
-    policy._fastsac_actor_action_center = torch.tensor([0.0])
-    policy._fastsac_actor_action_scale = torch.tensor([20.0])
+    _install_unit_action_contract(policy)
 
     effective_log_std = policy._bounded_log_std()
     dist = policy._sac_dist_from_mean(torch.zeros(2, 1))
@@ -1158,42 +1474,6 @@ def test_physical_gradient_probe_reports_sac_q_and_entropy_but_no_bc_std():
     assert std_group["unweighted_norms"]["sac"] > 0.0
 
 
-def test_causal_gradient_probe_mirrors_empty_teacher_confidence_gate():
-    policy = _tiny_physical_policy(q_slope=1.0)
-    policy.cfg.q_use_causal_hold_advantage = True
-    policy.qnet = _ActionSensitiveTwinC51(first_slope=1.0, second_slope=2.0)
-
-    def direct_q_forward(owner, qnet, observations, action, context):
-        del owner
-        assert context is None
-        return qnet(observations, action)
-
-    policy._q_forward = MethodType(direct_q_forward, policy)
-    batch = _tiny_physical_batch()
-    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.full((3, 1), 10.0)
-    batch[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(3, dtype=torch.bool)
-
-    result = diagnose_fastsac_actor_gradients(
-        policy,
-        batch,
-        sample_seed=313,
-        source_gradients=False,
-    )
-
-    assert result["actor_q_confidence_gate"]["enabled"] is True
-    assert result["actor_q_confidence_gate"]["active_rows"] == 0
-    assert result["actor_q_confidence_gate"]["active_fraction"] == 0.0
-    assert result["strata"]["all"][
-        "actor_q_confidence_policy_teacher_margin"
-    ] < 0.0
-    assert result["gradients"]["all"]["losses"]["negative_q"] == 0.0
-    for group in result["gradients"]["all"]["groups"].values():
-        assert group["unweighted_norms"]["q"] == 0.0
-    assert result["gradients"]["all"]["groups"]["global_log_std"][
-        "unweighted_norms"
-    ]["entropy"] > 0.0
-
-
 def test_physical_actor_update_applies_ordinary_sac_gradient_to_direct_std():
     policy = _tiny_physical_policy(q_slope=1.0)
     with torch.no_grad():
@@ -1212,6 +1492,31 @@ def test_physical_actor_update_applies_ordinary_sac_gradient_to_direct_std():
     assert "actor_std_kl_cap_fraction" not in metrics
     assert torch.all(policy._ppo_actor_std_parameter() >= 0.05)
     assert torch.all(policy._ppo_actor_std_parameter() <= 0.5)
+
+
+def test_physical_actor_bc_keeps_teacher_action_outside_nominal_q_box():
+    policy = _tiny_physical_policy(q_slope=1.0)
+    batch = _tiny_physical_batch()
+    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.tensor(
+        [[2.5], [-2.5], [0.1]]
+    )
+    with torch.no_grad():
+        prediction = policy._actor_mean_from_flat(batch["observations"])
+        expected_bc = _exact_teacher_bc_loss(
+            prediction,
+            batch[DAGGER_REPLAY_TEACHER_ACTIONS],
+            batch[DAGGER_TEACHER_ACTION_VALID_KEY],
+            policy._fastsac_q_action_center,
+            policy._fastsac_q_action_scale,
+            policy.cfg.dagger_actor_huber_delta,
+        )
+
+    metrics = policy._actor_update(batch)
+
+    assert metrics["exact_bc_loss"].item() == pytest.approx(expected_bc.item())
+    assert metrics[
+        "teacher_bc_student_support_projection_fraction"
+    ].item() == pytest.approx(0.0)
 
 
 def test_physical_rollout_applies_cumulative_kl_once_after_all_replay_updates(
@@ -1312,12 +1617,10 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
     expected_rng = torch.Generator().set_state(policy.sac_action_rng.get_state())
     raw_mean = expected_actor(batch["observations"])
     expected_dist = FastSACTanhNormal(
-        raw_mean / 20.0,
-        (
-            policy._bounded_log_std(expected_adapter.log_std).exp() / 20.0
-        ).expand_as(raw_mean),
-        low=torch.tensor([-20.0]),
-        high=torch.tensor([20.0]),
+        raw_mean,
+        policy._bounded_log_std(expected_adapter.log_std).exp().expand_as(raw_mean),
+        low=torch.tensor([-1.0]),
+        high=torch.tensor([1.0]),
         event_dims=1,
     )
     sampled_action, physical_log_prob = expected_dist.rsample_with_log_prob(
@@ -1375,102 +1678,6 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
     assert metrics["actor_teacher_replay_fraction"].item() == pytest.approx(2 / 3)
     assert all(parameter.grad is None for parameter in policy.qnet.parameters())
     assert all(parameter.requires_grad for parameter in policy.qnet.parameters())
-
-
-def test_causal_teacher_confidence_gate_blocks_untrusted_actor_q_gradient():
-    policy = _tiny_physical_policy(q_slope=1.0)
-    policy.cfg.q_use_causal_hold_advantage = True
-    policy.cfg.lambda_bc = 0.0
-    policy.cfg.eta_sac = 1.0
-    policy.qnet = _ActionSensitiveTwinC51(
-        first_slope=1.0, second_slope=2.0
-    )
-    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
-
-    def direct_q_forward(owner, qnet, observations, action, context):
-        del owner
-        assert context is None
-        return qnet(observations, action)
-
-    policy._q_forward = MethodType(direct_q_forward, policy)
-    batch = _tiny_physical_batch()
-    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.full((3, 1), 10.0)
-    batch[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(3, dtype=torch.bool)
-    mean_before = policy.actor_adapt.mean_weight.detach().clone()
-
-    metrics = policy._actor_update(batch)
-
-    assert torch.equal(policy.actor_adapt.mean_weight, mean_before)
-    assert metrics["actor_q_confidence_gate_enabled"].item() == 1.0
-    assert metrics["actor_q_confidence_gate_active_fraction"].item() == 0.0
-    assert metrics["actor_q_confidence_policy_teacher_margin"].item() < 0.0
-    assert metrics["exact_bc_loss"].item() > 0.0
-    assert all(parameter.grad is None for parameter in policy.qnet.parameters())
-    assert all(parameter.requires_grad for parameter in policy.qnet.parameters())
-
-
-def test_causal_teacher_confidence_gate_accepts_agreed_rows_and_ignores_nan_label():
-    policy = _tiny_physical_policy(q_slope=1.0)
-    policy.cfg.q_use_causal_hold_advantage = True
-    policy.cfg.lambda_bc = 0.0
-    policy.cfg.eta_sac = 1.0
-    policy.qnet = _ActionSensitiveTwinC51(
-        first_slope=1.0, second_slope=2.0
-    )
-    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
-
-    def direct_q_forward(owner, qnet, observations, action, context):
-        del owner
-        assert context is None
-        return qnet(observations, action)
-
-    policy._q_forward = MethodType(direct_q_forward, policy)
-    batch = _tiny_physical_batch()
-    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.tensor(
-        [[-10.0], [-10.0], [float("nan")]]
-    )
-    batch[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.tensor(
-        [True, True, False]
-    )
-    mean_before = policy.actor_adapt.mean_weight.detach().clone()
-
-    metrics = policy._actor_update(batch)
-
-    assert not torch.equal(policy.actor_adapt.mean_weight, mean_before)
-    assert metrics["actor_q_confidence_gate_active_fraction"].item() == (
-        pytest.approx(2.0 / 3.0)
-    )
-    assert metrics["actor_q_confidence_policy_teacher_margin"].item() > 0.0
-    assert torch.isfinite(metrics["actor_q_confidence_trusted_q_mean"])
-    assert all(parameter.grad is None for parameter in policy.qnet.parameters())
-    assert all(parameter.requires_grad for parameter in policy.qnet.parameters())
-
-
-def test_causal_teacher_confidence_gate_rejects_when_one_twin_disagrees():
-    policy = _tiny_physical_policy(q_slope=1.0)
-    policy.cfg.q_use_causal_hold_advantage = True
-    policy.cfg.lambda_bc = 0.0
-    policy.cfg.eta_sac = 1.0
-    # Q1 increases with action while Q2 decreases.  A low Teacher action is
-    # beaten by the policy in Q1 only, so the within-head twin agreement gate
-    # must remain closed.
-    policy.qnet = _ActionSensitiveTwinC51(first_slope=1.0, second_slope=-2.0)
-    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.05)
-
-    def direct_q_forward(owner, qnet, observations, action, context):
-        del owner
-        assert context is None
-        return qnet(observations, action)
-
-    policy._q_forward = MethodType(direct_q_forward, policy)
-    batch = _tiny_physical_batch()
-    batch[DAGGER_REPLAY_TEACHER_ACTIONS] = torch.full((3, 1), -10.0)
-    batch[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(3, dtype=torch.bool)
-
-    metrics = policy._actor_update(batch)
-
-    assert metrics["actor_q_confidence_gate_active_fraction"].item() == 0.0
-    assert metrics["actor_q_confidence_policy_teacher_margin"].item() < 0.0
 
 
 def test_bc_only_actor_step_does_not_update_global_log_std():
@@ -1960,7 +2167,11 @@ def test_zero_gradient_actor_update_is_noop_despite_nonzero_q_weight_decay():
 
 
 def _rollout_owner(
-    *, prefill: bool, beta: float = 0.5, teacher_prefill_ppo_noise: bool = False
+    *,
+    prefill: bool,
+    beta: float = 0.5,
+    teacher_prefill_ppo_noise: bool = False,
+    dagger_env_fraction: float | None = None,
 ):
     action_dim = 2
     batch_size = 64
@@ -1979,7 +2190,10 @@ def _rollout_owner(
         sac_log_std_max=-2.0,
         action_support_clip=20.0,
         teacher_prefill_use_ppo_noise=teacher_prefill_ppo_noise,
+        dagger_seed=17,
     )
+    if dagger_env_fraction is not None:
+        cfg.dagger_env_fraction = dagger_env_fraction
     owner = SimpleNamespace(cfg=cfg)
     owner.teacher_prefill_rollout_count = 0 if prefill else 1
     owner.dagger_rollout_count = 0
@@ -2016,6 +2230,128 @@ def _rollout_owner(
     owner._sac_dist_from_mean = stochastic_dist
     owner._q_action_input = lambda action: action.clamp(-20.0, 20.0)
     return owner, raw_mean, teacher
+
+
+def _rollout_step(
+    policy: _DistributionalFastSACDaggerRolloutPolicy,
+    batch_size: int,
+    *,
+    reset: torch.Tensor | None = None,
+) -> TensorDict:
+    if reset is None:
+        reset = torch.zeros(batch_size, dtype=torch.bool)
+    return policy(
+        TensorDict({"is_init": reset}, batch_size=[batch_size])
+    )
+
+
+def test_partition_alternates_each_step_and_resets_each_env_to_student():
+    owner, raw_mean, _ = _rollout_owner(
+        prefill=False, beta=1.0, dagger_env_fraction=0.5
+    )
+    policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
+    batch_size = raw_mean.shape[0]
+
+    first = _rollout_step(
+        policy, batch_size, reset=torch.ones(batch_size, dtype=torch.bool)
+    )
+    dagger_env = first[FASTSAC_DAGGER_ENV_KEY]
+    student_only = ~dagger_env
+    assert dagger_env.sum().item() == batch_size // 2
+    assert first[DAGGER_IS_STUDENT_ACTION_KEY].all()
+
+    second = _rollout_step(policy, batch_size)
+    assert torch.equal(second[FASTSAC_DAGGER_ENV_KEY], dagger_env)
+    assert not second[DAGGER_IS_STUDENT_ACTION_KEY][dagger_env].any()
+    assert second[DAGGER_IS_STUDENT_ACTION_KEY][student_only].all()
+
+    third = _rollout_step(policy, batch_size)
+    assert third[DAGGER_IS_STUDENT_ACTION_KEY].all()
+
+    reset = torch.zeros(batch_size, dtype=torch.bool)
+    reset_index = dagger_env.nonzero(as_tuple=False)[0, 0]
+    reset[reset_index] = True
+    fourth = _rollout_step(policy, batch_size, reset=reset)
+    expected_student = student_only.clone()
+    expected_student[reset_index] = True
+    assert torch.equal(fourth[DAGGER_IS_STUDENT_ACTION_KEY], expected_student)
+    assert fourth[DAGGER_IS_STUDENT_ACTION_KEY][reset_index]
+
+    # Logging receives the collector-owned cached tensor, not a newly sampled
+    # or reconstructed partition.
+    public_mask = policy.dagger_env_mask(batch_size, "cpu")
+    cached_mask = policy.dagger_env_mask(batch_size, "cpu")
+    assert public_mask.data_ptr() == cached_mask.data_ptr()
+    assert torch.equal(public_mask, dagger_env)
+    assert torch.equal(policy.student_only_env_mask(batch_size, "cpu"), student_only)
+
+
+def test_partition_prefill_remains_all_teacher_control():
+    owner, raw_mean, teacher = _rollout_owner(
+        prefill=True, beta=0.0, dagger_env_fraction=0.5
+    )
+    policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
+
+    result = _rollout_step(
+        policy,
+        raw_mean.shape[0],
+        reset=torch.ones(raw_mean.shape[0], dtype=torch.bool),
+    )
+
+    assert result[FASTSAC_DAGGER_ENV_KEY].sum().item() == raw_mean.shape[0] // 2
+    assert not result[DAGGER_IS_STUDENT_ACTION_KEY].any()
+    assert torch.equal(result[ACTION_KEY], teacher)
+
+
+def test_invalid_student_never_switches_student_only_env_to_teacher():
+    owner, raw_mean, teacher = _rollout_owner(
+        prefill=False, beta=1.0, dagger_env_fraction=0.5
+    )
+    policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
+    dagger_env = policy.dagger_env_mask(raw_mean.shape[0], "cpu")
+    dagger_index = dagger_env.nonzero(as_tuple=False)[0, 0]
+    student_only_index = (~dagger_env).nonzero(as_tuple=False)[0, 0]
+    raw_mean[dagger_index] = torch.nan
+    raw_mean[student_only_index] = torch.nan
+
+    result = _rollout_step(
+        policy,
+        raw_mean.shape[0],
+        reset=torch.ones(raw_mean.shape[0], dtype=torch.bool),
+    )
+
+    assert not result[DAGGER_STUDENT_ACTION_VALID_KEY][dagger_index]
+    assert not result[DAGGER_STUDENT_ACTION_VALID_KEY][student_only_index]
+    # A DAgger Student turn may take the valid Teacher safety fallback.
+    assert not result[DAGGER_IS_STUDENT_ACTION_KEY][dagger_index]
+    assert torch.equal(result[ACTION_KEY][dagger_index], teacher[dagger_index])
+    # The pure cohort keeps honest Student provenance and executes the finite,
+    # sanitized Student-mean fallback instead of contaminating its metrics.
+    assert result[DAGGER_IS_STUDENT_ACTION_KEY][student_only_index]
+    assert torch.isfinite(result[ACTION_KEY][student_only_index]).all()
+    assert torch.equal(
+        result[ACTION_KEY][student_only_index],
+        torch.zeros_like(result[ACTION_KEY][student_only_index]),
+    )
+
+
+def test_failed_dagger_issue_does_not_advance_alternating_phase():
+    owner, raw_mean, teacher = _rollout_owner(
+        prefill=False, beta=1.0, dagger_env_fraction=0.5
+    )
+    policy = _DistributionalFastSACDaggerRolloutPolicy(owner)
+    dagger_env = policy.dagger_env_mask(raw_mean.shape[0], "cpu")
+    failed_index = dagger_env.nonzero(as_tuple=False)[0, 0]
+    raw_mean[failed_index] = torch.nan
+    teacher[failed_index] = torch.nan
+
+    with pytest.raises(RuntimeError, match="in a DAgger environment"):
+        _rollout_step(policy, raw_mean.shape[0])
+
+    raw_mean[failed_index] = 0.0
+    teacher[failed_index] = 0.0
+    recovered = _rollout_step(policy, raw_mean.shape[0])
+    assert recovered[DAGGER_IS_STUDENT_ACTION_KEY].all()
 
 
 def test_main_rollout_keeps_teacher_rows_exact_and_samples_only_student_behavior():
@@ -2184,6 +2520,318 @@ class _FixedStochasticDist:
         return action, log_prob
 
 
+def test_twin_scalar_q_has_two_scalar_heads_and_actor_action_gradient():
+    rng_before = torch.random.get_rng_state().clone()
+    qnet = _build_isolated_scalar_q_network(
+        obs_dim=7,
+        action_dim=3,
+        hidden_dim=32,
+        device="cpu",
+        seed=17,
+    )
+    rng_after = torch.random.get_rng_state().clone()
+    same_seed = _build_isolated_scalar_q_network(
+        obs_dim=7,
+        action_dim=3,
+        hidden_dim=32,
+        device="cpu",
+        seed=17,
+    )
+    observations = torch.randn(5, 7)
+    actions = torch.randn(5, 3, requires_grad=True)
+
+    values = qnet(observations, actions)
+    loss = -values.min(dim=0).values.mean()
+    loss.backward()
+
+    assert values.shape == (2, 5)
+    assert torch.equal(qnet.values(values), values)
+    assert not hasattr(qnet, "support")
+    assert len(qnet.qnets) == 2
+    for head in qnet.qnets:
+        assert head.state_stem[0].in_features == 7
+        assert head.state_stem[0].out_features == 16
+        assert head.action_stem[0].in_features == 3
+        assert head.action_stem[0].out_features == 16
+        assert head.trunk[0].in_features == 32
+        assert head.trunk[0].out_features == 32
+        assert head.trunk[2].in_features == 32
+        assert head.trunk[2].out_features == 32
+        assert head.trunk[4].out_features == 1
+    assert not any(isinstance(module, nn.LayerNorm) for module in qnet.modules())
+    assert not set(qnet.qnets[0].parameters()).intersection(
+        set(qnet.qnets[1].parameters())
+    )
+    assert torch.equal(rng_before, rng_after)
+    for left, right in zip(qnet.parameters(), same_seed.parameters(), strict=True):
+        assert torch.equal(left, right)
+    assert actions.grad is not None
+    assert torch.isfinite(actions.grad).all()
+    assert actions.grad.abs().sum().item() > 0.0
+
+
+def test_twin_scalar_q_skateboard_widths_match_balanced_split_design():
+    qnet = _build_isolated_scalar_q_network(
+        obs_dim=2370,
+        action_dim=23,
+        hidden_dim=768,
+        device="cpu",
+        seed=19,
+    )
+
+    assert qnet.state_hidden_dim == 384
+    assert qnet.action_hidden_dim == 384
+    for head in qnet.qnets:
+        assert (head.state_stem[0].in_features, head.state_stem[0].out_features) == (
+            2370,
+            384,
+        )
+        assert (
+            head.action_stem[0].in_features,
+            head.action_stem[0].out_features,
+        ) == (23, 384)
+        assert (head.trunk[0].in_features, head.trunk[0].out_features) == (
+            768,
+            768,
+        )
+        assert (head.trunk[2].in_features, head.trunk[2].out_features) == (
+            768,
+            768,
+        )
+    assert sum(parameter.numel() for parameter in qnet.parameters()) == 4_203_266
+
+
+def test_twin_scalar_q_module_and_optimizer_round_trip():
+    source = _build_isolated_scalar_q_network(
+        obs_dim=7,
+        action_dim=3,
+        hidden_dim=16,
+        device="cpu",
+        seed=23,
+    )
+    source_optimizer = torch.optim.Adam(source.parameters(), lr=3.0e-4)
+    observations = torch.randn(4, 7)
+    actions = torch.randn(4, 3)
+    source(observations, actions).square().mean().backward()
+    source_optimizer.step()
+
+    restored = _build_isolated_scalar_q_network(
+        obs_dim=7,
+        action_dim=3,
+        hidden_dim=16,
+        device="cpu",
+        seed=29,
+    )
+    restored_optimizer = torch.optim.Adam(restored.parameters(), lr=3.0e-4)
+    restored.load_state_dict(source.state_dict())
+    restored_optimizer.load_state_dict(source_optimizer.state_dict())
+
+    assert torch.equal(
+        source(observations, actions), restored(observations, actions)
+    )
+    assert len(restored_optimizer.state) == len(source_optimizer.state)
+
+
+def test_standard_scalar_q_routes_actuator_memory_as_state_and_action_once():
+    policy = _bare_policy(
+        q_critic_type="scalar",
+        q_condition_on_actuator_state=True,
+        q_use_predicted_effect=True,
+        q_action_input_gain=1.0,
+        action_support_clip=20.0,
+    )
+    policy.action_dim = 2
+    policy._q_critic_dim = 3
+    policy._q_actuator_parameter_context_dim = 6
+    policy._q_actuator_context_dim = 8
+    policy._q_state_input_dim = 11
+    policy._q_action_input_dim = 2
+    policy._fastsac_q_action_center = torch.tensor([1.0, -1.0])
+    policy._fastsac_q_action_scale = torch.tensor([2.0, 4.0])
+    policy._fastsac_action_low = torch.tensor([-20.0, -20.0])
+    policy._fastsac_action_high = torch.tensor([20.0, 20.0])
+    critic_observations = torch.tensor([[0.1, -0.2, 0.3]])
+    candidate = torch.tensor([[3.0, 3.0]], requires_grad=True)
+    context = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0, 0.0, -0.5, -1.0, 7.0]],
+        requires_grad=True,
+    )
+
+    q_state, q_action = policy._q_network_inputs(
+        critic_observations, candidate, context
+    )
+
+    expected_previous = torch.tensor([[-1.0, 2.0]])
+    expected_state = torch.cat(
+        (critic_observations, context[:, :6].detach(), expected_previous), dim=-1
+    )
+    assert torch.equal(q_state, expected_state)
+    assert torch.equal(q_action, torch.tensor([[1.0, 1.0]]))
+    assert q_state.shape[-1] == 3 + 6 + 2
+    assert q_action.shape[-1] == 2
+    changed_state, changed_action = policy._q_network_inputs(
+        critic_observations,
+        torch.tensor([[-1.0, -5.0]]),
+        context,
+    )
+    assert torch.equal(changed_state, q_state)
+    assert not torch.equal(changed_action, q_action.detach())
+
+    (q_state.sum() + q_action.sum()).backward()
+    assert torch.allclose(candidate.grad, torch.tensor([[0.5, 0.25]]))
+    assert context.grad is None
+
+
+@pytest.mark.parametrize(
+    "legacy_architecture",
+    [
+        "monolithic_action_conditioned_c51_logits_v1",
+        "twin_independent_normalized_state_action_concat_scalar_mlp_v1",
+    ],
+)
+def test_scalar_checkpoint_rejects_legacy_topology(legacy_architecture):
+    policy = _bare_policy(q_critic_type="scalar", q_hidden_dim=768)
+    policy._q_state_input_dim = 2370
+    policy._q_action_input_dim = 23
+    legacy = {
+        "q_backend_config": {
+            "q_architecture_semantics": legacy_architecture,
+            "q_state_input_dim": 2341,
+            "q_action_input_dim": 121,
+        }
+    }
+
+    with pytest.raises(ValueError, match="balanced split-stem scalar"):
+        policy._validate_scalar_q_checkpoint_architecture(
+            legacy, context="unit test"
+        )
+
+    current = {
+        "q_backend_config": {
+            "q_architecture_semantics": (
+                FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
+            ),
+            "q_state_input_dim": 2370,
+            "q_action_input_dim": 23,
+            "q_state_hidden_dim": 384,
+            "q_action_hidden_dim": 384,
+            "q_action_fusion": "balanced_split_stems",
+            "q_action_fusion_semantics": (
+                FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS
+            ),
+        }
+    }
+    policy._validate_scalar_q_checkpoint_architecture(
+        current, context="unit test"
+    )
+
+
+def test_scalar_checkpoint_architecture_validation_does_not_affect_c51():
+    policy = _bare_policy(q_critic_type="c51")
+    policy._validate_scalar_q_checkpoint_architecture({}, context="unit test")
+
+
+def test_scalar_soft_target_uses_clipped_twin_q_entropy_and_terminal_cut():
+    policy = _bare_policy(
+        gamma=0.9,
+        q_action_input_gain=1.0,
+        q_critic_type="scalar",
+        q_n_step=1,
+        sac_use_autotune=True,
+    )
+    _install_unit_action_contract(policy)
+    policy.qnet_target = _FixedTwinScalarQ(
+        torch.tensor([[3.0, 4.0], [2.0, 5.0]])
+    )
+    policy.log_alpha = nn.Parameter(torch.log(torch.tensor(0.2)))
+    policy.sac_action_rng = torch.Generator().manual_seed(91)
+    policy._actor_dist_from_flat = lambda observations: _FixedStochasticDist(
+        observations.shape[0], action=0.25, log_prob=-0.5
+    )
+    batch = {
+        "next_observations": torch.zeros(2, 1),
+        "next_critic_observations": torch.zeros(2, 1),
+        "rewards": torch.tensor([1.0, 2.0]),
+        "dones": torch.tensor([False, True]),
+        "truncations": torch.zeros(2, dtype=torch.bool),
+        "discounts": torch.ones(2),
+    }
+
+    target, diagnostics, _ = policy._distributional_fastsac_target(batch)
+
+    # Row 0: 1 - .9*.2*(-.5) + .9*min(3,2) = 2.89.
+    # Row 1 is a true terminal and therefore receives neither entropy nor Q'.
+    assert torch.allclose(target, torch.tensor([2.89, 2.0]))
+    assert target.grad_fn is None
+    assert diagnostics["target_select_q1_fraction"].item() == pytest.approx(0.5)
+    assert diagnostics["target_select_q2_fraction"].item() == pytest.approx(0.5)
+    assert diagnostics["support_clip_fraction_mean"].item() == 0.0
+    assert diagnostics["target_distribution_entropy"].item() == 0.0
+
+
+def test_scalar_critic_update_uses_twin_bellman_mse():
+    policy = _bare_policy(
+        q_critic_type="scalar",
+        q_condition_on_actuator_state=False,
+        q_action_input_gain=1.0,
+        action_support_clip=20.0,
+        sac_max_grad_norm=1.0e6,
+        sac_alpha_update_cadence="actor",
+        sac_policy_frequency=2,
+        sac_use_autotune=False,
+        sac_tau=0.005,
+    )
+    _install_unit_action_contract(policy)
+    policy._q_critic_dim = 1
+    policy._q_state_input_dim = 1
+    policy._q_action_input_dim = 1
+    policy.qnet = _build_isolated_scalar_q_network(
+        obs_dim=1,
+        action_dim=1,
+        hidden_dim=8,
+        device="cpu",
+        seed=23,
+    )
+    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.01)
+    policy.log_alpha = nn.Parameter(torch.tensor(-20.0))
+    policy.critic_update_count = 0
+    policy.alpha_update_count = 0
+    policy._student_actor_warmup_active = lambda: False
+    scalar_target = torch.tensor([1.5, -0.5])
+    policy._distributional_fastsac_target = MethodType(
+        lambda owner, batch: (scalar_target, {}, torch.zeros(2)), policy
+    )
+    batch = {
+        "critic_observations": torch.tensor([[0.2], [-0.4]]),
+        "actions": torch.tensor([[0.3], [0.1]]),
+        "dones": torch.zeros(2, dtype=torch.bool),
+        "truncations": torch.zeros(2, dtype=torch.bool),
+    }
+    with torch.no_grad():
+        before = policy._q_forward(
+            policy.qnet,
+            batch["critic_observations"],
+            batch["actions"],
+            None,
+        )
+        expected_per_head = torch.stack(
+            [torch.nn.functional.mse_loss(head, scalar_target) for head in before]
+        )
+
+    metrics = policy._critic_update(batch)
+
+    assert policy.critic_optimizer.step_calls == 1
+    assert policy.critic_update_count == 1
+    assert torch.allclose(
+        torch.stack((metrics["critic_loss_1"], metrics["critic_loss_2"])),
+        expected_per_head,
+    )
+    assert metrics["critic_loss"].item() == pytest.approx(
+        expected_per_head.sum().item()
+    )
+
+
 def test_soft_c51_target_uses_entropy_and_one_complete_lower_twin_head_detached():
     policy = _bare_policy(
         gamma=1.0,
@@ -2331,6 +2979,22 @@ def test_critic_temperature_population_excludes_true_terminals_but_keeps_timeout
     assert performed["alpha_update_due_fraction"].item() == 1.0
     assert performed["alpha_update_performed_fraction"].item() == 1.0
 
+    policy.critic_update_count = 1
+    policy.cfg.perception_replay_mode = ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+    policy.cfg.teacher_perception_warmup_steps = 2
+    policy._teacher_prefill_complete = True
+    policy.dagger_rollout_count = 0
+    policy._fastsac_rollout_critic_metrics = []
+    warmup_alpha_before = policy.log_alpha.detach().clone()
+    warmup = policy._critic_update(batch)
+
+    assert torch.equal(policy.log_alpha, warmup_alpha_before)
+    assert policy.alpha_update_count == 1
+    assert warmup["alpha_update_due_fraction"].item() == 0.0
+    assert warmup["alpha_update_performed_fraction"].item() == 0.0
+    assert policy._fastsac_rollout_critic_metrics == [warmup]
+    policy.dagger_rollout_count = 2
+
     alpha_seen_by_actor = []
     policy._actor_update = MethodType(
         lambda owner, actor_batch: alpha_seen_by_actor.append(
@@ -2355,42 +3019,6 @@ def test_critic_temperature_population_excludes_true_terminals_but_keeps_timeout
     assert policy.alpha_update_count == 1
     assert terminal_due["alpha_update_due_fraction"].item() == 1.0
     assert terminal_due["alpha_update_performed_fraction"].item() == 0.0
-
-
-def test_row_scheduled_temperature_updates_only_with_actual_actor_steps():
-    policy = _tiny_physical_policy()
-    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
-    policy.cfg.sac_use_autotune = True
-    policy.cfg.sac_alpha_update_cadence = "actor"
-    policy.cfg.actor_update_to_data_ratio = 1.0
-    policy.cfg.sac_policy_frequency = 1
-    policy.cfg.sac_tau = 0.0
-    policy.alpha_optimizer = _CountingSGD([policy.log_alpha], lr=0.1)
-    policy.target_entropy = -1.0
-    policy.critic_update_count = 0
-    policy.alpha_update_count = 0
-    policy.sac_alpha_update_count = 0
-    target = torch.full((3, 3), 1.0 / 3.0)
-    policy._distributional_fastsac_target = MethodType(
-        lambda owner, batch: (target, {}, torch.full((3,), 2.0)), policy
-    )
-    critic_batch = {
-        "critic_observations": torch.zeros(3, 1),
-        "actions": torch.zeros(3, 1),
-        "dones": torch.zeros(3, dtype=torch.bool),
-        "truncations": torch.zeros(3, dtype=torch.bool),
-    }
-
-    critic_metrics = policy._critic_update(critic_batch)
-
-    assert policy.alpha_optimizer.step_calls == 0
-    assert policy.alpha_update_count == 0
-    assert critic_metrics["alpha_update_due_fraction"].item() == 0.0
-    actor_metrics = policy._actor_update(_tiny_physical_batch())
-    assert policy.alpha_optimizer.step_calls == 1
-    assert policy.alpha_update_count == 1
-    assert actor_metrics["actor_alpha_update_due_fraction"].item() == 1.0
-    assert actor_metrics["actor_alpha_update_performed_fraction"].item() == 1.0
 
 
 def test_fixed_temperature_skips_optimizer_but_remains_in_soft_target():
@@ -2449,10 +3077,13 @@ def _checkpoint_policy(seed: int):
     policy.teacher_prefill_action_rng = torch.Generator().manual_seed(seed + 6)
     policy.actor_target = None
     policy._last_fastsac_diagnostics = {}
+    policy.joint_names = ["unit_joint"]
+    _install_unit_action_contract(policy)
     policy._fastsac_action_contract = {
         "joint_names": ["unit_joint"],
         "fingerprint": "sha256:unit-test",
     }
+    policy._configure_student_action_support()
     return policy
 
 
@@ -2545,7 +3176,6 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     source.critic_update_count = 11
     source.alpha_update_count = 13
     source.q_update_row_credit = 123.0
-    source.actor_update_row_credit = 321.0
     source.dagger_rollout_count = 17
     source.dagger_environment_steps = 19
     source.teacher_prefill_rollout_count = 3
@@ -2602,7 +3232,6 @@ def test_checkpoint_seam_round_trips_sac_state_and_both_independent_rngs():
     assert restored.critic_update_count == 11
     assert restored.alpha_update_count == 13
     assert restored.q_update_row_credit == pytest.approx(123.0)
-    assert restored.actor_update_row_credit == pytest.approx(321.0)
     assert restored.dagger_rollout_count == 17
     assert restored.dagger_environment_steps == 19
     assert restored.teacher_prefill_rollout_count == 3
@@ -2859,10 +3488,13 @@ def test_fastsac_inference_requires_exact_bounded_action_contract_fingerprint(
     monkeypatch, saved_fingerprint
 ):
     policy = _bare_policy()
+    policy.joint_names = ["unit_joint"]
+    _install_unit_action_contract(policy)
     policy._fastsac_action_contract = {
         "joint_names": ["unit_joint"],
         "fingerprint": "sha256:raw-unit-test",
     }
+    policy._configure_student_action_support()
     saved_contract = {"joint_names": ["unit_joint"]}
     if saved_fingerprint is not None:
         saved_contract["fingerprint"] = saved_fingerprint
@@ -2871,6 +3503,9 @@ def test_fastsac_inference_requires_exact_bounded_action_contract_fingerprint(
         "checkpoint_version": CHECKPOINT_VERSION,
         "actor_backend": ACTOR_BACKEND,
         "action_contract": saved_contract,
+        "student_action_contract": copy.deepcopy(
+            policy._fastsac_student_action_contract
+        ),
     }
     monkeypatch.setattr(
         PPOVEL,

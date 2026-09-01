@@ -152,11 +152,11 @@ EXPECTED_AST_FINGERPRINTS = {
     (
         "active_adaptation/envs/base.py",
         "RewardGroup.compute",
-    ): "db329af2b1a2a976ba4548fe9fa3cd5fff59e44b59495b4d85858bc777d353b3",
+    ): "6948c80c82dab79bbd86c254227d5efaf63906667daa323e65ce7ab2342d678a",
     (
         "active_adaptation/envs/mdp/base.py",
         "Reward.__call__",
-    ): "7d04711aaf288f5fdd74ed69977e4db4987d12d18f78ffcd3de7e94e83acffa8",
+    ): "c2c67d0376de2399a99d4c0b84c847ca6dcee6cab276fd1bc8e890d5c950cdd3",
     (
         "active_adaptation/envs/mdp/action.py",
         "JointPosition.__call__",
@@ -168,15 +168,15 @@ EXPECTED_AST_FINGERPRINTS = {
     (
         "active_adaptation/learning/ppo/fastsac_vel.py",
         "DistributionalQNetwork",
-    ): "02f70b6a776f4693ea0e4d6f36bcac76fe73b6cec66e8e08f6906851feb40078",
+    ): "fe27fef8aed7143bfd3b05c0a77b62b781bbd42e0a690ad8fc0f235d0b4a03ef",
     (
         "active_adaptation/learning/ppo/fastsac_vel.py",
         "TwinDistributionalQ",
-    ): "6faf214e8a8fe82eafc8793e109a0b4173eab9e82b5b4b9e5038006cb3114d96",
+    ): "3618c1dbd9262a1d21b8bac5f2f71dd8ca31ac487e2d4f5f83c59ed82abdb004",
     (
         "active_adaptation/learning/ppo/fastsac_vel.py",
         "_build_isolated_q_network",
-    ): "19b33401e1fb5232d31f334aaeed6d86b30539283a357ef45bbdd54b18d1f0b3",
+    ): "c8d3025793db5b6c9e226e8b9d61eb71b065cc1a804ca6d1d79b0f774625d58e",
     (
         "active_adaptation/learning/ppo/ppo_bc_dagger.py",
         "_linear_teacher_probability",
@@ -886,8 +886,8 @@ def test_fastsac_normalized_std_and_finite_action_support_are_locked():
     td3_algo = _load_yaml(TD3_CONFIG_PATH)["algo"]
     fastsac_algo = _load_yaml(FASTSAC_CONFIG_PATH)["algo"]
 
-    # Both backends share one explicit physical command support.  Nominal
-    # per-joint limits remain coordinates for Q, BC, and FastSAC entropy/std.
+    # The scalar clip remains the Teacher/final execution safety guard. The
+    # FastSAC Student policy itself uses the nominal per-joint Q coordinates.
     assert td3_algo["action_support_clip"] == 20.0
     assert fastsac_algo["action_support_clip"] == 20.0
     assert np.isfinite(fastsac_algo["action_support_clip"])
@@ -898,7 +898,7 @@ def test_fastsac_normalized_std_and_finite_action_support_are_locked():
 
     dist_builder = _definition_ast(
         "active_adaptation/learning/ppo/fastsac_bc_dagger.py",
-        "DistributionalFastSACTeacherBC._sac_dist_from_mean",
+        "DistributionalFastSACTeacherBC._normalized_tanh_dist_from_mean",
     )
     assignments = {
         target.id: node.value
@@ -907,11 +907,18 @@ def test_fastsac_normalized_std_and_finite_action_support_are_locked():
         for target in node.targets
         if isinstance(target, ast.Name)
     }
+    assert ast.unparse(assignments["normalized_zero"]) == "-center / scale"
+    assert ast.unparse(assignments["latent_zero"]) == (
+        "torch.atanh(normalized_zero)"
+    )
+    assert ast.unparse(assignments["inverse_slope"]) == (
+        "(scale * (1.0 - normalized_zero.square())).reciprocal()"
+    )
     assert ast.unparse(assignments["latent_loc"]) == (
-        "(mean - actor_center) / actor_scale"
+        "latent_zero + inverse_slope * mean"
     )
     assert ast.unparse(assignments["latent_scale"]) == (
-        "(log_std.exp() * q_scale / actor_scale).expand_as(mean)"
+        "latent_std.expand_as(mean)"
     )
 
     dist_return = next(
@@ -921,8 +928,8 @@ def test_fastsac_normalized_std_and_finite_action_support_are_locked():
     assert isinstance(dist_call, ast.Call)
     assert ast.unparse(dist_call.func) == "FastSACTanhNormal"
     dist_keywords = {keyword.arg: keyword.value for keyword in dist_call.keywords}
-    assert ast.unparse(dist_keywords["low"]) == "self._fastsac_action_low.to(mean)"
-    assert ast.unparse(dist_keywords["high"]) == "self._fastsac_action_high.to(mean)"
+    assert ast.unparse(dist_keywords["low"]) == "low"
+    assert ast.unparse(dist_keywords["high"]) == "high"
 
     q_input = _definition_ast(
         "active_adaptation/learning/ppo/td3_bc_dagger.py",

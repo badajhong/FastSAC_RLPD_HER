@@ -41,22 +41,26 @@ from .common import CMD_KEY, DONE_KEY, OBS_KEY, OBS_PRIV_KEY, REWARD_KEY, TERM_K
 from .fastsac_bc_dagger import (
     ACTOR_BACKEND,
     ACTOR_LEARNING_SEMANTICS as BASE_NORMALIZED_ACTOR_LEARNING_SEMANTICS,
-    CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS,
     CHECKPOINT_VERSION as BASE_FASTSAC_CHECKPOINT_VERSION,
     NORMALIZED_TANH_ACTION_DISTRIBUTION,
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
     Q_EFFECTIVE_N_STEPS_KEY,
+    SCALAR_Q_CRITIC_TYPE,
     SPRED_P_BC_SEMANTICS,
     TRAINING_ALGORITHM as BASE_FASTSAC_TRAINING_ALGORITHM,
     DistributionalFastSACTeacherBC,
     DistributionalFastSACTeacherBCConfig,
     _fastsac_action_distribution,
     _fastsac_actor_backend,
+    _fastsac_q_critic_type,
+    _migrate_explicit_online_replay_capacities,
     _q_target_discount_factors,
 )
 from .fastsac_vel import (
-    FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
+    FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
+    FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
+    FASTSAC_STANDARD_SCALAR_Q_INPUT_SEMANTICS,
     _Stage1NStepAccumulator,
     _vaic_truncation_mask,
 )
@@ -71,9 +75,9 @@ from .td3_bc_dagger import (
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     OBJECT_GEO_REPLAY_SEMANTICS,
-    Q_CAUSAL_EXPERT_RANKING_SEMANTICS,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
+    PERCEPTION_REPLAY_SEMANTICS,
     NEXT_REFERENCE_PHASE_KEY,
     NEXT_Q_ACTUATOR_CONTEXT_KEY,
     REFERENCE_PHASE_KEY,
@@ -144,8 +148,7 @@ TEACHER_VALUE_POTENTIAL_SEMANTICS = (
     "frozen_raw_teacher_value_shared_terminal_cut_v2"
 )
 Q_N_STEP_SEMANTICS = (
-    "discounted_raw_student_behavior_rewards_endpoint_soft_bootstrap_"
-    "teacher_replay_one_step_partial_terminal_flush_v1"
+    "factual_one_step_expert_dagger_student_reward_endpoint_soft_bootstrap_v1"
 )
 PHASE_FADED_TEACHER_VALUE_POTENTIAL_SEMANTICS = (
     "reference_phase_faded_teacher_value_terminal_zero_v1"
@@ -181,11 +184,7 @@ def _tvkd_actor_learning_semantics(config) -> str:
     else:
         raise ValueError(f"unsupported FastSAC action distribution {distribution!r}")
     if getattr(config, "use_q_filtered_bc", False):
-        semantics = f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
-    if bool(getattr(config, "q_use_causal_hold_advantage", False)):
-        semantics = (
-            f"{semantics}_with_{CAUSAL_TEACHER_CONFIDENCE_GATE_SEMANTICS}"
-        )
+        return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
     return semantics
 
 
@@ -197,10 +196,9 @@ def _tvkd_critic_learning_semantics(config) -> str:
         semantics = PHASE_FADED_CRITIC_LEARNING_SEMANTICS
     else:
         semantics = CRITIC_LEARNING_SEMANTICS
-    if int(getattr(config, "q_n_step", 1)) > 1:
-        semantics = (
-            f"{semantics}_factual_student_endpoint_n_step_"
-            "teacher_one_step_soft_bootstrap_v1"
+    if _fastsac_q_critic_type(config) == SCALAR_Q_CRITIC_TYPE:
+        semantics = semantics.replace(
+            "soft_c51_target", "soft_clipped_twin_scalar_q_mse_target"
         )
     return semantics
 
@@ -275,6 +273,78 @@ def _finite_scalar(name: str, value, *, positive: bool = False) -> float:
         qualifier = "positive " if positive else ""
         raise ValueError(f"{name} must be a finite {qualifier}number")
     return value
+
+
+def _lambda_bc_fork_override_active(
+    config,
+    state: Mapping,
+    saved_lambda_bc,
+) -> bool:
+    """Validate an explicit pre-Actor fork with a different BC coefficient."""
+    saved = _finite_scalar("checkpoint lambda_bc", saved_lambda_bc)
+    runtime = _finite_scalar("runtime lambda_bc", config.lambda_bc)
+    if saved < 0.0 or runtime < 0.0:
+        raise ValueError("lambda_bc must be non-negative")
+    enabled = getattr(config, "resume_allow_lambda_bc_override", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("resume_allow_lambda_bc_override must be boolean")
+    changed = not math.isclose(saved, runtime, rel_tol=0.0, abs_tol=1e-12)
+    if not changed:
+        return False
+    if not enabled:
+        raise ValueError("TVKD resume fixed BC coefficient mismatch")
+    if (
+        state.get("training_algorithm"),
+        state.get("checkpoint_version"),
+    ) != (TRAINING_ALGORITHM, CHECKPOINT_VERSION):
+        raise ValueError(
+            "lambda_bc fork resume requires a current TVKD checkpoint"
+        )
+
+    # Changing the Actor objective is safe only at the warmup boundary, before
+    # any Actor/std/temperature update or associated Adam moment exists.
+    pristine_counters = (
+        "actor_update_count",
+        "actor_std_update_count",
+        "alpha_update_count",
+        "sac_actor_update_count",
+        "sac_alpha_update_count",
+    )
+    dirty_counters = {
+        name: state.get(name)
+        for name in pristine_counters
+        if state.get(name) != 0
+    }
+    if dirty_counters:
+        raise ValueError(
+            "lambda_bc fork resume requires a pre-Actor checkpoint; nonzero "
+            f"counters={dirty_counters}"
+        )
+    optimizers = state.get("optimizer_resume_state")
+    if not isinstance(optimizers, Mapping):
+        raise ValueError("lambda_bc fork resume lacks optimizer state")
+    dirty_optimizers = []
+    for name in ("actor_optimizer", "actor_std_optimizer", "alpha_optimizer"):
+        optimizer = optimizers.get(name)
+        if optimizer is None:
+            continue
+        if not isinstance(optimizer, Mapping):
+            raise ValueError(
+                f"lambda_bc fork resume has invalid {name} state"
+            )
+        optimizer_state = optimizer.get("state")
+        if not isinstance(optimizer_state, Mapping):
+            raise ValueError(
+                f"lambda_bc fork resume has invalid {name} moments"
+            )
+        if optimizer_state:
+            dirty_optimizers.append(name)
+    if dirty_optimizers:
+        raise ValueError(
+            "lambda_bc fork resume requires pristine Actor/std/alpha optimizer "
+            f"moments; nonempty={dirty_optimizers}"
+        )
+    return True
 
 
 def _required_contract_fingerprint(name: str, value) -> str:
@@ -435,38 +505,17 @@ def _validate_tvkd_algorithm_config(cfg) -> None:
         value = getattr(cfg, name, 1)
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer")
-    if int(getattr(cfg, "q_teacher_n_step", 1)) != 1:
-        raise ValueError(
-            "q_teacher_n_step is currently locked to 1 so Teacher replay "
-            "represents one Teacher action followed by a Student bootstrap"
-        )
-    if int(getattr(cfg, "q_n_step", 1)) > 1:
-        if str(getattr(cfg, "dagger_control_mode", "beta")) != "beta" or any(
-            float(getattr(cfg, name, 0.0)) != 0.0
-            for name in ("dagger_beta_start", "dagger_beta_end")
-        ):
+        if int(value) != 1:
             raise ValueError(
-                "q_n_step>1 currently requires beta-mode Student-only main "
-                "rollouts (dagger_beta_start=dagger_beta_end=0); Teacher "
-                "takeover would contaminate a Student factual horizon"
-            )
-        if any(
-            bool(getattr(cfg, name, False))
-            for name in (
-                "dagger_staging_enabled",
-                "dagger_finalization_enabled",
-            )
-        ):
-            raise ValueError(
-                "q_n_step>1 is incompatible with DAgger staging/finalization: "
-                "their replay-Q calibration can re-enable Teacher actions "
-                "inside a factual Student horizon"
+                f"{name} is locked to 1 for factual one-step Expert/DAgger/"
+                "Student SAC replay"
             )
     for name in (
         "use_tvkd_value_shaping",
         "use_teacher_residual_critic",
         "use_phase_faded_teacher_potential",
         "use_teacher_value_bottleneck_replay",
+        "resume_allow_lambda_bc_override",
     ):
         if not isinstance(getattr(cfg, name), bool):
             raise ValueError(f"{name} must be boolean")
@@ -501,15 +550,6 @@ def _validate_tvkd_algorithm_config(cfg) -> None:
         }
         # The shared allocator is also the canonical strict fraction validator.
         allocate_source_counts(1, fractions)
-    if bool(getattr(cfg, "q_use_causal_hold_advantage", False)) and (
-        float(cfg.q_uniform_student_fraction)
-        + float(cfg.q_failure_student_fraction)
-        <= 0.0
-    ):
-        raise ValueError(
-            "q_use_causal_hold_advantage requires a positive Student Q replay "
-            "fraction to identify its action advantage"
-        )
 
     tvkd_lambda = _finite_scalar("tvkd_lambda", getattr(cfg, "tvkd_lambda"))
     if tvkd_lambda < 0.0:
@@ -613,10 +653,12 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     perception_failure_teacher_fraction: float = 0.0
     perception_replay_mode: str = ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
 
-    # Factual backup horizon for Student-executed replay. Successful frozen
-    # Teacher replay intentionally remains one-step: a multi-step Teacher row
-    # would follow several Teacher actions before bootstrapping the Student and
-    # would no longer estimate the desired one-action Teacher intervention.
+    # Every source uses the standard one-step SAC Bellman contract.  This is
+    # especially important for the online DAgger partition, where Student and
+    # Teacher execute alternate actions: a multi-step target would otherwise
+    # credit a Student action with a later Teacher rescue.  Delayed actuation
+    # remains observable through the Critic state/action-history context and is
+    # propagated by ordinary one-step bootstrapping.
     q_n_step: int = 1
     q_teacher_n_step: int = 1
 
@@ -630,6 +672,11 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     # checkpoints still migrate this field to false so their saved critic
     # coordinates are never reinterpreted during resume.
     use_teacher_residual_critic: bool = True
+    # Explicit same-stage fork for a checkpoint captured before the first
+    # Actor/std/alpha update. It permits changing only the fixed BC
+    # coefficient while retaining trained perception and Student Critic state.
+    # Ordinary continuation remains strict by default.
+    resume_allow_lambda_bc_override: bool = False
     # Raw Phi=V_T is the default exact potential. Command completion already
     # cuts the absorbing successor with c_t=0, so the current decision state's
     # value must not be faded for terminal correctness. Phase fading remains an
@@ -1663,7 +1710,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         critic_reward = residual_reward if residual_enabled else terms.shaped_reward
         soft_reward = critic_reward.to(entropy_tax) - entropy_tax
         if not torch.isfinite(soft_reward).all():
-            raise RuntimeError("TVKD soft C51 reward contains NaN/Inf")
+            raise RuntimeError("TVKD soft critic reward contains NaN/Inf")
 
         target_logits = self._q_forward(
             self.qnet_target,
@@ -1671,67 +1718,92 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             next_action,
             batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
         )
-        target_probabilities = F.softmax(target_logits, dim=-1)
-        raw_expected_heads = (target_probabilities * self.qnet_target.support).sum(
-            dim=-1
-        )
-        projection_gamma = (
-            torch.full_like(continuation, gamma_power)
-            if isinstance(gamma_power, float)
-            else gamma_power
-        )
-        projected_heads = []
-        support_clip_fractions = []
-        for head_probability in target_probabilities:
-            projected, left_fraction, right_fraction = _project_c51_probabilities(
-                head_probability,
-                soft_reward,
-                continuation,
-                projection_gamma,
-                self.qnet_target.support,
+        if _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE:
+            if target_logits.ndim != 2 or target_logits.shape[0] != 2:
+                raise RuntimeError("TVKD scalar target must have shape [2, batch]")
+            raw_expected_heads = target_logits
+            selected_head = raw_expected_heads.argmin(dim=0)
+            selected_next_q = raw_expected_heads.gather(
+                0, selected_head.unsqueeze(0)
+            ).squeeze(0)
+            selected_target = soft_reward + effective_discount * (
+                bootstrap.to(effective_discount) * selected_next_q
             )
-            projected_heads.append(projected)
-            support_clip_fractions.append((left_fraction, right_fraction))
-        if len(support_clip_fractions) != 2:
-            raise RuntimeError("TVKD C51 target must contain exactly two Q heads")
-        (
-            (q1_left_support_clip_fraction, q1_right_support_clip_fraction),
-            (q2_left_support_clip_fraction, q2_right_support_clip_fraction),
-        ) = support_clip_fractions
-        q1_support_clip_fraction = (
-            q1_left_support_clip_fraction + q1_right_support_clip_fraction
-        )
-        q2_support_clip_fraction = (
-            q2_left_support_clip_fraction + q2_right_support_clip_fraction
-        )
-        support_clip_fraction_mean = 0.5 * (
-            q1_support_clip_fraction + q2_support_clip_fraction
-        )
-        support_clip_fraction_max = torch.maximum(
-            q1_support_clip_fraction, q2_support_clip_fraction
-        )
-        projected_heads = torch.stack(projected_heads, dim=0)
-        projected_expected_heads = (projected_heads * self.qnet_target.support).sum(
-            dim=-1
-        )
-        # Choose the clipped-double-Q head in the unprojected next-state
-        # coordinate. C51 projection clips at finite support boundaries and is
-        # not order preserving there; selecting after projection is therefore
-        # a target-semantics bug rather than a harmless implementation detail.
-        selected_head = raw_expected_heads.argmin(dim=0)
-        selected_target = projected_heads.gather(
-            0,
-            selected_head[None, :, None].expand(
-                1, projected_heads.shape[1], projected_heads.shape[2]
-            ),
-        ).squeeze(0)
-        selected_expected = projected_expected_heads.gather(
-            0, selected_head.unsqueeze(0)
-        ).squeeze(0)
-        selected_entropy = -(
-            selected_target
-            * selected_target.clamp_min(torch.finfo(selected_target.dtype).tiny).log()
-        ).sum(dim=-1)
+            selected_expected = selected_target
+            selected_entropy = torch.zeros_like(selected_target)
+            zero = selected_target.new_zeros(())
+            q1_left_support_clip_fraction = zero
+            q1_right_support_clip_fraction = zero
+            q2_left_support_clip_fraction = zero
+            q2_right_support_clip_fraction = zero
+            q1_support_clip_fraction = zero
+            q2_support_clip_fraction = zero
+            support_clip_fraction_mean = zero
+            support_clip_fraction_max = zero
+        else:
+            target_probabilities = F.softmax(target_logits, dim=-1)
+            raw_expected_heads = (
+                target_probabilities * self.qnet_target.support
+            ).sum(dim=-1)
+            projection_gamma = (
+                torch.full_like(continuation, gamma_power)
+                if isinstance(gamma_power, float)
+                else gamma_power
+            )
+            projected_heads = []
+            support_clip_fractions = []
+            for head_probability in target_probabilities:
+                projected, left_fraction, right_fraction = (
+                    _project_c51_probabilities(
+                        head_probability,
+                        soft_reward,
+                        continuation,
+                        projection_gamma,
+                        self.qnet_target.support,
+                    )
+                )
+                projected_heads.append(projected)
+                support_clip_fractions.append((left_fraction, right_fraction))
+            if len(support_clip_fractions) != 2:
+                raise RuntimeError(
+                    "TVKD C51 target must contain exactly two Q heads"
+                )
+            (
+                (q1_left_support_clip_fraction, q1_right_support_clip_fraction),
+                (q2_left_support_clip_fraction, q2_right_support_clip_fraction),
+            ) = support_clip_fractions
+            q1_support_clip_fraction = (
+                q1_left_support_clip_fraction + q1_right_support_clip_fraction
+            )
+            q2_support_clip_fraction = (
+                q2_left_support_clip_fraction + q2_right_support_clip_fraction
+            )
+            support_clip_fraction_mean = 0.5 * (
+                q1_support_clip_fraction + q2_support_clip_fraction
+            )
+            support_clip_fraction_max = torch.maximum(
+                q1_support_clip_fraction, q2_support_clip_fraction
+            )
+            projected_heads = torch.stack(projected_heads, dim=0)
+            projected_expected_heads = (
+                projected_heads * self.qnet_target.support
+            ).sum(dim=-1)
+            selected_head = raw_expected_heads.argmin(dim=0)
+            selected_target = projected_heads.gather(
+                0,
+                selected_head[None, :, None].expand(
+                    1, projected_heads.shape[1], projected_heads.shape[2]
+                ),
+            ).squeeze(0)
+            selected_expected = projected_expected_heads.gather(
+                0, selected_head.unsqueeze(0)
+            ).squeeze(0)
+            selected_entropy = -(
+                selected_target
+                * selected_target.clamp_min(
+                    torch.finfo(selected_target.dtype).tiny
+                ).log()
+            ).sum(dim=-1)
         reward_abs = batch["rewards"].abs().mean()
         full_q_state_baseline = (
             (1.0 - float(self.cfg.tvkd_lambda)) * terms.teacher_potential
@@ -2957,25 +3029,30 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             torch.device, list[tuple[torch.Tensor, torch.Tensor]]
         ] = {}
 
-        replay = self.dagger_replay
-        if (
-            event_keys_cpu.numel()
-            and STUDENT_REPLAY_EPISODE_ID_KEY in replay.data
-            and STUDENT_REPLAY_EPISODE_STEP_KEY in replay.data
-            and FAILURE_PHASE_STUDENT_SOURCE_KEY in replay.data
-            and replay.size
-        ):
-            matched, row_keys = self._student_focus_matches(
-                replay.data[STUDENT_REPLAY_EPISODE_ID_KEY][: replay.size],
-                replay.data[STUDENT_REPLAY_EPISODE_STEP_KEY][: replay.size],
-                event_keys_cpu.to(replay.device),
-            )
-            replay.data[FAILURE_PHASE_STUDENT_SOURCE_KEY][: replay.size].logical_or_(
-                matched
-            )
-            if bool(matched.any()):
-                found_keys.append(row_keys[matched].detach().cpu().unique())
-            replay._valid_index_cache.pop(FAILURE_PHASE_STUDENT_SOURCE_KEY, None)
+        online_replays = [self.dagger_replay]
+        if self._uses_separate_online_replays():
+            online_replays.append(self.student_replay)
+        for replay in online_replays:
+            if (
+                event_keys_cpu.numel()
+                and STUDENT_REPLAY_EPISODE_ID_KEY in replay.data
+                and STUDENT_REPLAY_EPISODE_STEP_KEY in replay.data
+                and FAILURE_PHASE_STUDENT_SOURCE_KEY in replay.data
+                and replay.size
+            ):
+                matched, row_keys = self._student_focus_matches(
+                    replay.data[STUDENT_REPLAY_EPISODE_ID_KEY][: replay.size],
+                    replay.data[STUDENT_REPLAY_EPISODE_STEP_KEY][: replay.size],
+                    event_keys_cpu.to(replay.device),
+                )
+                replay.data[FAILURE_PHASE_STUDENT_SOURCE_KEY][
+                    : replay.size
+                ].logical_or_(matched)
+                if bool(matched.any()):
+                    found_keys.append(row_keys[matched].detach().cpu().unique())
+                replay._valid_index_cache.pop(
+                    FAILURE_PHASE_STUDENT_SOURCE_KEY, None
+                )
 
         id_grid = self._student_replay_episode_id_grid
         step_grid = self._student_replay_episode_step_grid
@@ -3037,11 +3114,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 transitions[STUDENT_REPLAY_EPISODE_ID_KEY] = episode_ids
                 transitions[STUDENT_REPLAY_EPISODE_STEP_KEY] = episode_steps
                 transitions[FAILURE_PHASE_STUDENT_SOURCE_KEY] = matched
-                # Attach Teacher-value cache fields for every transition so the
-                # replay ring is allocated with the complete schema on the first
-                # extend.  Non-Student rows are later filtered to the student
-                # replay before extend is called, so their zero values are never
-                # persisted.
+                # Attach Teacher-value cache fields for every transition so
+                # both online provenance rings allocate one complete schema.
                 if needs_teacher_value_cache:
                     target_device = transitions["rewards"].device
                     cached_value_grids = value_grids.get(target_device)
@@ -3273,6 +3347,24 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
     def train_op(self, tensordict):
         info = DistributionalFastSACTeacherBC.train_op(self, tensordict)
+        warmup_metric_names = {
+            "student_actor_warmup_active": "active",
+            "student_actor_warmup_completed_rollouts": "completed_rollouts",
+            "student_actor_warmup_target_rollouts": "target_rollouts",
+            "student_actor_warmup_complete": "complete",
+            "prefill_perception_warmup_steps": "perception_updates",
+            "prefill_perception_warmup_complete": "complete",
+            "prefill_perception_warmup_priv_loss": "priv_loss",
+            "prefill_perception_warmup_object_loss": "object_loss",
+            "prefill_perception_warmup_grad_norm": "perception_grad_norm",
+            "prefill_perception_warmup_skipped_frozen": (
+                "perception_skipped_frozen"
+            ),
+        }
+        for old_name, new_name in warmup_metric_names.items():
+            old_key = f"fastsac/{old_name}"
+            if old_key in info:
+                info[f"warmup/{new_name}"] = info.pop(old_key)
         critic_metrics = getattr(self, "_fastsac_rollout_critic_metrics", [])
         actor_metrics = getattr(self, "_fastsac_rollout_actor_metrics", [])
 
@@ -3410,7 +3502,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         # the same exact algorithm contract as the CLI, so retain every
         # behavior-affecting structured-config field. Identity/source-location
         # fields do not alter the already embedded policy and are excluded.
-        non_behavioral = {"_target_", "name", "checkpoint_path"}
+        non_behavioral = {
+            "_target_",
+            "name",
+            "checkpoint_path",
+            "resume_allow_lambda_bc_override",
+        }
         for field in dataclass_fields(TVKDDistributionalFastSACTeacherBCConfig):
             if field.name in non_behavioral:
                 continue
@@ -3500,6 +3597,37 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 getattr(self.cfg, "bottleneck_selection_mode", "first")
             ),
         }
+        if self._uses_standard_scalar_q():
+            hidden_dim = int(getattr(self.cfg, "q_hidden_dim", 768))
+            state_hidden_dim = hidden_dim // 2
+            metadata.update(
+                {
+                    "q_state_input_dim": int(
+                        getattr(
+                            self,
+                            "_q_state_input_dim",
+                            getattr(self, "_q_critic_dim", 0)
+                            + getattr(self, "_q_actuator_context_dim", 0),
+                        )
+                    ),
+                    "q_state_context_dim": int(
+                        getattr(self, "_q_actuator_context_dim", 0)
+                    ),
+                    "q_input_semantics": (
+                        FASTSAC_STANDARD_SCALAR_Q_INPUT_SEMANTICS
+                    ),
+                    "q_architecture_semantics": (
+                        FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
+                    ),
+                    "hidden_dim": hidden_dim,
+                    "q_action_fusion": "balanced_split_stems",
+                    "q_state_hidden_dim": state_hidden_dim,
+                    "q_action_hidden_dim": hidden_dim - state_hidden_dim,
+                    "q_action_fusion_semantics": (
+                        FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS
+                    ),
+                }
+            )
         return metadata
 
     def _frozen_teacher_module_names(self) -> tuple[str, ...]:
@@ -3891,6 +4019,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "perception_replay_mode": str(self.cfg.perception_replay_mode),
                 "perception_training_semantics": (
                     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                    if str(self.cfg.perception_replay_mode)
+                    == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+                    else PERCEPTION_REPLAY_SEMANTICS
                 ),
                 "actor_replay_observation_semantics": (
                     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
@@ -4014,16 +4145,19 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         backend = state.get("dagger_backend_config")
         if not isinstance(backend, Mapping):
             raise ValueError("TVKD checkpoint lacks backend config")
+        if current and "student_buffer_capacity" not in backend:
+            # Early v9 checkpoints stored one total online capacity. Recreate
+            # their exact DAgger/pure-Student allocation before enforcing the
+            # current explicit two-capacity checkpoint schema.
+            backend = _migrate_explicit_online_replay_capacities(backend)
         saved_lambda_bc = _finite_scalar(
             "checkpoint lambda_bc", backend.get("lambda_bc")
         )
-        if not math.isclose(
+        lambda_bc_fork = _lambda_bc_fork_override_active(
+            self.cfg,
+            state,
             saved_lambda_bc,
-            float(self.cfg.lambda_bc),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            raise ValueError("TVKD resume fixed BC coefficient mismatch")
+        )
         if legacy or previous or v3:
             # Programmatic loads must perform the same explicit schema
             # migration as the Hydra entrypoint. Perception adopts the PPOVEL
@@ -4078,6 +4212,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             if "use_q_filtered_bc" not in backend:
                 backend = dict(backend)
                 backend["use_q_filtered_bc"] = False
+            if "q_critic_type" not in backend:
+                backend = dict(backend)
+                backend["q_critic_type"] = "c51"
             if "use_teacher_residual_critic" not in backend:
                 backend = dict(backend)
                 backend["use_teacher_residual_critic"] = False
@@ -4088,22 +4225,6 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             if "q_use_predicted_effect" not in backend:
                 backend = dict(backend)
                 backend.setdefault("q_use_predicted_effect", False)
-            if "q_use_delay_aware_mdp" not in backend:
-                backend = dict(backend)
-                backend["q_use_delay_aware_mdp"] = False
-                if expected_backend.get("q_use_delay_aware_mdp", False):
-                    raise ValueError(
-                        "TVKD checkpoint predates the delay-aware MDP critic; "
-                        "start a fresh run for the new architecture"
-                    )
-            if "q_use_causal_hold_advantage" not in backend:
-                backend = dict(backend)
-                backend["q_use_causal_hold_advantage"] = False
-                if expected_backend.get("q_use_causal_hold_advantage", False):
-                    raise ValueError(
-                        "TVKD checkpoint predates the causal hold-advantage "
-                        "critic; start a fresh run for the new architecture"
-                    )
             if (
                 "q_use_residual_film" not in backend
                 or "q_residual_film_scale" not in backend
@@ -4111,21 +4232,6 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 backend = dict(backend)
                 backend.setdefault("q_use_residual_film", False)
                 backend.setdefault("q_residual_film_scale", 0.1)
-            # Preserve the exact historical Critic-coupled Actor clock for
-            # same-stage checkpoints that predate the row scheduler. A fresh
-            # run is required to opt into a finite Actor row ratio.
-            checkpoint_predates_actor_row_scheduler = (
-                "actor_update_to_data_ratio" not in backend
-            )
-            if checkpoint_predates_actor_row_scheduler:
-                backend = dict(backend)
-                backend["actor_update_to_data_ratio"] = None
-                if expected_backend.get("actor_update_to_data_ratio") is not None:
-                    raise ValueError(
-                        "TVKD checkpoint predates the independent Actor row "
-                        "scheduler; set actor_update_to_data_ratio=None for an "
-                        "exact legacy resume, or start a fresh corrected run"
-                    )
             # These knobs are measurement-only and were added after the first
             # v6 checkpoints.  They do not affect policy, critic, replay, or
             # optimizer semantics, so an older checkpoint may safely inherit
@@ -4153,6 +4259,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     f"missing={missing}, unexpected={unexpected}"
                 )
             for name, expected_value in expected_backend.items():
+                if lambda_bc_fork and name == "lambda_bc":
+                    continue
                 if backend[name] != expected_value:
                     raise ValueError(f"TVKD resume config mismatch at {name!r}")
 
@@ -4202,6 +4310,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "perception_replay_mode": str(self.cfg.perception_replay_mode),
                 "perception_training_semantics": (
                     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                    if str(self.cfg.perception_replay_mode)
+                    == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+                    else PERCEPTION_REPLAY_SEMANTICS
                 ),
                 "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
                 "bottleneck_fallback_mode": str(self.cfg.bottleneck_fallback_mode),
@@ -4271,27 +4382,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     getattr(self, "action_dim", 0),
                 )
             )
-            causal_hold_advantage = self._q_uses_causal_hold_advantage()
-            q_architecture_semantics = self._q_architecture_semantics()
             metadata_defaults = {
                 "bottleneck_selection_mode": "first",
                 "bc_weighting_semantics": "fixed_unweighted_valid_teacher_bc",
                 "q_action_input_dim": q_action_input_dim,
-                "q_network_observation_dim": int(
-                    getattr(
-                        self,
-                        "_q_network_observation_dim",
-                        getattr(self, "_q_critic_dim", 0),
-                    )
-                ),
                 "q_actuator_context": {"enabled": False},
                 "q_action_feature_semantics": "normalized_issued_command_only_v1",
                 "q_predicted_effect": {"enabled": False},
                 "q_residual_film": {"enabled": False},
-                "q_architecture_semantics": FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
-                "q_causal_hold_advantage": False,
-                "q_causal_expert_ranking_semantics": None,
-                "q_teacher_td_advantage_gradient": "ordinary_all_source_c51_td",
                 "q_n_step_semantics": Q_N_STEP_SEMANTICS,
                 "student_q_n_step": 1,
                 "teacher_q_n_step": 1,
@@ -4309,29 +4407,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             expected_q_metadata = {
                 "target_semantics": critic_semantics,
                 "q_action_input_dim": q_action_input_dim,
-                "q_network_observation_dim": int(
-                    getattr(
-                        self,
-                        "_q_network_observation_dim",
-                        getattr(self, "_q_critic_dim", 0),
-                    )
-                ),
                 "q_actuator_context": q_context_metadata,
                 "q_action_feature_semantics": self._q_action_feature_semantics(),
                 "q_predicted_effect": self._q_predicted_effect_metadata(),
                 "q_residual_film": self._q_residual_film_metadata(),
-                "q_architecture_semantics": q_architecture_semantics,
-                "q_causal_hold_advantage": causal_hold_advantage,
-                "q_causal_expert_ranking_semantics": (
-                    Q_CAUSAL_EXPERT_RANKING_SEMANTICS
-                    if causal_hold_advantage
-                    else None
-                ),
-                "q_teacher_td_advantage_gradient": (
-                    "stopped_value_calibration_only_student_rows_mean_normalized_v1"
-                    if causal_hold_advantage
-                    else "ordinary_all_source_c51_td"
-                ),
                 "teacher_value_potential_semantics": (
                     potential_semantics
                 ),
@@ -4352,6 +4431,15 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     getattr(self.cfg, "bottleneck_selection_mode", "first")
                 ),
             }
+            if _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE:
+                runtime_q_backend = self._checkpoint_q_backend_metadata()
+                for name in (
+                    "q_state_input_dim",
+                    "q_state_context_dim",
+                    "q_input_semantics",
+                    "q_architecture_semantics",
+                ):
+                    expected_q_metadata[name] = runtime_q_backend[name]
             for name, expected in expected_q_metadata.items():
                 if q_backend.get(name, metadata_defaults.get(name)) != expected:
                     raise ValueError(
@@ -4372,8 +4460,6 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "sac_alpha_update_cadence",
                 "q_condition_on_actuator_state",
                 "q_use_predicted_effect",
-                "q_use_delay_aware_mdp",
-                "q_use_causal_hold_advantage",
                 "q_use_residual_film",
                 "q_residual_film_scale",
                 "perception_replay_mode",
@@ -4656,12 +4742,13 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         self._load_fastsac_checkpoint_state(state_dict, load_modules=True)
 
         self.dagger_replay.clear()
+        if self._uses_separate_online_replays():
+            self.student_replay.clear()
         self.q_teacher_replay.clear()
         self._student_q_n_step_accumulator = None
         # The restored partial UTD debt belongs to rows in the discarded
         # rings. It must not combine with the first rows of the rebuilt rings.
         self.q_update_row_credit = 0.0
-        self.actor_update_row_credit = 0.0
         self._teacher_prefill_complete = False
         self.teacher_prefill_rollout_count = 0
         self.teacher_prefill_environment_steps = 0

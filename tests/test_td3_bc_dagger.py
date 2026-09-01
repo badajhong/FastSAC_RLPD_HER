@@ -14,18 +14,9 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from active_adaptation.learning.ppo.common import (
-    ACTION_KEY,
-    Actor,
-    OBS_KEY,
-    OBS_PRIV_KEY,
-)
+from active_adaptation.learning.ppo.common import ACTION_KEY, OBS_KEY, OBS_PRIV_KEY
 from active_adaptation.learning.ppo.fastsac_vel import (
     FASTSAC_Q_ACTUATOR_CONTEXT_SEMANTICS,
-    FASTSAC_Q_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS,
-    FASTSAC_Q_DELAY_AWARE_ARCHITECTURE_SEMANTICS,
-    FASTSAC_Q_DELAY_AWARE_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS,
-    FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS,
     FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS,
     TwinDistributionalQ,
     _sac_bootstrap_mask,
@@ -57,6 +48,7 @@ from active_adaptation.learning.ppo.ppo_vel import (
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
+    DAGGER_IS_DAGGER_ENV_KEY,
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
     PERCEPTION_DEPTH_U8_KEY,
     PERCEPTION_IS_INIT_KEY,
@@ -69,6 +61,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     PRETRAINED_PERCEPTION_MODULES,
     NEXT_Q_ACTUATOR_CONTEXT_KEY,
     NEXT_REFERENCE_PHASE_KEY,
+    ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     Q_ACTUATOR_ACTION_FEATURE_SEMANTICS,
     Q_ACTUATOR_CONTEXT_KEY,
     Q_PREDICTED_EFFECT_ACTION_FEATURE_SEMANTICS,
@@ -79,6 +72,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     REPLAY_MOTION_ID_KEY,
     REPLAY_PERCEPTION_EMA_GENERATION_KEY,
     REPLAY_SAMPLE_IS_TEACHER_KEY,
+    REPLAY_SAMPLE_IS_DAGGER_ENV_KEY,
     REPLAY_SAMPLE_PHYSICAL_INDEX_KEY,
     REPLAY_SAMPLE_PROVENANCE_KEY,
     REPLAY_SOURCE_ORDER,
@@ -106,13 +100,13 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     _decode_replay_depth_u8,
     _encode_replay_depth_u8,
     _failure_lookback_offsets,
-    _interleaved_actor_update_counts,
     _joint_normalized_action_discrepancy,
     _polyak_update_,
     _prefetch_td3_replay_sample_plans,
     _project_c51_probabilities,
     _select_lower_expected_c51_distribution,
     _source_counts,
+    _split_count,
     _td3_actor_q1_loss,
     _valid_raw_action_rows,
 )
@@ -141,74 +135,6 @@ def _actuator_context_metadata() -> dict:
         "dimension": 6,
         "delay_range": [2, 6],
         "alpha_range": [0.8, 1.0],
-    }
-
-
-def _causal_hold_q_policy() -> DistributionalTD3TeacherBC:
-    policy = _bare_policy(
-        q_condition_on_actuator_state=True,
-        q_use_predicted_effect=False,
-        q_use_causal_hold_advantage=True,
-        q_use_residual_film=False,
-        q_action_input_gain=1.0,
-        action_support_clip=20.0,
-    )
-    policy.action_dim = 2
-    policy._q_critic_dim = 3
-    policy._q_actuator_parameter_context_dim = 3
-    policy._q_actuator_context_dim = 5
-    policy._q_network_observation_dim = 6
-    policy._q_action_input_dim = 2
-    policy._fastsac_action_low = torch.full((2,), -20.0)
-    policy._fastsac_action_high = torch.full((2,), 20.0)
-    policy._fastsac_q_action_center = torch.zeros(2)
-    policy._fastsac_q_action_scale = torch.ones(2)
-    policy.qnet = TwinDistributionalQ(
-        6,
-        2,
-        24,
-        51,
-        -2.0,
-        2.0,
-        True,
-        "balanced",
-        True,
-        scalar_reference_advantage=True,
-    )
-    return policy
-
-
-def _causal_hold_q_batch() -> dict[str, torch.Tensor]:
-    factual = torch.tensor(
-        [[0.2, -0.1], [0.1, 0.3], [-0.2, 0.4], [0.0, -0.2]]
-    )
-    teacher = factual.clone()
-    teacher[1] = torch.tensor([0.8, -0.5])
-    teacher[2] = torch.tensor([float("nan"), float("nan")])
-    # First three context entries are delay one-hot plus centered alpha;
-    # final two are the physical pre-shift hold command.
-    context = torch.tensor(
-        [
-            [1.0, 0.0, -0.5, 0.0, 0.0],
-            [0.0, 1.0, 0.5, -0.1, 0.2],
-            [1.0, 0.0, 0.0, 0.3, -0.2],
-            [0.0, 1.0, -1.0, -0.4, 0.1],
-        ]
-    )
-    return {
-        "critic_observations": torch.randn(4, 3),
-        "actions": factual,
-        Q_ACTUATOR_CONTEXT_KEY: context,
-        DAGGER_REPLAY_TEACHER_ACTIONS: teacher,
-        DAGGER_TEACHER_ACTION_VALID_KEY: torch.tensor(
-            [True, True, False, True]
-        ),
-        DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor(
-            [False, True, True, False]
-        ),
-        DAGGER_Q_TEACHER_SOURCE_KEY: torch.tensor(
-            [True, False, False, True]
-        ),
     }
 
 
@@ -248,203 +174,6 @@ def _predicted_effect_policy(action_dim: int = 2):
     policy._fastsac_action_low = torch.full((action_dim,), -20.0)
     policy._fastsac_action_high = torch.full((action_dim,), 20.0)
     return policy
-
-
-def test_fresh_causal_q_is_action_neutral_before_ranking_supervision():
-    policy = _causal_hold_q_policy()
-    batch = _causal_hold_q_batch()
-    alternative = batch["actions"] + torch.tensor([0.7, -0.4])
-
-    factual_logits = policy._q_forward(
-        policy.qnet,
-        batch["critic_observations"],
-        batch["actions"],
-        batch[Q_ACTUATOR_CONTEXT_KEY],
-    )
-    alternative_logits = policy._q_forward(
-        policy.qnet,
-        batch["critic_observations"],
-        alternative,
-        batch[Q_ACTUATOR_CONTEXT_KEY],
-    )
-    q_action = policy._q_action_input(batch["actions"])
-    state, _, _ = policy._causal_q_inputs_from_q_action(
-        batch["critic_observations"],
-        q_action,
-        batch[Q_ACTUATOR_CONTEXT_KEY],
-    )
-
-    assert torch.equal(factual_logits, alternative_logits)
-    assert torch.equal(factual_logits, policy.qnet.value_logits(state))
-    for q in policy.qnet.qnets:
-        assert torch.count_nonzero(q.advantage_net[-1].weight) == 0
-        assert torch.count_nonzero(q.advantage_net[-1].bias) == 0
-
-
-def test_causal_hold_td_forward_is_exact_and_routes_source_gradients():
-    policy = _causal_hold_q_policy()
-    batch = _causal_hold_q_batch()
-
-    ordinary = policy._q_forward(
-        policy.qnet,
-        batch["critic_observations"],
-        batch["actions"],
-        batch[Q_ACTUATOR_CONTEXT_KEY],
-    )
-    routed = policy._q_td_logits(batch)
-    assert torch.equal(routed, ordinary)
-
-    teacher = batch[DAGGER_Q_TEACHER_SOURCE_KEY]
-    teacher_loss = -F.log_softmax(routed[:, teacher], dim=-1)[..., 17].mean()
-    teacher_loss.backward()
-    for q in policy.qnet.qnets:
-        assert any(
-            parameter.grad is not None and torch.count_nonzero(parameter.grad)
-            for parameter in q.value_net.parameters()
-        )
-        assert all(
-            parameter.grad is None or torch.count_nonzero(parameter.grad) == 0
-            for module in (
-                q.advantage_obs_net,
-                q.advantage_action_net,
-                q.advantage_net,
-            )
-            for parameter in module.parameters()
-        )
-
-    policy.qnet.zero_grad(set_to_none=True)
-    routed = policy._q_td_logits(batch)
-    student_loss = -F.log_softmax(routed[:, ~teacher], dim=-1)[..., 17].mean()
-    student_loss.backward()
-    for q in policy.qnet.qnets:
-        assert any(
-            parameter.grad is not None and torch.count_nonzero(parameter.grad)
-            for parameter in q.value_net.parameters()
-        )
-        assert any(
-            parameter.grad is not None and torch.count_nonzero(parameter.grad)
-            for module in (
-                q.advantage_obs_net,
-                q.advantage_action_net,
-                q.advantage_net,
-            )
-            for parameter in module.parameters()
-        )
-
-
-def test_causal_student_td_advantage_gradient_is_teacher_fraction_invariant():
-    seed_policy = _causal_hold_q_policy()
-    source = _causal_hold_q_batch()
-
-    def advantage_gradient(indices, teacher_source):
-        policy = _causal_hold_q_policy()
-        policy.qnet.load_state_dict(seed_policy.qnet.state_dict(), strict=True)
-        batch = {
-            "critic_observations": source["critic_observations"].index_select(
-                0, indices
-            ),
-            "actions": source["actions"].index_select(0, indices),
-            Q_ACTUATOR_CONTEXT_KEY: source[Q_ACTUATOR_CONTEXT_KEY].index_select(
-                0, indices
-            ),
-            DAGGER_Q_TEACHER_SOURCE_KEY: teacher_source,
-        }
-        logits = policy._q_td_logits(batch)
-        loss = -F.log_softmax(logits, dim=-1)[..., 17].mean()
-        loss.backward()
-        gradients = []
-        for q in policy.qnet.qnets:
-            for module in (
-                q.advantage_obs_net,
-                q.advantage_action_net,
-                q.advantage_net,
-            ):
-                gradients.extend(
-                    parameter.grad.reshape(-1)
-                    for parameter in module.parameters()
-                )
-        return torch.cat(gradients)
-
-    half_teacher = advantage_gradient(
-        torch.tensor([0, 1]), torch.tensor([True, False])
-    )
-    three_quarters_teacher = advantage_gradient(
-        torch.tensor([0, 1, 0, 0]),
-        torch.tensor([True, False, True, True]),
-    )
-    assert torch.allclose(
-        half_teacher, three_quarters_teacher, atol=2e-6, rtol=2e-5
-    )
-
-
-def test_causal_expert_ranking_is_safe_for_nan_labels_and_trains_only_advantage():
-    policy = _causal_hold_q_policy()
-    batch = _causal_hold_q_batch()
-    for q in policy.qnet.qnets:
-        nn.init.zeros_(q.advantage_net[-1].weight)
-        nn.init.zeros_(q.advantage_net[-1].bias)
-
-    loss, metrics = policy._causal_expert_advantage_ranking(batch)
-    assert loss.item() > 0.0
-    assert metrics["causal_rank_eligible_fraction"].item() == pytest.approx(0.25)
-    assert metrics["causal_rank_violation_fraction"].item() == pytest.approx(1.0)
-    assert metrics["causal_action_margin"].item() > 0.0
-    assert metrics["causal_hold_anchor_error"].item() == 0.0
-    loss.backward()
-
-    for q in policy.qnet.qnets:
-        assert all(parameter.grad is None for parameter in q.value_net.parameters())
-        assert any(
-            parameter.grad is not None and torch.count_nonzero(parameter.grad)
-            for module in (
-                q.advantage_obs_net,
-                q.advantage_action_net,
-                q.advantage_net,
-            )
-            for parameter in module.parameters()
-        )
-
-    policy.qnet.zero_grad(set_to_none=True)
-    equal_batch = _causal_hold_q_batch()
-    equal_batch[DAGGER_REPLAY_TEACHER_ACTIONS] = equal_batch["actions"].clone()
-    equal_batch[DAGGER_TEACHER_ACTION_VALID_KEY].fill_(True)
-    equal_batch[DAGGER_IS_STUDENT_ACTION_KEY].fill_(True)
-    equal_batch[DAGGER_Q_TEACHER_SOURCE_KEY].fill_(False)
-    equal_loss, equal_metrics = policy._causal_expert_advantage_ranking(
-        equal_batch
-    )
-    assert equal_loss.item() == 0.0
-    assert equal_metrics["causal_action_margin"].item() == 0.0
-
-
-def test_causal_critic_update_combines_bellman_and_expert_identification():
-    policy = _causal_hold_q_policy()
-    for q in policy.qnet.qnets:
-        nn.init.zeros_(q.advantage_net[-1].weight)
-        nn.init.zeros_(q.advantage_net[-1].bias)
-    policy.cfg.q_max_grad_norm = 10.0
-    policy.critic_optimizer = torch.optim.Adam(policy.qnet.parameters(), lr=1e-3)
-    policy.critic_update_count = 0
-    batch = _causal_hold_q_batch()
-    target = torch.full((4, 51), 1.0 / 51.0)
-    policy._distributional_td3_target = MethodType(
-        lambda self, unused_batch: (target, {}), policy
-    )
-    before = {
-        name: parameter.detach().clone()
-        for name, parameter in policy.qnet.named_parameters()
-    }
-
-    metrics = policy._critic_update(batch)
-
-    assert policy.critic_update_count == 1
-    assert metrics["critic_loss"].item() > metrics["critic_loss_1"].item()
-    assert metrics["causal_rank_loss"].item() > 0.0
-    assert metrics["causal_rank_eligible_fraction"].item() == pytest.approx(0.25)
-    assert any(
-        not torch.equal(before[name], parameter)
-        for name, parameter in policy.qnet.named_parameters()
-    )
 
 
 def _joint_position_impulse_interval_means(
@@ -523,67 +252,6 @@ def test_dagger_q_actuator_context_encoding_and_action_branch_detach_are_exact()
     with pytest.raises(ValueError, match="conditioning is disabled"):
         disabled._append_q_actuator_context(unchanged, torch.zeros(2, 6))
 
-
-def test_causal_hold_context_captures_pre_shift_command_and_advances_exactly():
-    policy = _bare_policy(
-        q_condition_on_actuator_state=True,
-        q_use_predicted_effect=False,
-        q_use_causal_hold_advantage=True,
-        q_use_residual_film=False,
-        q_action_input_gain=1.0,
-        action_support_clip=20.0,
-    )
-    policy.action_dim = 2
-    policy._fastsac_action_low = torch.full((2,), -20.0)
-    policy._fastsac_action_high = torch.full((2,), 20.0)
-    manager = SimpleNamespace(
-        min_delay=2,
-        max_delay=3,
-        alpha_range=(0.8, 1.0),
-        delay=torch.tensor([[2], [3]]),
-        alpha=torch.tensor([[0.8], [1.0]]),
-        action_buf=torch.tensor(
-            [
-                [[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]],
-                [[-0.3, 0.0, 0.0], [0.4, 0.0, 0.0]],
-            ]
-        ),
-    )
-    policy.env = SimpleNamespace(action_manager=manager, decimation=4)
-    policy._q_actuator_context_metadata_value = (
-        policy._resolve_q_actuator_context_metadata()
-    )
-    policy._q_actuator_context_dim = int(
-        policy._q_actuator_context_metadata_value["dimension"]
-    )
-    policy._q_actuator_parameter_context_dim = 3
-
-    captured = policy.capture_q_actuator_context()
-    assert torch.equal(captured[:, -2:], manager.action_buf[:, :, 0])
-    manager.action_buf[:, :, 0].fill_(9.0)
-    assert torch.equal(
-        captured[:, -2:], torch.tensor([[0.1, 0.2], [-0.3, 0.4]])
-    )
-
-    issued = torch.tensor([[0.7, -0.6], [-0.5, 0.8]])
-    successor = policy._next_q_actuator_context(captured, issued)
-    assert torch.equal(successor[:, :3], captured[:, :3])
-    assert torch.equal(successor[:, -2:], issued)
-    assert torch.equal(
-        captured[:, -2:], torch.tensor([[0.1, 0.2], [-0.3, 0.4]])
-    )
-
-
-def test_causal_q_replay_schema_keeps_same_state_expert_supervision():
-    policy = _causal_hold_q_policy()
-    policy._has_canonical_replay_mix = lambda: False
-    policy._teacher_episode_cache_enabled = lambda: False
-    fields = policy._q_replay_storage_fields()
-    assert Q_ACTUATOR_CONTEXT_KEY in fields
-    assert NEXT_Q_ACTUATOR_CONTEXT_KEY in fields
-    assert DAGGER_REPLAY_TEACHER_ACTIONS in fields
-    assert DAGGER_TEACHER_ACTION_VALID_KEY in fields
-    assert DAGGER_IS_STUDENT_ACTION_KEY in fields
 
 def test_dagger_predicted_effect_context_metadata_and_capture_are_exact():
     policy = _bare_policy(
@@ -1413,27 +1081,6 @@ def test_raw_perception_replay_public_field_contract_has_no_priv_pred_latent():
     )
 
 
-def test_frozen_teacher_keeps_source_std_while_student_uses_finetune_reset():
-    policy = _bare_policy()
-    policy.actor = Actor(2, init_noise_scale=1.0, load_noise_scale=0.1)
-    policy.actor_adapt = Actor(2, init_noise_scale=1.0, load_noise_scale=0.1)
-    policy.actor(torch.zeros(1, 3))
-    policy.actor_adapt(torch.zeros(1, 3))
-    teacher_source = copy.deepcopy(policy.actor.state_dict())
-    student_source = copy.deepcopy(policy.actor_adapt.state_dict())
-    teacher_source["actor_std"] = torch.tensor([0.17, 0.29])
-    student_source["actor_std"] = torch.tensor([0.17, 0.29])
-
-    policy._preserve_frozen_teacher_std_on_source_load()
-    policy.actor.load_state_dict(teacher_source, strict=True)
-    policy.actor_adapt.load_state_dict(student_source, strict=True)
-
-    assert policy.actor.load_noise_scale is None
-    assert torch.equal(policy.actor.actor_std, torch.tensor([0.17, 0.29]))
-    assert policy.actor_adapt.load_noise_scale == pytest.approx(0.1)
-    assert torch.equal(policy.actor_adapt.actor_std, torch.tensor([0.1, 0.1]))
-
-
 def test_teacher_prefill_and_shared_teacher_mix_defaults_and_validation():
     cfg = DistributionalTD3TeacherBCConfig()
     assert cfg.teacher_prefill_max_rollouts == 1000
@@ -1476,66 +1123,11 @@ def test_teacher_replay_fraction_is_a_unit_interval(field, invalid):
         DistributionalTD3TeacherBC._validate_td3_config(cfg)
 
 
-def test_causal_q_rejects_teacher_only_q_replay():
-    cfg = DistributionalTD3TeacherBCConfig(
-        q_condition_on_actuator_state=True,
-        q_use_causal_hold_advantage=True,
-        q_teacher_replay_ratio=1.0,
-    )
-
-    with pytest.raises(ValueError, match="positive Student Q replay fraction"):
-        DistributionalTD3TeacherBC._validate_td3_config(cfg)
-
-
-def test_delay_aware_mdp_and_causal_hold_are_a_supported_combination():
-    cfg = DistributionalTD3TeacherBCConfig(
-        q_condition_on_actuator_state=True,
-        q_use_delay_aware_mdp=True,
-        q_use_causal_hold_advantage=True,
-    )
-
-    DistributionalTD3TeacherBC._validate_td3_config(cfg)
-
-
-@pytest.mark.parametrize(
-    ("delay_aware", "causal", "expected"),
-    (
-        (False, False, FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS),
-        (True, False, FASTSAC_Q_DELAY_AWARE_ARCHITECTURE_SEMANTICS),
-        (False, True, FASTSAC_Q_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS),
-        (
-            True,
-            True,
-            FASTSAC_Q_DELAY_AWARE_CAUSAL_HOLD_ARCHITECTURE_SEMANTICS,
-        ),
-    ),
-)
-def test_q_architecture_checkpoint_semantics_cover_all_flag_combinations(
-    delay_aware, causal, expected
-):
-    policy = _bare_policy(
-        q_use_delay_aware_mdp=delay_aware,
-        q_use_causal_hold_advantage=causal,
-    )
-
-    assert policy._q_architecture_semantics() == expected
-
-
 @pytest.mark.parametrize("invalid", (0.0, -1.0, float("nan"), True))
 def test_q_update_to_data_ratio_is_null_or_finite_positive(invalid):
     cfg = DistributionalTD3TeacherBCConfig(q_update_to_data_ratio=invalid)
 
     with pytest.raises(ValueError, match="q_update_to_data_ratio"):
-        DistributionalTD3TeacherBC._validate_td3_config(cfg)
-
-
-@pytest.mark.parametrize("invalid", (0.0, -1.0, float("nan"), True))
-def test_actor_update_to_data_ratio_is_null_or_finite_positive(invalid):
-    cfg = DistributionalTD3TeacherBCConfig(
-        actor_update_to_data_ratio=invalid
-    )
-
-    with pytest.raises(ValueError, match="actor_update_to_data_ratio"):
         DistributionalTD3TeacherBC._validate_td3_config(cfg)
 
 
@@ -1582,85 +1174,6 @@ def test_q_row_credit_preserves_fractional_residue_and_legacy_fallback():
     )
     assert legacy._q_updates_due(123) == 7
     assert not hasattr(legacy, "q_update_row_credit")
-
-
-def test_actor_row_credit_is_independent_of_q_batch_and_chunking():
-    def schedule(chunks, *, q_batch_size, q_ratio):
-        policy = _bare_policy(
-            dagger_batch_size=1024,
-            actor_update_to_data_ratio=1.0,
-            q_batch_size=q_batch_size,
-            q_updates_per_rollout=64,
-            q_update_to_data_ratio=q_ratio,
-        )
-        policy.actor_update_row_credit = 0.0
-        policy.q_update_row_credit = 0.0
-        actor_updates = sum(policy._actor_updates_due(rows) for rows in chunks)
-        q_updates = sum(policy._q_updates_due(rows) for rows in chunks)
-        return (
-            actor_updates,
-            policy.actor_update_row_credit,
-            q_updates,
-        )
-
-    chunks = [100, 4_000, 4_092, 7_680]
-    small_q = schedule(chunks, q_batch_size=1024, q_ratio=1.0)
-    large_q = schedule(chunks, q_batch_size=8192, q_ratio=2.0)
-
-    assert small_q[:2] == pytest.approx((15, 512.0))
-    assert large_q[:2] == pytest.approx(small_q[:2])
-    assert small_q[2] == 15
-    assert large_q[2] == 3
-
-
-def test_actor_row_credit_preserves_residue_and_legacy_fallback():
-    scheduled = _bare_policy(
-        dagger_batch_size=1024,
-        actor_update_to_data_ratio=1.0,
-    )
-    scheduled.actor_update_row_credit = 0.0
-    assert scheduled._actor_updates_due(100) == 0
-    assert scheduled.actor_update_row_credit == pytest.approx(100.0)
-    assert scheduled._actor_updates_due(924) == 1
-    assert scheduled.actor_update_row_credit == pytest.approx(0.0)
-
-    legacy = _bare_policy(
-        dagger_batch_size=1024,
-        actor_update_to_data_ratio=None,
-    )
-    assert legacy._actor_updates_due(123) is None
-    assert not hasattr(legacy, "actor_update_row_credit")
-
-
-@pytest.mark.parametrize(
-    ("critic_updates", "actor_updates", "expected"),
-    (
-        (0, 3, ()),
-        (4, 4, (1, 1, 1, 1)),
-        (8, 2, (0, 0, 0, 1, 0, 0, 0, 1)),
-        (3, 5, (1, 2, 2)),
-    ),
-)
-def test_independent_actor_updates_are_evenly_interleaved_after_q(
-    critic_updates, actor_updates, expected
-):
-    schedule = _interleaved_actor_update_counts(
-        critic_updates, actor_updates
-    )
-
-    assert schedule == expected
-    assert sum(schedule) == (0 if critic_updates == 0 else actor_updates)
-
-
-@pytest.mark.parametrize("invalid", (True, -1, 1.5, "1024"))
-def test_actor_row_credit_rejects_invalid_accepted_student_rows(invalid):
-    policy = _bare_policy(
-        dagger_batch_size=1024,
-        actor_update_to_data_ratio=1.0,
-    )
-
-    with pytest.raises(ValueError, match="accepted_student_rows"):
-        policy._actor_updates_due(invalid)
 
 
 @pytest.mark.parametrize("invalid", (True, -1, 1.5, "512"))
@@ -4203,16 +3716,15 @@ def test_teacher_prefill_boundary_warmup_touches_no_actor_or_critic_optimizer():
     )
 
 
-def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
+def test_frozen_actor_student_warmup_trains_mixed_critic_and_live_perception():
     policy = _bare_policy(
         teacher_prefill_max_rollouts=1,
         train_every=10,
         td3_learning_starts=2,
         q_updates_per_rollout=1,
         q_batch_size=4,
-        q_teacher_replay_ratio=0.25,
+        q_teacher_replay_ratio=0.5,
         dagger_batch_size=4,
-        actor_update_to_data_ratio=2.0,
         policy_delay=1,
         dagger_beta_start=0.0,
         dagger_beta_end=0.0,
@@ -4220,6 +3732,8 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
         teacher_actor_replay_fraction=0.0,
         failure_phase_teacher_fraction=0.0,
         failure_phase_num_bins=16,
+        perception_replay_mode=ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
+        teacher_perception_warmup_steps=1,
     )
     policy.teacher_prefill_rollout_count = 0
     policy.teacher_prefill_environment_steps = 0
@@ -4277,15 +3791,12 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
 
     critic_batches = []
     actor_batches = []
-    optimizer_events = []
-    actor_sampling_plans = []
     perception_updates = []
     policy._prepare_dagger_learning_batch = MethodType(
         lambda owner, batch: batch, policy
     )
 
     def critic_update(batch):
-        optimizer_events.append("critic")
         critic_batches.append(
             {key: value.detach().clone() for key, value in batch.items()}
         )
@@ -4293,7 +3804,6 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
         return {}
 
     def actor_and_targets(batch):
-        optimizer_events.append("actor")
         actor_batches.append(
             {key: value.detach().clone() for key, value in batch.items()}
         )
@@ -4301,25 +3811,7 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
         return {}
 
     policy._critic_update = critic_update
-    policy._actor_and_targets_update = actor_and_targets
-    original_sample_actor_batch = policy._sample_actor_batch
-
-    def sample_actor_batch(
-        owner,
-        indices=None,
-        teacher_indices=None,
-        teacher_focused=None,
-        student_focused=None,
-    ):
-        actor_sampling_plans.append((indices, teacher_indices))
-        return original_sample_actor_batch(
-            indices,
-            teacher_indices,
-            teacher_focused,
-            student_focused,
-        )
-
-    policy._sample_actor_batch = MethodType(sample_actor_batch, policy)
+    policy._maybe_delayed_actor_and_targets = actor_and_targets
     policy._mean_metric_dict = lambda metrics, keys: {key: 0.0 for key in keys}
     policy.train_adapt = lambda rollout: perception_updates.append(rollout) or {}
 
@@ -4385,13 +3877,15 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
     assert main_info["td3/teacher_replay_size"] == frozen_size
     assert main_info["td3/student_replay_rows"] == 2
     assert main_info["td3/critic_updates_this_rollout"] == 1
-    assert main_info["td3/actor_updates_this_rollout"] == 1
-    assert main_info["td3/q_sampled_teacher_rows_this_rollout"] == 1
-    assert main_info["td3/q_sampled_student_rows_this_rollout"] == 3
+    assert main_info["td3/actor_updates_this_rollout"] == 0
+    assert main_info["td3/q_sampled_teacher_rows_this_rollout"] == 2
+    assert main_info["td3/q_sampled_student_rows_this_rollout"] == 2
+    assert main_info["td3/student_actor_warmup_active"] == pytest.approx(1.0)
+    assert main_info["td3/student_actor_warmup_completed_rollouts"] == 1
+    assert main_info["td3/student_actor_warmup_target_rollouts"] == 1
+    assert main_info["td3/student_actor_warmup_complete"] == pytest.approx(1.0)
     assert len(critic_batches) == 1
-    assert len(actor_batches) == 1
-    assert optimizer_events == ["critic", "actor"]
-    assert actor_sampling_plans[0][0] is not None
+    assert len(actor_batches) == 0
     assert len(perception_updates) == 1
     perception_rollout = perception_updates[0]
     assert "_fastsac_raw" not in perception_rollout.keys()
@@ -4405,25 +3899,17 @@ def test_main_rollout_freezes_prefill_teacher_q_and_trains_from_both_replays():
     )
     assert torch.equal(perception_rollout["perception_sentinel"], perception_sentinel)
 
-    # The critic receives the configured 25/75 mix of immutable prefill Teacher
-    # actions and Student-executed main actions. The Actor batch comes entirely
-    # from main replay and therefore carries labels usable by exact BC.
+    # The Critic receives the configured 50/50 mix of immutable prefill Teacher
+    # actions and Student-executed main actions while Actor optimization is off.
     critic_batch = critic_batches[0]
     teacher_source = critic_batch[DAGGER_Q_TEACHER_SOURCE_KEY]
-    assert teacher_source.sum().item() == 1
-    assert (~teacher_source).sum().item() == 3
+    assert teacher_source.sum().item() == 2
+    assert (~teacher_source).sum().item() == 2
     assert set(critic_batch["actions"][teacher_source, 0].tolist()) <= {101.0, 103.0}
     assert set(critic_batch["actions"][~teacher_source, 0].tolist()) <= {
         1_001.0,
         1_003.0,
     }
-    assert set(actor_batches[0][DAGGER_REPLAY_TEACHER_ACTIONS][:, 0].tolist()) <= {
-        901.0,
-        902.0,
-        903.0,
-        904.0,
-    }
-    assert actor_batches[0][DAGGER_TEACHER_ACTION_VALID_KEY].all()
 
 
 def _sampling_policy(replay_type, seed: int, device):
@@ -4613,6 +4099,124 @@ def test_q_and_actor_batches_use_exact_shared_sources_and_student_only_main_rows
         actor["critic_observations"][~actor_teacher, 0] - 1_000.0
     ).long()
     assert student_mask.index_select(0, actor_student_rows).all()
+
+
+def _three_source_sampling_policy(seed: int = 853):
+    policy, _ = _curriculum_sampling_policy(seed)
+    policy.cfg.q_online_dagger_replay_fraction = 0.5
+    policy.cfg.actor_online_dagger_replay_fraction = 0.5
+    policy.cfg.dagger_env_fraction = 0.5
+    policy.student_replay = _TD3DeviceReplay(64, "cpu")
+    pure = _replay_rows(40, 3_000)
+    pure[DAGGER_IS_STUDENT_ACTION_KEY] = torch.ones(40, dtype=torch.bool)
+    pure[DAGGER_REPLAY_TEACHER_ACTIONS] = (
+        torch.arange(40, dtype=torch.float32)[:, None] + 4_000.0
+    )
+    pure[DAGGER_TEACHER_ACTION_VALID_KEY] = torch.ones(40, dtype=torch.bool)
+    pure[DAGGER_IS_DAGGER_ENV_KEY] = torch.zeros(40, dtype=torch.bool)
+    policy.student_replay.extend(pure)
+    return policy
+
+
+def test_three_source_routing_is_exclusive_and_preserves_actual_action_source():
+    policy = _bare_policy()
+    policy.dagger_replay = _TD3DeviceReplay(8, "cpu")
+    policy.student_replay = _TD3DeviceReplay(8, "cpu")
+    transitions = {
+        "actions": torch.arange(6, dtype=torch.float32)[:, None],
+        DAGGER_IS_DAGGER_ENV_KEY: torch.tensor(
+            [True, True, True, False, False, False]
+        ),
+        DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor(
+            [True, False, True, True, True, True]
+        ),
+        DAGGER_TEACHER_ACTION_VALID_KEY: torch.ones(6, dtype=torch.bool),
+        DAGGER_REPLAY_TEACHER_ACTIONS: torch.zeros(6, 1),
+    }
+
+    dagger_rows, student_rows = policy._extend_online_replays(transitions)
+
+    assert (dagger_rows, student_rows) == (3, 3)
+    assert policy.dagger_replay.data["actions"][:3, 0].tolist() == [0.0, 1.0, 2.0]
+    assert policy.student_replay.data["actions"][:3, 0].tolist() == [3.0, 4.0, 5.0]
+    assert policy.dagger_replay.data[DAGGER_IS_STUDENT_ACTION_KEY][:3].tolist() == [
+        True,
+        False,
+        True,
+    ]
+    assert policy.dagger_replay.data[DAGGER_IS_DAGGER_ENV_KEY][:3].all()
+    assert not policy.student_replay.data[DAGGER_IS_DAGGER_ENV_KEY][:3].any()
+
+
+def test_three_source_routing_rejects_teacher_action_in_pure_student_cohort():
+    policy = _bare_policy()
+    policy.dagger_replay = _TD3DeviceReplay(8, "cpu")
+    policy.student_replay = _TD3DeviceReplay(8, "cpu")
+    transitions = {
+        "actions": torch.zeros(2, 1),
+        DAGGER_IS_DAGGER_ENV_KEY: torch.tensor([True, False]),
+        DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor([True, False]),
+    }
+    with pytest.raises(RuntimeError, match="pure Student cohort"):
+        policy._extend_online_replays(transitions)
+
+
+def test_three_source_q_actor_sampling_is_exact_prefetch_equivalent_and_keeps_pure_bc():
+    direct = _three_source_sampling_policy(1117)
+    prefetched = _three_source_sampling_policy(1117)
+
+    expected_q = direct._sample_balanced_q_batch()
+    expected_actor = direct._sample_actor_batch()
+    plan = prefetched._prefetch_curriculum_sample_plans(1)[0]
+    actual_q = prefetched._sample_balanced_q_batch(plan)
+    actual_actor = prefetched._sample_actor_batch(
+        plan.actor_indices,
+        plan.actor_teacher_indices,
+        plan.actor_teacher_focused,
+        plan.actor_student_focused,
+        plan.actor_pure_student_indices,
+        plan.actor_pure_student_focused,
+    )
+
+    _assert_nested_equal(actual_q, expected_q)
+    _assert_nested_equal(actual_actor, expected_actor)
+    assert torch.equal(direct.q_rng.get_state(), prefetched.q_rng.get_state())
+    for batch in (actual_q, actual_actor):
+        expert = batch[REPLAY_SAMPLE_IS_TEACHER_KEY]
+        dagger = batch[REPLAY_SAMPLE_IS_DAGGER_ENV_KEY]
+        assert expert.sum().item() == 10
+        assert dagger.sum().item() == 5
+        assert (~expert & ~dagger).sum().item() == 5
+    pure_actor = (
+        ~actual_actor[REPLAY_SAMPLE_IS_TEACHER_KEY]
+        & ~actual_actor[REPLAY_SAMPLE_IS_DAGGER_ENV_KEY]
+    )
+    assert actual_actor[DAGGER_TEACHER_ACTION_VALID_KEY][pure_actor].all()
+
+
+def test_three_source_capacity_and_live_perception_keep_total_and_complete_sequences():
+    assert _split_count(131_072, 0.5) == (65_536, 65_536)
+    policy = _bare_policy()
+    policy.dagger_replay = _TD3DeviceReplay(4, "cpu")
+    policy.student_replay = _TD3DeviceReplay(4, "cpu")
+    values = torch.arange(12).reshape(4, 3)
+    rollout = TensorDict(
+        {
+            "marker": values,
+            DAGGER_IS_DAGGER_ENV_KEY: torch.tensor(
+                [
+                    [True, True, True],
+                    [False, False, False],
+                    [True, True, True],
+                    [False, False, False],
+                ]
+            ),
+        },
+        batch_size=(4, 3),
+    )
+    pure = policy._pure_student_perception_rollout(rollout)
+    assert pure.batch_size == torch.Size((2, 3))
+    assert torch.equal(pure["marker"], values[[1, 3]])
 
 
 @pytest.mark.parametrize(
@@ -6215,8 +5819,6 @@ def test_td3_checkpoint_seam_round_trips_all_owned_training_state():
     _take_optimizer_step(source.adapt_probe, source.opt_adapt)
     source.actor_update_count = 17
     source.critic_update_count = 39
-    source.q_update_row_credit = 123.0
-    source.actor_update_row_credit = 321.0
     source.dagger_rollout_count = 11
     source.dagger_environment_steps = 12_345
     source.teacher_prefill_rollout_count = 7
@@ -6256,8 +5858,6 @@ def test_td3_checkpoint_seam_round_trips_all_owned_training_state():
     _assert_nested_equal(source.opt_adapt.state_dict(), restored.opt_adapt.state_dict())
     assert restored.actor_update_count == 17
     assert restored.critic_update_count == 39
-    assert restored.q_update_row_credit == pytest.approx(123.0)
-    assert restored.actor_update_row_credit == pytest.approx(321.0)
     assert restored.dagger_rollout_count == 11
     assert restored.dagger_environment_steps == 12_345
     assert restored.teacher_prefill_rollout_count == 7

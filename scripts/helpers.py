@@ -102,11 +102,20 @@ class EpisodeStats:
         self._stats = TensorDict({key: torch.tensor([0.], device=device) for key in in_keys}, [1])
         self._episodes = torch.tensor(0, device=device)
 
-    def add(self, tensordict: TensorDictBase) -> TensorDictBase:
+    def add(
+        self,
+        tensordict: TensorDictBase,
+        env_mask: torch.Tensor | None = None,
+    ) -> TensorDictBase:
         next_tensordict = tensordict["next"]
-        done = next_tensordict["done"]
+        done = next_tensordict["done"].squeeze(-1)
+        if env_mask is not None:
+            done = done & _expand_env_mask(
+                env_mask,
+                done.shape,
+                device=done.device,
+            )
         if done.any():
-            done = done.squeeze(-1)
             next_tensordict = next_tensordict.select(*self.in_keys)
             self._stats = self._stats + next_tensordict[done].sum(dim=0)
             self._episodes += done.sum()
@@ -120,6 +129,84 @@ class EpisodeStats:
 
     def __len__(self):
         return self._episodes.item()
+
+
+def _expand_env_mask(
+    env_mask: torch.Tensor,
+    batch_shape,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return an environment mask broadcast over a rollout batch shape."""
+    mask = torch.as_tensor(env_mask, device=device).bool()
+    batch_shape = tuple(int(value) for value in batch_shape)
+    while mask.ndim > len(batch_shape) and mask.shape[-1] == 1:
+        mask = mask.squeeze(-1)
+    if mask.ndim == 1 and len(batch_shape) > 1:
+        mask = mask.reshape(mask.shape[0], *([1] * (len(batch_shape) - 1)))
+    try:
+        return torch.broadcast_to(mask, batch_shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"environment mask shape {tuple(mask.shape)} cannot broadcast to "
+            f"rollout batch shape {batch_shape}"
+        ) from exc
+
+
+def resolve_student_only_env_mask(
+    policy,
+    *,
+    num_envs: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Read the optional fixed Student-only cohort exposed by a policy.
+
+    Policies without the hook retain the historical all-environment logging
+    behavior.  Keeping mask ownership in the policy guarantees that action
+    routing, replay provenance, and reported task metrics use identical IDs.
+    """
+    getter = getattr(policy, "student_only_env_mask", None)
+    if not callable(getter):
+        return None
+    mask = getter(num_envs=int(num_envs), device=device)
+    if mask is None:
+        return None
+    mask = torch.as_tensor(mask, device=device)
+    if mask.dtype != torch.bool or mask.shape != (int(num_envs),):
+        raise ValueError(
+            "policy.student_only_env_mask() must return bool[num_envs]; "
+            f"got dtype={mask.dtype}, shape={tuple(mask.shape)}"
+        )
+    return mask.detach().clone()
+
+
+def validate_student_only_rollout_provenance(
+    tensordict: TensorDictBase,
+    student_only_env_mask: torch.Tensor | None,
+    *,
+    provenance_key: str = "is_dagger_env",
+) -> None:
+    """Fail if rollout provenance disagrees with the policy-owned cohort."""
+    if student_only_env_mask is None:
+        return
+    is_dagger_env = tensordict.get(provenance_key, None)
+    if is_dagger_env is None:
+        return
+    expected_student = _expand_env_mask(
+        student_only_env_mask,
+        tensordict.batch_size,
+        device=is_dagger_env.device,
+    )
+    actual_dagger = _expand_env_mask(
+        is_dagger_env,
+        tensordict.batch_size,
+        device=is_dagger_env.device,
+    )
+    if not torch.equal(~actual_dagger, expected_student):
+        raise RuntimeError(
+            "rollout is_dagger_env provenance disagrees with the policy's "
+            "Student-only metric cohort"
+        )
 
 
 def apply_teacher_replay_buffer_path_alias(cfg: DictConfig):
@@ -559,6 +646,33 @@ def _fill_replayless_inference_algo_defaults(
     filled_checkpoint = []
     filled_defaults = []
     with open_dict(cfg.algo):
+        fastsac_algorithms = {
+            "distributional_fastsac_teacher_bc_v1",
+            "distributional_tvkd_fastsac_teacher_bc_v1",
+            "distributional_tvkd_fastsac_teacher_bc_v2",
+            "distributional_tvkd_fastsac_teacher_bc_v3",
+            "distributional_tvkd_fastsac_teacher_bc_v4",
+            "distributional_tvkd_fastsac_teacher_bc_v5",
+            "distributional_tvkd_fastsac_teacher_bc_v6",
+            "distributional_tvkd_fastsac_teacher_bc_v7",
+            "distributional_tvkd_fastsac_teacher_bc_v8",
+            "distributional_tvkd_fastsac_teacher_bc_v9",
+        }
+        saved_q_critic_type = str(
+            policy_state.get(
+                "q_critic_type",
+                backend.get("q_critic_type", "c51"),
+            )
+        )
+        if saved_q_critic_type not in ("c51", "scalar"):
+            raise ValueError(
+                "inference checkpoint has invalid q_critic_type metadata"
+            )
+        if algorithm in fastsac_algorithms and (
+            cfg.algo.get("q_critic_type", "c51") != saved_q_critic_type
+        ):
+            cfg.algo.q_critic_type = saved_q_critic_type
+            filled_checkpoint.append("q_critic_type")
         q_context = q_backend.get(
             "q_actuator_context",
             {"enabled": backend.get("q_condition_on_actuator_state", False)},
@@ -580,7 +694,18 @@ def _fill_replayless_inference_algo_defaults(
                 "inference checkpoint has invalid Q predicted-effect metadata"
             )
         saved_q_context = bool(q_context["enabled"])
-        saved_predicted_effect = bool(predicted_effect["enabled"])
+        if saved_q_critic_type == "scalar":
+            saved_predicted_effect = predicted_effect.get(
+                "configured_context_collection",
+                backend.get("q_use_predicted_effect", False),
+            )
+            if not isinstance(saved_predicted_effect, bool):
+                raise ValueError(
+                    "scalar-Q inference checkpoint has invalid previous-action "
+                    "context metadata"
+                )
+        else:
+            saved_predicted_effect = bool(predicted_effect["enabled"])
         residual_film = q_backend.get(
             "q_residual_film",
             {
@@ -622,18 +747,7 @@ def _fill_replayless_inference_algo_defaults(
             if cfg.algo.get(name) != saved_value:
                 cfg.algo[name] = saved_value
                 filled_checkpoint.append(name)
-        if algorithm in {
-            "distributional_fastsac_teacher_bc_v1",
-            "distributional_tvkd_fastsac_teacher_bc_v1",
-            "distributional_tvkd_fastsac_teacher_bc_v2",
-            "distributional_tvkd_fastsac_teacher_bc_v3",
-            "distributional_tvkd_fastsac_teacher_bc_v4",
-            "distributional_tvkd_fastsac_teacher_bc_v5",
-            "distributional_tvkd_fastsac_teacher_bc_v6",
-            "distributional_tvkd_fastsac_teacher_bc_v7",
-            "distributional_tvkd_fastsac_teacher_bc_v8",
-            "distributional_tvkd_fastsac_teacher_bc_v9",
-        }:
+        if algorithm in fastsac_algorithms:
             # This field changes Actor parameter ownership and the distribution
             # class, so the checkpoint must select it before construction even
             # when the eval config already contains today's structured default.

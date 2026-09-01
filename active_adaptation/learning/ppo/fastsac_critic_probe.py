@@ -269,3 +269,85 @@ def summarize_distributional_critic_conditions(
             }
         report[name] = stratum
     return report
+
+
+def _scalar_condition_metrics(
+    values: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if values.ndim != 2 or values.shape[0] != 2:
+        raise ValueError("scalar critic values must have shape [2, rows]")
+    target = target.detach().float().reshape(-1)
+    if values.shape[1:] != target.shape:
+        raise ValueError("scalar critic target does not match values")
+    q = values.float()
+    error = q - target.unsqueeze(0)
+    return {
+        "q_per_head": q,
+        "target_q": target,
+        "error_per_head": error,
+        "squared_error_per_head": error.square(),
+    }
+
+
+def summarize_scalar_critic_conditions(
+    *,
+    correct_values: torch.Tensor,
+    shuffled_action_values: torch.Tensor,
+    shuffled_state_values: torch.Tensor,
+    target: torch.Tensor,
+    masks: Mapping[str, torch.Tensor],
+) -> dict[str, Any]:
+    """Summarize scalar Bellman fit and paired decoy degradation."""
+    conditions = {
+        "correct": _scalar_condition_metrics(correct_values, target),
+        "shuffled_action": _scalar_condition_metrics(
+            shuffled_action_values, target
+        ),
+        "shuffled_state": _scalar_condition_metrics(
+            shuffled_state_values, target
+        ),
+    }
+    report: dict[str, Any] = {}
+    row_count = int(target.numel())
+    for name, raw_mask in masks.items():
+        mask = torch.as_tensor(raw_mask, device=target.device).reshape(-1).bool()
+        if mask.shape != (row_count,):
+            raise ValueError(f"critic stratum {name!r} has the wrong shape")
+        if not bool(mask.any()):
+            continue
+        stratum: dict[str, Any] = {"rows": int(mask.sum().item())}
+        for condition_name, values in conditions.items():
+            squared_error = values["squared_error_per_head"][:, mask]
+            error = values["error_per_head"][:, mask]
+            q = values["q_per_head"][:, mask]
+            target_q = values["target_q"][mask]
+            stratum[condition_name] = {
+                "mse_head1": _finite_float(squared_error[0].mean()),
+                "mse_head2": _finite_float(squared_error[1].mean()),
+                "mse_twin_mean": _finite_float(squared_error.mean()),
+                "expected_q_head1_mean": _finite_float(q[0].mean()),
+                "expected_q_head2_mean": _finite_float(q[1].mean()),
+                "expected_target_mean": _finite_float(target_q.mean()),
+                "td_bias_head1": _finite_float(error[0].mean()),
+                "td_bias_head2": _finite_float(error[1].mean()),
+                "td_mae_twin_mean": _finite_float(error.abs().mean()),
+                "td_rmse_twin_mean": _finite_float(
+                    squared_error.mean().sqrt()
+                ),
+                "expected_q_target_pearson_head1": _pearson(q[0], target_q),
+                "expected_q_target_pearson_head2": _pearson(q[1], target_q),
+            }
+        correct_error = conditions["correct"]["squared_error_per_head"][:, mask]
+        for decoy_name in ("shuffled_action", "shuffled_state"):
+            decoy_error = conditions[decoy_name][
+                "squared_error_per_head"
+            ][:, mask]
+            delta = decoy_error - correct_error
+            stratum[f"{decoy_name}_minus_correct"] = {
+                "mse_delta_twin_mean": _finite_float(delta.mean()),
+                "mse_delta_twin_median": _finite_float(delta.median()),
+                "positive_fraction": _finite_float((delta > 0.0).float().mean()),
+            }
+        report[name] = stratum
+    return report

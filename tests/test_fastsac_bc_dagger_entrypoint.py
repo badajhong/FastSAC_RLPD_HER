@@ -37,14 +37,16 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "dagger_beta_decay_rollouts": 1800,
                 "dagger_beta_zero_iteration": None,
                 "dagger_seed": 0,
+                "dagger_env_fraction": 0.5,
                 "dagger_bc_lr": 3.0e-4,
                 "dagger_actor_huber_delta": 1.0,
-                "dagger_buffer_capacity": 131_072,
+                "dagger_buffer_capacity": 65_536,
+                "student_buffer_capacity": 65_536,
                 "dagger_buffer_device": "cpu",
                 "dagger_batch_size": 4096,
-                "actor_update_to_data_ratio": 1.0,
                 "teacher_prefill_max_rollouts": 10,
                 "teacher_actor_replay_fraction": 0.5,
+                "actor_online_dagger_replay_fraction": 0.5,
                 "teacher_perception_replay_fraction": 0.0,
                 "failure_phase_teacher_fraction": 0.3,
                 "failure_phase_lookback_steps": 50,
@@ -81,7 +83,10 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "q_updates_per_rollout": 32,
                 "q_update_to_data_ratio": 1.0,
                 "q_teacher_replay_ratio": 0.5,
+                "q_online_dagger_replay_fraction": 0.5,
                 "q_teacher_buffer_capacity": 131_072,
+                "q_n_step": 1,
+                "q_teacher_n_step": 1,
                 "eta_td3": 0.0,
                 "policy_delay": 8,
                 "target_policy_noise_std": 0.0,
@@ -154,6 +159,112 @@ def _write_fresh_ppo_checkpoint(path: Path) -> Path:
     return path
 
 
+def test_scalar_q_critic_type_is_an_opt_in_valid_configuration():
+    cfg = _cfg()
+    cfg.algo.q_critic_type = "scalar"
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_unknown_q_critic_type_is_rejected():
+    cfg = _cfg()
+    cfg.algo.q_critic_type = "quantile"
+
+    with pytest.raises(ValueError, match="q_critic_type"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize("field", ["q_n_step", "q_teacher_n_step"])
+def test_fastsac_entrypoint_rejects_non_one_q_horizon(field):
+    cfg = _cfg()
+    cfg.algo[field] = 2
+
+    with pytest.raises(ValueError, match=rf"algo.{field} is locked to 1"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dagger_env_fraction", 0.0),
+        ("dagger_env_fraction", 1.0),
+        ("q_online_dagger_replay_fraction", -0.1),
+        ("q_online_dagger_replay_fraction", 1.1),
+        ("actor_online_dagger_replay_fraction", float("nan")),
+    ],
+)
+def test_fastsac_entrypoint_rejects_invalid_three_source_fraction(field, value):
+    cfg = _cfg()
+    cfg.algo[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_fastsac_entrypoint_requires_both_main_rollout_cohorts():
+    cfg = _cfg()
+    cfg.task.num_envs = 1
+
+    with pytest.raises(ValueError, match="one DAgger and one pure-Student"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "field", ("dagger_buffer_capacity", "student_buffer_capacity")
+)
+def test_fastsac_entrypoint_requires_positive_online_ring_capacities(field):
+    cfg = _cfg()
+    cfg.algo[field] = 0
+
+    with pytest.raises(ValueError, match=field):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("field", "dagger_fraction"),
+    (
+        ("dagger_buffer_capacity", 0.5),
+        ("student_buffer_capacity", 0.5),
+        ("dagger_buffer_capacity", 0.25),
+        ("student_buffer_capacity", 0.25),
+    ),
+)
+def test_fastsac_entrypoint_online_ring_capacity_covers_cohort_learning_start(
+    field, dagger_fraction
+):
+    cfg = _cfg()
+    cfg.algo.dagger_env_fraction = dagger_fraction
+    dagger_start = int(
+        math.floor(cfg.algo.sac_learning_starts * dagger_fraction + 0.5)
+    )
+    student_start = cfg.algo.sac_learning_starts - dagger_start
+    required = (
+        dagger_start if field == "dagger_buffer_capacity" else student_start
+    )
+    cfg.algo[field] = required - 1
+
+    with pytest.raises(ValueError, match=field):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_fastsac_entrypoint_does_not_require_unused_dagger_ring_to_cover_warmup():
+    cfg = _cfg()
+    cfg.algo.q_online_dagger_replay_fraction = 0.0
+    cfg.algo.actor_online_dagger_replay_fraction = 0.0
+    cfg.algo.dagger_buffer_capacity = 1
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_fastsac_entrypoint_does_not_require_unused_student_ring_to_cover_warmup():
+    cfg = _cfg()
+    cfg.algo.q_online_dagger_replay_fraction = 1.0
+    cfg.algo.actor_online_dagger_replay_fraction = 1.0
+    cfg.algo.student_buffer_capacity = 1
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
 def _write_perception_checkpoint(path: Path, *, omit: str | None = None) -> Path:
     policy = {name: {} for name in sac_entry.REQUIRED_PRETRAINED_PERCEPTION_MODULES}
     if omit is not None:
@@ -180,6 +291,15 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     assert cfg.algo.teacher_prefill_max_rollouts == 1000
     assert "teacher_prefill_rollouts" not in cfg.algo
     assert cfg.algo.teacher_actor_replay_fraction == pytest.approx(0.5)
+    assert cfg.algo.actor_online_dagger_replay_fraction == pytest.approx(0.5)
+    assert cfg.algo.q_online_dagger_replay_fraction == pytest.approx(0.5)
+    assert cfg.algo.dagger_env_fraction == pytest.approx(0.5)
+    assert cfg.algo.dagger_buffer_capacity == 65_536
+    assert cfg.algo.student_buffer_capacity == 65_536
+    assert (
+        cfg.algo.dagger_buffer_capacity + cfg.algo.student_buffer_capacity
+        == 131_072
+    )
     assert cfg.algo.teacher_perception_replay_fraction == pytest.approx(0.0)
     assert cfg.algo.perception_replay_mode == "online_student_rollout"
     assert cfg.algo.failure_phase_teacher_fraction == pytest.approx(0.3)
@@ -250,6 +370,7 @@ def test_entrypoint_accepts_ppo_physical_gaussian_with_autotune():
     cfg.algo.sac_action_distribution = "ppo_physical_gaussian"
     cfg.algo.sac_use_autotune = True
     cfg.algo.load_noise_scale = 0.5
+    cfg.algo.lambda_bc = 0.0
 
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
@@ -508,16 +629,11 @@ def test_teacher_perception_replay_fraction_is_locked_off(fraction):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
-def test_live_student_perception_mode_and_teacher_warmup_are_locked():
+def test_live_student_perception_mode_accepts_teacher_only_prefill_warmup():
     cfg = _cfg()
-    cfg.algo.perception_replay_mode = "four_way"
-    with pytest.raises(ValueError, match="online_student_rollout"):
-        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+    cfg.algo.teacher_perception_warmup_steps = 5000
 
-    cfg = _cfg()
-    cfg.algo.teacher_perception_warmup_steps = 1
-    with pytest.raises(ValueError, match="teacher_perception_warmup_steps=0"):
-        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
 @pytest.mark.parametrize(
@@ -639,6 +755,16 @@ def test_sac_and_bc_weights_cannot_both_be_zero():
     cfg.algo.lambda_bc = 0.0
     with pytest.raises(ValueError, match="cannot both be zero"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_privileged_oracle_actor_observations_pass_preflight_only_in_live_mode():
+    cfg = _cfg()
+    cfg.algo.sac_actor_observation_mode = "privileged_oracle"
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    cfg.algo.perception_replay_mode = "four_way"
+    with pytest.raises(ValueError, match="online_student_rollout"):
+        sac_entry._validate_sac_controls(cfg)
 
 
 def test_unreachable_entropy_target_fails_before_training():
@@ -777,8 +903,7 @@ def test_entrypoint_reuses_shared_training_engine(monkeypatch, capsys):
     assert sources == [cfg]
     assert received == [cfg]
     output = capsys.readouterr().out
-    assert "alpha_update_cadence=actor (on each actual Actor update)" in output
-    assert "actor_schedule=row ratio 1, batch 4096" in output
+    assert "alpha_update_cadence=actor (every 8 Critic updates)" in output
 
 
 @pytest.mark.parametrize(

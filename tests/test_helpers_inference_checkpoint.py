@@ -210,6 +210,49 @@ def test_predicted_effect_checkpoint_overrides_structured_q_inference_defaults()
     assert "q_use_predicted_effect" in filled["checkpoint"]
 
 
+def test_scalar_checkpoint_restores_type_and_previous_action_state_context():
+    cfg = OmegaConf.create(
+        {
+            "algo": {
+                "q_critic_type": "c51",
+                "q_condition_on_actuator_state": False,
+                "q_use_predicted_effect": False,
+            }
+        }
+    )
+    policy_state = {
+        "training_algorithm": "distributional_tvkd_fastsac_teacher_bc_v9",
+        "q_critic_type": "scalar",
+        "dagger_backend_config": {
+            "q_critic_type": "scalar",
+            "q_condition_on_actuator_state": True,
+            "q_use_predicted_effect": True,
+            "value_norm": False,
+        },
+        "q_backend_config": {
+            "q_actuator_context": {"enabled": True},
+            "q_predicted_effect": {
+                "enabled": False,
+                "configured_context_collection": True,
+                "previous_action_usage": (
+                    "normalized_detached_scalar_state_context"
+                ),
+                "candidate_effect_features": "disabled",
+            },
+        },
+    }
+
+    filled = helpers._fill_replayless_inference_algo_defaults(
+        cfg, policy_state, inference_only=True
+    )
+
+    assert cfg.algo.q_critic_type == "scalar"
+    assert cfg.algo.q_condition_on_actuator_state is True
+    assert cfg.algo.q_use_predicted_effect is True
+    assert "q_critic_type" in filled["checkpoint"]
+    assert "q_use_predicted_effect" in filled["checkpoint"]
+
+
 def test_physical_fastsac_inference_restores_sac_std_guard_contract():
     cfg = OmegaConf.create(
         {
