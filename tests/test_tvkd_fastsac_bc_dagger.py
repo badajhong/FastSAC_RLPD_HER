@@ -27,6 +27,7 @@ from active_adaptation.learning.ppo.fastsac_vel import (
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_IS_STUDENT_ACTION_KEY,
     DAGGER_Q_TEACHER_SOURCE_KEY,
+    DAGGER_REPLAY_MIN_STEP_COUNT,
     DAGGER_REPLAY_TEACHER_ACTIONS,
     DAGGER_TEACHER_ACTION_VALID_KEY,
 )
@@ -1554,6 +1555,69 @@ def test_rollout_bottleneck_residual_caches_unique_student_states_and_raw_reward
     # boundary helper deliberately self-bootstraps from the current value.
     assert teacher_value_calls[0].squeeze(-1).tolist() == [1, 2, 3, 20, 30, 40]
 
+    # Replay also contains Teacher-executed turns from the fixed DAgger cohort.
+    # Their Phi cache must be complete even though they remain ineligible for
+    # Student-only bottleneck residual detection.
+    teacher_value_calls.clear()
+    residual_with_full_cache = policy._student_teacher_td_residual_grid(
+        rollout,
+        student,
+        cache_rows=torch.ones_like(student),
+    )
+    assert torch.equal(residual_with_full_cache, residual)
+    assert torch.equal(
+        policy._rollout_teacher_v_current_grid,
+        torch.tensor([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]]),
+    )
+    assert torch.equal(
+        policy._rollout_teacher_v_next_grid,
+        torch.tensor([[2.0, 3.0, 0.0], [20.0, 30.0, 40.0]]),
+    )
+    assert policy._rollout_teacher_v_cache_valid_grid.all()
+    assert len(teacher_value_calls) == 1
+    assert teacher_value_calls[0].squeeze(-1).tolist() == [1, 2, 3, 10, 20, 30, 40]
+
+
+def test_shaping_without_bottleneck_skips_residual_and_caches_replayable_rows():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        use_tvkd_value_shaping=True,
+        use_teacher_value_bottleneck_replay=False,
+    )
+    policy._reset_bottleneck_statistics()
+    policy._reset_student_replay_episode_tracking()
+    policy._bottleneck_episode_histories = None
+    policy._failure_phase_histogram = torch.zeros(1, dtype=torch.float64)
+    policy._verified_failure_motion_phase_histogram = {}
+    policy._rollout_final_batch = {}
+    observed = {}
+
+    def cache_values(_rollout, student, *, cache_rows=None):
+        observed["student"] = student.clone()
+        observed["cache_rows"] = cache_rows.clone()
+        return torch.zeros_like(student, dtype=torch.float32)
+
+    policy._student_teacher_td_residual_grid = cache_values
+    rollout = TensorDict(
+        {
+            DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor(
+                [[[True], [False]], [[False], [True]]]
+            ),
+            "step_count": torch.tensor([[[5], [6]], [[9], [1]]]),
+        },
+        batch_size=[2, 2],
+    )
+
+    assert policy._update_failure_phase_histogram(rollout) == 0
+    assert not observed["student"].any()
+    assert torch.equal(
+        observed["cache_rows"],
+        rollout["step_count"].squeeze(-1) > DAGGER_REPLAY_MIN_STEP_COUNT,
+    )
+
 
 def _old_loop_teacher_residual_reference(
     rollout: TensorDict,
@@ -1891,7 +1955,9 @@ def test_failed_rollout_registers_detected_bottleneck_in_existing_phase_source(
     policy._rollout_final_batch = {}
     residual = torch.full((1, 40), 0.1)
     residual[:, 18:25] = -0.2
-    policy._student_teacher_td_residual_grid = lambda rollout, student: residual.clone()
+    policy._student_teacher_td_residual_grid = (
+        lambda rollout, student, *, cache_rows=None: residual.clone()
+    )
     policy._reference_phase = lambda rollout: rollout["reference_phase"]
     policy._record_teacher_phase_match_distances = lambda phases, motion_ids: None
 
@@ -2066,8 +2132,10 @@ def test_unsuccessful_timeout_does_not_enter_physical_failure_curriculum():
     policy._bottleneck_episode_histories = None
     policy._rollout_final_batch = {}
     policy._reference_phase = lambda rollout: rollout["reference_phase"]
-    policy._student_teacher_td_residual_grid = lambda rollout, student: torch.full(
-        tuple(rollout.batch_size), -1.0
+    policy._student_teacher_td_residual_grid = (
+        lambda rollout, student, *, cache_rows=None: torch.full(
+            tuple(rollout.batch_size), -1.0
+        )
     )
     processed = []
     policy._process_failed_student_episode = lambda *args, **kwargs: processed.append(
@@ -2210,6 +2278,8 @@ def test_shaping_without_bottleneck_attaches_nonzero_teacher_value_cache(monkeyp
     )
     policy._rollout_teacher_v_current_grid = current_grid
     policy._rollout_teacher_v_next_grid = next_grid
+    valid_grid = _DeviceMoveCounter(torch.ones(2, 2, dtype=torch.bool))
+    policy._rollout_teacher_v_cache_valid_grid = valid_grid
     chunks = (
         {
             "actions": torch.ones(1, 1),
@@ -2247,18 +2317,15 @@ def test_shaping_without_bottleneck_attaches_nonzero_teacher_value_cache(monkeyp
         torch.cat([chunk[REPLAY_TEACHER_V_NEXT_KEY] for chunk in annotated]),
         torch.tensor([23.0, 22.0]),
     )
-    assert torch.equal(
-        torch.cat([chunk[STUDENT_REPLAY_EPISODE_ID_KEY] for chunk in annotated]),
-        torch.tensor([-1, -1]),
-    )
-    assert torch.equal(
-        torch.cat([chunk[STUDENT_REPLAY_EPISODE_STEP_KEY] for chunk in annotated]),
-        torch.tensor([-1, -1]),
-    )
+    assert all(STUDENT_REPLAY_EPISODE_ID_KEY not in chunk for chunk in annotated)
+    assert all(STUDENT_REPLAY_EPISODE_STEP_KEY not in chunk for chunk in annotated)
+    assert all(FAILURE_PHASE_STUDENT_SOURCE_KEY not in chunk for chunk in annotated)
     assert len(current_grid.calls) == 1
     assert len(next_grid.calls) == 1
+    assert len(valid_grid.calls) == 1
     assert policy._rollout_teacher_v_current_grid is None
     assert policy._rollout_teacher_v_next_grid is None
+    assert policy._rollout_teacher_v_cache_valid_grid is None
 
 
 def test_tvkd_actor_is_exact_fixed_baseline_implementation_without_scheduler():

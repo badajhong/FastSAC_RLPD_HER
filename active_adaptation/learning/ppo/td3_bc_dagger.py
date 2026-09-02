@@ -9557,10 +9557,19 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise RuntimeError("Q UTD row credit escaped its batch range")
         return updates
 
-    def _pure_student_perception_rollout(self, rollout: TensorDict) -> TensorDict:
+    def _pure_student_perception_rollout(
+        self,
+        rollout: TensorDict,
+        *,
+        max_envs: int | None = None,
+    ) -> TensorDict:
         """Select complete fixed-cohort sequences for live perception training."""
+        if max_envs is not None:
+            if isinstance(max_envs, bool) or int(max_envs) < 1:
+                raise ValueError("max_envs must be a positive integer")
+            max_envs = int(max_envs)
         if not self._uses_separate_online_replays():
-            return rollout
+            return rollout if max_envs is None else rollout[:max_envs]
         if DAGGER_IS_DAGGER_ENV_KEY not in rollout.keys(True, True):
             raise KeyError(
                 "three-source live perception rollout is missing is_dagger_env"
@@ -9578,6 +9587,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         pure_indices = (~first[:, 0]).nonzero(as_tuple=False).squeeze(-1)
         if pure_indices.numel() < 1:
             raise RuntimeError("live perception requires a pure Student cohort")
+        if max_envs is not None:
+            pure_indices = pure_indices[:max_envs]
         return rollout[pure_indices]
 
     def _live_perception_rollout(self, rollout: TensorDict) -> TensorDict:
@@ -9689,9 +9700,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             and TERM_KEY in rollout.keys(True, True)
         ):
             failure_anchors_added = self._update_failure_phase_histogram(rollout)
-            self._capture_student_perception_drift_rollout(
-                self._pure_student_perception_rollout(rollout)
-            )
+            # The exact-staleness journal is diagnostic-only. Avoid selecting
+            # and materializing a complete pure-Student TensorDict when the
+            # probe is disabled, and select only its requested tiny cohort when
+            # it is enabled.
+            if self._student_perception_drift_probe_enabled():
+                self._capture_student_perception_drift_rollout(
+                    self._pure_student_perception_rollout(
+                        rollout,
+                        max_envs=int(self.cfg.perception_staleness_probe_num_envs),
+                    )
+                )
         transition_chunks = tuple(self._dagger_transition_chunks(rollout))
         appended = 0
         dagger_rows_appended = 0
@@ -9797,8 +9816,12 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     f"timeout_episodes={self._teacher_prefill_timeout_episodes}, "
                     f"pending_rows={self._teacher_prefill_pending_rows()}"
                 )
-            if self._teacher_prefill_complete and hasattr(
-                self.cfg, "failure_phase_num_bins"
+            if (
+                self._teacher_prefill_complete
+                and hasattr(self.cfg, "failure_phase_num_bins")
+                and bool(
+                    getattr(self.cfg, "use_teacher_value_bottleneck_replay", True)
+                )
             ):
                 self._build_teacher_phase_index()
             if self._teacher_prefill_complete:

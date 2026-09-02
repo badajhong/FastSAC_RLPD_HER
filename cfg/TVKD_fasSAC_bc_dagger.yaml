@@ -54,11 +54,11 @@ algo:
   perception_failure_teacher_fraction: 0.0
   perception_replay_mode: online_student_rollout
 
-  # Diagnostic only: journal two live envs and retain up to four complete
-  # Student episodes from their true reset
-  # and compare collection-time Actor inputs against a current-EMA full
-  # re-encode. These rows never enter any optimizer or replay sampler.
-  perception_staleness_probe_num_envs: 2
+  # Diagnostic only, opt-in: set num_envs > 0 to journal a few live Student
+  # episodes from their true reset and compare collection-time Actor inputs
+  # against a current-EMA full re-encode. These rows never enter any optimizer
+  # or replay sampler, so production training leaves the probe disabled.
+  perception_staleness_probe_num_envs: 0
   perception_staleness_probe_max_episodes: 4
   perception_staleness_probe_max_generation_age: 8
   perception_staleness_probe_interval: 2

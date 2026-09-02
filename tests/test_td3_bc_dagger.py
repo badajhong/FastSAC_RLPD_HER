@@ -4217,6 +4217,9 @@ def test_three_source_capacity_and_live_perception_keep_total_and_complete_seque
     pure = policy._pure_student_perception_rollout(rollout)
     assert pure.batch_size == torch.Size((2, 3))
     assert torch.equal(pure["marker"], values[[1, 3]])
+    limited = policy._pure_student_perception_rollout(rollout, max_envs=1)
+    assert limited.batch_size == torch.Size((1, 3))
+    assert torch.equal(limited["marker"], values[[1]])
 
     policy.cfg.perception_live_env_scope = "all"
     live = policy._live_perception_rollout(rollout)
