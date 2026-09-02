@@ -14,9 +14,12 @@ from tensordict import TensorDict
 
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     DistributionalFastSACTeacherBC,
+    Q_TWIN_REDUCTION_MEAN,
+    Q_TWIN_REDUCTION_MIN,
 )
 from active_adaptation.learning.ppo.common import Actor
 from active_adaptation.learning.ppo.fastsac_vel import (
+    FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
     _BCDaggerSACAdapter,
@@ -2600,7 +2603,14 @@ def test_disabled_tvkd_target_delegates_to_exact_baseline_path(monkeypatch):
     assert metrics["tvkd_shaped_reward_std"].item() == pytest.approx(2.0)
 
 
-def test_tvkd_scalar_target_preserves_residual_shaping_and_terminal_cut():
+@pytest.mark.parametrize(
+    ("q_twin_reduction", "expected_continuing_target"),
+    ((Q_TWIN_REDUCTION_MIN, 3.39), (Q_TWIN_REDUCTION_MEAN, 3.84)),
+)
+def test_tvkd_scalar_target_preserves_residual_shaping_and_terminal_cut(
+    q_twin_reduction,
+    expected_continuing_target,
+):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
@@ -2609,6 +2619,7 @@ def test_tvkd_scalar_target_preserves_residual_shaping_and_terminal_cut():
         gamma=0.9,
         q_n_step=1,
         q_critic_type="scalar",
+        q_twin_reduction=q_twin_reduction,
         use_tvkd_value_shaping=True,
         use_teacher_residual_critic=True,
         use_phase_faded_teacher_potential=False,
@@ -2652,21 +2663,36 @@ def test_tvkd_scalar_target_preserves_residual_shaping_and_terminal_cut():
     target, metrics, _ = policy._distributional_fastsac_target(batch)
 
     # Residual rewards are [1.5, 1.75]. On the continuing row the entropy
-    # contribution is +.09 and clipped next-Q contributes .9 * 2.
-    assert torch.allclose(target, torch.tensor([3.39, 1.75]))
+    # contribution is +.09; the configured twin reduction supplies Q'.
+    assert torch.allclose(
+        target, torch.tensor([expected_continuing_target, 1.75])
+    )
     assert metrics["tvkd_residual_reward_mean"].item() == pytest.approx(1.625)
     assert metrics["target_select_q2_fraction"].item() == pytest.approx(0.5)
     assert metrics["support_clip_fraction_mean"].item() == 0.0
     assert metrics["target_distribution_entropy"].item() == 0.0
 
 
-def test_tvkd_scalar_checkpoint_metadata_uses_balanced_split_stems():
+@pytest.mark.parametrize(
+    ("critic_type", "architecture_semantics"),
+    (
+        ("scalar", FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS),
+        (
+            "distributional",
+            FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS,
+        ),
+    ),
+)
+def test_tvkd_split_stem_checkpoint_metadata_uses_balanced_stems(
+    critic_type,
+    architecture_semantics,
+):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
     nn.Module.__init__(policy)
     policy.cfg = TVKDDistributionalFastSACTeacherBCConfig(
-        q_critic_type="scalar",
+        q_critic_type=critic_type,
         q_hidden_dim=768,
     )
     policy.action_dim = 23
@@ -2676,9 +2702,7 @@ def test_tvkd_scalar_checkpoint_metadata_uses_balanced_split_stems():
 
     metadata = policy._checkpoint_q_backend_metadata()
 
-    assert metadata["q_architecture_semantics"] == (
-        FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
-    )
+    assert metadata["q_architecture_semantics"] == architecture_semantics
     assert metadata["q_action_fusion"] == "balanced_split_stems"
     assert metadata["q_state_hidden_dim"] == 384
     assert metadata["q_action_hidden_dim"] == 384
@@ -2686,6 +2710,7 @@ def test_tvkd_scalar_checkpoint_metadata_uses_balanced_split_stems():
         FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS
     )
     assert metadata["q_n_step_semantics"] == tvkd_module.Q_N_STEP_SEMANTICS
+    assert metadata["q_twin_reduction"] == Q_TWIN_REDUCTION_MIN
     assert metadata["student_q_n_step"] == 1
     assert metadata["teacher_q_n_step"] == 1
     state = {"q_backend_config": metadata}
@@ -2701,6 +2726,26 @@ def test_tvkd_scalar_checkpoint_metadata_uses_balanced_split_stems():
         policy._validate_scalar_q_checkpoint_architecture(
             stale_state, context="TVKD unit test"
         )
+
+
+def test_tvkd_checkpoint_metadata_records_mean_q_twin_reduction():
+    policy = TVKDDistributionalFastSACTeacherBC.__new__(
+        TVKDDistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = TVKDDistributionalFastSACTeacherBCConfig(
+        q_critic_type="distributional",
+        q_twin_reduction=Q_TWIN_REDUCTION_MEAN,
+    )
+    policy.action_dim = 23
+    policy._q_state_input_dim = 2370
+    policy._q_action_input_dim = 23
+    policy._q_actuator_context_dim = 29
+
+    metadata = policy._checkpoint_q_backend_metadata()
+
+    assert metadata["q_twin_reduction"] == Q_TWIN_REDUCTION_MEAN
+    assert "soft_mean_twin_c51_target" in metadata["target_semantics"]
 
 
 @pytest.mark.parametrize("variant", ("baseline", "tvkd"))
@@ -2816,7 +2861,10 @@ def test_disabled_bottleneck_replay_never_calls_legacy_failure_phase_path(
     assert policy._verified_failure_motion_phase_histogram == {}
 
 
-def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
+@pytest.mark.parametrize("critic_type", ("c51", "distributional"))
+def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached(
+    critic_type,
+):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
@@ -2827,6 +2875,7 @@ def test_tvkd_c51_target_inserts_shaped_reward_once_and_stays_detached():
         tvkd_lambda=0.25,
         tvkd_potential_clip=None,
         gamma=1.0,
+        q_critic_type=critic_type,
     )
     first = torch.tensor([[0.05, 0.15, 0.80], [0.05, 0.15, 0.80], [0.05, 0.15, 0.80]])
     second = torch.tensor([[0.80, 0.15, 0.05], [0.80, 0.15, 0.05], [0.80, 0.15, 0.05]])
@@ -3036,7 +3085,12 @@ def test_teacher_residual_target_routes_next_actuator_context_to_q_action_branch
     )
 
 
-def test_tvkd_clipped_double_q_selects_head_before_c51_projection(monkeypatch):
+@pytest.mark.parametrize(
+    "q_twin_reduction", (Q_TWIN_REDUCTION_MIN, Q_TWIN_REDUCTION_MEAN)
+)
+def test_tvkd_q_reduction_uses_complete_projected_c51_distributions(
+    monkeypatch, q_twin_reduction,
+):
     policy = TVKDDistributionalFastSACTeacherBC.__new__(
         TVKDDistributionalFastSACTeacherBC
     )
@@ -3048,6 +3102,7 @@ def test_tvkd_clipped_double_q_selects_head_before_c51_projection(monkeypatch):
         tvkd_lambda=0.5,
         tvkd_potential_clip=None,
         gamma=1.0,
+        q_twin_reduction=q_twin_reduction,
     )
     # Q1 is lower before projection and must be selected.
     q1 = torch.tensor([[0.80, 0.15, 0.05]])
@@ -3085,8 +3140,25 @@ def test_tvkd_clipped_double_q_selects_head_before_c51_projection(monkeypatch):
     }
 
     projected, metrics, _ = policy._distributional_fastsac_target(batch)
-    assert torch.equal(projected, projected_q1)
-    assert metrics["target_select_q1_fraction"].item() == 1.0
+    expected = (
+        projected_q1
+        if q_twin_reduction == Q_TWIN_REDUCTION_MIN
+        else 0.5 * (projected_q1 + projected_q2)
+    )
+    expected_q1_fraction = (
+        1.0 if q_twin_reduction == Q_TWIN_REDUCTION_MIN else 0.5
+    )
+    assert torch.equal(projected, expected)
+    assert metrics["target_select_q1_fraction"].item() == expected_q1_fraction
+    assert metrics["target_q1_contribution_fraction"].item() == (
+        expected_q1_fraction
+    )
+    assert metrics["target_q2_contribution_fraction"].item() == (
+        1.0 - expected_q1_fraction
+    )
+    assert metrics["reduced_target_expected_mean"].item() == pytest.approx(
+        (expected * policy.qnet_target.support).sum(dim=-1).mean().item()
+    )
 
 
 def test_shaping_and_q_bootstrap_read_one_continuation_coefficient():
@@ -3331,6 +3403,23 @@ def test_tvkd_v8_actor_semantics_follow_selected_action_distribution():
         f"{tvkd_module.Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS}_with_"
         f"{tvkd_module.SPRED_P_BC_SEMANTICS}"
     )
+
+
+@pytest.mark.parametrize("q_critic_type", ("scalar", "distributional"))
+def test_tvkd_mean_q_reduction_has_distinct_actor_and_target_semantics(
+    q_critic_type,
+):
+    cfg = TVKDDistributionalFastSACTeacherBCConfig(
+        q_critic_type=q_critic_type,
+        q_twin_reduction=Q_TWIN_REDUCTION_MEAN,
+    )
+
+    assert "twin_mean" in tvkd_module._tvkd_actor_learning_semantics(cfg)
+    critic_semantics = tvkd_module._tvkd_critic_learning_semantics(cfg)
+    if q_critic_type == "scalar":
+        assert "soft_mean_twin_scalar_q_mse_target" in critic_semantics
+    else:
+        assert "soft_mean_twin_c51_target" in critic_semantics
 
 
 def test_tvkd_v4_training_resume_is_rejected_under_v5_sampler():
@@ -4050,6 +4139,53 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     assert legacy_capacity_result["path"] == str(legacy_capacity_path.resolve())
     assert legacy_capacity_runtime.algo.dagger_buffer_capacity == 65_536
     assert legacy_capacity_runtime.algo.student_buffer_capacity == 65_536
+
+    # The reduction field was added after TVKD v9 was already in use. Treat a
+    # v9 checkpoint with no field in either saved config or backend metadata as
+    # the historical clipped-double-Q rule (min), while rejecting an attempt to
+    # silently reinterpret that same checkpoint as mean reduction.
+    pre_reduction_path = checkpoint_path.with_name(
+        "checkpoint_v9_before_q_twin_reduction.pt"
+    )
+    pre_reduction_cfg = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    del pre_reduction_cfg.algo.q_twin_reduction
+    pre_reduction_policy = copy.deepcopy(policy_state)
+    pre_reduction_policy.pop("q_twin_reduction", None)
+    pre_reduction_policy["dagger_backend_config"].pop(
+        "q_twin_reduction", None
+    )
+    pre_reduction_policy["q_backend_config"].pop("q_twin_reduction", None)
+    torch.save(
+        {
+            "policy": pre_reduction_policy,
+            "vecnorm": {},
+            "cfg": pre_reduction_cfg,
+        },
+        pre_reduction_path,
+    )
+    pre_reduction_min_runtime = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    pre_reduction_min_runtime.fastsac_bc_dagger_checkpoint = str(
+        pre_reduction_path
+    )
+
+    pre_reduction_result = _prepare_tvkd_checkpoint(pre_reduction_min_runtime)
+
+    assert pre_reduction_result["path"] == str(pre_reduction_path.resolve())
+    assert pre_reduction_min_runtime.algo.q_twin_reduction == "min"
+
+    pre_reduction_mean_runtime = OmegaConf.create(
+        OmegaConf.to_container(saved_cfg, resolve=False)
+    )
+    pre_reduction_mean_runtime.algo.q_twin_reduction = "mean"
+    pre_reduction_mean_runtime.fastsac_bc_dagger_checkpoint = str(
+        pre_reduction_path
+    )
+    with pytest.raises(ValueError, match="algorithm config"):
+        _prepare_tvkd_checkpoint(pre_reduction_mean_runtime)
 
     v5_policy_state = {
         "training_algorithm": TVKD_V5_TRAINING_ALGORITHM,
@@ -6287,6 +6423,42 @@ def test_live_student_perception_rejects_teacher_controlled_rows():
 
     with pytest.raises(RuntimeError, match="Teacher-controlled"):
         policy.train_adapt(rollout)
+
+
+def test_live_all_env_perception_accepts_teacher_controlled_rows(monkeypatch):
+    policy = DistributionalFastSACTeacherBC.__new__(
+        DistributionalFastSACTeacherBC
+    )
+    nn.Module.__init__(policy)
+    policy.cfg = SimpleNamespace(
+        train_perception=True,
+        perception_replay_mode="online_student_rollout",
+        perception_live_env_scope="all",
+        num_minibatches=4,
+    )
+    rollout = TensorDict(
+        {
+            "is_init": torch.zeros(2, 2, 1, dtype=torch.bool),
+            DAGGER_IS_STUDENT_ACTION_KEY: torch.tensor(
+                [[[True], [False]], [[True], [True]]]
+            ),
+        },
+        batch_size=[2, 2],
+    )
+    seen = []
+    monkeypatch.setattr(
+        PPOVEL,
+        "train_adapt",
+        lambda owner, td: seen.append(td)
+        or {"adapt/priv_loss": 1.0, "adapt/object_loss": 2.0},
+    )
+
+    result = policy.train_adapt(rollout)
+
+    assert seen == [rollout]
+    assert result["adapt/perception_live_all_envs"] == 1.0
+    assert result["adapt/perception_live_rows"] == 4.0
+    assert result["adapt/online_student_fraction"] == pytest.approx(0.75)
 
 
 def _student_q_n_step_test_chunk(

@@ -9,8 +9,8 @@ prefill, DAgger source selection, timeout handling, and twin-C51 topology from
 * Teacher BC is applied only to the distribution's noise-free mean, optionally
   with a detached SPReD-P probability from the online twin Critic;
 * the soft Bellman target contains the next-policy entropy term;
-* both online critics learn from the complete target-C51 head with the lower
-  expected return; and
+* both online critics learn from either the complete lower-expected target or
+  an equal mixture of the two complete targets, as explicitly configured; and
 * there is a target critic but no target Actor or TD3 smoothing noise.
 
 Student replay keeps the exact carried-hidden Actor inputs seen at collection;
@@ -40,6 +40,7 @@ from tensordict import TensorDict
 
 from .common import ACTION_KEY, CMD_KEY, OBS_KEY, OBS_PRIV_KEY, Actor, hard_copy_
 from .fastsac_vel import (
+    FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
     FastSACTanhNormal,
@@ -78,7 +79,6 @@ from .td3_bc_dagger import (
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
     FAILURE_PHASE_TEACHER_SOURCE_KEY,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
-    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
     ONLINE_STUDENT_ACTOR_WARMUP_SEMANTICS,
     PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE,
     SAC_ACTOR_OBSERVATION_MODES,
@@ -99,6 +99,7 @@ from .td3_bc_dagger import (
     TD3_NOISE_FREE_STUDENT_ACTION_KEY,
     DistributionalTD3TeacherBC,
     DistributionalTD3TeacherBCConfig,
+    online_rollout_perception_semantics,
     _DeterministicTD3StudentEvalPolicy,
     _exact_teacher_bc_loss,
     _joint_normalized_action_discrepancy,
@@ -122,7 +123,19 @@ NORMALIZED_TANH_ACTION_DISTRIBUTION = "normalized_tanh"
 PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION = "ppo_physical_gaussian"
 C51_Q_CRITIC_TYPE = "c51"
 SCALAR_Q_CRITIC_TYPE = "scalar"
-Q_CRITIC_TYPES = frozenset((C51_Q_CRITIC_TYPE, SCALAR_Q_CRITIC_TYPE))
+DISTRIBUTIONAL_Q_CRITIC_TYPE = "distributional"
+Q_CRITIC_TYPES = frozenset(
+    (
+        C51_Q_CRITIC_TYPE,
+        SCALAR_Q_CRITIC_TYPE,
+        DISTRIBUTIONAL_Q_CRITIC_TYPE,
+    )
+)
+Q_TWIN_REDUCTION_MIN = "min"
+Q_TWIN_REDUCTION_MEAN = "mean"
+Q_TWIN_REDUCTIONS = frozenset(
+    (Q_TWIN_REDUCTION_MIN, Q_TWIN_REDUCTION_MEAN)
+)
 UNIFORM_PHYSICAL_STD_BOUND_MODE = "uniform_physical"
 Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE = "q_normalized"
 PHYSICAL_STD_BOUND_MODES = frozenset(
@@ -407,6 +420,46 @@ def _fastsac_q_critic_type(cfg) -> str:
     return str(getattr(cfg, "q_critic_type", C51_Q_CRITIC_TYPE))
 
 
+def _fastsac_q_twin_reduction(cfg) -> str:
+    """Return the Q1/Q2 reduction, defaulting historical configs to min."""
+    return str(getattr(cfg, "q_twin_reduction", Q_TWIN_REDUCTION_MIN))
+
+
+def _reduce_fastsac_twin_target(
+    target_heads: torch.Tensor,
+    selection_values: torch.Tensor,
+    reduction: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reduce complete twin targets and return each head's contribution.
+
+    ``min`` selects the complete target belonging to the lower scalar value on
+    each row. ``mean`` forms an equal mixture of the two complete targets. For
+    C51 this deliberately averages probability vectors, never logits or atoms.
+    """
+    if target_heads.ndim < 2 or target_heads.shape[0] != 2:
+        raise ValueError("FastSAC twin target must have two leading heads")
+    if selection_values.ndim != 2 or selection_values.shape[0] != 2:
+        raise ValueError("FastSAC twin selection values must have shape [2, batch]")
+    if target_heads.shape[1] != selection_values.shape[1]:
+        raise ValueError("FastSAC twin target and selection batch sizes differ")
+    if reduction == Q_TWIN_REDUCTION_MEAN:
+        half = selection_values.new_tensor(0.5)
+        return target_heads.mean(dim=0), half, half
+    if reduction != Q_TWIN_REDUCTION_MIN:
+        raise ValueError(f"unsupported Q twin reduction {reduction!r}")
+    selected_head = selection_values.argmin(dim=0)
+    index_shape = (1, target_heads.shape[1]) + (1,) * (
+        target_heads.ndim - 2
+    )
+    index = selected_head.view(index_shape).expand(1, *target_heads.shape[1:])
+    selected_target = target_heads.gather(0, index).squeeze(0)
+    return (
+        selected_target,
+        (selected_head == 0).to(selection_values).mean(),
+        (selected_head == 1).to(selection_values).mean(),
+    )
+
+
 def _fastsac_actor_backend(cfg) -> str:
     if _fastsac_action_distribution(cfg) == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
         return PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
@@ -636,13 +689,19 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # the online twin Critic.  The legacy option name is retained so existing
     # Hydra commands do not need another migration.
     use_q_filtered_bc: bool = False
-    # Opt-in standard scalar Bellman critic. The default preserves C51. Scalar
-    # uses two independent balanced state/action-stem MLPs; C51 retains the
-    # engineered split action branch and categorical heads.
+    # The default ``c51`` uses the engineered action branch and categorical
+    # heads. ``scalar`` uses independent balanced state/action-stem MLPs with
+    # scalar Bellman outputs. ``distributional`` keeps those exact split-stem
+    # inputs and hidden layers but replaces only the final scalar with C51
+    # logits.
     q_critic_type: str = C51_Q_CRITIC_TYPE
-    # Give Q episode-constant delayed-actuator parameters. C51 consumes them
-    # in its engineered action branch; scalar consumes them as state context.
-    # Actor observations and environment execution remain unchanged.
+    # One reduction controls both the stochastic Actor objective and the
+    # bootstrap target. ``min`` is clipped double-Q; ``mean`` averages scalar
+    # heads or forms an equal mixture of complete C51 distributions.
+    q_twin_reduction: str = Q_TWIN_REDUCTION_MIN
+    # Give Q episode-constant delayed-actuator parameters. Engineered ``c51``
+    # consumes them in its action branch; both split-stem modes consume them as
+    # state context. Actor observations and execution remain unchanged.
     q_condition_on_actuator_state: bool = False
     # Add the exact queue/lerp counterfactual response of each candidate action.
     q_use_predicted_effect: bool = False
@@ -1387,7 +1446,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # though the inherited eta_td3 field is correctly locked to zero.
         critic_type = _fastsac_q_critic_type(cfg)
         if critic_type not in Q_CRITIC_TYPES:
-            raise ValueError("q_critic_type must be 'c51' or 'scalar'")
+            raise ValueError(
+                "q_critic_type must be 'c51', 'scalar', or 'distributional'"
+            )
+        q_twin_reduction = _fastsac_q_twin_reduction(cfg)
+        if q_twin_reduction not in Q_TWIN_REDUCTIONS:
+            raise ValueError("q_twin_reduction must be 'min' or 'mean'")
         base_cfg = copy.copy(cfg)
         base_cfg.eta_td3 = float(cfg.eta_sac)
         DistributionalTD3TeacherBC._validate_td3_config(base_cfg)
@@ -1728,6 +1792,14 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION
         )
 
+    def _uses_min_q_twin_reduction(self) -> bool:
+        return _fastsac_q_twin_reduction(self.cfg) == Q_TWIN_REDUCTION_MIN
+
+    def _reduce_twin_q_values(self, q_values: torch.Tensor) -> torch.Tensor:
+        return _reduce_actor_q_values(
+            q_values, self._uses_min_q_twin_reduction()
+        )
+
     def _actor_learning_semantics(self) -> str:
         if not self._uses_ppo_physical_gaussian():
             semantics = ACTOR_LEARNING_SEMANTICS
@@ -1738,9 +1810,24 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             semantics = Q_NORMALIZED_PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
         else:
             semantics = PPO_PHYSICAL_GAUSSIAN_ACTOR_LEARNING_SEMANTICS
+        if not self._uses_min_q_twin_reduction():
+            if "twin_min" not in semantics:
+                raise RuntimeError(
+                    "FastSAC Actor semantics lack the twin-min reduction marker"
+                )
+            semantics = semantics.replace("twin_min", "twin_mean", 1)
         if getattr(self.cfg, "use_q_filtered_bc", False):
             return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
         return semantics
+
+    def _critic_learning_semantics(self) -> str:
+        scalar = _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE
+        semantics = SCALAR_CRITIC_SEMANTICS if scalar else CRITIC_SEMANTICS
+        if self._uses_min_q_twin_reduction():
+            return semantics
+        if scalar:
+            return semantics.replace("clipped_twin", "mean_twin", 1)
+        return semantics.replace("lower_expected_complete", "mean_complete", 1)
 
     def _entropy_semantics(self) -> str:
         if self._uses_ppo_physical_gaussian():
@@ -2270,10 +2357,15 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 raise RuntimeError(
                     "FastSAC scalar target must have shape [2, batch]"
                 )
-            selected_head = target_logits.argmin(dim=0)
-            selected_next_q = target_logits.gather(
-                0, selected_head.unsqueeze(0)
-            ).squeeze(0)
+            (
+                selected_next_q,
+                q1_target_fraction,
+                q2_target_fraction,
+            ) = _reduce_fastsac_twin_target(
+                target_logits,
+                target_logits,
+                _fastsac_q_twin_reduction(self.cfg),
+            )
             scalar_target = soft_reward + (
                 effective_discount * bootstrap * selected_next_q
             )
@@ -2283,10 +2375,15 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 "target_expected_q1_mean": target_logits[0].mean(),
                 "target_expected_q2_mean": target_logits[1].mean(),
                 "projected_target_mean": scalar_target.mean(),
+                "reduced_target_expected_mean": scalar_target.mean(),
+                "target_q1_contribution_fraction": q1_target_fraction,
+                "target_q2_contribution_fraction": q2_target_fraction,
+                # Historical dashboard aliases. In mean mode these are equal
+                # contribution weights; no individual head is selected.
                 "selected_target_expected_mean": selected_next_q.mean(),
                 "target_distribution_entropy": zero,
-                "target_select_q1_fraction": (selected_head == 0).float().mean(),
-                "target_select_q2_fraction": (selected_head == 1).float().mean(),
+                "target_select_q1_fraction": q1_target_fraction,
+                "target_select_q2_fraction": q2_target_fraction,
                 "q1_left_support_clip_fraction": zero,
                 "q1_right_support_clip_fraction": zero,
                 "q2_left_support_clip_fraction": zero,
@@ -2348,23 +2445,22 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             q1_right_support_clip_fraction + q2_right_support_clip_fraction
         )
         projected_heads = torch.stack(projected_heads, dim=0)
-        projected_expected_heads = (projected_heads * self.qnet_target.support).sum(
-            dim=-1
+        # Min mode chooses one complete distribution using its pre-projection
+        # expectation. Mean mode instead forms an equal mixture of both
+        # complete projected distributions. Projection is linear in the source
+        # probabilities, so this equals projecting their pre-projection mix.
+        (
+            selected_target,
+            q1_target_fraction,
+            q2_target_fraction,
+        ) = _reduce_fastsac_twin_target(
+            projected_heads,
+            raw_expected_heads,
+            _fastsac_q_twin_reduction(self.cfg),
         )
-        # Clipped double-Q chooses the lower next-state distribution before the
-        # reward/discount C51 projection.  Projection is nonlinear at support
-        # boundaries, so selecting after projection can reverse the intended
-        # head exactly on the rows where clipping is most consequential.
-        selected_head = raw_expected_heads.argmin(dim=0)
-        selected_target = projected_heads.gather(
-            0,
-            selected_head[None, :, None].expand(
-                1, projected_heads.shape[1], projected_heads.shape[2]
-            ),
-        ).squeeze(0)
-        selected_expected = projected_expected_heads.gather(
-            0, selected_head.unsqueeze(0)
-        ).squeeze(0)
+        selected_expected = (
+            selected_target * self.qnet_target.support
+        ).sum(dim=-1)
         selected_entropy = -(
             selected_target
             * selected_target.clamp_min(torch.finfo(selected_target.dtype).tiny).log()
@@ -2374,10 +2470,15 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "target_expected_q1_mean": raw_expected_heads[0].mean(),
             "target_expected_q2_mean": raw_expected_heads[1].mean(),
             "projected_target_mean": selected_expected.mean(),
+            "reduced_target_expected_mean": selected_expected.mean(),
+            "target_q1_contribution_fraction": q1_target_fraction,
+            "target_q2_contribution_fraction": q2_target_fraction,
+            # Historical dashboard aliases. In mean mode these are equal
+            # contribution weights; no individual head is selected.
             "selected_target_expected_mean": selected_expected.mean(),
             "target_distribution_entropy": selected_entropy.mean(),
-            "target_select_q1_fraction": (selected_head == 0).float().mean(),
-            "target_select_q2_fraction": (selected_head == 1).float().mean(),
+            "target_select_q1_fraction": q1_target_fraction,
+            "target_select_q2_fraction": q2_target_fraction,
             "q1_left_support_clip_fraction": q1_left_support_clip_fraction,
             "q1_right_support_clip_fraction": q1_right_support_clip_fraction,
             "q2_left_support_clip_fraction": q2_left_support_clip_fraction,
@@ -2572,9 +2673,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 parameter.grad = None
             twin_outputs = self.qnet(q_state, q_action)
             twin_expected = self._q_output_values(self.qnet, twin_outputs)
-            minimum_expected = _reduce_actor_q_values(twin_expected, True)
+            reduced_expected = self._reduce_twin_q_values(twin_expected)
             sac_actor_loss = (
-                self.log_alpha.exp().detach() * normalized_log_prob - minimum_expected
+                self.log_alpha.exp().detach() * normalized_log_prob
+                - reduced_expected
             ).mean()
         finally:
             for parameter, requires_grad in zip(
@@ -2793,6 +2895,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             if teacher_source is None
             else teacher_source.float().mean()
         )
+        minimum_expected = twin_expected.min(dim=0).values
+        mean_expected = twin_expected.mean(dim=0)
         metrics = {
             # Compatibility names consumed by the inherited replay loop.
             "td3_actor_loss": sac_actor_loss.detach(),
@@ -2809,6 +2913,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_expected_q2_mean": twin_expected[1].detach().mean(),
             "actor_min_expected_q_mean": minimum_expected.detach().mean(),
             "actor_expected_q_min_mean": minimum_expected.detach().mean(),
+            "actor_mean_expected_q_mean": mean_expected.detach().mean(),
+            "actor_reduced_expected_q_mean": reduced_expected.detach().mean(),
             "actor_log_prob_mean": normalized_log_prob.detach().mean(),
             "actor_entropy": -normalized_log_prob.detach().mean(),
             "actor_sample_action_abs_mean": sampled_action.detach().abs().mean(),
@@ -2977,6 +3083,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         critic_keys = (
             "target_sample_action_abs_mean",
             "target_log_prob_mean",
+            "reduced_target_expected_mean",
+            "target_q1_contribution_fraction",
+            "target_q2_contribution_fraction",
             "entropy_tax_mean",
             "entropy_tax_abs_mean",
             "entropy_tax_reward_abs_ratio",
@@ -2995,6 +3104,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             "actor_expected_q1_mean",
             "actor_expected_q2_mean",
             "actor_min_expected_q_mean",
+            "actor_mean_expected_q_mean",
+            "actor_reduced_expected_q_mean",
             "actor_log_prob_mean",
             "actor_entropy",
             "actor_sample_action_abs_mean",
@@ -3113,6 +3224,12 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             info["fastsac/physical_entropy_bound_min"] = entropy_min
             info["fastsac/physical_entropy_bound_max"] = entropy_max
         info["fastsac/target_entropy"] = float(self.target_entropy)
+        info["fastsac/q_twin_reduction_min"] = float(
+            self._uses_min_q_twin_reduction()
+        )
+        info["fastsac/q_twin_reduction_mean"] = float(
+            not self._uses_min_q_twin_reduction()
+        )
         info["fastsac/privileged_oracle_actor_observation_mode"] = float(
             self._uses_privileged_oracle_actor_observations()
         )
@@ -3127,28 +3244,28 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         metadata = DistributionalTD3TeacherBC._q_backend_metadata(self)
         alpha_update_cadence = str(self.cfg.sac_alpha_update_cadence)
         critic_type = _fastsac_q_critic_type(self.cfg)
+        q_twin_reduction = _fastsac_q_twin_reduction(self.cfg)
         metadata.update(
             {
                 "q_critic_type": critic_type,
-                "target_semantics": (
-                    SCALAR_CRITIC_SEMANTICS
-                    if critic_type == SCALAR_Q_CRITIC_TYPE
-                    else CRITIC_SEMANTICS
-                ),
+                "q_twin_reduction": q_twin_reduction,
+                "target_semantics": self._critic_learning_semantics(),
                 "num_atoms": (
                     1
                     if critic_type == SCALAR_Q_CRITIC_TYPE
                     else int(self.cfg.q_num_atoms)
                 ),
                 "clipped_double_distribution": (
-                    critic_type == C51_Q_CRITIC_TYPE
+                    critic_type != SCALAR_Q_CRITIC_TYPE
+                    and q_twin_reduction == Q_TWIN_REDUCTION_MIN
                 ),
+                "clipped_double_q": q_twin_reduction == Q_TWIN_REDUCTION_MIN,
                 "critic_loss": (
                     "twin_scalar_bellman_mse"
                     if critic_type == SCALAR_Q_CRITIC_TYPE
                     else "twin_c51_cross_entropy"
                 ),
-                "categorical": critic_type == C51_Q_CRITIC_TYPE,
+                "categorical": critic_type != SCALAR_Q_CRITIC_TYPE,
                 "v_min": (
                     None
                     if critic_type == SCALAR_Q_CRITIC_TYPE
@@ -3159,7 +3276,16 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     if critic_type == SCALAR_Q_CRITIC_TYPE
                     else float(self.cfg.q_v_max)
                 ),
-                "actor_q_reduction": "minimum_online_twin_expectations",
+                "target_q_reduction": (
+                    "lower_complete_twin_target"
+                    if q_twin_reduction == Q_TWIN_REDUCTION_MIN
+                    else "mean_complete_twin_target"
+                ),
+                "actor_q_reduction": (
+                    "minimum_online_twin_expectations"
+                    if q_twin_reduction == Q_TWIN_REDUCTION_MIN
+                    else "mean_online_twin_expectations"
+                ),
                 "actor_mean_optimizer_semantics": ACTOR_MEAN_OPTIMIZER_SEMANTICS,
                 "actor_mean_weight_decay": _fastsac_actor_weight_decay(self.cfg),
                 "bc_weighting_semantics": (
@@ -3247,6 +3373,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "lambda_bc",
                     "use_q_filtered_bc",
                     "q_critic_type",
+                    "q_twin_reduction",
                     "teacher_prefill_use_ppo_noise",
                     "dagger_env_fraction",
                     "student_buffer_capacity",
@@ -3333,11 +3460,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 self, "actor_backend", _fastsac_actor_backend(self.cfg)
             ),
             "q_critic_type": _fastsac_q_critic_type(self.cfg),
-            "critic_learning_semantics": (
-                SCALAR_CRITIC_SEMANTICS
-                if _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE
-                else CRITIC_SEMANTICS
-            ),
+            "q_twin_reduction": _fastsac_q_twin_reduction(self.cfg),
+            "critic_learning_semantics": self._critic_learning_semantics(),
             "actor_learning_semantics": self._actor_learning_semantics(),
             "actor_mean_optimizer_semantics": ACTOR_MEAN_OPTIMIZER_SEMANTICS,
             "actor_mean_weight_decay": _fastsac_actor_weight_decay(self.cfg),
@@ -3413,28 +3537,39 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         *,
         context: str,
     ) -> None:
-        """Reject scalar checkpoints from an incompatible Q topology.
+        """Reject standard split-stem checkpoints from an incompatible topology.
 
         ``q_critic_type=scalar`` existed briefly with the C51 state/action
         trunk and later with an early-concat MLP. Their tensors and optimizer
         moments are not compatible with the balanced split-stem scalar critic,
-        so critic type alone is not a sufficient checkpoint contract.
+        so critic type alone is not a sufficient checkpoint contract. The
+        split-stem categorical variant has the same input/fusion contract but
+        a distinct final-layer architecture marker.
         """
-        if _fastsac_q_critic_type(self.cfg) != SCALAR_Q_CRITIC_TYPE:
+        critic_type = _fastsac_q_critic_type(self.cfg)
+        if critic_type not in (
+            SCALAR_Q_CRITIC_TYPE,
+            DISTRIBUTIONAL_Q_CRITIC_TYPE,
+        ):
             return
         backend = state.get("q_backend_config")
         if not isinstance(backend, Mapping):
             raise ValueError(
-                f"{context} scalar Q checkpoint lacks architecture metadata"
+                f"{context} split-stem Q checkpoint lacks architecture metadata"
             )
         architecture = backend.get("q_architecture_semantics")
-        if architecture != FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS:
+        expected_architecture = (
+            FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
+            if critic_type == SCALAR_Q_CRITIC_TYPE
+            else FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS
+        )
+        if architecture != expected_architecture:
             raise ValueError(
-                f"{context} scalar Q architecture is incompatible: expected "
-                f"{FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS!r}, got "
+                f"{context} split-stem Q architecture is incompatible: expected "
+                f"{expected_architecture!r}, got "
                 f"{architecture!r}. Legacy one-atom C51-shaped and early-concat "
                 "scalar critics cannot be resumed as the balanced split-stem "
-                "scalar critic."
+                "scalar-style critic."
             )
         state_hidden_dim = int(self.cfg.q_hidden_dim) // 2
         expected_dimensions = {
@@ -3447,11 +3582,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             saved = backend.get(name)
             if isinstance(saved, bool) or not isinstance(saved, int):
                 raise ValueError(
-                    f"{context} scalar Q checkpoint lacks integer {name}"
+                    f"{context} split-stem Q checkpoint lacks integer {name}"
                 )
             if int(saved) != expected:
                 raise ValueError(
-                    f"{context} scalar Q {name} mismatch: "
+                    f"{context} split-stem Q {name} mismatch: "
                     f"checkpoint={int(saved)}, runtime={expected}"
                 )
         expected_fusion = {
@@ -3464,9 +3599,47 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             saved = backend.get(name)
             if saved != expected:
                 raise ValueError(
-                    f"{context} scalar Q {name} mismatch: "
+                    f"{context} split-stem Q {name} mismatch: "
                     f"checkpoint={saved!r}, runtime={expected!r}"
                 )
+
+    def _validate_q_twin_reduction_checkpoint(
+        self,
+        state: Mapping,
+        *,
+        context: str,
+    ) -> None:
+        """Validate the learning-rule contract, defaulting legacy state to min."""
+        q_backend = state.get("q_backend_config")
+        if not isinstance(q_backend, Mapping):
+            q_backend = {}
+        dagger_backend = state.get("dagger_backend_config")
+        if not isinstance(dagger_backend, Mapping):
+            dagger_backend = {}
+        reductions = {
+            "top-level": state.get("q_twin_reduction"),
+            "Q backend": q_backend.get("q_twin_reduction"),
+            "DAgger backend": dagger_backend.get("q_twin_reduction"),
+        }
+        present_reductions = {
+            source: value
+            for source, value in reductions.items()
+            if value is not None
+        }
+        if any(
+            not isinstance(value, str) or value not in Q_TWIN_REDUCTIONS
+            for value in present_reductions.values()
+        ):
+            raise ValueError(f"{context} Q twin reduction is invalid")
+        if len(set(present_reductions.values())) > 1:
+            raise ValueError(
+                f"{context} Q twin reduction metadata is inconsistent"
+            )
+        saved_reduction = next(
+            iter(present_reductions.values()), Q_TWIN_REDUCTION_MIN
+        )
+        if saved_reduction != _fastsac_q_twin_reduction(self.cfg):
+            raise ValueError(f"{context} Q twin reduction mismatch")
 
     def _validate_student_action_checkpoint_contract(
         self, state: Mapping, *, context: str
@@ -3499,6 +3672,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             _fastsac_q_critic_type(self.cfg)
         ):
             raise ValueError("FastSAC checkpoint Q critic type mismatch")
+        self._validate_q_twin_reduction_checkpoint(
+            state, context="FastSAC resume"
+        )
         self._validate_scalar_q_checkpoint_architecture(
             state, context="FastSAC resume"
         )
@@ -3691,6 +3867,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             _fastsac_q_critic_type(self.cfg)
         ):
             raise ValueError("FastSAC inference checkpoint Q critic type mismatch")
+        self._validate_q_twin_reduction_checkpoint(
+            state_dict, context="FastSAC inference"
+        )
         self._validate_scalar_q_checkpoint_architecture(
             state_dict, context="FastSAC inference"
         )
@@ -3842,7 +4021,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     else "disabled"
                 ),
                 "perception_training_semantics": (
-                    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                    online_rollout_perception_semantics(self.cfg)
                     if str(self.cfg.perception_replay_mode)
                     == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
                     else PERCEPTION_REPLAY_SEMANTICS
@@ -3950,6 +4129,7 @@ __all__ = [
     "ACTOR_MEAN_OPTIMIZER_SEMANTICS",
     "CHECKPOINT_VERSION",
     "C51_Q_CRITIC_TYPE",
+    "DISTRIBUTIONAL_Q_CRITIC_TYPE",
     "FASTSAC_ACTION_PROJECTION_KEY",
     "FASTSAC_DAGGER_ENV_KEY",
     "FASTSAC_PREFILL_TEACHER_NOISE_KEY",
@@ -3961,6 +4141,9 @@ __all__ = [
     "PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND",
     "Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE",
     "Q_CRITIC_TYPES",
+    "Q_TWIN_REDUCTION_MEAN",
+    "Q_TWIN_REDUCTION_MIN",
+    "Q_TWIN_REDUCTIONS",
     "SCALAR_Q_CRITIC_TYPE",
     "SCALAR_CRITIC_SEMANTICS",
     "SPRED_P_BC_SEMANTICS",
@@ -3972,5 +4155,7 @@ __all__ = [
     "_DeterministicFastSACStudentEvalPolicy",
     "_DistributionalFastSACDaggerRolloutPolicy",
     "_fastsac_q_critic_type",
+    "_fastsac_q_twin_reduction",
+    "_reduce_fastsac_twin_target",
     "_spred_p_teacher_probability",
 ]

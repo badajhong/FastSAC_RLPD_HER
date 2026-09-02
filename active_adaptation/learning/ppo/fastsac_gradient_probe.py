@@ -6,7 +6,7 @@ live diagnostic collection or a focused unit seam.  It mirrors the production
 Actor objective while keeping its three causes separate:
 
 * exact mean-action Teacher BC;
-* the negative pessimistic twin-C51 expectation; and
+* the negative configured twin-Q expectation (minimum or mean); and
 * the temperature-weighted policy log probability.
 
 Only :func:`torch.autograd.grad` is used.  No optimizer is zeroed or stepped,
@@ -192,8 +192,21 @@ def _expected_twin_q(
         actuator_context,
     )
     expected = policy._q_output_values(policy.qnet, outputs)
-    minimum = _reduce_actor_q_values(expected, True)
-    return expected, minimum
+    reducer = getattr(policy, "_reduce_twin_q_values", None)
+    if callable(reducer):
+        reduced = reducer(expected)
+    else:
+        reduction = str(
+            getattr(
+                getattr(policy, "cfg", None),
+                "q_twin_reduction",
+                "min",
+            )
+        )
+        if reduction not in ("min", "mean"):
+            raise ValueError(f"invalid diagnostic Q twin reduction {reduction!r}")
+        reduced = _reduce_actor_q_values(expected, reduction == "min")
+    return expected, reduced
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -792,6 +805,9 @@ def diagnose_fastsac_actor_gradients(
         "source_masks_present": source_available,
         "failure_source_mask_present": failure_available,
         "source_gradients": bool(source_gradients),
+        "q_twin_reduction": str(
+            getattr(policy.cfg, "q_twin_reduction", "min")
+        ),
         "bc_filter": {
             "configured": configured_q_filter,
             "enabled_for_probe": q_filter_enabled,

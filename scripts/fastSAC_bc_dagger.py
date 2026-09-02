@@ -37,6 +37,7 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
+    apply_perception_training_source,
 )
 
 try:
@@ -785,6 +786,10 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
 def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     """Fail before simulator startup when the method contract is violated."""
     _require_single_process_execution()
+    # New commands use one unambiguous perception selector. Resolve it before
+    # entrypoint validation so all existing validation and metadata continue
+    # to operate on their stable internal representation.
+    apply_perception_training_source(cfg.algo)
     apply_fastsac_dagger_iteration_controls(cfg)
     if cfg.algo.get("name") != EXPECTED_ALGO_NAME:
         raise ValueError(
@@ -896,9 +901,14 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
             "algo.q_teacher_buffer_capacity must cover algo.sac_learning_starts"
         )
     q_critic_type = str(cfg.algo.get("q_critic_type", "c51"))
-    if q_critic_type not in ("c51", "scalar"):
-        raise ValueError("algo.q_critic_type must be c51 or scalar")
-    if q_critic_type == "c51":
+    if q_critic_type not in ("c51", "scalar", "distributional"):
+        raise ValueError(
+            "algo.q_critic_type must be c51, scalar, or distributional"
+        )
+    q_twin_reduction = str(cfg.algo.get("q_twin_reduction", "min"))
+    if q_twin_reduction not in ("min", "mean"):
+        raise ValueError("algo.q_twin_reduction must be min or mean")
+    if q_critic_type != "scalar":
         if int(cfg.algo.get("q_num_atoms", -1)) != 501:
             raise ValueError(
                 "distributional FastSAC requires exactly 501 C51 atoms"
@@ -907,18 +917,21 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
             raise ValueError("distributional FastSAC requires q_v_min=-20")
         if not math.isclose(float(cfg.algo.get("q_v_max", math.nan)), 20.0):
             raise ValueError("distributional FastSAC requires q_v_max=20")
-        if cfg.algo.get("q_action_fusion") not in ("late", "balanced"):
-            raise ValueError(
-                "distributional FastSAC requires late or balanced "
-                "Q-action fusion"
-            )
-        if cfg.algo.get("q_layer_norm") is not True:
-            raise ValueError(
-                "distributional FastSAC requires LayerNorm Q Critics"
-            )
-    elif cfg.algo.get("q_use_residual_film", False) is not False:
+        if q_critic_type == "c51":
+            if cfg.algo.get("q_action_fusion") not in ("late", "balanced"):
+                raise ValueError(
+                    "engineered C51 FastSAC requires late or balanced "
+                    "Q-action fusion"
+                )
+            if cfg.algo.get("q_layer_norm") is not True:
+                raise ValueError(
+                    "engineered C51 FastSAC requires LayerNorm Q Critics"
+                )
+    if q_critic_type in ("scalar", "distributional") and cfg.algo.get(
+        "q_use_residual_film", False
+    ) is not False:
         raise ValueError(
-            "standard scalar Q requires algo.q_use_residual_film=false"
+            "standard split-stem Q requires algo.q_use_residual_film=false"
         )
     if cfg.algo.get("q_action_coordinates") != "raw_joint_command":
         raise ValueError("distributional FastSAC requires raw_joint_command Q actions")
@@ -1011,15 +1024,18 @@ def main(cfg: DictConfig):
         f"method={EXPECTED_TRAINING_ALGORITHM}"
     )
     critic_type = str(cfg.algo.get("q_critic_type", "c51"))
-    critic_architecture = (
-        "balanced-state/action-stems->"
-        f"{int(cfg.algo.q_hidden_dim)}x{int(cfg.algo.q_hidden_dim)}->scalar"
-        if critic_type == "scalar"
-        else "split-action C51"
-    )
+    if critic_type in ("scalar", "distributional"):
+        critic_architecture = (
+            "balanced-state/action-stems->"
+            f"{int(cfg.algo.q_hidden_dim)}x{int(cfg.algo.q_hidden_dim)}->"
+            f"{'scalar' if critic_type == 'scalar' else 'C51'}"
+        )
+    else:
+        critic_architecture = "engineered-action-branch->C51"
     print(
         "FastSAC updates: "
         f"critic={critic_type}, "
+        f"q_twin_reduction={str(cfg.algo.get('q_twin_reduction', 'min'))}, "
         f"critic_architecture={critic_architecture}, "
         f"outputs_per_head={1 if critic_type == 'scalar' else int(cfg.algo.q_num_atoms)}, "
         f"policy_frequency={int(cfg.algo.sac_policy_frequency)}, "

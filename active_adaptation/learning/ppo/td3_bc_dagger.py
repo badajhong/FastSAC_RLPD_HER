@@ -49,6 +49,7 @@ from .fastsac_vel import (
     FASTSAC_Q_LATE_FUSION_SEMANTICS,
     FASTSAC_Q_PREDICTED_EFFECT_CONTEXT_SEMANTICS,
     FASTSAC_Q_RESIDUAL_FILM_SEMANTICS,
+    FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_INPUT_SEMANTICS,
@@ -56,6 +57,7 @@ from .fastsac_vel import (
     REPLAY_OBSERVATION_SEMANTICS,
     TRUNCATION_NEXT_OBSERVATION_SEMANTICS,
     _build_isolated_q_network,
+    _build_isolated_distributional_scalar_q_network,
     _build_isolated_scalar_q_network,
     _filter_replay_rows,
     _measure_or_clip_grad_norm,
@@ -271,6 +273,22 @@ PERCEPTION_REPLAY_SEMANTICS = (
     "burn_in_8_v2"
 )
 ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE = "online_student_rollout"
+PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE = "pure_student"
+ALL_PERCEPTION_LIVE_ENV_SCOPE = "all"
+PERCEPTION_LIVE_ENV_SCOPES = frozenset(
+    (PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE, ALL_PERCEPTION_LIVE_ENV_SCOPE)
+)
+# Public, single-knob surface for perception training.  The older
+# ``perception_replay_mode`` and ``perception_live_env_scope`` fields remain
+# as the internal/checkpoint-compatibility representation.
+PERCEPTION_TRAINING_SOURCE_FOUR_WAY = "four_way"
+PERCEPTION_TRAINING_SOURCES = frozenset(
+    (
+        PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE,
+        ALL_PERCEPTION_LIVE_ENV_SCOPE,
+        PERCEPTION_TRAINING_SOURCE_FOUR_WAY,
+    )
+)
 STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE = "student_perception"
 PRIVILEGED_ORACLE_ACTOR_OBSERVATION_MODE = "privileged_oracle"
 SAC_ACTOR_OBSERVATION_MODES = frozenset(
@@ -282,6 +300,50 @@ SAC_ACTOR_OBSERVATION_MODES = frozenset(
 ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS = (
     "ppovel_live_recurrent_fixed_pure_student_cohort_2epoch_v2"
 )
+ALL_LIVE_ROLLOUT_PERCEPTION_SEMANTICS = (
+    "ppovel_live_recurrent_all_env_mixed_control_cohort_2epoch_v1"
+)
+
+
+def apply_perception_training_source(cfg) -> str | None:
+    """Resolve the public perception source onto the legacy internal knobs.
+
+    ``None`` deliberately preserves legacy commands and checkpoint configs.
+    A configured source is authoritative, so new launches need only set this
+    one field instead of coordinating replay mode and live-environment scope.
+    """
+    source = getattr(cfg, "perception_training_source", None)
+    if source is None:
+        return None
+    source = str(source)
+    if source not in PERCEPTION_TRAINING_SOURCES:
+        raise ValueError(
+            "perception_training_source must be 'pure_student', 'all', or "
+            "'four_way'"
+        )
+    if source == PERCEPTION_TRAINING_SOURCE_FOUR_WAY:
+        cfg.perception_replay_mode = "four_way"
+        cfg.perception_live_env_scope = PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE
+    else:
+        cfg.perception_replay_mode = ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+        cfg.perception_live_env_scope = source
+    return source
+
+
+def online_rollout_perception_semantics(cfg) -> str:
+    """Describe which complete live recurrent sequences train perception."""
+    scope = str(
+        getattr(
+            cfg,
+            "perception_live_env_scope",
+            PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE,
+        )
+    )
+    if scope == ALL_PERCEPTION_LIVE_ENV_SCOPE:
+        return ALL_LIVE_ROLLOUT_PERCEPTION_SEMANTICS
+    return ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+
+
 ONLINE_STUDENT_ACTOR_WARMUP_SEMANTICS = (
     "frozen_student_actor_live_depth_perception_mixed_replay_critic_v1"
 )
@@ -1435,11 +1497,20 @@ class DistributionalTD3TeacherBCConfig(PPOConfig):
     perception_replay_burn_in: int = 8
     perception_encode_microbatch_size: int = 128
     teacher_perception_batch_size: int = 128
+    # The preferred public surface is ``perception_training_source`` below.
     # ``online_student_rollout`` delegates perception training exactly to
     # PPOVEL.train_adapt: two epochs over the current recurrent rollout and no
     # perception replay sampling.  The older modes remain available only for
     # explicitly configured TD3/checkpoint-compatibility paths.
     perception_replay_mode: str = "legacy_online_student"
+    # Keep the historical strict Student-only cohort by default. ``all`` uses
+    # every complete live environment sequence, including mixed-control DAgger
+    # environments, but still never samples perception data from replay.
+    perception_live_env_scope: str = PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE
+    # Set this single public control to ``pure_student``, ``all``, or
+    # ``four_way``. ``None`` retains the two legacy fields above for old
+    # commands and checkpoints.
+    perception_training_source: str | None = None
     perception_replay_batch_size: int = 128
     # Optional reset-exact diagnostic for collection-cache representation
     # drift.  Zero disables every raw journal allocation/transfer.  Enabled
@@ -1804,20 +1875,32 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             if self._q_conditions_on_actuator_state()
             else 0
         )
-        if self._uses_standard_scalar_q():
+        if self._uses_standard_split_stem_q():
             # Standard SAC treats actuator memory as part of state and exposes
             # the normalized candidate command to the Q MLP exactly once.
             self._q_state_input_dim = (
                 self._q_critic_dim + self._q_actuator_context_dim
             )
             self._q_action_input_dim = self.action_dim
-            self.qnet = _build_isolated_scalar_q_network(
-                obs_dim=self._q_state_input_dim,
-                action_dim=self._q_action_input_dim,
-                hidden_dim=cfg.q_hidden_dim,
-                device=device,
-                seed=cfg.q_seed,
-            )
+            if self._uses_standard_scalar_q():
+                self.qnet = _build_isolated_scalar_q_network(
+                    obs_dim=self._q_state_input_dim,
+                    action_dim=self._q_action_input_dim,
+                    hidden_dim=cfg.q_hidden_dim,
+                    device=device,
+                    seed=cfg.q_seed,
+                )
+            else:
+                self.qnet = _build_isolated_distributional_scalar_q_network(
+                    obs_dim=self._q_state_input_dim,
+                    action_dim=self._q_action_input_dim,
+                    hidden_dim=cfg.q_hidden_dim,
+                    num_atoms=cfg.q_num_atoms,
+                    v_min=cfg.q_v_min,
+                    v_max=cfg.q_v_max,
+                    device=device,
+                    seed=cfg.q_seed,
+                )
         else:
             self._q_state_input_dim = self._q_critic_dim
             if self._q_uses_predicted_effect():
@@ -2021,6 +2104,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
 
     @staticmethod
     def _validate_td3_config(cfg) -> None:
+        # Resolve the compact public selector before any downstream component
+        # reads the historical mode/scope representation.
+        apply_perception_training_source(cfg)
         try:
             configured_world_size = int(os.environ.get("WORLD_SIZE", "1"))
         except ValueError as exc:
@@ -2097,9 +2183,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             )
         if str(cfg.dagger_control_mode) not in DAGGER_CONTROL_MODES:
             raise ValueError(f"invalid dagger_control_mode={cfg.dagger_control_mode!r}")
-        standard_scalar_q = (
-            str(getattr(cfg, "q_critic_type", "c51")) == "scalar"
-        )
+        critic_type = str(getattr(cfg, "q_critic_type", "c51"))
+        standard_scalar_q = critic_type == "scalar"
+        standard_split_stem_q = critic_type in ("scalar", "distributional")
         if not standard_scalar_q:
             if (
                 int(cfg.q_num_atoms) != 501
@@ -2110,9 +2196,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     "distributional TD3 requires the locked 501-atom "
                     "[-20,20] support"
                 )
-            if not bool(cfg.q_layer_norm) or str(cfg.q_action_fusion) not in (
-                FASTSAC_Q_DEFAULT_ACTION_FUSION,
-                "balanced",
+            if critic_type == "c51" and (
+                not bool(cfg.q_layer_norm) or str(cfg.q_action_fusion) not in (
+                    FASTSAC_Q_DEFAULT_ACTION_FUSION,
+                    "balanced",
+                )
             ):
                 raise ValueError(
                     "distributional TD3 requires late or balanced-fusion "
@@ -2138,11 +2226,11 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             )
         if not isinstance(getattr(cfg, "q_use_residual_film", False), bool):
             raise ValueError("q_use_residual_film must be a boolean")
-        if standard_scalar_q and bool(
+        if standard_split_stem_q and bool(
             getattr(cfg, "q_use_residual_film", False)
         ):
             raise ValueError(
-                "standard scalar Q does not support q_use_residual_film=true"
+                "standard split-stem Q does not support q_use_residual_film=true"
             )
         if bool(getattr(cfg, "q_use_residual_film", False)):
             if not bool(getattr(cfg, "q_condition_on_actuator_state", False)):
@@ -2215,6 +2303,26 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             raise ValueError(
                 "perception_replay_mode must be 'online_student_rollout', "
                 "'legacy_online_student', or 'four_way'"
+            )
+        perception_live_env_scope = str(
+            getattr(
+                cfg,
+                "perception_live_env_scope",
+                PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE,
+            )
+        )
+        if perception_live_env_scope not in PERCEPTION_LIVE_ENV_SCOPES:
+            raise ValueError(
+                "perception_live_env_scope must be 'pure_student' or 'all'"
+            )
+        if (
+            perception_replay_mode != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+            and perception_live_env_scope
+            != PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE
+        ):
+            raise ValueError(
+                "perception_live_env_scope='all' requires "
+                "perception_replay_mode='online_student_rollout'"
             )
         if perception_replay_mode == "four_way" and bool(cfg.train_dr_estimator):
             raise ValueError(
@@ -2617,6 +2725,13 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _uses_standard_scalar_q(self) -> bool:
         """Whether Q uses the normalized split-stem scalar backend."""
         return str(getattr(self.cfg, "q_critic_type", "c51")) == "scalar"
+
+    def _uses_standard_split_stem_q(self) -> bool:
+        """Whether Q uses the scalar critic's normalized split-stem inputs."""
+        return str(getattr(self.cfg, "q_critic_type", "c51")) in (
+            "scalar",
+            "distributional",
+        )
 
     def _q_uses_predicted_effect(self) -> bool:
         return bool(getattr(self.cfg, "q_use_predicted_effect", False))
@@ -3082,7 +3197,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         actuator_context: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the exact state/action pair consumed by the configured Q."""
-        if self._uses_standard_scalar_q():
+        if self._uses_standard_split_stem_q():
             return (
                 self._standard_scalar_q_state_input(
                     critic_observations, action, actuator_context
@@ -7342,7 +7457,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         return actor_metrics
 
     def _q_action_feature_semantics(self) -> str:
-        if self._uses_standard_scalar_q():
+        if self._uses_standard_split_stem_q():
             return STANDARD_SCALAR_Q_ACTION_FEATURE_SEMANTICS
         if self._q_uses_predicted_effect():
             return Q_PREDICTED_EFFECT_ACTION_FEATURE_SEMANTICS
@@ -7351,7 +7466,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         return "normalized_issued_command_only_v1"
 
     def _q_predicted_effect_metadata(self) -> dict:
-        if self._uses_standard_scalar_q():
+        if self._uses_standard_split_stem_q():
             return {
                 "enabled": False,
                 "configured_context_collection": self._q_uses_predicted_effect(),
@@ -7373,8 +7488,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         }
 
     def _q_residual_film_metadata(self) -> dict:
-        if self._uses_standard_scalar_q():
-            return {"enabled": False, "reason": "standard_split_stem_scalar_q"}
+        if self._uses_standard_split_stem_q():
+            return {"enabled": False, "reason": "standard_split_stem_q"}
         if not self._q_uses_residual_film():
             return {"enabled": False}
         scale = float(self.cfg.q_residual_film_scale)
@@ -7404,8 +7519,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             and int(self.cfg.q_batch_size) % 2 == 0
             and math.isclose(q_teacher_fraction, 0.5, rel_tol=0.0, abs_tol=1e-12)
         )
-        standard_scalar_q = self._uses_standard_scalar_q()
-        if standard_scalar_q:
+        standard_split_stem_q = self._uses_standard_split_stem_q()
+        if standard_split_stem_q:
             q_action_fusion = "balanced_split_stems"
             q_state_hidden_dim = int(self.cfg.q_hidden_dim) // 2
             q_action_hidden_dim = int(self.cfg.q_hidden_dim) - q_state_hidden_dim
@@ -7414,6 +7529,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             )
             q_architecture_semantics = (
                 FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
+                if self._uses_standard_scalar_q()
+                else FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS
             )
             q_input_semantics = FASTSAC_STANDARD_SCALAR_Q_INPUT_SEMANTICS
             q_state_context_semantics = (
@@ -7487,7 +7604,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 getattr(self, "_q_state_input_dim", self._q_critic_dim)
             ),
             "q_state_context_dim": (
-                self._q_actuator_context_dim if standard_scalar_q else 0
+                self._q_actuator_context_dim if standard_split_stem_q else 0
             ),
             "q_state_context_semantics": q_state_context_semantics,
             "q_input_semantics": q_input_semantics,
@@ -7571,7 +7688,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 getattr(self.cfg, "perception_replay_mode", "legacy_online_student")
             ),
             "perception_training_semantics": (
-                ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                online_rollout_perception_semantics(self.cfg)
                 if str(
                     getattr(
                         self.cfg,
@@ -7660,6 +7777,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "perception_encode_microbatch_size",
             "teacher_perception_batch_size",
             "perception_replay_mode",
+            "perception_live_env_scope",
             "perception_replay_batch_size",
             "perception_staleness_probe_num_envs",
             "perception_staleness_probe_max_episodes",
@@ -9114,13 +9232,23 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         if perception_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE:
             reset = tensordict["is_init"].bool()
             student_source = tensordict.get(DAGGER_IS_STUDENT_ACTION_KEY, None)
+            live_env_scope = str(
+                getattr(
+                    self.cfg,
+                    "perception_live_env_scope",
+                    PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE,
+                )
+            )
             if student_source is not None:
                 while student_source.ndim < reset.ndim:
                     student_source = student_source.unsqueeze(-1)
                 while reset.ndim < student_source.ndim:
                     reset = reset.unsqueeze(-1)
                 teacher_controlled = (~reset) & ~student_source.bool()
-                if bool(teacher_controlled.any()):
+                if (
+                    live_env_scope == PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE
+                    and bool(teacher_controlled.any())
+                ):
                     raise RuntimeError(
                         "online_student_rollout perception received a "
                         "Teacher-controlled live transition"
@@ -9151,6 +9279,9 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     ),
                     "adapt/perception_sequence_length": float(
                         tensordict.batch_size[-1]
+                    ),
+                    "adapt/perception_live_all_envs": float(
+                        live_env_scope == ALL_PERCEPTION_LIVE_ENV_SCOPE
                     ),
                     "adapt/online_priv_loss": result["adapt/priv_loss"],
                     "adapt/online_object_loss": result["adapt/object_loss"],
@@ -9448,6 +9579,21 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         if pure_indices.numel() < 1:
             raise RuntimeError("live perception requires a pure Student cohort")
         return rollout[pure_indices]
+
+    def _live_perception_rollout(self, rollout: TensorDict) -> TensorDict:
+        """Select the configured complete live sequences for perception."""
+        scope = str(
+            getattr(
+                self.cfg,
+                "perception_live_env_scope",
+                PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE,
+            )
+        )
+        if scope == ALL_PERCEPTION_LIVE_ENV_SCOPE:
+            return rollout
+        if scope == PURE_STUDENT_PERCEPTION_LIVE_ENV_SCOPE:
+            return self._pure_student_perception_rollout(rollout)
+        raise RuntimeError(f"unsupported perception_live_env_scope={scope!r}")
 
     @torch.no_grad()
     def _extend_online_replays(
@@ -9952,7 +10098,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             # reads only the authoritative top-level live observation fields;
             # excluding these replay-only roots prevents make_batch from
             # gathering the large raw-depth copy for every perception minibatch.
-            perception_rollout = self._pure_student_perception_rollout(rollout)
+            perception_rollout = self._live_perception_rollout(rollout)
             perception_rollout = perception_rollout.exclude(*replay_only_keys)
             adapt_info = self.train_adapt(perception_rollout)
             if bool(getattr(self.cfg, "train_perception", True)):
@@ -10476,7 +10622,7 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                     else "disabled"
                 ),
                 "perception_training_semantics": (
-                    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                    online_rollout_perception_semantics(self.cfg)
                     if str(
                         getattr(
                             self.cfg,

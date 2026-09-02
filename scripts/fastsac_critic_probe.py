@@ -53,7 +53,6 @@ from active_adaptation.learning.ppo.fastsac_critic_probe import (
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     _migrate_explicit_online_replay_capacities,
 )
-from active_adaptation.learning.ppo.fastsac_vel import _reduce_actor_q_values
 from active_adaptation.learning.ppo.ppo_bc_dagger import (
     DAGGER_IS_STUDENT_ACTION_KEY,
     DAGGER_Q_TEACHER_SOURCE_KEY,
@@ -133,6 +132,26 @@ def _critic_checkpoint_runtime_config(cfg: DictConfig) -> DictConfig:
         runtime.algo.use_teacher_residual_critic = bool(
             backend.get("use_teacher_residual_critic", False)
         )
+    if "q_twin_reduction" not in runtime.algo:
+        q_backend = (
+            policy_state.get("q_backend_config", {})
+            if isinstance(policy_state, dict)
+            else {}
+        )
+        saved_reduction = (
+            policy_state.get(
+                "q_twin_reduction",
+                q_backend.get(
+                    "q_twin_reduction",
+                    backend.get("q_twin_reduction", "min"),
+                ),
+            )
+            if isinstance(policy_state, dict)
+            else "min"
+        )
+        if saved_reduction not in ("min", "mean"):
+            raise ValueError("FastSAC probe checkpoint has invalid Q reduction")
+        runtime.algo.q_twin_reduction = saved_reduction
     runtime.checkpoint_path = checkpoint_path
     runtime.task.num_envs = requested_envs
     runtime.headless = requested_headless
@@ -158,7 +177,7 @@ def _expected_twin_q(
         actuator_context,
     )
     expected = policy._q_output_values(policy.qnet, outputs)
-    return outputs, expected, _reduce_actor_q_values(expected, True)
+    return outputs, expected, policy._reduce_twin_q_values(expected)
 
 
 def _required_transition_fields(policy) -> tuple[str, ...]:
@@ -544,7 +563,7 @@ def _local_action_gradient_report(policy, batch, policy_action, epsilon):
     # that the Actor can choose, so only the physical-action-width prefix is a
     # gradient leaf.
     q_action = policy._q_action_input(policy_action).detach().requires_grad_(True)
-    if policy._uses_standard_scalar_q():
+    if policy._uses_standard_split_stem_q():
         q_state = policy._standard_scalar_q_state_input(
             batch["critic_observations"], policy_action, actuator_context
         ).detach()
@@ -565,8 +584,8 @@ def _local_action_gradient_report(policy, batch, policy_action, epsilon):
             return policy._q_output_values(policy.qnet, outputs)
 
     expected = values_from_q_action(q_action)
-    minimum = _reduce_actor_q_values(expected, True)
-    gradient = torch.autograd.grad(minimum.sum(), q_action)[0].detach().float()
+    reduced = policy._reduce_twin_q_values(expected)
+    gradient = torch.autograd.grad(reduced.sum(), q_action)[0].detach().float()
     norm = gradient.norm(dim=-1)
     direction = gradient / norm.clamp_min(torch.finfo(gradient.dtype).eps).unsqueeze(-1)
     with torch.no_grad():
@@ -576,8 +595,8 @@ def _local_action_gradient_report(policy, batch, policy_action, epsilon):
         minus_expected = values_from_q_action(
             q_action.detach() - float(epsilon) * direction
         )
-        plus = _reduce_actor_q_values(plus_expected, True)
-        minus = _reduce_actor_q_values(minus_expected, True)
+        plus = policy._reduce_twin_q_values(plus_expected)
+        minus = policy._reduce_twin_q_values(minus_expected)
         finite_difference = (plus - minus) / (2.0 * float(epsilon))
         relative_error = (finite_difference - norm).abs() / (
             finite_difference.abs() + norm.abs()
@@ -624,7 +643,7 @@ def _residual_identity_report(policy, batch, continuation, rng_state):
         batch.get(NEXT_Q_ACTUATOR_CONTEXT_KEY),
     )
     next_expected = policy._q_output_values(policy.qnet_target, next_outputs)
-    next_q = _reduce_actor_q_values(next_expected, True)
+    next_q = policy._reduce_twin_q_values(next_expected)
     terms = policy._teacher_value_terms_from_batch(batch, continuation)
     gamma_continuation = float(policy.cfg.gamma) * continuation
     entropy_adjusted_next = next_q - policy.log_alpha.exp() * next_log_prob
@@ -885,6 +904,9 @@ def main(cfg: DictConfig):
             },
             "critic_target_fit": fit_report,
             "q_critic_type": str(getattr(policy.cfg, "q_critic_type", "c51")),
+            "q_twin_reduction": str(
+                getattr(policy.cfg, "q_twin_reduction", "min")
+            ),
             "teacher_policy_ranking": ranking_report,
             "local_action_gradient": gradient_report,
             "residual_parameterization": residual_report,

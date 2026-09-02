@@ -210,7 +210,10 @@ def test_predicted_effect_checkpoint_overrides_structured_q_inference_defaults()
     assert "q_use_predicted_effect" in filled["checkpoint"]
 
 
-def test_scalar_checkpoint_restores_type_and_previous_action_state_context():
+@pytest.mark.parametrize("critic_type", ("scalar", "distributional"))
+def test_split_stem_checkpoint_restores_type_and_previous_action_state_context(
+    critic_type,
+):
     cfg = OmegaConf.create(
         {
             "algo": {
@@ -222,9 +225,9 @@ def test_scalar_checkpoint_restores_type_and_previous_action_state_context():
     )
     policy_state = {
         "training_algorithm": "distributional_tvkd_fastsac_teacher_bc_v9",
-        "q_critic_type": "scalar",
+        "q_critic_type": critic_type,
         "dagger_backend_config": {
-            "q_critic_type": "scalar",
+            "q_critic_type": critic_type,
             "q_condition_on_actuator_state": True,
             "q_use_predicted_effect": True,
             "value_norm": False,
@@ -246,11 +249,70 @@ def test_scalar_checkpoint_restores_type_and_previous_action_state_context():
         cfg, policy_state, inference_only=True
     )
 
-    assert cfg.algo.q_critic_type == "scalar"
+    assert cfg.algo.q_critic_type == critic_type
     assert cfg.algo.q_condition_on_actuator_state is True
     assert cfg.algo.q_use_predicted_effect is True
     assert "q_critic_type" in filled["checkpoint"]
     assert "q_use_predicted_effect" in filled["checkpoint"]
+
+
+@pytest.mark.parametrize(
+    "training_algorithm",
+    (
+        "distributional_fastsac_teacher_bc_v1",
+        "distributional_tvkd_fastsac_teacher_bc_v9",
+    ),
+)
+def test_fastsac_inference_restores_mean_q_twin_reduction_over_default_min(
+    training_algorithm,
+):
+    cfg = OmegaConf.create(
+        {
+            "algo": {
+                "q_twin_reduction": "min",
+                "q_condition_on_actuator_state": False,
+                "q_use_predicted_effect": False,
+                "q_use_residual_film": False,
+                "q_residual_film_scale": 0.1,
+            }
+        }
+    )
+    policy_state = {
+        "training_algorithm": training_algorithm,
+        "q_twin_reduction": "mean",
+        "dagger_backend_config": {
+            "q_twin_reduction": "mean",
+            "value_norm": False,
+        },
+        "q_backend_config": {
+            "q_twin_reduction": "mean",
+            "q_actuator_context": {"enabled": False},
+            "q_predicted_effect": {"enabled": False},
+            "q_residual_film": {"enabled": False},
+        },
+    }
+
+    filled = helpers._fill_replayless_inference_algo_defaults(
+        cfg, policy_state, inference_only=True
+    )
+
+    assert cfg.algo.q_twin_reduction == "mean"
+    assert "q_twin_reduction" in filled["checkpoint"]
+
+
+def test_fastsac_inference_rejects_inconsistent_q_twin_reduction_metadata():
+    cfg = OmegaConf.create({"algo": {"q_twin_reduction": "min"}})
+    policy_state = {
+        "training_algorithm": "distributional_fastsac_teacher_bc_v1",
+        "q_twin_reduction": "mean",
+        "q_backend_config": {"q_twin_reduction": "mean"},
+        "dagger_backend_config": {"q_twin_reduction": "min"},
+    }
+
+    with pytest.raises(ValueError, match="inconsistent q_twin_reduction"):
+        helpers._fill_replayless_inference_algo_defaults(
+            cfg, policy_state, inference_only=True
+        )
 
 
 def test_physical_fastsac_inference_restores_sac_std_guard_contract():

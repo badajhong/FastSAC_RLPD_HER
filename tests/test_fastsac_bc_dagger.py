@@ -12,10 +12,12 @@ from tensordict import TensorDict
 
 from active_adaptation.learning.ppo.common import ACTION_KEY, OBS_KEY, Actor
 from active_adaptation.learning.ppo.fastsac_vel import (
+    FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
     FastSACTanhNormal,
     _BCDaggerSACAdapter,
+    _build_isolated_distributional_scalar_q_network,
     _build_isolated_scalar_q_network,
     _fastsac_target_entropy,
 )
@@ -46,6 +48,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     TD3_EXPLORATORY_STUDENT_ACTION_KEY,
     TD3_NOISE_FREE_STUDENT_ACTION_KEY,
     DistributionalTD3TeacherBC,
+    apply_perception_training_source,
     _failure_lookback_offsets,
     _source_counts,
     _categorical_expected_value,
@@ -64,6 +67,8 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND,
     PREVIOUS_CHECKPOINT_VERSION,
+    Q_TWIN_REDUCTION_MEAN,
+    Q_TWIN_REDUCTION_MIN,
     TRAINING_ALGORITHM,
     UNIFORM_PHYSICAL_STD_BOUND_MODE,
     DistributionalFastSACTeacherBC,
@@ -306,6 +311,7 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert cfg.sac_physical_std_normalized_min == pytest.approx(0.02)
     assert cfg.sac_physical_std_normalized_max == pytest.approx(0.11)
     assert cfg.sac_target_entropy_ratio == pytest.approx(1.0)
+    assert cfg.q_twin_reduction == Q_TWIN_REDUCTION_MIN
     assert cfg.q_update_to_data_ratio == pytest.approx(1.0)
     assert cfg.perception_encode_microbatch_size == 512
     assert cfg.perception_replay_mode == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
@@ -317,6 +323,22 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
         cfg.sac_actor_observation_mode
         == STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE
     )
+
+
+@pytest.mark.parametrize("reduction", (Q_TWIN_REDUCTION_MIN, Q_TWIN_REDUCTION_MEAN))
+def test_q_twin_reduction_accepts_min_and_mean(reduction):
+    cfg = DistributionalFastSACTeacherBCConfig(q_twin_reduction=reduction)
+
+    DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize("reduction", ("max", "average", "", True, None))
+def test_q_twin_reduction_rejects_unknown_modes(reduction):
+    cfg = DistributionalFastSACTeacherBCConfig()
+    cfg.q_twin_reduction = reduction
+
+    with pytest.raises(ValueError, match="q_twin_reduction"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
 
 
 def test_privileged_oracle_actor_observation_mode_is_validated_and_live_only():
@@ -695,6 +717,31 @@ def test_backend_accepts_teacher_only_prefill_warmup_in_live_rollout_mode():
     )
 
     DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_mode", "expected_scope"),
+    (
+        ("pure_student", ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE, "pure_student"),
+        ("all", ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE, "all"),
+        ("four_way", "four_way", "pure_student"),
+    ),
+)
+def test_perception_training_source_resolves_the_legacy_pair(
+    source, expected_mode, expected_scope
+):
+    cfg = DistributionalFastSACTeacherBCConfig(perception_training_source=source)
+
+    assert apply_perception_training_source(cfg) == source
+    assert cfg.perception_replay_mode == expected_mode
+    assert cfg.perception_live_env_scope == expected_scope
+
+
+def test_perception_training_source_rejects_unknown_value():
+    cfg = DistributionalFastSACTeacherBCConfig(perception_training_source="student")
+
+    with pytest.raises(ValueError, match="perception_training_source"):
+        apply_perception_training_source(cfg)
 
 
 def test_backend_rejects_unsupported_perception_mode():
@@ -1585,7 +1632,12 @@ def test_physical_std_projection_and_nonfinite_failure_are_explicit():
         policy._project_physical_actor_std_()
 
 
-def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
+@pytest.mark.parametrize(
+    "q_twin_reduction", (Q_TWIN_REDUCTION_MIN, Q_TWIN_REDUCTION_MEAN)
+)
+def test_reparameterized_actor_step_uses_configured_twin_q_and_exact_bc(
+    q_twin_reduction,
+):
     policy = _bare_policy(
         eta_sac=0.7,
         lambda_bc=1.3,
@@ -1594,6 +1646,7 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
         sac_log_std_max=1.0,
         sac_max_grad_norm=1.0e6,
         q_action_input_gain=1.0,
+        q_twin_reduction=q_twin_reduction,
     )
     _install_unit_action_contract(policy)
     _install_tiny_stochastic_actor(policy)
@@ -1630,9 +1683,14 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
     expected_heads = expected_q.values(
         expected_q(batch["critic_observations"], sampled_action)
     )
-    expected_pessimistic_q = expected_heads.min(dim=0).values
+    expected_min_q = expected_heads.min(dim=0).values
+    expected_reduced_q = (
+        expected_min_q
+        if q_twin_reduction == Q_TWIN_REDUCTION_MIN
+        else expected_heads.mean(dim=0)
+    )
     expected_sac = (
-        policy.log_alpha.detach().exp() * log_prob - expected_pessimistic_q
+        policy.log_alpha.detach().exp() * log_prob - expected_reduced_q
     ).mean()
     expected_bc = _exact_teacher_bc_loss(
         expected_dist.mean,
@@ -1673,7 +1731,10 @@ def test_reparameterized_actor_step_combines_entropy_min_twin_q_and_exact_bc():
         policy.cfg.lambda_bc * expected_bc.item()
     )
     assert metrics["actor_min_expected_q_mean"].item() == pytest.approx(
-        expected_pessimistic_q.mean().item()
+        expected_min_q.mean().item()
+    )
+    assert metrics["actor_reduced_expected_q_mean"].item() == pytest.approx(
+        expected_reduced_q.mean().item()
     )
     assert metrics["actor_teacher_replay_fraction"].item() == pytest.approx(2 / 3)
     assert all(parameter.grad is None for parameter in policy.qnet.parameters())
@@ -2570,6 +2631,69 @@ def test_twin_scalar_q_has_two_scalar_heads_and_actor_action_gradient():
     assert actions.grad.abs().sum().item() > 0.0
 
 
+def test_twin_distributional_q_keeps_scalar_topology_and_emits_c51_logits():
+    scalar = _build_isolated_scalar_q_network(
+        obs_dim=7,
+        action_dim=3,
+        hidden_dim=32,
+        device="cpu",
+        seed=17,
+    )
+    distributional = _build_isolated_distributional_scalar_q_network(
+        obs_dim=7,
+        action_dim=3,
+        hidden_dim=32,
+        num_atoms=51,
+        v_min=-10.0,
+        v_max=10.0,
+        device="cpu",
+        seed=17,
+    )
+    observations = torch.randn(5, 7)
+    actions = torch.randn(5, 3, requires_grad=True)
+
+    logits = distributional(observations, actions)
+    values = distributional.values(logits)
+    (-values.min(dim=0).values.mean()).backward()
+
+    assert logits.shape == (2, 5, 51)
+    assert values.shape == (2, 5)
+    assert torch.equal(
+        distributional.support, torch.linspace(-10.0, 10.0, 51)
+    )
+    assert distributional.state_hidden_dim == scalar.state_hidden_dim == 16
+    assert distributional.action_hidden_dim == scalar.action_hidden_dim == 16
+    for scalar_head, distributional_head in zip(
+        scalar.qnets, distributional.qnets, strict=True
+    ):
+        assert scalar_head.state_stem[0].in_features == (
+            distributional_head.state_stem[0].in_features
+        )
+        assert scalar_head.state_stem[0].out_features == (
+            distributional_head.state_stem[0].out_features
+        )
+        assert scalar_head.action_stem[0].in_features == (
+            distributional_head.action_stem[0].in_features
+        )
+        assert scalar_head.action_stem[0].out_features == (
+            distributional_head.action_stem[0].out_features
+        )
+        assert scalar_head.trunk[0].in_features == (
+            distributional_head.trunk[0].in_features
+        )
+        assert scalar_head.trunk[2].out_features == (
+            distributional_head.trunk[2].out_features
+        )
+        assert scalar_head.trunk[4].out_features == 1
+        assert distributional_head.trunk[4].out_features == 51
+    assert not any(
+        isinstance(module, nn.LayerNorm) for module in distributional.modules()
+    )
+    assert actions.grad is not None
+    assert torch.isfinite(actions.grad).all()
+    assert actions.grad.abs().sum().item() > 0.0
+
+
 def test_twin_scalar_q_skateboard_widths_match_balanced_split_design():
     qnet = _build_isolated_scalar_q_network(
         obs_dim=2370,
@@ -2632,9 +2756,12 @@ def test_twin_scalar_q_module_and_optimizer_round_trip():
     assert len(restored_optimizer.state) == len(source_optimizer.state)
 
 
-def test_standard_scalar_q_routes_actuator_memory_as_state_and_action_once():
+@pytest.mark.parametrize("critic_type", ("scalar", "distributional"))
+def test_standard_split_stem_q_routes_actuator_memory_as_state_and_action_once(
+    critic_type,
+):
     policy = _bare_policy(
-        q_critic_type="scalar",
+        q_critic_type=critic_type,
         q_condition_on_actuator_state=True,
         q_use_predicted_effect=True,
         q_action_input_gain=1.0,
@@ -2731,12 +2858,125 @@ def test_scalar_checkpoint_architecture_validation_does_not_affect_c51():
     policy._validate_scalar_q_checkpoint_architecture({}, context="unit test")
 
 
-def test_scalar_soft_target_uses_clipped_twin_q_entropy_and_terminal_cut():
+def test_distributional_checkpoint_requires_split_stem_c51_architecture():
+    policy = _bare_policy(q_critic_type="distributional", q_hidden_dim=32)
+    policy._q_state_input_dim = 11
+    policy._q_action_input_dim = 3
+    current = {
+        "q_backend_config": {
+            "q_architecture_semantics": (
+                FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS
+            ),
+            "q_state_input_dim": 11,
+            "q_action_input_dim": 3,
+            "q_state_hidden_dim": 16,
+            "q_action_hidden_dim": 16,
+            "q_action_fusion": "balanced_split_stems",
+            "q_action_fusion_semantics": (
+                FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS
+            ),
+        }
+    }
+
+    policy._validate_scalar_q_checkpoint_architecture(
+        current, context="unit test"
+    )
+    current["q_backend_config"]["q_architecture_semantics"] = (
+        FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
+    )
+    with pytest.raises(ValueError, match="split-stem Q architecture"):
+        policy._validate_scalar_q_checkpoint_architecture(
+            current, context="unit test"
+        )
+
+
+def test_q_twin_reduction_checkpoint_contract_defaults_legacy_to_min():
+    minimum = _bare_policy(q_twin_reduction=Q_TWIN_REDUCTION_MIN)
+    minimum._validate_q_twin_reduction_checkpoint({}, context="unit test")
+
+    mean = _bare_policy(q_twin_reduction=Q_TWIN_REDUCTION_MEAN)
+    state = {
+        "q_twin_reduction": Q_TWIN_REDUCTION_MEAN,
+        "q_backend_config": {
+            "q_twin_reduction": Q_TWIN_REDUCTION_MEAN,
+        },
+        "dagger_backend_config": {
+            "q_twin_reduction": Q_TWIN_REDUCTION_MEAN,
+        },
+    }
+    mean._validate_q_twin_reduction_checkpoint(state, context="unit test")
+    with pytest.raises(ValueError, match="Q twin reduction mismatch"):
+        mean._validate_q_twin_reduction_checkpoint({}, context="unit test")
+    with pytest.raises(ValueError, match="metadata is inconsistent"):
+        mean._validate_q_twin_reduction_checkpoint(
+            {
+                "q_twin_reduction": Q_TWIN_REDUCTION_MEAN,
+                "q_backend_config": {
+                    "q_twin_reduction": Q_TWIN_REDUCTION_MIN,
+                },
+            },
+            context="unit test",
+        )
+    with pytest.raises(ValueError, match="metadata is inconsistent"):
+        mean._validate_q_twin_reduction_checkpoint(
+            {
+                "q_twin_reduction": Q_TWIN_REDUCTION_MEAN,
+                "q_backend_config": {
+                    "q_twin_reduction": Q_TWIN_REDUCTION_MEAN,
+                },
+                "dagger_backend_config": {
+                    "q_twin_reduction": Q_TWIN_REDUCTION_MIN,
+                },
+            },
+            context="unit test",
+        )
+
+
+def test_mean_q_twin_reduction_has_distinct_learning_semantics(monkeypatch):
+    policy = _bare_policy(
+        q_critic_type="distributional",
+        q_twin_reduction=Q_TWIN_REDUCTION_MEAN,
+        q_num_atoms=501,
+        q_v_min=-20.0,
+        q_v_max=20.0,
+        sac_action_distribution=NORMALIZED_TANH_ACTION_DISTRIBUTION,
+        sac_alpha_update_cadence="actor",
+        sac_policy_frequency=1,
+        sac_actor_observation_mode=STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+        use_q_filtered_bc=False,
+    )
+    policy._fastsac_student_action_contract = {}
+    policy._fastsac_entropy_reference_log_scale_sum = 0.0
+    policy.target_entropy = -1.0
+    monkeypatch.setattr(
+        DistributionalTD3TeacherBC,
+        "_q_backend_metadata",
+        lambda owner: {},
+    )
+
+    assert "mean_complete" in policy._critic_learning_semantics()
+    assert "twin_mean" in policy._actor_learning_semantics()
+    metadata = policy._q_backend_metadata()
+    assert metadata["q_twin_reduction"] == Q_TWIN_REDUCTION_MEAN
+    assert metadata["clipped_double_q"] is False
+    assert metadata["clipped_double_distribution"] is False
+    assert metadata["target_q_reduction"] == "mean_complete_twin_target"
+    assert metadata["actor_q_reduction"] == "mean_online_twin_expectations"
+
+@pytest.mark.parametrize(
+    ("q_twin_reduction", "expected_continuing_target"),
+    ((Q_TWIN_REDUCTION_MIN, 2.89), (Q_TWIN_REDUCTION_MEAN, 3.34)),
+)
+def test_scalar_soft_target_uses_configured_twin_q_and_terminal_cut(
+    q_twin_reduction,
+    expected_continuing_target,
+):
     policy = _bare_policy(
         gamma=0.9,
         q_action_input_gain=1.0,
         q_critic_type="scalar",
         q_n_step=1,
+        q_twin_reduction=q_twin_reduction,
         sac_use_autotune=True,
     )
     _install_unit_action_contract(policy)
@@ -2759,12 +2999,23 @@ def test_scalar_soft_target_uses_clipped_twin_q_entropy_and_terminal_cut():
 
     target, diagnostics, _ = policy._distributional_fastsac_target(batch)
 
-    # Row 0: 1 - .9*.2*(-.5) + .9*min(3,2) = 2.89.
+    # Row 0 is 2.89 for min(3,2) and 3.34 for mean(3,2).
     # Row 1 is a true terminal and therefore receives neither entropy nor Q'.
-    assert torch.allclose(target, torch.tensor([2.89, 2.0]))
+    assert torch.allclose(
+        target, torch.tensor([expected_continuing_target, 2.0])
+    )
     assert target.grad_fn is None
     assert diagnostics["target_select_q1_fraction"].item() == pytest.approx(0.5)
     assert diagnostics["target_select_q2_fraction"].item() == pytest.approx(0.5)
+    assert diagnostics["target_q1_contribution_fraction"].item() == pytest.approx(
+        0.5
+    )
+    assert diagnostics["target_q2_contribution_fraction"].item() == pytest.approx(
+        0.5
+    )
+    assert diagnostics["reduced_target_expected_mean"].item() == pytest.approx(
+        (expected_continuing_target + 2.0) / 2.0
+    )
     assert diagnostics["support_clip_fraction_mean"].item() == 0.0
     assert diagnostics["target_distribution_entropy"].item() == 0.0
 
@@ -2832,11 +3083,88 @@ def test_scalar_critic_update_uses_twin_bellman_mse():
     )
 
 
-def test_soft_c51_target_uses_entropy_and_one_complete_lower_twin_head_detached():
+def test_distributional_split_stem_critic_update_uses_c51_cross_entropy():
+    policy = _bare_policy(
+        q_critic_type="distributional",
+        q_condition_on_actuator_state=False,
+        q_action_input_gain=1.0,
+        action_support_clip=20.0,
+        sac_max_grad_norm=1.0e6,
+        sac_alpha_update_cadence="actor",
+        sac_policy_frequency=2,
+        sac_use_autotune=False,
+        sac_tau=0.005,
+    )
+    _install_unit_action_contract(policy)
+    policy._q_critic_dim = 1
+    policy._q_state_input_dim = 1
+    policy._q_action_input_dim = 1
+    policy.qnet = _build_isolated_distributional_scalar_q_network(
+        obs_dim=1,
+        action_dim=1,
+        hidden_dim=8,
+        num_atoms=3,
+        v_min=-1.0,
+        v_max=1.0,
+        device="cpu",
+        seed=23,
+    )
+    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.critic_optimizer = _CountingSGD(policy.qnet.parameters(), lr=0.01)
+    policy.log_alpha = nn.Parameter(torch.tensor(-20.0))
+    policy.critic_update_count = 0
+    policy.alpha_update_count = 0
+    policy._student_actor_warmup_active = lambda: False
+    categorical_target = torch.tensor(
+        [[0.2, 0.3, 0.5], [0.7, 0.2, 0.1]]
+    )
+    policy._distributional_fastsac_target = MethodType(
+        lambda owner, batch: (categorical_target, {}, torch.zeros(2)), policy
+    )
+    batch = {
+        "critic_observations": torch.tensor([[0.2], [-0.4]]),
+        "actions": torch.tensor([[0.3], [0.1]]),
+        "dones": torch.zeros(2, dtype=torch.bool),
+        "truncations": torch.zeros(2, dtype=torch.bool),
+    }
+    with torch.no_grad():
+        before = policy._q_forward(
+            policy.qnet,
+            batch["critic_observations"],
+            batch["actions"],
+            None,
+        )
+        expected_per_head = -(
+            categorical_target.unsqueeze(0)
+            * torch.nn.functional.log_softmax(before, dim=-1)
+        ).sum(dim=-1).mean(dim=-1)
+
+    metrics = policy._critic_update(batch)
+
+    assert policy.critic_optimizer.step_calls == 1
+    assert policy.critic_update_count == 1
+    assert torch.allclose(
+        torch.stack((metrics["critic_loss_1"], metrics["critic_loss_2"])),
+        expected_per_head,
+    )
+    assert metrics["critic_loss"].item() == pytest.approx(
+        expected_per_head.sum().item()
+    )
+
+
+@pytest.mark.parametrize("critic_type", ("c51", "distributional"))
+@pytest.mark.parametrize(
+    "q_twin_reduction", (Q_TWIN_REDUCTION_MIN, Q_TWIN_REDUCTION_MEAN)
+)
+def test_soft_c51_target_uses_configured_complete_twin_distribution_detached(
+    critic_type, q_twin_reduction,
+):
     policy = _bare_policy(
         gamma=1.0,
         q_action_input_gain=1.0,
         sac_use_autotune=True,
+        q_critic_type=critic_type,
+        q_twin_reduction=q_twin_reduction,
     )
     _install_unit_action_contract(policy)
     first = torch.tensor([[0.05, 0.15, 0.80], [0.05, 0.15, 0.80]])
@@ -2864,8 +3192,13 @@ def test_soft_c51_target_uses_entropy_and_one_complete_lower_twin_head_detached(
     projected, diagnostics = result[:2]
 
     # r - gamma * alpha * log(pi) = 0 - 1 * .2 * -.5 = +.1.
+    expected_source = (
+        second
+        if q_twin_reduction == Q_TWIN_REDUCTION_MIN
+        else 0.5 * (first + second)
+    )
     expected, _, _ = _project_c51_probabilities(
-        second,
+        expected_source,
         rewards=torch.full((2,), 0.1),
         bootstrap=torch.ones(2),
         effective_discount=torch.ones(2),
@@ -2874,7 +3207,21 @@ def test_soft_c51_target_uses_entropy_and_one_complete_lower_twin_head_detached(
     assert torch.allclose(projected, expected)
     assert projected.grad_fn is None
     assert projected.requires_grad is False
-    assert diagnostics["target_select_q2_fraction"].item() == pytest.approx(1.0)
+    expected_q2_fraction = (
+        1.0 if q_twin_reduction == Q_TWIN_REDUCTION_MIN else 0.5
+    )
+    assert diagnostics["target_select_q2_fraction"].item() == pytest.approx(
+        expected_q2_fraction
+    )
+    assert diagnostics["target_q1_contribution_fraction"].item() == pytest.approx(
+        1.0 - expected_q2_fraction
+    )
+    assert diagnostics["target_q2_contribution_fraction"].item() == pytest.approx(
+        expected_q2_fraction
+    )
+    assert diagnostics["reduced_target_expected_mean"].item() == pytest.approx(
+        (projected * policy.qnet_target.support).sum(dim=-1).mean().item()
+    )
     assert diagnostics["target_log_prob_mean"].item() == pytest.approx(-0.5)
     assert diagnostics["entropy_tax_mean"].item() == pytest.approx(-0.1)
     assert not torch.equal(policy.sac_action_rng.get_state(), rng_before)

@@ -4218,6 +4218,11 @@ def test_three_source_capacity_and_live_perception_keep_total_and_complete_seque
     assert pure.batch_size == torch.Size((2, 3))
     assert torch.equal(pure["marker"], values[[1, 3]])
 
+    policy.cfg.perception_live_env_scope = "all"
+    live = policy._live_perception_rollout(rollout)
+    assert live is rollout
+    assert live.batch_size == torch.Size((4, 3))
+
 
 @pytest.mark.parametrize(
     ("q_fraction", "actor_fraction"),

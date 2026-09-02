@@ -65,12 +65,21 @@ algo:
   teacher_prefill_max_rollouts: 1000
   # Actor replay accepts an independent Expert share. Within its remaining
   # online share, this conditional fraction comes from mixed-control DAgger;
-  # the complement comes from the pure-Student ring. Perception is different:
-  # it learns only from complete live sequences of the pure-Student cohort.
+  # the complement comes from the pure-Student ring. Perception instead uses
+  # complete live recurrent sequences selected by perception_live_env_scope.
   teacher_actor_replay_fraction: 0.5
   actor_online_dagger_replay_fraction: 0.5
   teacher_perception_replay_fraction: 0.0
+  # Preferred single perception-data selector. Use ``pure_student`` for the
+  # historical Student-only cohort, ``all`` for every live environment, or
+  # ``four_way`` for replay-based perception. Null preserves legacy commands
+  # that still set the two internal fields below.
+  perception_training_source: null
   perception_replay_mode: online_student_rollout
+  # ``pure_student`` preserves the historical on-policy cohort. ``all`` uses
+  # complete live sequences from both pure-Student and mixed-control DAgger
+  # environments; neither setting samples perception data from replay.
+  perception_live_env_scope: pure_student
   failure_phase_teacher_fraction: 0.3
   # Each failed Student episode contributes ten evenly spaced reference-phase
   # samples from the inclusive [done - 50, done] interval.  The histogram is
@@ -109,27 +118,34 @@ algo:
   # ``c51`` preserves the engineered split-action distributional critic.
   # ``scalar`` uses independent standard-SAC Q heads with balanced state/action
   # stems, followed by two shared-width hidden layers and one scalar output.
+  # ``distributional`` keeps those exact scalar-style inputs and hidden layers
+  # but replaces only the final scalar with the categorical C51 atom logits.
   q_critic_type: c51
-  # Locked C51 support (retained as inactive compatibility metadata in scalar
-  # mode) with an independently configurable Teacher/Student replay mixture.
+  # Shared Q1/Q2 reduction for both Actor and bootstrap targets. ``min`` keeps
+  # clipped double-Q. ``mean`` averages scalar values or mixes the two complete
+  # C51 probability distributions with equal weight.
+  q_twin_reduction: min
+  # Locked support for both categorical modes (retained as inactive
+  # compatibility metadata in scalar mode), with an independently configurable
+  # Teacher/Student replay mixture.
   q_hidden_dim: 768
   q_num_atoms: 501
   q_v_min: -20.0
   q_v_max: 20.0
-  # These two topology knobs apply only to C51. Scalar always uses its fixed
-  # balanced state/action stems and no LayerNorm.
+  # These two topology knobs apply only to engineered ``c51``. ``scalar`` and
+  # ``distributional`` always use fixed balanced stems and no LayerNorm.
   q_layer_norm: true
   q_action_fusion: late
   q_action_coordinates: raw_joint_command
   q_normalize_actions: true
   q_action_input_gain: 1.0
-  # Requires q_condition_on_actuator_state=true. C51 receives engineered
-  # delta/effect features. Scalar uses this flag only to retain the normalized
-  # previous issued action as detached state context.
+  # Requires q_condition_on_actuator_state=true. Engineered ``c51`` receives
+  # delta/effect features. Both split-stem modes use this flag only to retain
+  # the normalized previous issued action as detached state context.
   q_use_predicted_effect: false
   # Zero-initialized bounded FiLM of the Q action stem, conditioned only on
   # delay one-hot and centered actuator alpha. Requires actuator context and
-  # late/balanced action fusion.
+  # late/balanced action fusion; unavailable to both split-stem modes.
   q_use_residual_film: false
   q_residual_film_scale: 0.1
   q_lr: 3.0e-5

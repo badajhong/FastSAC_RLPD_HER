@@ -46,6 +46,7 @@ from .fastsac_bc_dagger import (
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE,
     Q_EFFECTIVE_N_STEPS_KEY,
+    Q_TWIN_REDUCTION_MEAN,
     SCALAR_Q_CRITIC_TYPE,
     SPRED_P_BC_SEMANTICS,
     TRAINING_ALGORITHM as BASE_FASTSAC_TRAINING_ALGORITHM,
@@ -54,10 +55,13 @@ from .fastsac_bc_dagger import (
     _fastsac_action_distribution,
     _fastsac_actor_backend,
     _fastsac_q_critic_type,
+    _fastsac_q_twin_reduction,
     _migrate_explicit_online_replay_capacities,
     _q_target_discount_factors,
+    _reduce_fastsac_twin_target,
 )
 from .fastsac_vel import (
+    FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_FUSION_SEMANTICS,
     FASTSAC_STANDARD_SCALAR_Q_INPUT_SEMANTICS,
@@ -89,6 +93,7 @@ from .td3_bc_dagger import (
     STUDENT_REPLAY_EPISODE_ID_KEY,
     STUDENT_REPLAY_EPISODE_STEP_KEY,
     TEACHER_EPISODE_SIDECAR_SEMANTICS,
+    online_rollout_perception_semantics,
     _PREFILL_ENV_INDEX_KEY,
     _PREFILL_COMMAND_FINISHED_KEY,
     _PREFILL_STEP_INDEX_KEY,
@@ -183,6 +188,10 @@ def _tvkd_actor_learning_semantics(config) -> str:
             semantics = ACTOR_LEARNING_SEMANTICS
     else:
         raise ValueError(f"unsupported FastSAC action distribution {distribution!r}")
+    if _fastsac_q_twin_reduction(config) == Q_TWIN_REDUCTION_MEAN:
+        if "twin_min" not in semantics:
+            raise RuntimeError("TVKD Actor semantics lack the twin-min marker")
+        semantics = semantics.replace("twin_min", "twin_mean", 1)
     if getattr(config, "use_q_filtered_bc", False):
         return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
     return semantics
@@ -196,9 +205,20 @@ def _tvkd_critic_learning_semantics(config) -> str:
         semantics = PHASE_FADED_CRITIC_LEARNING_SEMANTICS
     else:
         semantics = CRITIC_LEARNING_SEMANTICS
-    if _fastsac_q_critic_type(config) == SCALAR_Q_CRITIC_TYPE:
+    scalar = _fastsac_q_critic_type(config) == SCALAR_Q_CRITIC_TYPE
+    mean_reduction = (
+        _fastsac_q_twin_reduction(config) == Q_TWIN_REDUCTION_MEAN
+    )
+    if scalar:
+        replacement = (
+            "soft_mean_twin_scalar_q_mse_target"
+            if mean_reduction
+            else "soft_clipped_twin_scalar_q_mse_target"
+        )
+        semantics = semantics.replace("soft_c51_target", replacement)
+    elif mean_reduction:
         semantics = semantics.replace(
-            "soft_c51_target", "soft_clipped_twin_scalar_q_mse_target"
+            "soft_c51_target", "soft_mean_twin_c51_target"
         )
     return semantics
 
@@ -1722,10 +1742,15 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             if target_logits.ndim != 2 or target_logits.shape[0] != 2:
                 raise RuntimeError("TVKD scalar target must have shape [2, batch]")
             raw_expected_heads = target_logits
-            selected_head = raw_expected_heads.argmin(dim=0)
-            selected_next_q = raw_expected_heads.gather(
-                0, selected_head.unsqueeze(0)
-            ).squeeze(0)
+            (
+                selected_next_q,
+                q1_target_fraction,
+                q2_target_fraction,
+            ) = _reduce_fastsac_twin_target(
+                raw_expected_heads,
+                raw_expected_heads,
+                _fastsac_q_twin_reduction(self.cfg),
+            )
             selected_target = soft_reward + effective_discount * (
                 bootstrap.to(effective_discount) * selected_next_q
             )
@@ -1785,19 +1810,18 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 q1_support_clip_fraction, q2_support_clip_fraction
             )
             projected_heads = torch.stack(projected_heads, dim=0)
-            projected_expected_heads = (
-                projected_heads * self.qnet_target.support
+            (
+                selected_target,
+                q1_target_fraction,
+                q2_target_fraction,
+            ) = _reduce_fastsac_twin_target(
+                projected_heads,
+                raw_expected_heads,
+                _fastsac_q_twin_reduction(self.cfg),
+            )
+            selected_expected = (
+                selected_target * self.qnet_target.support
             ).sum(dim=-1)
-            selected_head = raw_expected_heads.argmin(dim=0)
-            selected_target = projected_heads.gather(
-                0,
-                selected_head[None, :, None].expand(
-                    1, projected_heads.shape[1], projected_heads.shape[2]
-                ),
-            ).squeeze(0)
-            selected_expected = projected_expected_heads.gather(
-                0, selected_head.unsqueeze(0)
-            ).squeeze(0)
             selected_entropy = -(
                 selected_target
                 * selected_target.clamp_min(
@@ -1843,10 +1867,15 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             "target_expected_q1_mean": raw_expected_heads[0].mean(),
             "target_expected_q2_mean": raw_expected_heads[1].mean(),
             "projected_target_mean": selected_expected.mean(),
+            "reduced_target_expected_mean": selected_expected.mean(),
+            "target_q1_contribution_fraction": q1_target_fraction,
+            "target_q2_contribution_fraction": q2_target_fraction,
+            # Historical dashboard aliases. In mean mode these are equal
+            # contribution weights; no individual head is selected.
             "selected_target_expected_mean": selected_expected.mean(),
             "target_distribution_entropy": selected_entropy.mean(),
-            "target_select_q1_fraction": (selected_head == 0).float().mean(),
-            "target_select_q2_fraction": (selected_head == 1).float().mean(),
+            "target_select_q1_fraction": q1_target_fraction,
+            "target_select_q2_fraction": q2_target_fraction,
             "q1_left_support_clip_fraction": q1_left_support_clip_fraction,
             "q1_right_support_clip_fraction": q1_right_support_clip_fraction,
             "q2_left_support_clip_fraction": q2_left_support_clip_fraction,
@@ -3566,6 +3595,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             return self._q_backend_metadata()
         metadata = {
             "target_semantics": _tvkd_critic_learning_semantics(self.cfg),
+            "q_twin_reduction": _fastsac_q_twin_reduction(self.cfg),
             "q_action_input_dim": int(
                 getattr(self, "_q_action_input_dim", getattr(self, "action_dim", 0))
             ),
@@ -3597,9 +3627,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 getattr(self.cfg, "bottleneck_selection_mode", "first")
             ),
         }
-        if self._uses_standard_scalar_q():
+        if self._uses_standard_split_stem_q():
             hidden_dim = int(getattr(self.cfg, "q_hidden_dim", 768))
             state_hidden_dim = hidden_dim // 2
+            q_architecture_semantics = (
+                FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
+                if self._uses_standard_scalar_q()
+                else FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS
+            )
             metadata.update(
                 {
                     "q_state_input_dim": int(
@@ -3617,7 +3652,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                         FASTSAC_STANDARD_SCALAR_Q_INPUT_SEMANTICS
                     ),
                     "q_architecture_semantics": (
-                        FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS
+                        q_architecture_semantics
                     ),
                     "hidden_dim": hidden_dim,
                     "q_action_fusion": "balanced_split_stems",
@@ -4017,8 +4052,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "q_backend_config": self._checkpoint_q_backend_metadata(),
                 "replay_mix_state": replay_mix_state,
                 "perception_replay_mode": str(self.cfg.perception_replay_mode),
+                "perception_live_env_scope": str(
+                    self.cfg.perception_live_env_scope
+                ),
                 "perception_training_semantics": (
-                    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                    online_rollout_perception_semantics(self.cfg)
                     if str(self.cfg.perception_replay_mode)
                     == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
                     else PERCEPTION_REPLAY_SEMANTICS
@@ -4215,6 +4253,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             if "q_critic_type" not in backend:
                 backend = dict(backend)
                 backend["q_critic_type"] = "c51"
+            if "q_twin_reduction" not in backend:
+                backend = dict(backend)
+                backend["q_twin_reduction"] = "min"
             if "use_teacher_residual_critic" not in backend:
                 backend = dict(backend)
                 backend["use_teacher_residual_critic"] = False
@@ -4308,8 +4349,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     else _tvkd_actor_learning_semantics(self.cfg)
                 ),
                 "perception_replay_mode": str(self.cfg.perception_replay_mode),
+                "perception_live_env_scope": str(
+                    self.cfg.perception_live_env_scope
+                ),
                 "perception_training_semantics": (
-                    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+                    online_rollout_perception_semantics(self.cfg)
                     if str(self.cfg.perception_replay_mode)
                     == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
                     else PERCEPTION_REPLAY_SEMANTICS
@@ -4384,12 +4428,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             )
             metadata_defaults = {
                 "bottleneck_selection_mode": "first",
+                "perception_live_env_scope": "pure_student",
                 "bc_weighting_semantics": "fixed_unweighted_valid_teacher_bc",
                 "q_action_input_dim": q_action_input_dim,
                 "q_actuator_context": {"enabled": False},
                 "q_action_feature_semantics": "normalized_issued_command_only_v1",
                 "q_predicted_effect": {"enabled": False},
                 "q_residual_film": {"enabled": False},
+                "q_twin_reduction": "min",
                 "q_n_step_semantics": Q_N_STEP_SEMANTICS,
                 "student_q_n_step": 1,
                 "teacher_q_n_step": 1,
@@ -4406,6 +4452,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 )
             expected_q_metadata = {
                 "target_semantics": critic_semantics,
+                "q_twin_reduction": _fastsac_q_twin_reduction(self.cfg),
                 "q_action_input_dim": q_action_input_dim,
                 "q_actuator_context": q_context_metadata,
                 "q_action_feature_semantics": self._q_action_feature_semantics(),
@@ -4431,7 +4478,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     getattr(self.cfg, "bottleneck_selection_mode", "first")
                 ),
             }
-            if _fastsac_q_critic_type(self.cfg) == SCALAR_Q_CRITIC_TYPE:
+            if self._uses_standard_split_stem_q():
                 runtime_q_backend = self._checkpoint_q_backend_metadata()
                 for name in (
                     "q_state_input_dim",
@@ -4463,6 +4510,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "q_use_residual_film",
                 "q_residual_film_scale",
                 "perception_replay_mode",
+                "perception_live_env_scope",
                 "perception_replay_batch_size",
                 "use_tvkd_value_shaping",
                 "use_teacher_residual_critic",
@@ -4476,7 +4524,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "bottleneck_include_unsuccessful_timeouts",
                 "max_teacher_phase_match_distance",
             ):
-                if backend.get(name) != getattr(self.cfg, name):
+                default = "pure_student" if name == "perception_live_env_scope" else None
+                if backend.get(name, default) != getattr(self.cfg, name):
                     raise ValueError(f"TVKD resume config mismatch at {name!r}")
         if legacy:
             warnings.warn(

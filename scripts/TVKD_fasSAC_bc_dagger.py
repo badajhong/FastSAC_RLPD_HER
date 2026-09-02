@@ -33,7 +33,7 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     LEGACY_CHECKPOINT_VERSION,
     LEGACY_TRAINING_ALGORITHM,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
-    ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
+    online_rollout_perception_semantics,
     PERCEPTION_REPLAY_SEMANTICS,
     PREVIOUS_CHECKPOINT_VERSION,
     PREVIOUS_TRAINING_ALGORITHM,
@@ -75,6 +75,9 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     _fastsac_actor_backend,
 )
+from active_adaptation.learning.ppo.td3_bc_dagger import (
+    apply_perception_training_source,
+)
 from active_adaptation.utils.wandb import parse_checkpoint_path
 
 try:
@@ -107,7 +110,7 @@ CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
 def _perception_training_semantics(algo) -> str:
     return (
-        ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
+        online_rollout_perception_semantics(algo)
         if str(algo.perception_replay_mode)
         == ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
         else PERCEPTION_REPLAY_SEMANTICS
@@ -839,7 +842,10 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         )
     # Checkpoints written before the selection knob carry no such key; their
     # behavior was exactly the earliest-crossing rule that "first" reproduces.
-    q_metadata_defaults = {"bottleneck_selection_mode": "first"}
+    q_metadata_defaults = {
+        "bottleneck_selection_mode": "first",
+        "q_twin_reduction": "min",
+    }
     for name, expected in exact.items():
         if not isinstance(expected, str) or not expected:
             raise ValueError(f"TVKD runtime lacks required metadata {name!r}")
@@ -850,6 +856,9 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         raise ValueError(f"TVKD {label} checkpoint lacks Q backend metadata")
     expected_q_metadata = {
         "target_semantics": critic_semantics,
+        "q_twin_reduction": str(
+            cfg.algo.get("q_twin_reduction", "min")
+        ),
         "failure_phase_replay_semantics": VERIFIED_HISTOGRAM_SEMANTICS,
         "bottleneck_location_semantics": BOTTLENECK_LOCATION_SEMANTICS,
         "bottleneck_fallback_mode": str(cfg.algo.bottleneck_fallback_mode),
@@ -1298,6 +1307,10 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault("use_q_filtered_bc", False)
     # Checkpoints before the selectable critic family are exactly C51.
     source_algo_contract.setdefault("q_critic_type", "c51")
+    # Historical live perception used only the fixed pure-Student cohort.
+    source_algo_contract.setdefault("perception_live_env_scope", "pure_student")
+    # Every checkpoint before this explicit selector used clipped double-Q.
+    source_algo_contract.setdefault("q_twin_reduction", "min")
     # Older checkpoints used the ordinary shaped-Q parameterization.
     source_algo_contract.setdefault("use_teacher_residual_critic", False)
     # Older V9 checkpoints that predate explicit horizon fields already used
@@ -1454,6 +1467,7 @@ def _prepare_tvkd_checkpoint(
 
 def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
     """Reuse every baseline lock, then validate only the added controls."""
+    apply_perception_training_source(cfg.algo)
     apply_fastsac_dagger_iteration_controls(cfg)
     if cfg.algo.get("name") != EXPECTED_ALGO_NAME:
         raise ValueError(f"TVKD entrypoint requires algo.name={EXPECTED_ALGO_NAME!r}")
@@ -1515,6 +1529,7 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
 )
 def main(cfg: DictConfig):
     _require_single_process_execution()
+    apply_perception_training_source(cfg.algo)
     apply_fastsac_dagger_iteration_controls(cfg)
     task_overrides = (
         HydraConfig.get().overrides.task if HydraConfig.initialized() else ()
@@ -1560,6 +1575,7 @@ def main(cfg: DictConfig):
     print(
         "TVKD FastSAC + fixed BC + value-bottleneck replay: "
         f"critic={str(cfg.algo.get('q_critic_type', 'c51'))}, "
+        f"q_twin_reduction={str(cfg.algo.get('q_twin_reduction', 'min'))}, "
         f"prefill=until {schedule['prefill_target_rows']} Teacher rows, "
         f"main_additional={schedule['main_rollouts']}, "
         f"main_range=[{start_rollout}, "

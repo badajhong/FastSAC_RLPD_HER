@@ -166,11 +166,35 @@ def test_scalar_q_critic_type_is_an_opt_in_valid_configuration():
     sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 
+def test_distributional_q_critic_type_is_an_opt_in_valid_configuration():
+    cfg = _cfg()
+    cfg.algo.q_critic_type = "distributional"
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
 def test_unknown_q_critic_type_is_rejected():
     cfg = _cfg()
     cfg.algo.q_critic_type = "quantile"
 
     with pytest.raises(ValueError, match="q_critic_type"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize("q_twin_reduction", ("min", "mean"))
+def test_q_twin_reduction_accepts_min_and_mean(q_twin_reduction):
+    cfg = _cfg()
+    cfg.algo.q_twin_reduction = q_twin_reduction
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+@pytest.mark.parametrize("q_twin_reduction", ("max", "average", ""))
+def test_unknown_q_twin_reduction_is_rejected(q_twin_reduction):
+    cfg = _cfg()
+    cfg.algo.q_twin_reduction = q_twin_reduction
+
+    with pytest.raises(ValueError, match="q_twin_reduction"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 

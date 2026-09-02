@@ -664,7 +664,7 @@ def _fill_replayless_inference_algo_defaults(
                 backend.get("q_critic_type", "c51"),
             )
         )
-        if saved_q_critic_type not in ("c51", "scalar"):
+        if saved_q_critic_type not in ("c51", "scalar", "distributional"):
             raise ValueError(
                 "inference checkpoint has invalid q_critic_type metadata"
             )
@@ -673,6 +673,36 @@ def _fill_replayless_inference_algo_defaults(
         ):
             cfg.algo.q_critic_type = saved_q_critic_type
             filled_checkpoint.append("q_critic_type")
+        q_twin_reductions = {
+            "top-level": policy_state.get("q_twin_reduction"),
+            "Q backend": q_backend.get("q_twin_reduction"),
+            "DAgger backend": backend.get("q_twin_reduction"),
+        }
+        present_q_twin_reductions = {
+            source: value
+            for source, value in q_twin_reductions.items()
+            if value is not None
+        }
+        if any(
+            not isinstance(value, str) or value not in ("min", "mean")
+            for value in present_q_twin_reductions.values()
+        ):
+            raise ValueError(
+                "inference checkpoint has invalid q_twin_reduction metadata"
+            )
+        if len(set(present_q_twin_reductions.values())) > 1:
+            raise ValueError(
+                "inference checkpoint has inconsistent q_twin_reduction metadata"
+            )
+        saved_q_twin_reduction = next(
+            iter(present_q_twin_reductions.values()), "min"
+        )
+        if algorithm in fastsac_algorithms and (
+            cfg.algo.get("q_twin_reduction", "min")
+            != saved_q_twin_reduction
+        ):
+            cfg.algo.q_twin_reduction = saved_q_twin_reduction
+            filled_checkpoint.append("q_twin_reduction")
         q_context = q_backend.get(
             "q_actuator_context",
             {"enabled": backend.get("q_condition_on_actuator_state", False)},
@@ -694,14 +724,14 @@ def _fill_replayless_inference_algo_defaults(
                 "inference checkpoint has invalid Q predicted-effect metadata"
             )
         saved_q_context = bool(q_context["enabled"])
-        if saved_q_critic_type == "scalar":
+        if saved_q_critic_type in ("scalar", "distributional"):
             saved_predicted_effect = predicted_effect.get(
                 "configured_context_collection",
                 backend.get("q_use_predicted_effect", False),
             )
             if not isinstance(saved_predicted_effect, bool):
                 raise ValueError(
-                    "scalar-Q inference checkpoint has invalid previous-action "
+                    "split-stem Q inference checkpoint has invalid previous-action "
                     "context metadata"
                 )
         else:

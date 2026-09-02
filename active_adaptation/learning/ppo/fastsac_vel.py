@@ -368,6 +368,9 @@ FASTSAC_Q_DIRECT_ARCHITECTURE_SEMANTICS = (
 FASTSAC_STANDARD_SCALAR_Q_ARCHITECTURE_SEMANTICS = (
     "twin_independent_balanced_state_action_stems_scalar_mlp_v2"
 )
+FASTSAC_STANDARD_DISTRIBUTIONAL_Q_ARCHITECTURE_SEMANTICS = (
+    "twin_independent_balanced_state_action_stems_c51_mlp_v1"
+)
 FASTSAC_STANDARD_SCALAR_Q_INPUT_SEMANTICS = (
     "normalized_critic_observation_plus_detached_actuator_state_to_state_"
     "stem_and_normalized_candidate_action_once_to_action_stem_v2"
@@ -2288,7 +2291,7 @@ class TwinDistributionalQ(nn.Module):
 
 
 class _ScalarQHead(nn.Module):
-    """One scalar-Q head with balanced state/action representation capacity."""
+    """One split-stem Q head with balanced state/action representation capacity."""
 
     def __init__(
         self,
@@ -2297,8 +2300,15 @@ class _ScalarQHead(nn.Module):
         hidden_dim: int,
         state_hidden_dim: int,
         action_hidden_dim: int,
+        output_dim: int = 1,
     ):
         super().__init__()
+        if (
+            isinstance(output_dim, bool)
+            or not isinstance(output_dim, int)
+            or output_dim < 1
+        ):
+            raise ValueError("split-stem Q output dimension must be positive")
         self.state_stem = nn.Sequential(
             nn.Linear(obs_dim, state_hidden_dim),
             nn.ReLU(),
@@ -2313,7 +2323,7 @@ class _ScalarQHead(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, obs, action):
@@ -2386,6 +2396,95 @@ class TwinScalarQ(nn.Module):
         return outputs
 
 
+class TwinDistributionalScalarQ(nn.Module):
+    """Twin C51 critics with the standard scalar critic's exact input topology.
+
+    State and normalized candidate action pass through the same independent,
+    balanced stems and two shared-width hidden layers as :class:`TwinScalarQ`.
+    Only the final linear layer differs: it emits one logit per C51 atom rather
+    than a single Bellman value.
+    """
+
+    def __init__(
+        self,
+        obs_dim,
+        action_dim,
+        hidden_dim,
+        num_atoms,
+        v_min,
+        v_max,
+    ):
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_atoms = int(num_atoms)
+        self.v_min = float(v_min)
+        self.v_max = float(v_max)
+        if self.obs_dim <= 0 or self.action_dim <= 0 or self.hidden_dim <= 0:
+            raise ValueError(
+                "standard distributional-Q dimensions must be positive"
+            )
+        if self.hidden_dim < 2:
+            raise ValueError(
+                "standard distributional-Q hidden dimension must be at least 2"
+            )
+        if self.num_atoms < 2:
+            raise ValueError("standard distributional-Q requires at least two atoms")
+        if not math.isfinite(self.v_min) or not math.isfinite(self.v_max):
+            raise ValueError("standard distributional-Q support must be finite")
+        if self.v_min >= self.v_max:
+            raise ValueError(
+                "standard distributional-Q support bounds must be ordered"
+            )
+        self.state_hidden_dim = self.hidden_dim // 2
+        self.action_hidden_dim = self.hidden_dim - self.state_hidden_dim
+        self.qnets = nn.ModuleList(
+            _ScalarQHead(
+                self.obs_dim,
+                self.action_dim,
+                self.hidden_dim,
+                self.state_hidden_dim,
+                self.action_hidden_dim,
+                output_dim=self.num_atoms,
+            )
+            for _ in range(2)
+        )
+        self.register_buffer(
+            "support", torch.linspace(self.v_min, self.v_max, self.num_atoms)
+        )
+
+    def forward(self, obs, action):
+        if obs.ndim != action.ndim or obs.shape[:-1] != action.shape[:-1]:
+            raise ValueError(
+                "standard distributional-Q state/action batch shapes must match"
+            )
+        if int(obs.shape[-1]) != self.obs_dim:
+            raise ValueError(
+                "standard distributional-Q state width mismatch: "
+                f"got {int(obs.shape[-1])}, expected {self.obs_dim}"
+            )
+        if int(action.shape[-1]) != self.action_dim:
+            raise ValueError(
+                "standard distributional-Q action width mismatch: "
+                f"got {int(action.shape[-1])}, expected {self.action_dim}"
+            )
+        return torch.stack(
+            [critic(obs, action) for critic in self.qnets], dim=0
+        )
+
+    def values(self, logits):
+        if (
+            logits.ndim != 3
+            or logits.shape[0] != 2
+            or logits.shape[-1] != self.num_atoms
+        ):
+            raise ValueError(
+                "distributional twin-Q outputs must have shape [2, batch, atoms]"
+            )
+        return (F.softmax(logits, dim=-1) * self.support).sum(dim=-1)
+
+
 def _build_isolated_q_network(
     obs_dim, action_dim, hidden_dim, num_atoms, v_min, v_max,
     layer_norm, device, seed,
@@ -2441,6 +2540,41 @@ def _build_isolated_scalar_q_network(
             obs_dim,
             action_dim,
             hidden_dim,
+        ).to(device)
+    return qnet
+
+
+def _build_isolated_distributional_scalar_q_network(
+    obs_dim,
+    action_dim,
+    hidden_dim,
+    num_atoms,
+    v_min,
+    v_max,
+    device,
+    seed,
+):
+    """Build split-stem C51 Q1/Q2 without advancing global RNG streams."""
+    device = torch.device(device)
+    cuda_devices = []
+    if device.type == "cuda":
+        cuda_devices = [
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        ]
+    with torch.random.fork_rng(devices=cuda_devices):
+        torch.default_generator.manual_seed(int(seed))
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                torch.cuda.manual_seed(int(seed))
+        qnet = TwinDistributionalScalarQ(
+            obs_dim,
+            action_dim,
+            hidden_dim,
+            num_atoms,
+            v_min,
+            v_max,
         ).to(device)
     return qnet
 
