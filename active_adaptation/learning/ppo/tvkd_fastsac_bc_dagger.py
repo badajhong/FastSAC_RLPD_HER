@@ -74,7 +74,7 @@ from .ppo_bc_dagger import (
     DAGGER_REPLAY_TEACHER_ACTIONS,
 )
 from .ppo_vel import DEPTH_KEY, OBJECT_GEO_KEY, OBJECT_KEY, VEL_CMD_KEY
-from .ppo_vel import PPOVEL
+from .ppo_vel import PPOVEL, PRIV_FEATURE_KEY, PRIV_PRED_KEY, DepthResidualGRUModule
 from .td3_bc_dagger import (
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
@@ -521,6 +521,26 @@ def _install_v3_replay_migration(
 
 def _validate_tvkd_algorithm_config(cfg) -> None:
     """Validate controls shared by direct construction and the Hydra CLI."""
+    depth_residual = getattr(cfg, "perception_depth_residual", False)
+    if not isinstance(depth_residual, bool):
+        raise ValueError("perception_depth_residual must be boolean")
+    if depth_residual and (
+        cfg.phase != "finetune" or cfg.adapt_module != "gru" or not cfg.use_depth
+    ):
+        raise ValueError("perception_depth_residual requires finetune, gru, and use_depth=true")
+    action_coef = getattr(cfg, "perception_action_consistency_coef", 0.0)
+    if (
+        isinstance(action_coef, bool)
+        or not isinstance(action_coef, (int, float))
+        or not math.isfinite(action_coef)
+        or action_coef < 0.0
+    ):
+        raise ValueError("perception_action_consistency_coef must be finite and nonnegative")
+    if action_coef > 0.0:
+        if not cfg.train_perception:
+            raise ValueError("perception_action_consistency_coef requires train_perception=true")
+        if cfg.perception_replay_mode != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE:
+            raise ValueError("perception action consistency requires online_student_rollout")
     if getattr(cfg, "sac_alpha_update_cadence", None) not in {"actor", "critic"}:
         raise ValueError("sac_alpha_update_cadence must be 'actor' or 'critic'")
     for name in ("q_n_step", "q_teacher_n_step"):
@@ -674,6 +694,13 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     perception_uniform_teacher_fraction: float = 0.0
     perception_failure_teacher_fraction: float = 0.0
     perception_replay_mode: str = ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE
+    # Control-sensitive supervision through the current Student actor. Its
+    # parameters are constant only for this perception forward; SAC+BC still
+    # updates the actor normally. Zero retains historical training exactly.
+    perception_action_consistency_coef: float = 0.0
+    # Zero-initialized direct temporal-depth projection before adaptation GRU.
+    # Nested in adapt_module/adapt_ema; no extra optimizer or recurrent state.
+    perception_depth_residual: bool = False
 
     # Every source uses the standard one-step SAC Bellman contract.  This is
     # especially important for the online DAgger partition, where Student and
@@ -1368,6 +1395,103 @@ def compute_teacher_value_terms(
 
 class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
     """Twin-C51 FastSAC with frozen shaping and bottleneck-aligned replay."""
+
+    def _prepare_perception_warmstart(self, policy_state):
+        """Add only absent depth projections when initializing from an old model.
+
+        Never relax validation for existing keys or incomplete new models.
+        A learned projection must exist in both online and EMA state; only a
+        source with no projection in either is eligible for zero expansion.
+        """
+        if not getattr(self.cfg, "perception_depth_residual", False):
+            return policy_state
+        names = ("adapt_module", "adapt_ema")
+        target_states = {name: getattr(self, name).state_dict() for name in names}
+        projection_keys = {
+            name: [key for key in state if key.endswith("depth_projection.weight")]
+            for name, state in target_states.items()
+        }
+        if any(len(keys) != 1 for keys in projection_keys.values()):
+            raise RuntimeError("depth residual warm start requires online and EMA projections")
+        source_states = {name: policy_state.get(name, {}) for name in names}
+        source_has_projection = any(
+            any(str(key).endswith("depth_projection.weight") for key in source)
+            for source in source_states.values() if isinstance(source, Mapping)
+        )
+        backend = policy_state.get("dagger_backend_config", {})
+        flags = [
+            source["perception_depth_residual"]
+            for source in (policy_state, backend)
+            if isinstance(source, Mapping) and "perception_depth_residual" in source
+        ]
+        if any(not isinstance(flag, bool) for flag in flags) or (
+            flags and any(flag != flags[0] for flag in flags)
+        ) or (flags and not flags[0] and source_has_projection):
+            raise ValueError("perception warm start has inconsistent perception_depth_residual metadata")
+        if (flags and flags[0]) or source_has_projection:
+            return policy_state  # strict loaders reject missing/malformed tensors
+        expanded = dict(policy_state)
+        for name, source in source_states.items():
+            if not isinstance(source, Mapping):
+                raise ValueError(f"perception checkpoint lacks mapping {name!r}")
+            expanded[name] = dict(source)
+            for key in projection_keys[name]:
+                expanded[name][key] = torch.zeros_like(target_states[name][key])
+        return expanded
+
+    def _perception_auxiliary_loss(self, tensordict: TensorDict):
+        """Match this actor's oracle-latent actions on live recurrent histories.
+
+        Use the online latent already computed by PPOVEL.train_adapt, never
+        cached replay/EMA features. Freezing parameters at forward construction
+        prevents actor gradients even after their flags are restored, while
+        retaining the actor's input Jacobian for the perception backward.
+        """
+        metrics = {}
+        if getattr(self.cfg, "perception_depth_residual", False):
+            for module in self.adapt_module.modules():
+                if isinstance(module, DepthResidualGRUModule):
+                    metrics["adapt/depth_residual_weight_norm"] = (
+                        module.depth_projection.weight.detach().norm()
+                    )
+        coefficient = float(getattr(self.cfg, "perception_action_consistency_coef", 0.0))
+        if coefficient == 0.0:
+            return None, metrics
+
+        predicted_latent = tensordict[PRIV_PRED_KEY]
+        oracle_latent = tensordict[PRIV_FEATURE_KEY].detach()
+        observation = tensordict[OBS_KEY].detach()
+        command = tensordict[VEL_CMD_KEY].detach()
+        predicted_input = torch.cat((command, observation, predicted_latent), dim=-1)
+        oracle_input = torch.cat((command, observation, oracle_latent), dim=-1)
+        parameters = tuple(self.actor_adapt.parameters())
+        original_flags = tuple(parameter.requires_grad for parameter in parameters)
+        try:
+            for parameter in parameters:
+                parameter.requires_grad_(False)
+            with torch.no_grad():
+                target = self._actor_dist_from_flat(oracle_input.flatten(0, -2)).mean
+            prediction = self._actor_dist_from_flat(predicted_input.flatten(0, -2)).mean
+        finally:
+            for parameter, requires_grad in zip(parameters, original_flags):
+                parameter.requires_grad_(requires_grad)
+
+        # Same physical joint normalization as BC, without sampling actions or
+        # involving the Q network/temperature. Reset rows do not supervise the
+        # recurrent perception, matching the reconstruction loss's reset mask.
+        scale = self._fastsac_q_action_scale.detach().to(prediction)
+        per_row = ((prediction - target) / scale).square().mean(dim=-1)
+        valid = (~tensordict["is_init"].bool()).reshape(-1)
+        loss = torch.where(valid, per_row, torch.zeros_like(per_row)).sum()
+        loss = loss / valid.sum().clamp_min(1)
+        weighted_loss = coefficient * loss
+        return weighted_loss, {
+            **metrics,
+            "adapt/action_consistency_loss": loss.detach(),
+            "adapt/action_consistency_weighted_loss": weighted_loss.detach(),
+            "adapt/action_consistency_valid_fraction": valid.float().mean().detach(),
+            "adapt/action_consistency_coef": loss.new_tensor(coefficient),
+        }
 
     @staticmethod
     def _validate_td3_config(cfg) -> None:
@@ -4310,6 +4434,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         if current:
             contract_label = "v9"
             expected_backend = self._checkpoint_config()
+            # Historical checkpoints had reconstruction-only perception.
+            # Never inherit an enabled runtime objective during exact resume.
+            backend = dict(backend)
+            backend.setdefault("perception_action_consistency_coef", 0.0)
+            backend.setdefault("perception_depth_residual", False)
             if "sac_action_distribution" not in backend:
                 if (
                     state.get("actor_backend") != ACTOR_BACKEND
@@ -4357,6 +4486,16 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             if "q_twin_reduction" not in backend:
                 backend = dict(backend)
                 backend["q_twin_reduction"] = "min"
+            if "student_actor_initialization" not in backend:
+                # Earlier v9 checkpoints always loaded actor_adapt from the
+                # PPO Teacher/BC source, matching the new default exactly.
+                backend = dict(backend)
+                backend["student_actor_initialization"] = "teacher_bc"
+            if "actor_adopt_checkpoint_path" not in backend:
+                # Older checkpoints predate the optional external actor_adapt
+                # mean/body overlay and therefore used no such source.
+                backend = dict(backend)
+                backend["actor_adopt_checkpoint_path"] = None
             if "use_teacher_residual_critic" not in backend:
                 backend = dict(backend)
                 backend["use_teacher_residual_critic"] = False
@@ -4856,6 +4995,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
     def state_dict(self):
         state = DistributionalFastSACTeacherBC.state_dict(self)
+        state["perception_depth_residual"] = bool(
+            getattr(self.cfg, "perception_depth_residual", False)
+        )
         state["replay_resume_semantics"] = REPLAY_RESUME_SEMANTICS
         return state
 
@@ -4877,7 +5019,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             LEGACY_TRAINING_ALGORITHM,
         }:
             failed = DistributionalFastSACTeacherBC.load_state_dict(
-                self, state_dict, strict
+                self, self._prepare_perception_warmstart(state_dict), strict
             )
             self._student_q_n_step_accumulator = None
             self.teacher_value_wrapper.freeze()

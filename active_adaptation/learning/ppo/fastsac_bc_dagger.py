@@ -31,6 +31,7 @@ import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -73,6 +74,13 @@ from .ppo_vel import (
     VEL_CMD_KEY,
     PPOVEL,
 )
+from .perception_actor import (
+    ACTOR_BC_PERCEPTION_SOURCE as PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE,
+    ACTOR_INITIALIZATION_SEMANTICS as PERCEPTION_ACTOR_INITIALIZATION_SEMANTICS,
+    ACTOR_OBJECTIVE_SEMANTICS as PERCEPTION_ACTOR_OBJECTIVE_SEMANTICS,
+    OPTIMIZED_MODULES as PERCEPTION_ACTOR_OPTIMIZED_MODULES,
+    TRAINING_ALGORITHM as PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+)
 from .td3_bc_dagger import (
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
     DAGGER_IS_DAGGER_ENV_KEY,
@@ -87,6 +95,7 @@ from .td3_bc_dagger import (
     PERCEPTION_PREFILL_WARMUP_SEMANTICS,
     PERCEPTION_REPLAY_SEMANTICS,
     PERCEPTION_PREFILL_DISABLED_SEMANTICS,
+    PRETRAINED_PERCEPTION_MODULES,
     NEXT_Q_ACTUATOR_CONTEXT_KEY,
     REPLAY_SOURCE_ORDER,
     REPLAY_MOTION_ID_KEY,
@@ -140,6 +149,25 @@ UNIFORM_PHYSICAL_STD_BOUND_MODE = "uniform_physical"
 Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE = "q_normalized"
 PHYSICAL_STD_BOUND_MODES = frozenset(
     (UNIFORM_PHYSICAL_STD_BOUND_MODE, Q_NORMALIZED_PHYSICAL_STD_BOUND_MODE)
+)
+TEACHER_BC_STUDENT_ACTOR_INITIALIZATION = "teacher_bc"
+FRESH_STUDENT_ACTOR_INITIALIZATION = "fresh"
+STUDENT_ACTOR_INITIALIZATION_MODES = frozenset(
+    (
+        TEACHER_BC_STUDENT_ACTOR_INITIALIZATION,
+        FRESH_STUDENT_ACTOR_INITIALIZATION,
+    )
+)
+STUDENT_ACTOR_INITIALIZATION_SEMANTICS = (
+    "ppo_bc_actor_adapt_or_pre_source_fresh_mean_v1"
+)
+ACTOR_ADOPT_CHECKPOINT_SEMANTICS = (
+    "strict_perception_actor_checkpoint_actor_adapt_mean_body_only_overlay_v1"
+)
+PERCEPTION_ACTOR_ALGO_NAME = "teacher_rollout_perception_actor"
+PERCEPTION_ACTOR_ALGO_TARGET = (
+    "active_adaptation.learning.ppo.perception_actor."
+    "TeacherRolloutPerceptionActor"
 )
 FASTSAC_ACTION_PROJECTION_KEY = "fastsac_action_projection"
 FASTSAC_DAGGER_ENV_KEY = DAGGER_IS_DAGGER_ENV_KEY
@@ -471,6 +499,259 @@ def _fastsac_actor_weight_decay(cfg) -> float:
     return float(getattr(cfg, "sac_actor_weight_decay", 0.0))
 
 
+def _student_actor_initialization(cfg) -> str:
+    """Return the fresh-PPO Student mean initialization contract."""
+    return str(
+        getattr(
+            cfg,
+            "student_actor_initialization",
+            TEACHER_BC_STUDENT_ACTOR_INITIALIZATION,
+        )
+    )
+
+
+def _actor_adopt_checkpoint_path(cfg) -> str | None:
+    """Return the optional external spelling for the actor_adapt overlay."""
+    path = getattr(cfg, "actor_adopt_checkpoint_path", None)
+    return None if path is None else str(path)
+
+
+def _checkpoint_config_mapping(checkpoint: Mapping) -> tuple[Mapping, Mapping]:
+    """Return the saved root/algo config required by the overlay contract."""
+    source_cfg = checkpoint.get("cfg")
+    if not isinstance(source_cfg, Mapping):
+        raise ValueError(
+            "actor_adopt checkpoint must contain its saved cfg mapping"
+        )
+    source_algo = source_cfg.get("algo")
+    if not isinstance(source_algo, Mapping):
+        raise ValueError(
+            "actor_adopt checkpoint must contain cfg.algo"
+        )
+    return source_cfg, source_algo
+
+
+def _validate_actor_adapt_source_mapping(source_state: object) -> Mapping:
+    """Validate the self-describing actor_adapt state before any target mutates."""
+    if not isinstance(source_state, Mapping) or not source_state:
+        raise ValueError(
+            "actor_adopt checkpoint must contain a non-empty actor_adapt mapping"
+        )
+    invalid_keys = [key for key in source_state if not isinstance(key, str)]
+    if invalid_keys:
+        raise ValueError("actor_adopt checkpoint actor_adapt keys must be strings")
+    for key, value in source_state.items():
+        if not torch.is_tensor(value):
+            raise ValueError(
+                f"actor_adopt checkpoint actor_adapt key {key!r} is not a tensor"
+            )
+        if value.dtype != torch.float32:
+            raise ValueError(
+                f"actor_adopt checkpoint actor_adapt key {key!r} must be float32"
+            )
+        if value.numel() == 0 or not torch.isfinite(value).all():
+            raise ValueError(
+                f"actor_adopt checkpoint actor_adapt key {key!r} is empty or non-finite"
+            )
+
+    def unique_suffix(suffix: str) -> tuple[str, torch.Tensor]:
+        matches = [
+            (key, value)
+            for key, value in source_state.items()
+            if key.endswith(suffix)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "actor_adopt checkpoint actor_adapt must contain exactly one "
+                f"{suffix!r} tensor"
+            )
+        return matches[0]
+
+    _, actor_std = unique_suffix("actor_std")
+    _, actor_mean_weight = unique_suffix("actor_mean.weight")
+    _, actor_mean_bias = unique_suffix("actor_mean.bias")
+    if actor_std.ndim != 1 or actor_mean_bias.ndim != 1:
+        raise ValueError(
+            "actor_adopt checkpoint actor_std and actor_mean bias must be vectors"
+        )
+    if actor_mean_weight.ndim != 2 or actor_mean_weight.shape[1] < 1:
+        raise ValueError(
+            "actor_adopt checkpoint actor_mean weight must be a non-empty matrix"
+        )
+    action_dim = int(actor_std.shape[0])
+    if action_dim < 1 or tuple(actor_mean_bias.shape) != (action_dim,) or (
+        int(actor_mean_weight.shape[0]) != action_dim
+    ):
+        raise ValueError(
+            "actor_adopt checkpoint actor_std/actor_mean action dimensions disagree"
+        )
+    return source_state
+
+
+def validate_actor_adopt_checkpoint_payload(
+    checkpoint: object,
+    *,
+    source_path: str | None = None,
+) -> tuple[Mapping, dict]:
+    """Strictly audit a perception+Actor-BC source checkpoint.
+
+    The intentionally misspelled public option is retained for the user's CLI;
+    the only model child returned from this audit is the real ``actor_adapt``.
+    """
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("actor_adopt checkpoint must be a top-level mapping")
+    policy_state = checkpoint.get("policy")
+    if not isinstance(policy_state, Mapping):
+        raise ValueError("actor_adopt checkpoint must contain a policy mapping")
+    exact_metadata = {
+        "training_algorithm": PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+        "last_phase": "finetune",
+        "actor_objective_semantics": PERCEPTION_ACTOR_OBJECTIVE_SEMANTICS,
+        "actor_initialization_semantics": (
+            PERCEPTION_ACTOR_INITIALIZATION_SEMANTICS
+        ),
+        "actor_adapt_loaded_from_teacher_checkpoint": True,
+        "actor_adapt_trained": True,
+        "actor_adapt_controls_rollout": False,
+        "actor_bc_perception_source": PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE,
+        "actor_bc_uses_online_priv_pred": False,
+    }
+    for name, expected in exact_metadata.items():
+        if policy_state.get(name) != expected:
+            raise ValueError(
+                f"actor_adopt checkpoint metadata mismatch at policy.{name}: "
+                f"expected {expected!r}, got {policy_state.get(name)!r}"
+            )
+    for name in ("last_iter", "actor_adapt_bc_update_count"):
+        value = policy_state.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(
+                f"actor_adopt checkpoint policy.{name} must be a positive integer"
+            )
+    if tuple(policy_state.get("optimized_modules", ())) != tuple(
+        PERCEPTION_ACTOR_OPTIMIZED_MODULES
+    ):
+        raise ValueError(
+            "actor_adopt checkpoint optimized_modules does not match the "
+            "perception+actor BC stage"
+        )
+    actor_state = _validate_actor_adapt_source_mapping(
+        policy_state.get("actor_adapt")
+    )
+    missing_perception = [
+        name
+        for name in PRETRAINED_PERCEPTION_MODULES
+        if not isinstance(policy_state.get(name), Mapping)
+    ]
+    if missing_perception:
+        raise ValueError(
+            "actor_adopt checkpoint lacks its jointly trained perception module "
+            f"mappings: {missing_perception}"
+        )
+
+    source_cfg, source_algo = _checkpoint_config_mapping(checkpoint)
+    if source_algo.get("name") != PERCEPTION_ACTOR_ALGO_NAME:
+        raise ValueError("actor_adopt checkpoint cfg.algo.name is incompatible")
+    if source_algo.get("_target_") != PERCEPTION_ACTOR_ALGO_TARGET:
+        raise ValueError("actor_adopt checkpoint cfg.algo._target_ is incompatible")
+    if source_algo.get("distill_with_priv_pred") is not True:
+        raise ValueError(
+            "actor_adopt checkpoint must have cfg.algo.distill_with_priv_pred=true"
+        )
+    if source_algo.get("actor_bc_perception_source") != (
+        PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE
+    ):
+        raise ValueError(
+            "actor_adopt checkpoint must use rollout EMA perception for Actor BC"
+        )
+    source_task = source_cfg.get("task")
+    if not isinstance(source_task, Mapping) or not isinstance(
+        source_task.get("name"), str
+    ):
+        raise ValueError("actor_adopt checkpoint must record cfg.task.name")
+    teacher_path = source_cfg.get("checkpoint_path")
+    if not isinstance(teacher_path, str) or not teacher_path.strip():
+        raise ValueError(
+            "actor_adopt checkpoint must record its Teacher cfg.checkpoint_path"
+        )
+    if source_algo.get("latent_dim") != 256:
+        raise ValueError("actor_adopt checkpoint cfg.algo.latent_dim must be 256")
+
+    provenance = {
+        "semantics": ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+        "loaded": True,
+        "source_path": source_path,
+        "source_algorithm": policy_state.get("training_algorithm"),
+        "source_phase": policy_state.get("last_phase"),
+        "source_iter": int(policy_state["last_iter"]),
+        "source_actor_bc_update_count": int(
+            policy_state["actor_adapt_bc_update_count"]
+        ),
+        "source_actor_objective_semantics": policy_state.get(
+            "actor_objective_semantics"
+        ),
+        "source_actor_initialization_semantics": policy_state.get(
+            "actor_initialization_semantics"
+        ),
+        "source_actor_bc_perception_source": policy_state.get(
+            "actor_bc_perception_source"
+        ),
+        "source_teacher_checkpoint_path": teacher_path,
+        "source_task_name": source_task["name"],
+        "module": "actor_adapt",
+        "runtime_std_source": "load_noise_scale",
+    }
+    return actor_state, provenance
+
+
+def checkpoint_module_mismatches(
+    first_policy: Mapping,
+    second_policy: Mapping,
+    module_names,
+    *,
+    ignored_key_suffixes: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Return module names whose serialized child states are not bit-exact."""
+    mismatches: list[str] = []
+    for name in module_names:
+        first = first_policy.get(name)
+        second = second_policy.get(name)
+        if not isinstance(first, Mapping) or not isinstance(second, Mapping):
+            mismatches.append(name)
+            continue
+        first_keys = {
+            key
+            for key in first
+            if not any(str(key).endswith(suffix) for suffix in ignored_key_suffixes)
+        }
+        second_keys = {
+            key
+            for key in second
+            if not any(str(key).endswith(suffix) for suffix in ignored_key_suffixes)
+        }
+        if first_keys != second_keys:
+            mismatches.append(name)
+            continue
+        for key in first_keys:
+            left = first[key]
+            right = second[key]
+            if torch.is_tensor(left):
+                if (
+                    not torch.is_tensor(right)
+                    or left.shape != right.shape
+                    or left.dtype != right.dtype
+                    or not torch.equal(
+                        left.detach().cpu(), right.detach().cpu()
+                    )
+                ):
+                    mismatches.append(name)
+                    break
+            elif type(left) is not type(right) or left != right:
+                mismatches.append(name)
+                break
+    return tuple(mismatches)
+
+
 def _spred_p_teacher_probability(
     policy_q: torch.Tensor,
     teacher_q: torch.Tensor,
@@ -635,6 +916,17 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
         "DistributionalFastSACTeacherBC"
     )
     name: str = "fastsac_bc_dagger"
+
+    # The frozen privileged Teacher always loads from the PPO checkpoint.
+    # ``teacher_bc`` also loads that checkpoint's distilled actor_adapt mean,
+    # preserving all existing runs. ``fresh`` retains the constructor-created
+    # actor_adapt mean while still resetting its PPO std through
+    # ``load_noise_scale`` and independently applying any perception overlay.
+    student_actor_initialization: str = TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+    # Optional final actor_adapt-only overlay from percetpion_actor.py.  The
+    # public ``adopt`` spelling is retained exactly for command compatibility;
+    # no Teacher, Critic, Q, or perception tensor is loaded through this field.
+    actor_adopt_checkpoint_path: str | None = None
 
     dagger_control_mode: str = "beta"
     dagger_beta_start: float = 0.0
@@ -1297,6 +1589,46 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.alpha_update_count = 0
         self.actor_std_update_count = 0
         self._last_fastsac_diagnostics: dict[str, float] = {}
+        self._actor_initialization = {
+            "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+            "mode": _student_actor_initialization(cfg),
+            "teacher_actor_loaded": False,
+            "actor_adapt_mean_loaded": False,
+            "actor_adapt_mean_fresh": True,
+            "source_phase": None,
+            "source_iter": None,
+        }
+        self._actor_adopt_initialization = {
+            "semantics": ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+            "loaded": False,
+            "source_path": None,
+            "source_algorithm": None,
+            "source_phase": None,
+            "source_iter": None,
+            "source_actor_bc_update_count": None,
+            "source_actor_objective_semantics": None,
+            "source_actor_initialization_semantics": None,
+            "source_actor_bc_perception_source": None,
+            "source_teacher_checkpoint_path": None,
+            "source_task_name": None,
+            "module": "actor_adapt",
+            "runtime_std_source": "load_noise_scale",
+            "perception_source_path": getattr(
+                cfg, "perception_checkpoint_path", None
+            ),
+            "perception_exact_match": None,
+            "perception_mismatched_modules": (),
+        }
+        if _student_actor_initialization(cfg) == FRESH_STUDENT_ACTOR_INITIALIZATION:
+            # Capture the true constructor state before any checkpoint loader
+            # can mutate actor_adapt. This transient snapshot is discarded as
+            # soon as a source or same-stage checkpoint has been applied.
+            self._fresh_student_actor_constructor_state = copy.deepcopy(
+                self.actor_adapt.state_dict()
+            )
+            self._fresh_student_actor_constructor_parameter_ids = tuple(
+                id(parameter) for parameter in self.actor_adapt.parameters()
+            )
 
     def _configure_student_action_support(self) -> None:
         """Use nominal joint coordinates as the one Student SAC action Box."""
@@ -1452,6 +1784,35 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         q_twin_reduction = _fastsac_q_twin_reduction(cfg)
         if q_twin_reduction not in Q_TWIN_REDUCTIONS:
             raise ValueError("q_twin_reduction must be 'min' or 'mean'")
+        actor_initialization = _student_actor_initialization(cfg)
+        if actor_initialization not in STUDENT_ACTOR_INITIALIZATION_MODES:
+            raise ValueError(
+                "student_actor_initialization must be 'teacher_bc' or 'fresh'"
+            )
+        actor_adopt_path = getattr(cfg, "actor_adopt_checkpoint_path", None)
+        if actor_adopt_path is not None:
+            if not isinstance(actor_adopt_path, str) or not actor_adopt_path.strip():
+                raise ValueError(
+                    "actor_adopt_checkpoint_path must be null or a non-empty path"
+                )
+            if actor_initialization != TEACHER_BC_STUDENT_ACTOR_INITIALIZATION:
+                raise ValueError(
+                    "actor_adopt_checkpoint_path cannot be combined with "
+                    "student_actor_initialization='fresh'; the explicit "
+                    "actor_adapt overlay is the final Student Actor initialization"
+                )
+            if not bool(cfg.load_pretrained_perception):
+                raise ValueError(
+                    "actor_adopt_checkpoint_path requires "
+                    "load_pretrained_perception=true because actor_adapt was "
+                    "trained on a predicted privileged latent"
+                )
+            perception_path = getattr(cfg, "perception_checkpoint_path", None)
+            if not isinstance(perception_path, str) or not perception_path.strip():
+                raise ValueError(
+                    "actor_adopt_checkpoint_path requires a non-empty "
+                    "perception_checkpoint_path"
+                )
         base_cfg = copy.copy(cfg)
         base_cfg.eta_td3 = float(cfg.eta_sac)
         DistributionalTD3TeacherBC._validate_td3_config(base_cfg)
@@ -3382,6 +3743,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "q_use_residual_film",
                     "q_residual_film_scale",
                     "sac_actor_lr",
+                    "student_actor_initialization",
+                    "actor_adopt_checkpoint_path",
                     "sac_action_distribution",
                     "sac_physical_std_lr",
                     "sac_physical_std_max_kl",
@@ -3407,6 +3770,15 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             }
         )
         common["sac_actor_weight_decay"] = _fastsac_actor_weight_decay(self.cfg)
+        for path_name in (
+            "perception_checkpoint_path",
+            "actor_adopt_checkpoint_path",
+        ):
+            configured_path = common.get(path_name)
+            if isinstance(configured_path, str) and configured_path:
+                common[path_name] = str(
+                    Path(configured_path).expanduser().resolve()
+                )
         common["sac_actor_observation_mode"] = str(
             getattr(
                 self.cfg,
@@ -3472,6 +3844,44 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     self.cfg,
                     "sac_actor_observation_mode",
                     STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE,
+                )
+            ),
+            "actor_initialization": copy.deepcopy(
+                getattr(
+                    self,
+                    "_actor_initialization",
+                    {
+                        "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+                        "mode": _student_actor_initialization(self.cfg),
+                        "teacher_actor_loaded": True,
+                        "actor_adapt_mean_loaded": (
+                            _student_actor_initialization(self.cfg)
+                            == TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+                        ),
+                        "actor_adapt_mean_fresh": (
+                            _student_actor_initialization(self.cfg)
+                            == FRESH_STUDENT_ACTOR_INITIALIZATION
+                        ),
+                        "source_phase": None,
+                        "source_iter": None,
+                        "legacy_inferred": True,
+                    },
+                )
+            ),
+            "actor_adopt_initialization": copy.deepcopy(
+                getattr(
+                    self,
+                    "_actor_adopt_initialization",
+                    {
+                        "semantics": ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+                        "loaded": False,
+                        "source_path": None,
+                        "module": "actor_adapt",
+                        "runtime_std_source": "load_noise_scale",
+                        "perception_exact_match": None,
+                        "perception_mismatched_modules": (),
+                        "legacy_inferred": True,
+                    },
                 )
             ),
             "student_action_contract": (
@@ -3661,6 +4071,368 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     f"{context} Student action contract mismatch at {key!r}"
                 )
 
+    @staticmethod
+    def _validate_actor_adapt_overlay_target(
+        target_state: Mapping,
+        source_state: Mapping,
+    ) -> None:
+        """Require an exact actor_adapt schema before loading any tensor."""
+        target_keys = set(target_state)
+        source_keys = set(source_state)
+        if target_keys != source_keys:
+            missing = sorted(target_keys.difference(source_keys))
+            unexpected = sorted(source_keys.difference(target_keys))
+            raise RuntimeError(
+                "actor_adopt checkpoint actor_adapt has incompatible keys; "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+        for key, target_value in target_state.items():
+            source_value = source_state[key]
+            if torch.is_tensor(target_value):
+                if not torch.is_tensor(source_value):
+                    raise RuntimeError(
+                        f"actor_adopt actor_adapt key {key!r} is not a tensor"
+                    )
+                if target_value.shape != source_value.shape:
+                    raise RuntimeError(
+                        f"actor_adopt actor_adapt key {key!r} shape mismatch: "
+                        f"expected {tuple(target_value.shape)}, "
+                        f"got {tuple(source_value.shape)}"
+                    )
+                if target_value.dtype != source_value.dtype:
+                    raise RuntimeError(
+                        f"actor_adopt actor_adapt key {key!r} dtype mismatch: "
+                        f"expected {target_value.dtype}, got {source_value.dtype}"
+                    )
+            elif type(target_value) is not type(source_value):
+                raise RuntimeError(
+                    f"actor_adopt actor_adapt key {key!r} has incompatible type"
+                )
+
+    def _load_actor_adopt_checkpoint(
+        self,
+        path: str,
+        *,
+        teacher_source_policy: Mapping,
+    ) -> dict:
+        """Overlay only actor_adapt from the audited perception+Actor stage."""
+        resolved_path = Path(path).expanduser().resolve(strict=True)
+        checkpoint = torch.load(
+            resolved_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        actor_state, provenance = validate_actor_adopt_checkpoint_payload(
+            checkpoint,
+            source_path=str(resolved_path),
+        )
+        source_policy = checkpoint["policy"]
+        source_cfg, source_algo = _checkpoint_config_mapping(checkpoint)
+        if tuple(source_algo.get("in_keys", ())) != tuple(self.cfg.in_keys):
+            raise ValueError(
+                "actor_adopt checkpoint Actor observation keys/order do not "
+                "match the FastSAC actor_adapt"
+            )
+        if int(source_algo.get("latent_dim", -1)) != int(self.cfg.latent_dim):
+            raise ValueError(
+                "actor_adopt checkpoint latent_dim does not match FastSAC"
+            )
+
+        # The main checkpoint remains the privileged Teacher authority.  The
+        # auxiliary stage freezes these children, so exact weights (apart from
+        # Actor.actor_std, which every loader intentionally resets from its
+        # runtime noise scale) prove that both stages used the same Teacher.
+        teacher_mismatches = checkpoint_module_mismatches(
+            teacher_source_policy,
+            source_policy,
+            ("actor", "encoder_priv", "critic"),
+            ignored_key_suffixes=("actor_std",),
+        )
+        if teacher_mismatches:
+            raise ValueError(
+                "actor_adopt checkpoint was not trained from the same privileged "
+                "Teacher checkpoint; mismatched frozen modules="
+                f"{list(teacher_mismatches)}"
+            )
+
+        target_state = self.actor_adapt.state_dict()
+        self._validate_actor_adapt_overlay_target(target_state, actor_state)
+        parameter_ids = tuple(id(parameter) for parameter in self.actor_adapt.parameters())
+        actor_std_keys = [key for key in target_state if key.endswith("actor_std")]
+        if len(actor_std_keys) != 1:
+            raise RuntimeError(
+                "FastSAC actor_adapt must expose exactly one actor_std tensor"
+            )
+        actor_std_key = actor_std_keys[0]
+        actor_std_before = target_state[actor_std_key].detach().clone()
+        actor_state_to_load = dict(actor_state)
+        # The auxiliary checkpoint supplies only the learned Actor body/mean.
+        # Keep runtime variance explicitly even if Actor._load_from_state_dict's
+        # load_noise_scale hook changes in the future.
+        actor_state_to_load[actor_std_key] = actor_std_before
+
+        # Compare, but never load, the actor checkpoint's perception tensors.
+        # Independent later perception training is permitted because both
+        # checkpoints regress the same frozen Teacher latent coordinates.  The
+        # exact/non-exact pairing is retained in every downstream checkpoint.
+        current_perception = {
+            name: getattr(self, name).state_dict()
+            for name in PRETRAINED_PERCEPTION_MODULES
+        }
+        perception_mismatches = checkpoint_module_mismatches(
+            current_perception,
+            source_policy,
+            PRETRAINED_PERCEPTION_MODULES,
+        )
+
+        try:
+            self.actor_adapt.load_state_dict(actor_state_to_load, strict=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "failed to load actor_adapt from actor_adopt checkpoint"
+            ) from exc
+        if tuple(id(parameter) for parameter in self.actor_adapt.parameters()) != (
+            parameter_ids
+        ):
+            raise RuntimeError(
+                "actor_adopt overlay replaced actor_adapt Parameter objects"
+            )
+        loaded_actor_std = self.actor_adapt.state_dict()[actor_std_key]
+        if not torch.equal(loaded_actor_std, actor_std_before):
+            raise RuntimeError(
+                "actor_adopt overlay changed runtime actor_std"
+            )
+        if self._uses_ppo_physical_gaussian():
+            expected_std = torch.full_like(
+                self._ppo_actor_std_parameter().detach(),
+                float(self.cfg.load_noise_scale),
+            )
+            if not torch.equal(
+                self._ppo_actor_std_parameter().detach(), expected_std
+            ):
+                raise RuntimeError(
+                    "actor_adopt overlay imported checkpoint actor_std instead "
+                    "of resetting it from runtime load_noise_scale"
+                )
+
+        provenance.update(
+            {
+                "source_teacher_checkpoint_path": str(
+                    Path(source_cfg["checkpoint_path"]).expanduser().resolve()
+                ),
+                "perception_source_path": str(
+                    Path(self.cfg.perception_checkpoint_path).expanduser().resolve()
+                ),
+                "perception_exact_match": not perception_mismatches,
+                "perception_mismatched_modules": perception_mismatches,
+            }
+        )
+        self._actor_adopt_initialization = copy.deepcopy(provenance)
+        return copy.deepcopy(provenance)
+
+    def _restore_actor_adopt_initialization_provenance(
+        self, state: Mapping
+    ) -> None:
+        """Restore overlay provenance without reopening the historical source."""
+        backend = state.get("dagger_backend_config")
+        backend = backend if isinstance(backend, Mapping) else {}
+        backend_path = backend.get("actor_adopt_checkpoint_path")
+        initialization = state.get("actor_adopt_initialization")
+        if initialization is None:
+            if backend_path is not None:
+                raise ValueError(
+                    "FastSAC actor_adopt checkpoint path lacks overlay provenance"
+                )
+            initialization = {
+                "semantics": ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+                "loaded": False,
+                "source_path": None,
+                "source_algorithm": None,
+                "source_phase": None,
+                "source_iter": None,
+                "source_actor_bc_update_count": None,
+                "source_actor_objective_semantics": None,
+                "source_actor_initialization_semantics": None,
+                "source_actor_bc_perception_source": None,
+                "source_teacher_checkpoint_path": None,
+                "source_task_name": None,
+                "module": "actor_adapt",
+                "runtime_std_source": "load_noise_scale",
+                "perception_source_path": None,
+                "perception_exact_match": None,
+                "perception_mismatched_modules": (),
+                "legacy_inferred": True,
+            }
+        if not isinstance(initialization, Mapping):
+            raise ValueError("FastSAC actor_adopt initialization is invalid")
+        initialization = copy.deepcopy(dict(initialization))
+        if initialization.get("semantics") != ACTOR_ADOPT_CHECKPOINT_SEMANTICS:
+            raise ValueError("FastSAC actor_adopt initialization semantics mismatch")
+        loaded = initialization.get("loaded")
+        if not isinstance(loaded, bool):
+            raise ValueError("FastSAC actor_adopt loaded flag is invalid")
+        runtime_path = _actor_adopt_checkpoint_path(self.cfg)
+        if loaded:
+            for name, expected in (
+                ("source_algorithm", PERCEPTION_ACTOR_TRAINING_ALGORITHM),
+                ("source_phase", "finetune"),
+                ("source_actor_objective_semantics", PERCEPTION_ACTOR_OBJECTIVE_SEMANTICS),
+                ("source_actor_initialization_semantics", PERCEPTION_ACTOR_INITIALIZATION_SEMANTICS),
+                ("source_actor_bc_perception_source", PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE),
+                ("module", "actor_adapt"),
+                ("runtime_std_source", "load_noise_scale"),
+            ):
+                if initialization.get(name) != expected:
+                    raise ValueError(
+                        f"FastSAC actor_adopt provenance mismatch at {name!r}"
+                    )
+            for name in ("source_iter", "source_actor_bc_update_count"):
+                value = initialization.get(name)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(
+                        f"FastSAC actor_adopt provenance has invalid {name!r}"
+                    )
+            for name in (
+                "source_teacher_checkpoint_path",
+                "source_task_name",
+            ):
+                if not isinstance(initialization.get(name), str) or not (
+                    initialization.get(name)
+                ):
+                    raise ValueError(
+                        f"FastSAC actor_adopt provenance has invalid {name!r}"
+                    )
+            if not isinstance(initialization.get("perception_exact_match"), bool):
+                raise ValueError(
+                    "FastSAC actor_adopt provenance lacks perception exact-match flag"
+                )
+            mismatches = initialization.get("perception_mismatched_modules")
+            if not isinstance(mismatches, (tuple, list)):
+                raise ValueError(
+                    "FastSAC actor_adopt perception mismatch provenance is invalid"
+                )
+            if (
+                len(set(mismatches)) != len(mismatches)
+                or not set(mismatches).issubset(PRETRAINED_PERCEPTION_MODULES)
+            ):
+                raise ValueError(
+                    "FastSAC actor_adopt perception mismatch modules are invalid"
+                )
+            if bool(mismatches) == bool(
+                initialization.get("perception_exact_match")
+            ):
+                raise ValueError(
+                    "FastSAC actor_adopt perception match provenance is inconsistent"
+                )
+            if not isinstance(backend_path, str) or not backend_path:
+                raise ValueError(
+                    "FastSAC actor_adopt provenance requires backend source path"
+                )
+            source_path = initialization.get("source_path")
+            if not isinstance(source_path, str) or not source_path or (
+                Path(source_path).expanduser().resolve()
+                != Path(backend_path).expanduser().resolve()
+            ):
+                raise ValueError(
+                    "FastSAC actor_adopt provenance/backend source path mismatch"
+                )
+            backend_perception_path = backend.get("perception_checkpoint_path")
+            if backend.get("load_pretrained_perception") is not True or not isinstance(
+                backend_perception_path, str
+            ) or not backend_perception_path:
+                raise ValueError(
+                    "FastSAC actor_adopt provenance requires pretrained perception"
+                )
+            provenance_perception_path = initialization.get(
+                "perception_source_path"
+            )
+            if not isinstance(provenance_perception_path, str) or not (
+                provenance_perception_path
+            ) or (
+                Path(provenance_perception_path).expanduser().resolve()
+                != Path(backend_perception_path).expanduser().resolve()
+            ):
+                raise ValueError(
+                    "FastSAC actor_adopt provenance/perception source path mismatch"
+                )
+        elif backend_path is not None or initialization.get("source_path") is not None:
+            raise ValueError(
+                "FastSAC disabled actor_adopt provenance unexpectedly has a source"
+            )
+        if (
+            runtime_path is None
+        ) != (backend_path is None) or (
+            runtime_path is not None
+            and Path(runtime_path).expanduser().resolve()
+            != Path(backend_path).expanduser().resolve()
+        ):
+            raise ValueError(
+                "FastSAC actor_adopt checkpoint path/runtime mismatch"
+            )
+        self._actor_adopt_initialization = initialization
+
+    def _restore_actor_initialization_provenance(self, state: Mapping) -> None:
+        """Restore saved provenance, defaulting old checkpoints to Teacher BC."""
+        backend = state.get("dagger_backend_config")
+        backend = backend if isinstance(backend, Mapping) else {}
+        backend_mode = backend.get(
+            "student_actor_initialization",
+            TEACHER_BC_STUDENT_ACTOR_INITIALIZATION,
+        )
+        if backend_mode not in STUDENT_ACTOR_INITIALIZATION_MODES:
+            raise ValueError(
+                "FastSAC checkpoint backend Actor initialization mode is invalid"
+            )
+        initialization = state.get("actor_initialization")
+        if initialization is None:
+            if backend_mode != TEACHER_BC_STUDENT_ACTOR_INITIALIZATION:
+                raise ValueError(
+                    "FastSAC fresh-Actor checkpoint lacks initialization provenance"
+                )
+            initialization = {
+                "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+                "mode": TEACHER_BC_STUDENT_ACTOR_INITIALIZATION,
+                "teacher_actor_loaded": True,
+                "actor_adapt_mean_loaded": True,
+                "actor_adapt_mean_fresh": False,
+                "source_phase": None,
+                "source_iter": None,
+                "legacy_inferred": True,
+            }
+        if not isinstance(initialization, Mapping):
+            raise ValueError("FastSAC checkpoint Actor initialization is invalid")
+        initialization = dict(initialization)
+        if initialization.get("semantics") != STUDENT_ACTOR_INITIALIZATION_SEMANTICS:
+            raise ValueError(
+                "FastSAC checkpoint Actor initialization semantics mismatch"
+            )
+        if initialization.get("mode") not in STUDENT_ACTOR_INITIALIZATION_MODES:
+            raise ValueError("FastSAC checkpoint Actor initialization mode is invalid")
+        mode = initialization["mode"]
+        if mode != backend_mode:
+            raise ValueError(
+                "FastSAC checkpoint Actor initialization/backend mismatch"
+            )
+        if mode != _student_actor_initialization(self.cfg):
+            raise ValueError(
+                "FastSAC checkpoint Actor initialization/runtime mismatch"
+            )
+        expected_flags = {
+            "teacher_actor_loaded": True,
+            "actor_adapt_mean_loaded": (
+                mode == TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+            ),
+            "actor_adapt_mean_fresh": mode == FRESH_STUDENT_ACTOR_INITIALIZATION,
+        }
+        for name, expected in expected_flags.items():
+            if initialization.get(name) is not expected:
+                raise ValueError(
+                    "FastSAC checkpoint Actor initialization flags are inconsistent"
+                )
+        self._actor_initialization = copy.deepcopy(initialization)
+        self.__dict__.pop("_fresh_student_actor_constructor_state", None)
+        self.__dict__.pop("_fresh_student_actor_constructor_parameter_ids", None)
+
     def _load_fastsac_checkpoint_state(self, state, *, load_modules=True):
         if state.get("training_algorithm") != TRAINING_ALGORITHM:
             raise ValueError("not a distributional FastSAC Teacher-BC checkpoint")
@@ -3840,6 +4612,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self._last_fastsac_diagnostics = copy.deepcopy(
             state.get("last_fastsac_diagnostics", {})
         )
+        self._restore_actor_initialization_provenance(state)
+        self._restore_actor_adopt_initialization_provenance(state)
         self.qnet_target.requires_grad_(False).eval()
 
     def load_inference_state_dict(self, state_dict, strict=True):
@@ -3974,6 +4748,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         initialization = state_dict.get("perception_initialization")
         if isinstance(initialization, Mapping):
             self._perception_initialization = copy.deepcopy(dict(initialization))
+        self._restore_actor_initialization_provenance(state_dict)
+        self._restore_actor_adopt_initialization_provenance(state_dict)
         self.actor_target = None
         self._teacher_prefill_complete = True
         self._teacher_perception_warmup_complete = True
@@ -4070,6 +4846,24 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # child.  The dedicated SAC variance adapter cannot exist in an older
         # PPO source, so seed only that new child with its fresh initialization
         # while leaving every source-owned module subject to strict loading.
+        actor_initialization = _student_actor_initialization(self.cfg)
+        constructor_actor_state = getattr(
+            self, "_fresh_student_actor_constructor_state", None
+        )
+        constructor_actor_parameter_ids = getattr(
+            self, "_fresh_student_actor_constructor_parameter_ids", None
+        )
+        if (
+            actor_initialization == FRESH_STUDENT_ACTOR_INITIALIZATION
+            and (
+                not isinstance(constructor_actor_state, Mapping)
+                or not isinstance(constructor_actor_parameter_ids, tuple)
+            )
+        ):
+            raise RuntimeError(
+                "fresh Student Actor initialization lacks its constructor snapshot"
+            )
+
         padded_source = dict(state_dict)
         padded_source["bc_dagger_sac_adapter"] = self.bc_dagger_sac_adapter.state_dict()
         # A raw PPO Teacher source never owns the Student SAC critic. Preserve
@@ -4078,6 +4872,45 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         padded_source["qnet"] = self.qnet.state_dict()
         padded_source["qnet_target"] = self.qnet_target.state_dict()
         failed = DistributionalTD3TeacherBC.load_state_dict(self, padded_source, strict)
+        if constructor_actor_state is not None:
+            # Load tensors into the existing module rather than replacing it:
+            # actor/std optimizer Parameter identities therefore remain valid.
+            self.actor_adapt.load_state_dict(constructor_actor_state, strict=True)
+            if tuple(id(parameter) for parameter in self.actor_adapt.parameters()) != (
+                constructor_actor_parameter_ids
+            ):
+                raise RuntimeError(
+                    "fresh Student Actor initialization replaced Parameter objects"
+                )
+            load_noise_scale = getattr(self.cfg, "load_noise_scale", None)
+            if load_noise_scale is not None:
+                actual_std = self._ppo_actor_std_parameter().detach()
+                expected_std = torch.full_like(actual_std, float(load_noise_scale))
+                if not torch.equal(actual_std, expected_std):
+                    raise RuntimeError(
+                        "fresh Student actor_std was not reset from load_noise_scale"
+                    )
+        self._actor_initialization = {
+            "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+            "mode": actor_initialization,
+            "teacher_actor_loaded": True,
+            "actor_adapt_mean_loaded": (
+                actor_initialization == TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+            ),
+            "actor_adapt_mean_fresh": (
+                actor_initialization == FRESH_STUDENT_ACTOR_INITIALIZATION
+            ),
+            "source_phase": state_dict.get("last_phase"),
+            "source_iter": state_dict.get("last_iter"),
+        }
+        actor_adopt_path = _actor_adopt_checkpoint_path(self.cfg)
+        if actor_adopt_path is not None:
+            self._load_actor_adopt_checkpoint(
+                actor_adopt_path,
+                teacher_source_policy=state_dict,
+            )
+        self.__dict__.pop("_fresh_student_actor_constructor_state", None)
+        self.__dict__.pop("_fresh_student_actor_constructor_parameter_ids", None)
         self.actor_target = None
         self.bc_dagger_sac_adapter.log_std.data.copy_(self._fastsac_initial_raw_log_std)
         self.log_alpha.data.fill_(math.log(float(self.cfg.sac_alpha_init)))
@@ -4125,11 +4958,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
 
 __all__ = [
     "ACTION_CONTRACT_SEMANTICS",
+    "ACTOR_ADOPT_CHECKPOINT_SEMANTICS",
     "ACTOR_BACKEND",
     "ACTOR_MEAN_OPTIMIZER_SEMANTICS",
     "CHECKPOINT_VERSION",
     "C51_Q_CRITIC_TYPE",
     "DISTRIBUTIONAL_Q_CRITIC_TYPE",
+    "FRESH_STUDENT_ACTOR_INITIALIZATION",
     "FASTSAC_ACTION_PROJECTION_KEY",
     "FASTSAC_DAGGER_ENV_KEY",
     "FASTSAC_PREFILL_TEACHER_NOISE_KEY",
@@ -4147,6 +4982,9 @@ __all__ = [
     "SCALAR_Q_CRITIC_TYPE",
     "SCALAR_CRITIC_SEMANTICS",
     "SPRED_P_BC_SEMANTICS",
+    "STUDENT_ACTOR_INITIALIZATION_MODES",
+    "STUDENT_ACTOR_INITIALIZATION_SEMANTICS",
+    "TEACHER_BC_STUDENT_ACTOR_INITIALIZATION",
     "UNIFORM_PHYSICAL_STD_BOUND_MODE",
     "PREVIOUS_CHECKPOINT_VERSION",
     "TRAINING_ALGORITHM",
@@ -4158,4 +4996,6 @@ __all__ = [
     "_fastsac_q_twin_reduction",
     "_reduce_fastsac_twin_target",
     "_spred_p_teacher_probability",
+    "checkpoint_module_mismatches",
+    "validate_actor_adopt_checkpoint_payload",
 ]

@@ -3906,6 +3906,10 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
     # fresh, non-serialized replay rings and may safely rebuild the new codebook.
     pre_geometry_codebook_state = copy.deepcopy(state)
     pre_geometry_codebook_state.pop("object_geo_replay_semantics")
+    pre_geometry_codebook_state["dagger_backend_config"].pop(
+        "perception_action_consistency_coef"
+    )
+    pre_geometry_codebook_state["dagger_backend_config"].pop("perception_depth_residual")
     policy._load_fastsac_checkpoint_state(
         pre_geometry_codebook_state, load_modules=False
     )
@@ -3948,6 +3952,26 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
     with pytest.raises(ValueError, match="v5 training resume is incompatible"):
         policy._load_fastsac_checkpoint_state(v5_state, load_modules=False)
     assert len(translated) == 1
+
+    # A new objective is recorded and must agree on exact resume. Legacy
+    # checkpoints missing the field mean coefficient zero, never runtime 1.
+    policy.cfg.perception_action_consistency_coef = 1.0
+    with pytest.raises(ValueError, match="perception_action_consistency_coef"):
+        policy._load_fastsac_checkpoint_state(pre_geometry_codebook_state, load_modules=False)
+    action_state = copy.deepcopy(state)
+    action_state["dagger_backend_config"]["perception_action_consistency_coef"] = 1.0
+    policy._load_fastsac_checkpoint_state(action_state, load_modules=False)
+    assert policy._fastsac_checkpoint_state()["dagger_backend_config"][
+        "perception_action_consistency_coef"
+    ] == 1.0
+    policy.cfg.perception_action_consistency_coef = 0.0
+    policy.cfg.perception_depth_residual = True
+    with pytest.raises(ValueError, match="perception_depth_residual"):
+        policy._load_fastsac_checkpoint_state(pre_geometry_codebook_state, load_modules=False)
+    depth_state = copy.deepcopy(state)
+    depth_state["dagger_backend_config"]["perception_depth_residual"] = True
+    policy._load_fastsac_checkpoint_state(depth_state, load_modules=False)
+    assert policy._fastsac_checkpoint_state()["dagger_backend_config"]["perception_depth_residual"] is True
 
 
 def test_v5_checkpoint_rejects_binwise_motion_histogram_mismatch(monkeypatch):
@@ -4162,6 +4186,30 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     assert cfg._tvkd_model_only_resume is True
     assert cfg._bc_dagger_fresh_source is True
     assert cfg.algo.value_norm is False
+
+    # Saved configs from before action supervision retain their exact zero
+    # coefficient. Both enabled round-trips and mismatched objectives are
+    # checked at the CLI boundary, before creating the simulator.
+    for saved_action_coef in (None, 1.0):
+        action_cfg = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
+        action_policy = copy.deepcopy(policy_state)
+        if saved_action_coef is None:
+            del action_cfg.algo.perception_action_consistency_coef
+            action_policy["dagger_backend_config"].pop("perception_action_consistency_coef")
+        else:
+            action_cfg.algo.perception_action_consistency_coef = saved_action_coef
+            action_policy["dagger_backend_config"]["perception_action_consistency_coef"] = saved_action_coef
+        action_path = checkpoint_path.with_name(f"checkpoint_action_{saved_action_coef}.pt")
+        torch.save({"policy": action_policy, "vecnorm": {}, "cfg": action_cfg}, action_path)
+        for runtime_coef in (0.0, 1.0):
+            runtime = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
+            runtime.algo.perception_action_consistency_coef = runtime_coef
+            runtime.fastsac_bc_dagger_checkpoint = str(action_path)
+            if runtime_coef == (saved_action_coef or 0.0):
+                assert _prepare_tvkd_checkpoint(runtime)["rollout_count"] == 600
+            else:
+                with pytest.raises(ValueError, match="algorithm config"):
+                    _prepare_tvkd_checkpoint(runtime)
 
     # Early v9 checkpoints already had the three-source collector but stored
     # the combined online allocation in dagger_buffer_capacity. Exercise the
@@ -5240,6 +5288,8 @@ def test_tvkd_hydra_config_inherits_source_mix_defaults_and_new_controls():
     )
 
     assert cfg.algo.name == "tvkd_fastsac_bc_dagger"
+    assert cfg.algo.student_actor_initialization == "teacher_bc"
+    assert cfg.algo.actor_adopt_checkpoint_path is None
     assert cfg.algo.sac_alpha_update_cadence == "actor"
     assert cfg.algo.use_tvkd_value_shaping is True
     assert cfg.algo.use_teacher_residual_critic is True
@@ -5298,6 +5348,43 @@ def test_tvkd_hydra_config_inherits_source_mix_defaults_and_new_controls():
     cfg.algo.failure_phase_samples_per_failure = 11
     with pytest.raises(ValueError, match="strictly pre-onset"):
         validate_tvkd_fastsac_bc_dagger_config(cfg)
+
+
+def test_tvkd_hydra_exposes_fresh_student_actor_initialization():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                "algo.student_actor_initialization=fresh",
+            ],
+            return_hydra_config=True,
+        )
+
+    assert cfg.algo.student_actor_initialization == "fresh"
+    tvkd_module._validate_tvkd_algorithm_config(cfg.algo)
+
+
+def test_tvkd_hydra_exposes_actor_adopt_checkpoint_path_without_plus_prefix():
+    config_dir = Path(__file__).resolve().parents[1] / "cfg"
+    actor_path = "/tmp/perception_actor_checkpoint.pt"
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="TVKD_fasSAC_bc_dagger",
+            overrides=[
+                "task=G1/vaic/skateboard_stu",
+                "checkpoint_path=/tmp/fresh_ppo.pt",
+                "fastsac_dagger_iterations=10",
+                "algo.load_pretrained_perception=true",
+                "algo.perception_checkpoint_path=/tmp/perception.pt",
+                f"algo.actor_adopt_checkpoint_path={actor_path}",
+            ],
+        )
+
+    assert cfg.algo.actor_adopt_checkpoint_path == actor_path
 
 
 def test_tvkd_hydra_resolves_independent_q_and_actor_four_way_mixes():

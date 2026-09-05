@@ -1,0 +1,32 @@
+# Dedicated perception + actor_adapt Teacher-BC training.  The filename keeps
+# the spelling used by scripts/percetpion_actor.py and the experiment command.
+defaults:
+  - train
+  - override /task: G1/vaic/skateboard_general_tracking_stu
+  - override /algo: teacher_rollout_perception_actor
+  - _self_
+
+# Number of outer rollouts.  The entrypoint converts this to
+# iteration * num_envs * train_every * world_size global frames.
+iteration: 3000
+total_frames: 49_152_000
+save_interval: 600
+
+algo:
+  # Noise belongs only to the frozen privileged Teacher rollout policy.
+  load_noise_scale: 0.2
+  # The default preserves PPOVEL's warm-start comparison.  Override with
+  # `algo.perception_initialization=fresh` (as in the requested command) to
+  # initialize all perception modules independently while still loading
+  # actor_adapt from the original PPOVEL Teacher checkpoint.
+  perception_initialization: teacher_warmstart
+  # Fixed stage semantics: actor_adapt learns only from the detached EMA
+  # priv_pred captured during rollout, never online/GT latent and never through
+  # perception gradients.  The three online perception modules still use the
+  # unchanged PPOVEL-finetune supervised update and then soft-update their EMA.
+  distill_with_priv_pred: true
+  actor_bc_perception_source: ema_rollout
+
+wandb:
+  job_type: perception_actor_teacher_bc
+  tags: [teacher-rollout, perception, actor-adapt-bc]

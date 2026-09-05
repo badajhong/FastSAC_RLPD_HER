@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from collections.abc import Mapping
 
 import hydra
@@ -34,6 +35,8 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     UNIFORM_PHYSICAL_STD_BOUND_MODE,
     TRAINING_ALGORITHM,
     _validate_fastsac_entropy_target_controls,
+    checkpoint_module_mismatches,
+    validate_actor_adopt_checkpoint_payload,
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
@@ -259,6 +262,177 @@ def _validate_perception_training_controls(cfg: DictConfig) -> str | None:
     with open_dict(cfg.algo):
         cfg.algo.perception_checkpoint_path = resolved
     return resolved
+
+
+def _saved_checkpoint_contract(checkpoint: Mapping, *, label: str) -> dict:
+    saved_cfg = checkpoint.get("cfg")
+    if not isinstance(saved_cfg, Mapping):
+        raise ValueError(f"{label} must contain its saved cfg mapping")
+    saved_algo = saved_cfg.get("algo")
+    saved_task = saved_cfg.get("task")
+    if not isinstance(saved_algo, Mapping) or not isinstance(saved_task, Mapping):
+        raise ValueError(f"{label} must contain cfg.algo and cfg.task mappings")
+    teacher_path = saved_cfg.get("checkpoint_path")
+    task_name = saved_task.get("name")
+    if not isinstance(teacher_path, str) or not teacher_path.strip():
+        raise ValueError(f"{label} must record cfg.checkpoint_path")
+    if not isinstance(task_name, str) or not task_name:
+        raise ValueError(f"{label} must record cfg.task.name")
+    return {
+        "teacher_path": os.path.realpath(os.path.expanduser(teacher_path)),
+        "task_name": task_name,
+        "latent_dim": saved_algo.get("latent_dim"),
+        "in_keys": tuple(saved_algo.get("in_keys", ())),
+    }
+
+
+def _validate_actor_adopt_checkpoint_controls(
+    cfg: DictConfig,
+    *,
+    perception_path: str | None,
+) -> dict | None:
+    """Audit and canonicalize the optional actor_adapt-only warm start."""
+    configured_path = cfg.algo.get("actor_adopt_checkpoint_path", None)
+    if configured_path is None:
+        return None
+    if str(cfg.algo.get("student_actor_initialization", "teacher_bc")) != (
+        "teacher_bc"
+    ):
+        raise ValueError(
+            "algo.actor_adopt_checkpoint_path cannot be combined with "
+            "algo.student_actor_initialization=fresh"
+        )
+    if cfg.algo.get("load_pretrained_perception") is not True or (
+        perception_path is None
+    ):
+        raise ValueError(
+            "algo.actor_adopt_checkpoint_path requires "
+            "algo.load_pretrained_perception=true and an explicit "
+            "algo.perception_checkpoint_path"
+        )
+    try:
+        raw_path = os.fspath(configured_path)
+    except TypeError as exc:
+        raise ValueError(
+            "algo.actor_adopt_checkpoint_path must be a local filesystem path"
+        ) from exc
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError(
+            "algo.actor_adopt_checkpoint_path must be a non-empty local path"
+        )
+    raw_path = os.path.expanduser(raw_path)
+    if raw_path.startswith("run:") or "://" in raw_path:
+        raise ValueError(
+            "algo.actor_adopt_checkpoint_path must be a local filesystem path"
+        )
+    resolved = os.path.realpath(hydra.utils.to_absolute_path(raw_path))
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(
+            f"actor_adopt checkpoint does not exist: {resolved}"
+        )
+    actor_checkpoint = torch.load(
+        resolved, map_location="cpu", weights_only=False
+    )
+    _, provenance = validate_actor_adopt_checkpoint_payload(
+        actor_checkpoint,
+        source_path=resolved,
+    )
+
+    runtime_task = cfg.task.get("name")
+    actor_contract = _saved_checkpoint_contract(
+        actor_checkpoint, label="actor_adopt checkpoint"
+    )
+    expected_contract = {
+        "task_name": runtime_task,
+        "latent_dim": int(cfg.algo.get("latent_dim")),
+        "in_keys": tuple(cfg.algo.get("in_keys", ())),
+    }
+    for name, expected in expected_contract.items():
+        if actor_contract[name] != expected:
+            raise ValueError(
+                f"actor_adopt checkpoint {name} does not match runtime: "
+                f"expected {expected!r}, got {actor_contract[name]!r}"
+            )
+
+    main_teacher_path = cfg.get("checkpoint_path")
+    if not isinstance(main_teacher_path, str) or not main_teacher_path.strip():
+        raise ValueError(
+            "algo.actor_adopt_checkpoint_path requires an explicit root "
+            "checkpoint_path for the privileged Teacher"
+        )
+    resolved_teacher_path = os.path.realpath(
+        hydra.utils.to_absolute_path(os.path.expanduser(main_teacher_path))
+    )
+    if actor_contract["teacher_path"] != resolved_teacher_path:
+        raise ValueError(
+            "actor_adopt checkpoint was trained from a different privileged "
+            "Teacher checkpoint than root checkpoint_path"
+        )
+    if not os.path.isfile(resolved_teacher_path):
+        raise FileNotFoundError(
+            f"privileged Teacher checkpoint does not exist: {resolved_teacher_path}"
+        )
+    teacher_checkpoint = torch.load(
+        resolved_teacher_path, map_location="cpu", weights_only=False
+    )
+    teacher_policy = teacher_checkpoint.get("policy")
+    actor_policy = actor_checkpoint["policy"]
+    if not isinstance(teacher_policy, Mapping):
+        raise ValueError("privileged Teacher checkpoint lacks policy mapping")
+    teacher_mismatches = checkpoint_module_mismatches(
+        teacher_policy,
+        actor_policy,
+        ("actor", "encoder_priv", "critic"),
+        ignored_key_suffixes=("actor_std",),
+    )
+    if teacher_mismatches:
+        raise ValueError(
+            "actor_adopt checkpoint frozen Teacher does not match root "
+            f"checkpoint_path; mismatched modules={list(teacher_mismatches)}"
+        )
+
+    perception_checkpoint = torch.load(
+        perception_path, map_location="cpu", weights_only=False
+    )
+    if not isinstance(perception_checkpoint, Mapping) or not isinstance(
+        perception_checkpoint.get("policy"), Mapping
+    ):
+        raise ValueError("pretrained perception checkpoint lacks policy mapping")
+    perception_contract = _saved_checkpoint_contract(
+        perception_checkpoint, label="pretrained perception checkpoint"
+    )
+    for name in ("teacher_path", "task_name", "latent_dim", "in_keys"):
+        if perception_contract[name] != actor_contract[name]:
+            raise ValueError(
+                "actor_adopt and perception checkpoints do not share the same "
+                f"Teacher/task/latent contract at {name!r}"
+            )
+    perception_mismatches = checkpoint_module_mismatches(
+        perception_checkpoint["policy"],
+        actor_policy,
+        REQUIRED_PRETRAINED_PERCEPTION_MODULES,
+    )
+    exact_match = not perception_mismatches
+    if not exact_match:
+        warnings.warn(
+            "actor_adapt was BC-trained against the perception tensors in its "
+            "joint checkpoint, but algo.perception_checkpoint_path selects a "
+            "different later/independent perception state. This pairing is "
+            "allowed because both regress the same frozen Teacher latent, but "
+            "it is not an exact coupled restoration. For the exact pair, set "
+            "BOTH paths to the same perception_actor checkpoint. Differing "
+            f"modules: {list(perception_mismatches)}",
+            UserWarning,
+            stacklevel=2,
+        )
+    with open_dict(cfg.algo):
+        cfg.algo.actor_adopt_checkpoint_path = resolved
+    return {
+        **provenance,
+        "perception_source_path": perception_path,
+        "perception_exact_match": exact_match,
+        "perception_mismatched_modules": perception_mismatches,
+    }
 
 
 def _validate_failure_phase_teacher_sampling(cfg: DictConfig) -> None:
@@ -589,6 +763,13 @@ def _validate_replay_contract(cfg: DictConfig) -> None:
 
 
 def _validate_sac_controls(cfg: DictConfig) -> None:
+    student_actor_initialization = str(
+        cfg.algo.get("student_actor_initialization", "teacher_bc")
+    )
+    if student_actor_initialization not in ("teacher_bc", "fresh"):
+        raise ValueError(
+            "algo.student_actor_initialization must be 'teacher_bc' or 'fresh'"
+        )
     actor_observation_mode = str(
         cfg.algo.get("sac_actor_observation_mode", "student_perception")
     )
@@ -805,7 +986,11 @@ def validate_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         )
     _validate_locked_topology(cfg)
     _reject_obsolete_bounded_action_controls(cfg)
-    _validate_perception_training_controls(cfg)
+    perception_path = _validate_perception_training_controls(cfg)
+    _validate_actor_adopt_checkpoint_controls(
+        cfg,
+        perception_path=perception_path,
+    )
 
     dagger_env_fraction = _finite_fraction(
         "algo.dagger_env_fraction",
@@ -1044,6 +1229,10 @@ def main(cfg: DictConfig):
         f"lambda_bc={float(cfg.algo.lambda_bc):g}, "
         "actor_observation_mode="
         f"{cfg.algo.get('sac_actor_observation_mode', 'student_perception')}, "
+        "student_actor_initialization="
+        f"{cfg.algo.get('student_actor_initialization', 'teacher_bc')}, "
+        "actor_adapt_checkpoint="
+        f"{cfg.algo.get('actor_adopt_checkpoint_path', None)}, "
         "action_distribution="
         f"{cfg.algo.get('sac_action_distribution', NORMALIZED_TANH_ACTION_DISTRIBUTION)}, "
         f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "

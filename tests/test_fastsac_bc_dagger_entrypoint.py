@@ -8,6 +8,13 @@ from omegaconf import OmegaConf, open_dict
 
 from scripts import fastSAC_bc_dagger as sac_entry
 from scripts.train import run_training as shared_run_training
+from active_adaptation.learning.ppo.perception_actor import (
+    ACTOR_BC_PERCEPTION_SOURCE,
+    ACTOR_INITIALIZATION_SEMANTICS,
+    ACTOR_OBJECTIVE_SEMANTICS,
+    OPTIMIZED_MODULES,
+    TRAINING_ALGORITHM as PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+)
 
 
 def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
@@ -65,6 +72,7 @@ def _cfg(*, checkpoint="/tmp/fresh_ppo.pt", iterations=3000):
                 "load_pretrained_perception": False,
                 "perception_checkpoint_path": None,
                 "train_perception": True,
+                "actor_adopt_checkpoint_path": None,
                 "q_hidden_dim": 768,
                 "q_num_atoms": 501,
                 "q_v_min": -20.0,
@@ -297,6 +305,58 @@ def _write_perception_checkpoint(path: Path, *, omit: str | None = None) -> Path
     return path
 
 
+def _write_actor_adopt_checkpoint(
+    path: Path,
+    *,
+    teacher: Path,
+    perception_policy: dict,
+    task_name: str = "G1Skateboard",
+) -> Path:
+    actor_state = {
+        "body.weight": torch.zeros(4, 3, dtype=torch.float32),
+        "body.bias": torch.zeros(4, dtype=torch.float32),
+        "head.actor_std": torch.full((2,), 0.2, dtype=torch.float32),
+        "head.actor_mean.weight": torch.zeros(2, 4, dtype=torch.float32),
+        "head.actor_mean.bias": torch.zeros(2, dtype=torch.float32),
+    }
+    policy = {
+        **{name: dict(state) for name, state in perception_policy.items()},
+        "actor": {},
+        "encoder_priv": {},
+        "critic": {},
+        "actor_adapt": actor_state,
+        "training_algorithm": PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+        "last_phase": "finetune",
+        "last_iter": 1200,
+        "actor_objective_semantics": ACTOR_OBJECTIVE_SEMANTICS,
+        "actor_initialization_semantics": ACTOR_INITIALIZATION_SEMANTICS,
+        "actor_adapt_loaded_from_teacher_checkpoint": True,
+        "actor_adapt_trained": True,
+        "actor_adapt_controls_rollout": False,
+        "actor_bc_perception_source": ACTOR_BC_PERCEPTION_SOURCE,
+        "actor_bc_uses_online_priv_pred": False,
+        "actor_adapt_bc_update_count": 1201,
+        "optimized_modules": OPTIMIZED_MODULES,
+    }
+    source_cfg = {
+        "checkpoint_path": str(teacher.resolve()),
+        "task": {"name": task_name},
+        "algo": {
+            "name": "teacher_rollout_perception_actor",
+            "_target_": (
+                "active_adaptation.learning.ppo.perception_actor."
+                "TeacherRolloutPerceptionActor"
+            ),
+            "distill_with_priv_pred": True,
+            "actor_bc_perception_source": ACTOR_BC_PERCEPTION_SOURCE,
+            "latent_dim": 256,
+            "in_keys": list(sac_entry.EXPECTED_ACTOR_IN_KEYS),
+        },
+    }
+    torch.save({"policy": policy, "cfg": source_cfg}, path)
+    return path
+
+
 def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     with initialize_config_dir(config_dir=str(config_dir), version_base=None):
@@ -343,6 +403,7 @@ def test_fastsac_config_composes_with_bounded_normalized_std_contract():
     assert cfg.algo.load_pretrained_perception is False
     assert cfg.algo.perception_checkpoint_path is None
     assert cfg.algo.train_perception is True
+    assert cfg.algo.actor_adopt_checkpoint_path is None
     assert cfg.algo.dagger_beta_start == pytest.approx(0.0)
     assert cfg.algo.dagger_beta_end == pytest.approx(0.0)
     assert cfg.algo.eta_sac == pytest.approx(1.0e-4)
@@ -607,6 +668,123 @@ def test_pretrained_perception_requires_all_module_mappings(tmp_path):
     cfg.algo.perception_checkpoint_path = str(perception)
 
     with pytest.raises(ValueError, match=f"module mappings.*{missing}"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_actor_adopt_checkpoint_is_strictly_audited_and_canonicalized(tmp_path):
+    teacher = _write_fresh_ppo_checkpoint(tmp_path / "teacher.pt")
+    perception_policy = {
+        name: {"weight": torch.full((1,), float(index))}
+        for index, name in enumerate(
+            sac_entry.REQUIRED_PRETRAINED_PERCEPTION_MODULES
+        )
+    }
+    perception = tmp_path / "perception.pt"
+    torch.save(
+        {
+            "policy": perception_policy,
+            "cfg": {
+                "checkpoint_path": str(teacher.resolve()),
+                "task": {"name": "G1Skateboard"},
+                "algo": {
+                    "latent_dim": 256,
+                    "in_keys": list(sac_entry.EXPECTED_ACTOR_IN_KEYS),
+                },
+            },
+        },
+        perception,
+    )
+    actor = _write_actor_adopt_checkpoint(
+        tmp_path / "actor.pt",
+        teacher=teacher,
+        perception_policy=perception_policy,
+    )
+    cfg = _cfg(checkpoint=str(teacher))
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+    cfg.algo.train_perception = False
+    cfg.algo.actor_adopt_checkpoint_path = str(actor)
+
+    sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+    assert cfg.algo.perception_checkpoint_path == str(perception.resolve())
+    assert cfg.algo.actor_adopt_checkpoint_path == str(actor.resolve())
+
+
+def test_actor_adopt_allows_but_warns_for_independent_perception_weights(tmp_path):
+    teacher = _write_fresh_ppo_checkpoint(tmp_path / "teacher.pt")
+    actor_perception = {
+        name: {"weight": torch.zeros(1)}
+        for name in sac_entry.REQUIRED_PRETRAINED_PERCEPTION_MODULES
+    }
+    selected_perception = {
+        name: {"weight": value["weight"].clone()}
+        for name, value in actor_perception.items()
+    }
+    selected_perception["adapt_module"]["weight"].fill_(1.0)
+    perception = tmp_path / "perception.pt"
+    torch.save(
+        {
+            "policy": selected_perception,
+            "cfg": {
+                "checkpoint_path": str(teacher.resolve()),
+                "task": {"name": "G1Skateboard"},
+                "algo": {
+                    "latent_dim": 256,
+                    "in_keys": list(sac_entry.EXPECTED_ACTOR_IN_KEYS),
+                },
+            },
+        },
+        perception,
+    )
+    actor = _write_actor_adopt_checkpoint(
+        tmp_path / "actor.pt",
+        teacher=teacher,
+        perception_policy=actor_perception,
+    )
+    cfg = _cfg(checkpoint=str(teacher))
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+    cfg.algo.train_perception = False
+    cfg.algo.actor_adopt_checkpoint_path = str(actor)
+
+    with pytest.warns(UserWarning, match="not an exact coupled restoration"):
+        sac_entry.validate_fastsac_bc_dagger_config(cfg)
+
+
+def test_actor_adopt_checkpoint_rejects_fresh_student_initialization(tmp_path):
+    teacher = _write_fresh_ppo_checkpoint(tmp_path / "teacher.pt")
+    perception_policy = {
+        name: {"weight": torch.zeros(1)}
+        for name in sac_entry.REQUIRED_PRETRAINED_PERCEPTION_MODULES
+    }
+    perception = tmp_path / "perception.pt"
+    torch.save(
+        {
+            "policy": perception_policy,
+            "cfg": {
+                "checkpoint_path": str(teacher.resolve()),
+                "task": {"name": "G1Skateboard"},
+                "algo": {
+                    "latent_dim": 256,
+                    "in_keys": list(sac_entry.EXPECTED_ACTOR_IN_KEYS),
+                },
+            },
+        },
+        perception,
+    )
+    actor = _write_actor_adopt_checkpoint(
+        tmp_path / "actor.pt",
+        teacher=teacher,
+        perception_policy=perception_policy,
+    )
+    cfg = _cfg(checkpoint=str(teacher))
+    cfg.algo.load_pretrained_perception = True
+    cfg.algo.perception_checkpoint_path = str(perception)
+    cfg.algo.actor_adopt_checkpoint_path = str(actor)
+    cfg.algo.student_actor_initialization = "fresh"
+
+    with pytest.raises(ValueError, match="cannot be combined.*fresh"):
         sac_entry.validate_fastsac_bc_dagger_config(cfg)
 
 

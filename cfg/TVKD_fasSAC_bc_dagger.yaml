@@ -16,6 +16,15 @@ fastsac_bc_dagger_checkpoint: null
 _tvkd_model_only_resume: false
 
 algo:
+  # Adds action supervision to the existing live perception backward. The
+  # same Student actor supplies detached GT-latent targets and differentiable
+  # predicted-latent actions, with its parameters frozen only for this forward.
+  # SAC+BC actor updates remain active. Set to 1.0 to enable the new objective.
+  perception_action_consistency_coef: 0.0
+  # Add a 64 -> latent_dim zero-initialized projection of temporal depth to
+  # the existing adaptation MLP feature, before the GRU and residual output.
+  perception_depth_residual: false
+
   # Fresh TVKD runs inherit the parent FastSAC Actor-cadence temperature
   # update. A resumed v3 checkpoint may explicitly retain its saved Critic
   # cadence as a legacy compatibility contract.

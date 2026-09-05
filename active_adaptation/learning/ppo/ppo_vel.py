@@ -158,6 +158,38 @@ class GRUModule(nn.Module):
         return (out3, hx.contiguous())
 
 
+class ZeroDepthProjection(nn.Module):
+    """A bias-free residual projection, also untouched by PPOVEL's init_.
+
+    Creating a zero Parameter consumes no RNG, so enabling this branch does
+    not change the initialization of existing perception or actor weights.
+    """
+
+    def __init__(self, depth_dim: int, feature_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(feature_dim, depth_dim))
+
+    def forward(self, depth_feature):
+        return F.linear(depth_feature, self.weight)
+
+
+class DepthResidualGRUModule(GRUModule):
+    """Fuse temporal depth directly into the existing adaptation feature.
+
+    The original MLP, GRU, output layer, and hidden-state shapes/keys remain
+    unchanged. At zero projection this is exactly the original GRUModule.
+    """
+
+    def __init__(self, dim: int, depth_dim: int):
+        super().__init__(dim)
+        self.depth_projection = ZeroDepthProjection(depth_dim, dim)
+
+    def forward(self, x, is_init, hx, depth_feature):
+        feature = self.mlp(x) + self.depth_projection(depth_feature)
+        recurrent_feature, hx = self.gru(feature, is_init, hx)
+        return self.out(recurrent_feature + feature), hx.contiguous()
+
+
 class ZeroDepthInjector(TensorDictModuleBase):
     """Injects a zero tensor as '_depth_feature' when no depth sensor is available."""
     in_keys = []
@@ -364,10 +396,24 @@ class PPOVEL(TensorDictModuleBase):
             selected_out_keys=[PRIV_FEATURE_KEY]
         ).to(self.device)
 
+        depth_residual = getattr(self.cfg, "perception_depth_residual", False)
+        if not isinstance(depth_residual, bool):
+            raise ValueError("perception_depth_residual must be boolean")
+        if depth_residual and (
+            self.cfg.phase != "finetune" or self.cfg.adapt_module != "gru" or not has_depth
+        ):
+            raise ValueError("perception_depth_residual requires finetune, gru, and depth observations")
         if self.cfg.adapt_module == "gru":
+            adaptation_core = (
+                DepthResidualGRUModule(latent_dim, self.depth_feature_dim)
+                if depth_residual else GRUModule(latent_dim)
+            )
+            adaptation_keys = ["_adapt_inp", "is_init", "adapt_hx"]
+            if depth_residual:
+                adaptation_keys.append("_depth_feature")
             self.adapt_module = Seq(
                 CatTensors(adapt_module_in_keys, "_adapt_inp", del_keys=False, sort=False),
-                Mod(GRUModule(latent_dim), ["_adapt_inp", "is_init", "adapt_hx"], [PRIV_PRED_KEY, ("next", "adapt_hx")]),
+                Mod(adaptation_core, adaptation_keys, [PRIV_PRED_KEY, ("next", "adapt_hx")]),
                 selected_out_keys=[PRIV_PRED_KEY, ("next", "adapt_hx")]
             ).to(self.device)
         elif self.cfg.adapt_module == "mlp":
@@ -660,6 +706,52 @@ class PPOVEL(TensorDictModuleBase):
             infos[f"critic/{group_name}.ret_std"] = ret_std[i].item()
             infos[f"critic/{group_name}.neg_rew_ratio"] = (tensordict[REWARD_KEY][:, :, i] <= 0.).float().mean().item()
         return dict(sorted(infos.items()))
+
+    def _actor_distillation_target_mean(
+        self,
+        tensordict: TensorDict,
+        teacher_dist: D.Distribution,
+    ) -> torch.Tensor:
+        """Return the Teacher mean in ``actor_adapt`` action coordinates.
+
+        Standard PPOVEL training already constructs ``teacher_dist.mean`` in
+        the correct coordinates.  Dedicated stages that instantiate a
+        train-phase residual Teacher inside a finetune topology can override
+        this hook without duplicating the perception/actor update loop.
+        """
+
+        return teacher_dist.mean
+
+    def _actor_distillation_priv_pred(
+        self,
+        tensordict: TensorDict,
+    ) -> torch.Tensor:
+        """Return the predicted latent used only by finetune Actor BC.
+
+        PPOVEL's optional finetune distillation historically uses the online
+        prediction already produced by ``train_adapt``.  Dedicated training
+        stages can override this hook to select a deployment-aligned latent
+        without changing the perception loss/update implementation.
+        """
+
+        return tensordict[PRIV_PRED_KEY]
+
+    def _actor_distillation_student_dist(
+        self,
+        tensordict: TensorDict,
+    ) -> D.Distribution:
+        """Build the Student distribution without mutating perception outputs."""
+
+        priv_pred = self._actor_distillation_priv_pred(tensordict)
+        if not torch.isfinite(priv_pred).all():
+            raise RuntimeError("Actor-distillation latent contains NaN/Inf")
+
+        # Actor TensorDict modules write scratch keys such as loc/scale.  Keep
+        # those writes, and the selected latent, out of the perception batch so
+        # its online prediction remains available for canonical diagnostics.
+        actor_tensordict = tensordict.clone(False)
+        actor_tensordict[PRIV_PRED_KEY] = priv_pred.detach()
+        return self.actor_adapt.get_dist(actor_tensordict)
     
     @set_recurrent_mode(True)
     def _train_adapt_no_depth(self, tensordict: TensorDict):
@@ -724,7 +816,11 @@ class PPOVEL(TensorDictModuleBase):
                     dist_teacher = self.actor.get_dist(minibatch)
                 minibatch[PRIV_PRED_KEY] = minibatch[PRIV_FEATURE_KEY].detach()
                 dist_student = self.actor_adapt.get_dist(minibatch)
-                adapt_loss = (dist_teacher.mean - dist_student.mean).square().mean()
+                teacher_mean = self._actor_distillation_target_mean(
+                    minibatch,
+                    dist_teacher,
+                )
+                adapt_loss = (teacher_mean - dist_student.mean).square().mean()
                 if getattr(self, "actor_backend", None) in {
                     "hoi_fastsac_tanh_gaussian_v1",
                     "vaic_fastsac_tanh_gaussian_v2",
@@ -745,6 +841,18 @@ class PPOVEL(TensorDictModuleBase):
 
         infos = {k: v.mean().item() for k, v in sorted(torch.stack(infos).items())}
         return infos
+
+    def _prepare_perception_warmstart(self, policy_state):
+        """Architecture-specific migration for explicit weight initialization only."""
+        return policy_state
+
+    def _perception_auxiliary_loss(self, tensordict: TensorDict):
+        """Optional control supervision on the current online perception graph.
+
+        Subclasses return a weighted scalar loss and detached diagnostics.
+        None preserves the original PPOVEL objective and gradient path.
+        """
+        return None, {}
 
     @set_recurrent_mode(True)
     def train_adapt(self, tensordict: TensorDict):
@@ -782,6 +890,10 @@ class PPOVEL(TensorDictModuleBase):
 
                 total_loss = priv_loss + object_loss
 
+                auxiliary_loss, auxiliary_info = self._perception_auxiliary_loss(minibatch)
+                if auxiliary_loss is not None:
+                    total_loss = total_loss + auxiliary_loss
+
                 self.opt_adapt.zero_grad()
                 total_loss.backward()
 
@@ -806,7 +918,7 @@ class PPOVEL(TensorDictModuleBase):
                 opt_adapt_grad_norm = nn.utils.clip_grad_norm_(all_params, self.cfg.max_grad_norm)
                 self.opt_adapt.step()
 
-                info = {}
+                info = dict(auxiliary_info)
                 info["adapt/priv_loss"] = priv_loss
                 info["adapt/object_loss"] = object_loss
                 info["adapt/grad_norm"] = opt_adapt_grad_norm
@@ -829,10 +941,19 @@ class PPOVEL(TensorDictModuleBase):
                     if "_depth_feature" in minibatch.keys():
                         minibatch["_depth_feature"] = minibatch["_depth_feature"].detach()
 
+                    dist_student = self._actor_distillation_student_dist(minibatch)
+                    # Preserve PPOVEL's post-loss graph release for the online
+                    # perception output.  Dedicated subclasses may select a
+                    # different detached Actor latent through the hook above.
                     minibatch[PRIV_PRED_KEY] = minibatch[PRIV_PRED_KEY].detach()
-                    dist_student = self.actor_adapt.get_dist(minibatch)
 
-                    adapt_loss = (dist_teacher.mean - dist_student.mean).square().mean()
+                    teacher_mean = self._actor_distillation_target_mean(
+                        minibatch,
+                        dist_teacher,
+                    )
+                    adapt_loss = (
+                        teacher_mean - dist_student.mean
+                    ).square().mean()
                     if getattr(self, "actor_backend", None) in {
                         "hoi_fastsac_tanh_gaussian_v1",
                         "vaic_fastsac_tanh_gaussian_v2",

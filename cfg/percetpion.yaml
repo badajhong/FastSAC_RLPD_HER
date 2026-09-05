@@ -1,0 +1,26 @@
+# Dedicated perception-only training.  The filename intentionally matches the
+# experiment command's ``scripts/percetpion.py`` spelling.
+defaults:
+  - train
+  - override /task: G1/vaic/skateboard_general_tracking_stu
+  - override /algo: teacher_rollout_perception_only
+  - _self_
+
+# Number of outer rollouts.  The entrypoint converts this at runtime to the
+# exact global frame budget: iteration * num_envs * train_every * world_size.
+iteration: 3000
+total_frames: 49_152_000
+save_interval: 600
+
+algo:
+  # Applied only to the frozen privileged Teacher actor.  The frozen
+  # actor_adapt std is restored from the source checkpoint after loading.
+  load_noise_scale: 0.2
+  # Use `fresh` for an independent comparison model: no depth/object/privileged
+  # perception weights are transferred from the Teacher. `teacher_warmstart`
+  # retains the original PPOVEL-finetune initialization for controlled ablations.
+  perception_initialization: teacher_warmstart
+
+wandb:
+  job_type: perception_only
+  tags: [teacher-rollout, perception-only]

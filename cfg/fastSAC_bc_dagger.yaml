@@ -115,6 +115,18 @@ algo:
   # Disable only to freeze a successfully loaded complete perception stack.
   train_perception: true
 
+  # Student actor_adapt mean initialization at the fresh PPO-source boundary.
+  # teacher_bc preserves the checkpoint-trained BC mean; fresh keeps the
+  # constructor mean while the privileged Teacher still loads and remains
+  # frozen. In both modes PPO actor_std is reset by algo.load_noise_scale.
+  student_actor_initialization: teacher_bc
+  # Optional actor_adapt-only initialization from scripts/percetpion_actor.py.
+  # The public ``adopt`` spelling is intentional. The privileged Teacher still
+  # comes only from root checkpoint_path; this source never overlays Teacher,
+  # perception, Q, or Critic tensors. It requires teacher_bc initialization and
+  # an explicit pretrained perception checkpoint.
+  actor_adopt_checkpoint_path: null
+
   # ``c51`` preserves the engineered split-action distributional critic.
   # ``scalar`` uses independent standard-SAC Q heads with balanced state/action
   # stems, followed by two shared-width hidden layers and one scalar output.

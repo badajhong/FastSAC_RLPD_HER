@@ -73,6 +73,8 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     compute_teacher_value_terms,
 )
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+    ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+    PERCEPTION_ACTOR_TRAINING_ALGORITHM,
     _fastsac_actor_backend,
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
@@ -329,6 +331,42 @@ def _validate_tvkd_resume_policy_state(
         raise ValueError(
             f"TVKD resume checkpoint lacks policy module mappings: {missing_modules}"
         )
+
+    actor_adopt_path = source_algo.get("actor_adopt_checkpoint_path")
+    actor_adopt_initialization = policy_state.get("actor_adopt_initialization")
+    if actor_adopt_path is None:
+        if isinstance(actor_adopt_initialization, Mapping) and (
+            actor_adopt_initialization.get("loaded") is True
+        ):
+            raise ValueError(
+                "TVKD resume checkpoint has actor_adopt provenance without a path"
+            )
+    else:
+        if not isinstance(actor_adopt_path, str) or not actor_adopt_path:
+            raise ValueError("TVKD resume checkpoint has invalid actor_adopt path")
+        if source_algo.get("student_actor_initialization", "teacher_bc") != (
+            "teacher_bc"
+        ):
+            raise ValueError(
+                "TVKD actor_adopt resume is incompatible with fresh Actor initialization"
+            )
+        if source_algo.get("load_pretrained_perception") is not True or not isinstance(
+            source_algo.get("perception_checkpoint_path"), str
+        ) or not source_algo.get("perception_checkpoint_path"):
+            raise ValueError(
+                "TVKD actor_adopt resume lacks pretrained perception provenance"
+            )
+        if not isinstance(actor_adopt_initialization, Mapping):
+            raise ValueError("TVKD resume checkpoint lacks actor_adopt provenance")
+        if (
+            actor_adopt_initialization.get("semantics")
+            != ACTOR_ADOPT_CHECKPOINT_SEMANTICS
+            or actor_adopt_initialization.get("loaded") is not True
+            or actor_adopt_initialization.get("source_path") != actor_adopt_path
+            or actor_adopt_initialization.get("source_algorithm")
+            != PERCEPTION_ACTOR_TRAINING_ALGORITHM
+        ):
+            raise ValueError("TVKD resume actor_adopt provenance mismatch")
 
     frozen = policy_state.get("frozen_teacher_state")
     frozen_names = ["actor", "encoder_priv", "critic", "value_norm"]
@@ -1272,6 +1310,16 @@ def _prepare_tvkd_checkpoint(
         # contract stays exact without requiring the old file to still exist.
         with open_dict(cfg.algo):
             cfg.algo.perception_checkpoint_path = saved_perception_path
+    saved_actor_adopt_path = source_algo.get("actor_adopt_checkpoint_path")
+    if saved_actor_adopt_path is not None:
+        if not isinstance(saved_actor_adopt_path, str) or not saved_actor_adopt_path:
+            raise ValueError(
+                "TVKD resume checkpoint has invalid actor_adopt provenance path"
+            )
+        # The actor_adapt tensors are embedded in the TVKD checkpoint. Keep the
+        # historical path only as exact provenance; resume never reopens it.
+        with open_dict(cfg.algo):
+            cfg.algo.actor_adopt_checkpoint_path = saved_actor_adopt_path
     # Full same-stage semantics are fixed by the saved algo config.  The new
     # run may change only outer execution controls (additional rollout count,
     # logging, W&B, and checkpoint path), none of which live in cfg.algo.
@@ -1298,6 +1346,13 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault(
         "sac_actor_observation_mode", "student_perception"
     )
+    # Checkpoints written before the explicit selector loaded actor_adapt from
+    # the PPO Teacher/BC source, which is exactly the new default mode.
+    source_algo_contract.setdefault("student_actor_initialization", "teacher_bc")
+    # Older checkpoints had no independent perception+Actor-BC overlay.
+    source_algo_contract.setdefault("actor_adopt_checkpoint_path", None)
+    source_algo_contract.setdefault("perception_action_consistency_coef", 0.0)
+    source_algo_contract.setdefault("perception_depth_residual", False)
     # Older FastSAC/TVKD checkpoints accidentally reused q_weight_decay for the
     # Actor optimizer and therefore had no independent Actor-decay field.  The
     # bug-fixed resume contract is explicit zero; policy loading retains the
@@ -1510,6 +1565,7 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
             baseline_cfg.algo.load_pretrained_perception = False
             baseline_cfg.algo.perception_checkpoint_path = None
             baseline_cfg.algo.train_perception = True
+            baseline_cfg.algo.actor_adopt_checkpoint_path = None
     validate_fastsac_bc_dagger_config(baseline_cfg)
     if not model_only_resume and bool(baseline_cfg.algo.load_pretrained_perception):
         # Baseline validation resolves local paths against Hydra's original
@@ -1519,6 +1575,9 @@ def validate_tvkd_fastsac_bc_dagger_config(cfg: DictConfig) -> None:
         with open_dict(cfg.algo):
             cfg.algo.perception_checkpoint_path = (
                 baseline_cfg.algo.perception_checkpoint_path
+            )
+            cfg.algo.actor_adopt_checkpoint_path = (
+                baseline_cfg.algo.actor_adopt_checkpoint_path
             )
 
 
@@ -1585,6 +1644,10 @@ def main(cfg: DictConfig):
         f"bottleneck={bool(cfg.algo.use_teacher_value_bottleneck_replay)}, "
         "actor_observation_mode="
         f"{cfg.algo.get('sac_actor_observation_mode', 'student_perception')}, "
+        "student_actor_initialization="
+        f"{cfg.algo.get('student_actor_initialization', 'teacher_bc')}, "
+        "actor_adapt_checkpoint="
+        f"{cfg.algo.get('actor_adopt_checkpoint_path', None)}, "
         f"action_distribution={cfg.algo.get('sac_action_distribution', 'normalized_tanh')}, "
         f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence}, "

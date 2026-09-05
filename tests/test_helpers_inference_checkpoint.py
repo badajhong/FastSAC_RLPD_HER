@@ -3,6 +3,13 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+    ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+    STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+)
+from active_adaptation.learning.ppo.perception_actor import (
+    TRAINING_ALGORITHM as PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+)
 from scripts import helpers
 
 
@@ -150,6 +157,7 @@ def test_legacy_fastsac_inference_config_uses_checkpoint_then_defaults():
     assert cfg.algo.teacher_perception_batch_size == 128
     assert cfg.algo.load_pretrained_perception is False
     assert cfg.algo.perception_checkpoint_path is None
+    assert cfg.algo.actor_adopt_checkpoint_path is None
     assert cfg.algo.train_perception is True
     assert "teacher_perception_warmup_steps" in filled["defaults"]
     assert "actor_output" not in cfg.algo
@@ -176,6 +184,109 @@ def test_physical_fastsac_checkpoint_overrides_structured_tanh_inference_default
     assert cfg.algo.sac_use_autotune is True
     assert cfg.algo.load_noise_scale == pytest.approx(0.5)
     assert "sac_action_distribution" in filled["checkpoint"]
+
+
+def test_fresh_actor_checkpoint_overrides_structured_teacher_bc_inference_default():
+    cfg = OmegaConf.create(
+        {"algo": {"student_actor_initialization": "teacher_bc"}}
+    )
+    policy_state = {
+        "training_algorithm": "distributional_fastsac_teacher_bc_v1",
+        "actor_initialization": {
+            "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+            "mode": "fresh",
+            "teacher_actor_loaded": True,
+            "actor_adapt_mean_loaded": False,
+            "actor_adapt_mean_fresh": True,
+            "source_phase": "train",
+            "source_iter": 123,
+        },
+        "dagger_backend_config": {
+            "student_actor_initialization": "fresh",
+        },
+    }
+
+    filled = helpers._fill_replayless_inference_algo_defaults(
+        cfg, policy_state, inference_only=True
+    )
+
+    assert cfg.algo.student_actor_initialization == "fresh"
+    assert "student_actor_initialization" in filled["checkpoint"]
+
+
+def test_fresh_actor_inference_rejects_missing_or_inconsistent_provenance():
+    cfg = OmegaConf.create(
+        {"algo": {"student_actor_initialization": "teacher_bc"}}
+    )
+    missing = {
+        "training_algorithm": "distributional_fastsac_teacher_bc_v1",
+        "dagger_backend_config": {"student_actor_initialization": "fresh"},
+    }
+    with pytest.raises(ValueError, match="lacks initialization provenance"):
+        helpers._fill_replayless_inference_algo_defaults(
+            cfg, missing, inference_only=True
+        )
+
+    inconsistent = {
+        **missing,
+        "actor_initialization": {
+            "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+            "mode": "fresh",
+            "teacher_actor_loaded": True,
+            "actor_adapt_mean_loaded": True,
+            "actor_adapt_mean_fresh": True,
+        },
+    }
+    with pytest.raises(ValueError, match="flags are inconsistent"):
+        helpers._fill_replayless_inference_algo_defaults(
+            cfg, inconsistent, inference_only=True
+        )
+
+
+def test_actor_adopt_inference_restores_paths_from_provenance_without_opening_files():
+    cfg = OmegaConf.create(
+        {
+            "algo": {
+                "student_actor_initialization": "teacher_bc",
+                "actor_adopt_checkpoint_path": None,
+                "load_pretrained_perception": False,
+                "perception_checkpoint_path": None,
+            }
+        }
+    )
+    actor_path = "/removed/source/actor.pt"
+    perception_path = "/removed/source/perception.pt"
+    policy_state = {
+        "training_algorithm": "distributional_fastsac_teacher_bc_v1",
+        "actor_initialization": {
+            "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+            "mode": "teacher_bc",
+            "teacher_actor_loaded": True,
+            "actor_adapt_mean_loaded": True,
+            "actor_adapt_mean_fresh": False,
+        },
+        "actor_adopt_initialization": {
+            "semantics": ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+            "loaded": True,
+            "source_path": actor_path,
+            "source_algorithm": PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+        },
+        "dagger_backend_config": {
+            "student_actor_initialization": "teacher_bc",
+            "actor_adopt_checkpoint_path": actor_path,
+            "load_pretrained_perception": True,
+            "perception_checkpoint_path": perception_path,
+        },
+    }
+
+    filled = helpers._fill_replayless_inference_algo_defaults(
+        cfg, policy_state, inference_only=True
+    )
+
+    assert cfg.algo.actor_adopt_checkpoint_path == actor_path
+    assert cfg.algo.load_pretrained_perception is True
+    assert cfg.algo.perception_checkpoint_path == perception_path
+    assert "actor_adopt_checkpoint_path" in filled["checkpoint"]
 
 
 def test_predicted_effect_checkpoint_overrides_structured_q_inference_defaults():

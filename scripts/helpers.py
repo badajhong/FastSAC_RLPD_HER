@@ -646,6 +646,20 @@ def _fill_replayless_inference_algo_defaults(
     filled_checkpoint = []
     filled_defaults = []
     with open_dict(cfg.algo):
+        if str(algorithm).startswith("distributional_tvkd_fastsac_teacher_bc_"):
+            residual_flags = [
+                source["perception_depth_residual"]
+                for source in (policy_state, backend)
+                if "perception_depth_residual" in source
+            ]
+            if any(not isinstance(flag, bool) for flag in residual_flags) or (
+                residual_flags and any(flag != residual_flags[0] for flag in residual_flags)
+            ):
+                raise ValueError("inference checkpoint has inconsistent perception_depth_residual metadata")
+            saved_depth_residual = residual_flags[0] if residual_flags else False
+            if cfg.algo.get("perception_depth_residual", False) != saved_depth_residual:
+                cfg.algo.perception_depth_residual = saved_depth_residual
+                filled_checkpoint.append("perception_depth_residual")
         fastsac_algorithms = {
             "distributional_fastsac_teacher_bc_v1",
             "distributional_tvkd_fastsac_teacher_bc_v1",
@@ -778,6 +792,149 @@ def _fill_replayless_inference_algo_defaults(
                 cfg.algo[name] = saved_value
                 filled_checkpoint.append(name)
         if algorithm in fastsac_algorithms:
+            from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+                ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+                FRESH_STUDENT_ACTOR_INITIALIZATION,
+                PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+                STUDENT_ACTOR_INITIALIZATION_MODES,
+                STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+                TEACHER_BC_STUDENT_ACTOR_INITIALIZATION,
+            )
+
+            backend_actor_initialization = backend.get(
+                "student_actor_initialization",
+                TEACHER_BC_STUDENT_ACTOR_INITIALIZATION,
+            )
+            if backend_actor_initialization not in STUDENT_ACTOR_INITIALIZATION_MODES:
+                raise ValueError(
+                    "FastSAC inference checkpoint has invalid backend Student "
+                    "Actor initialization"
+                )
+            actor_initialization = policy_state.get("actor_initialization")
+            if actor_initialization is None:
+                if (
+                    backend_actor_initialization
+                    != TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+                ):
+                    raise ValueError(
+                        "FastSAC fresh-Actor inference checkpoint lacks "
+                        "initialization provenance"
+                    )
+                saved_actor_initialization = (
+                    TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+                )
+            else:
+                if not isinstance(actor_initialization, Mapping):
+                    raise ValueError(
+                        "FastSAC inference checkpoint has invalid Actor "
+                        "initialization provenance"
+                    )
+                if actor_initialization.get("semantics") != (
+                    STUDENT_ACTOR_INITIALIZATION_SEMANTICS
+                ):
+                    raise ValueError(
+                        "FastSAC inference checkpoint Actor initialization "
+                        "semantics mismatch"
+                    )
+                saved_actor_initialization = actor_initialization.get("mode")
+                if saved_actor_initialization not in STUDENT_ACTOR_INITIALIZATION_MODES:
+                    raise ValueError(
+                        "FastSAC inference checkpoint has invalid Actor "
+                        "initialization mode"
+                    )
+                expected_flags = {
+                    "teacher_actor_loaded": True,
+                    "actor_adapt_mean_loaded": (
+                        saved_actor_initialization
+                        == TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+                    ),
+                    "actor_adapt_mean_fresh": (
+                        saved_actor_initialization
+                        == FRESH_STUDENT_ACTOR_INITIALIZATION
+                    ),
+                }
+                if any(
+                    actor_initialization.get(name) is not expected
+                    for name, expected in expected_flags.items()
+                ):
+                    raise ValueError(
+                        "FastSAC inference checkpoint Actor initialization "
+                        "flags are inconsistent"
+                    )
+            if saved_actor_initialization != backend_actor_initialization:
+                raise ValueError(
+                    "FastSAC inference checkpoint Actor initialization/backend "
+                    "mismatch"
+                )
+            if cfg.algo.get("student_actor_initialization") != (
+                saved_actor_initialization
+            ):
+                cfg.algo.student_actor_initialization = saved_actor_initialization
+                filled_checkpoint.append("student_actor_initialization")
+
+            saved_actor_adopt_path = backend.get("actor_adopt_checkpoint_path")
+            actor_adopt_initialization = policy_state.get(
+                "actor_adopt_initialization"
+            )
+            if saved_actor_adopt_path is None:
+                if actor_adopt_initialization is not None and (
+                    not isinstance(actor_adopt_initialization, Mapping)
+                    or actor_adopt_initialization.get("loaded") is not False
+                ):
+                    raise ValueError(
+                        "FastSAC inference checkpoint has inconsistent disabled "
+                        "actor_adopt provenance"
+                    )
+            else:
+                if not isinstance(saved_actor_adopt_path, str) or not (
+                    saved_actor_adopt_path
+                ):
+                    raise ValueError(
+                        "FastSAC inference checkpoint has invalid actor_adopt path"
+                    )
+                if saved_actor_initialization != (
+                    TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+                ):
+                    raise ValueError(
+                        "FastSAC actor_adopt overlay is incompatible with fresh "
+                        "Student Actor initialization"
+                    )
+                if not isinstance(actor_adopt_initialization, Mapping):
+                    raise ValueError(
+                        "FastSAC inference checkpoint lacks actor_adopt provenance"
+                    )
+                if (
+                    actor_adopt_initialization.get("semantics")
+                    != ACTOR_ADOPT_CHECKPOINT_SEMANTICS
+                    or actor_adopt_initialization.get("loaded") is not True
+                    or actor_adopt_initialization.get("source_path")
+                    != saved_actor_adopt_path
+                    or actor_adopt_initialization.get("source_algorithm")
+                    != PERCEPTION_ACTOR_TRAINING_ALGORITHM
+                ):
+                    raise ValueError(
+                        "FastSAC inference checkpoint actor_adopt provenance mismatch"
+                    )
+                saved_load_perception = backend.get("load_pretrained_perception")
+                saved_perception_path = backend.get("perception_checkpoint_path")
+                if saved_load_perception is not True or not isinstance(
+                    saved_perception_path, str
+                ) or not saved_perception_path:
+                    raise ValueError(
+                        "FastSAC actor_adopt inference checkpoint lacks its "
+                        "predicted-latent perception provenance"
+                    )
+                for name, value in (
+                    ("load_pretrained_perception", True),
+                    ("perception_checkpoint_path", saved_perception_path),
+                ):
+                    if cfg.algo.get(name) != value:
+                        cfg.algo[name] = copy.deepcopy(value)
+                        filled_checkpoint.append(name)
+            if cfg.algo.get("actor_adopt_checkpoint_path") != saved_actor_adopt_path:
+                cfg.algo.actor_adopt_checkpoint_path = saved_actor_adopt_path
+                filled_checkpoint.append("actor_adopt_checkpoint_path")
+
             # This field changes Actor parameter ownership and the distribution
             # class, so the checkpoint must select it before construction even
             # when the eval config already contains today's structured default.

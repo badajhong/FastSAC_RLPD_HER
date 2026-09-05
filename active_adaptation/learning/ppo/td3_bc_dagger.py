@@ -2579,6 +2579,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 "pretrained perception checkpoint must contain a policy mapping"
             )
 
+        # Explicit perception initialization may add a zero residual branch.
+        # Exact resume/inference use strict loaders and never call this hook.
+        original_policy_state = policy_state
+        policy_state = self._prepare_perception_warmstart(policy_state)
         all_names = set(PRETRAINED_PERCEPTION_MODULES)
         partial_names = set(PPOVEL_PARTIAL_PERCEPTION_MODULES)
         present_names = {name for name in all_names if name in policy_state}
@@ -2657,6 +2661,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             "fresh_modules": fresh_modules,
             "trainable": bool(self.cfg.train_perception),
         }
+        if policy_state is not original_policy_state:
+            metadata["depth_residual_zero_initialized"] = True
         self._perception_initialization = metadata
         return copy.deepcopy(metadata)
 

@@ -56,8 +56,10 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     _project_c51_probabilities,
 )
 from active_adaptation.learning.ppo.fastsac_bc_dagger import (
+    ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
     ACTOR_BACKEND,
     CHECKPOINT_VERSION,
+    FRESH_STUDENT_ACTOR_INITIALIZATION,
     FASTSAC_DAGGER_ENV_KEY,
     FASTSAC_PREFILL_TEACHER_NOISE_KEY,
     FASTSAC_PREFILL_TEACHER_PROJECTION_KEY,
@@ -69,6 +71,8 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     PREVIOUS_CHECKPOINT_VERSION,
     Q_TWIN_REDUCTION_MEAN,
     Q_TWIN_REDUCTION_MIN,
+    STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+    TEACHER_BC_STUDENT_ACTOR_INITIALIZATION,
     TRAINING_ALGORITHM,
     UNIFORM_PHYSICAL_STD_BOUND_MODE,
     DistributionalFastSACTeacherBC,
@@ -77,6 +81,15 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     _DistributionalFastSACDaggerRolloutPolicy,
     _seeded_dagger_env_mask,
     _spred_p_teacher_probability,
+    checkpoint_module_mismatches,
+    validate_actor_adopt_checkpoint_payload,
+)
+from active_adaptation.learning.ppo.perception_actor import (
+    ACTOR_BC_PERCEPTION_SOURCE as PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE,
+    ACTOR_INITIALIZATION_SEMANTICS as PERCEPTION_ACTOR_INITIALIZATION_SEMANTICS,
+    ACTOR_OBJECTIVE_SEMANTICS as PERCEPTION_ACTOR_OBJECTIVE_SEMANTICS,
+    OPTIMIZED_MODULES as PERCEPTION_ACTOR_OPTIMIZED_MODULES,
+    TRAINING_ALGORITHM as PERCEPTION_ACTOR_TRAINING_ALGORITHM,
 )
 from active_adaptation.learning.ppo.fastsac_gradient_probe import (
     GRADIENT_PROBE_SCHEMA,
@@ -295,6 +308,11 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
     assert TRAINING_ALGORITHM == "distributional_fastsac_teacher_bc_v1"
     assert cfg._target_.endswith(".DistributionalFastSACTeacherBC")
     assert cfg.name == "fastsac_bc_dagger"
+    assert (
+        cfg.student_actor_initialization
+        == TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+    )
+    assert cfg.actor_adopt_checkpoint_path is None
     assert cfg.target_policy_noise_std == 0.0
     assert cfg.target_policy_noise_clip == 0.0
     assert cfg.collector_exploration_noise_std == 0.0
@@ -323,6 +341,42 @@ def test_config_identifies_fastsac_and_locks_all_inherited_td3_noise_off():
         cfg.sac_actor_observation_mode
         == STUDENT_PERCEPTION_ACTOR_OBSERVATION_MODE
     )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (TEACHER_BC_STUDENT_ACTOR_INITIALIZATION, FRESH_STUDENT_ACTOR_INITIALIZATION),
+)
+def test_student_actor_initialization_accepts_only_explicit_modes(mode):
+    cfg = DistributionalFastSACTeacherBCConfig(
+        student_actor_initialization=mode
+    )
+    DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+def test_student_actor_initialization_rejects_unknown_mode():
+    cfg = DistributionalFastSACTeacherBCConfig(
+        student_actor_initialization="teacher"
+    )
+    with pytest.raises(ValueError, match="student_actor_initialization"):
+        DistributionalFastSACTeacherBC._validate_td3_config(cfg)
+
+
+def test_actor_adopt_overlay_rejects_fresh_or_missing_perception_contract():
+    fresh = DistributionalFastSACTeacherBCConfig(
+        student_actor_initialization="fresh",
+        actor_adopt_checkpoint_path="/tmp/actor.pt",
+        load_pretrained_perception=True,
+        perception_checkpoint_path="/tmp/perception.pt",
+    )
+    with pytest.raises(ValueError, match="cannot be combined.*fresh"):
+        DistributionalFastSACTeacherBC._validate_td3_config(fresh)
+
+    missing_perception = DistributionalFastSACTeacherBCConfig(
+        actor_adopt_checkpoint_path="/tmp/actor.pt",
+    )
+    with pytest.raises(ValueError, match="load_pretrained_perception=true"):
+        DistributionalFastSACTeacherBC._validate_td3_config(missing_perception)
 
 
 @pytest.mark.parametrize("reduction", (Q_TWIN_REDUCTION_MIN, Q_TWIN_REDUCTION_MEAN))
@@ -1306,6 +1360,405 @@ class _TinyPhysicalActor(nn.Module):
 
     def forward(self, observations):
         return observations @ self.mean_weight
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_mean"),
+    (
+        (TEACHER_BC_STUDENT_ACTOR_INITIALIZATION, 7.0),
+        (FRESH_STUDENT_ACTOR_INITIALIZATION, 0.25),
+    ),
+)
+def test_fresh_ppo_source_selects_student_mean_without_touching_teacher_or_perception(
+    monkeypatch, mode, expected_mean
+):
+    policy = _bare_policy(
+        student_actor_initialization=mode,
+        load_noise_scale=0.5,
+        sac_action_distribution=NORMALIZED_TANH_ACTION_DISTRIBUTION,
+        sac_alpha_init=1.0e-5,
+        dagger_seed=11,
+        q_seed=13,
+    )
+    policy.actor = nn.Linear(1, 1, bias=False)
+    policy.actor_adapt = _TinyPhysicalActor(
+        1, mean_weight=0.25, std=0.17
+    )
+    policy.perception_probe = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        policy.actor.weight.fill_(0.1)
+        policy.perception_probe.weight.fill_(0.2)
+    policy.bc_dagger_sac_adapter = _BCDaggerSACAdapter(
+        1, torch.tensor([-2.0]), "cpu"
+    )
+    policy._fastsac_initial_raw_log_std = torch.tensor([-2.0])
+    policy.qnet = nn.Linear(1, 1)
+    policy.qnet_target = copy.deepcopy(policy.qnet).requires_grad_(False)
+    policy.log_alpha = nn.Parameter(torch.tensor(-1.0))
+    policy.dagger_rng = torch.Generator().manual_seed(1)
+    policy.q_rng = torch.Generator().manual_seed(2)
+    policy.sac_action_rng = torch.Generator().manual_seed(3)
+    policy.sac_rollout_rng = torch.Generator().manual_seed(4)
+    policy.teacher_prefill_action_rng = torch.Generator().manual_seed(5)
+    policy.teacher_perception_rng = torch.Generator().manual_seed(6)
+    policy.actor_optimizer = torch.optim.Adam(
+        policy.actor_adapt.parameters(), lr=1.0e-3
+    )
+    optimizer_parameter_ids = tuple(
+        id(parameter)
+        for group in policy.actor_optimizer.param_groups
+        for parameter in group["params"]
+    )
+    if mode == FRESH_STUDENT_ACTOR_INITIALIZATION:
+        policy._fresh_student_actor_constructor_state = copy.deepcopy(
+            policy.actor_adapt.state_dict()
+        )
+        policy._fresh_student_actor_constructor_parameter_ids = tuple(
+            id(parameter) for parameter in policy.actor_adapt.parameters()
+        )
+
+    def fake_ppo_source_load(owner, state, strict=True):
+        del state, strict
+        with torch.no_grad():
+            owner.actor.weight.fill_(5.0)
+            owner.actor_adapt.mean_weight.fill_(7.0)
+            owner.actor_adapt.actor_core.actor_mean.weight.fill_(8.0)
+            owner.actor_adapt.actor_core.actor_mean.bias.fill_(9.0)
+            # Match Actor._load_from_state_dict: source means load while std
+            # is reset to the runtime load_noise_scale.
+            owner.actor_adapt.actor_core.actor_std.fill_(0.5)
+            owner.perception_probe.weight.fill_(6.0)
+        return []
+
+    monkeypatch.setattr(
+        DistributionalTD3TeacherBC,
+        "load_state_dict",
+        fake_ppo_source_load,
+    )
+    failed = policy.load_state_dict(
+        {"last_phase": "train", "last_iter": 123}, strict=True
+    )
+
+    assert failed == []
+    assert policy.actor.weight.item() == pytest.approx(5.0)
+    assert policy.perception_probe.weight.item() == pytest.approx(6.0)
+    assert policy.actor_adapt.mean_weight.item() == pytest.approx(expected_mean)
+    assert torch.equal(
+        policy.actor_adapt.actor_core.actor_std,
+        torch.full_like(policy.actor_adapt.actor_core.actor_std, 0.5),
+    )
+    assert optimizer_parameter_ids == tuple(
+        id(parameter)
+        for group in policy.actor_optimizer.param_groups
+        for parameter in group["params"]
+    )
+    assert policy._actor_initialization == {
+        "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+        "mode": mode,
+        "teacher_actor_loaded": True,
+        "actor_adapt_mean_loaded": (
+            mode == TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+        ),
+        "actor_adapt_mean_fresh": mode == FRESH_STUDENT_ACTOR_INITIALIZATION,
+        "source_phase": "train",
+        "source_iter": 123,
+    }
+    assert not hasattr(policy, "_fresh_student_actor_constructor_state")
+
+
+def _actor_adopt_checkpoint_payload(
+    actor_state,
+    perception_state,
+    *,
+    teacher_path="/tmp/teacher.pt",
+):
+    policy = {
+        "training_algorithm": PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+        "last_phase": "finetune",
+        "last_iter": 1200,
+        "actor_objective_semantics": PERCEPTION_ACTOR_OBJECTIVE_SEMANTICS,
+        "actor_initialization_semantics": (
+            PERCEPTION_ACTOR_INITIALIZATION_SEMANTICS
+        ),
+        "actor_adapt_loaded_from_teacher_checkpoint": True,
+        "actor_adapt_trained": True,
+        "actor_adapt_controls_rollout": False,
+        "actor_bc_perception_source": PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE,
+        "actor_bc_uses_online_priv_pred": False,
+        "actor_adapt_bc_update_count": 1201,
+        "optimized_modules": PERCEPTION_ACTOR_OPTIMIZED_MODULES,
+        "actor_adapt": copy.deepcopy(actor_state),
+        "actor": {},
+        "encoder_priv": {},
+        "critic": {},
+    }
+    policy.update(copy.deepcopy(perception_state))
+    return {
+        "policy": policy,
+        "cfg": {
+            "checkpoint_path": teacher_path,
+            "task": {"name": "G1SkateboardGeneralTracking"},
+            "algo": {
+                "name": "teacher_rollout_perception_actor",
+                "_target_": (
+                    "active_adaptation.learning.ppo.perception_actor."
+                    "TeacherRolloutPerceptionActor"
+                ),
+                "distill_with_priv_pred": True,
+                "actor_bc_perception_source": (
+                    PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE
+                ),
+                "latent_dim": 256,
+                "in_keys": [
+                    "command",
+                    "policy",
+                    "object_",
+                    "priv",
+                    "object_geo_",
+                    "vel_command",
+                    "depth",
+                ],
+            },
+        },
+    }
+
+
+def test_actor_adopt_payload_requires_exact_stage_metadata_and_actor_shape():
+    actor = _TinyPhysicalActor(2, mean_weight=0.25, std=0.17)
+    perception = {
+        name: nn.Linear(2, 2).state_dict()
+        for name in PRETRAINED_PERCEPTION_MODULES
+    }
+    checkpoint = _actor_adopt_checkpoint_payload(
+        actor.state_dict(), perception
+    )
+
+    actor_state, provenance = validate_actor_adopt_checkpoint_payload(
+        checkpoint,
+        source_path="/tmp/actor.pt",
+    )
+
+    _assert_nested_equal(dict(actor_state), dict(actor.state_dict()))
+    assert provenance["semantics"] == ACTOR_ADOPT_CHECKPOINT_SEMANTICS
+    assert provenance["source_actor_bc_update_count"] == 1201
+    assert provenance["source_actor_bc_perception_source"] == (
+        PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE
+    )
+    assert provenance["runtime_std_source"] == "load_noise_scale"
+
+    invalid = copy.deepcopy(checkpoint)
+    invalid["policy"]["actor_adapt_trained"] = False
+    with pytest.raises(ValueError, match="actor_adapt_trained"):
+        validate_actor_adopt_checkpoint_payload(invalid)
+
+    invalid = copy.deepcopy(checkpoint)
+    invalid["policy"]["actor_bc_uses_online_priv_pred"] = True
+    with pytest.raises(ValueError, match="actor_bc_uses_online_priv_pred"):
+        validate_actor_adopt_checkpoint_payload(invalid)
+
+    invalid = copy.deepcopy(checkpoint)
+    invalid["cfg"]["algo"]["actor_bc_perception_source"] = "online"
+    with pytest.raises(ValueError, match="rollout EMA perception"):
+        validate_actor_adopt_checkpoint_payload(invalid)
+
+    invalid = copy.deepcopy(checkpoint)
+    mean_key = next(
+        key
+        for key in invalid["policy"]["actor_adapt"]
+        if key.endswith("actor_mean.weight")
+    )
+    invalid["policy"]["actor_adapt"][mean_key] = torch.zeros(3, 1)
+    with pytest.raises(ValueError, match="action dimensions disagree"):
+        validate_actor_adopt_checkpoint_payload(invalid)
+
+
+def test_actor_adopt_loader_overlays_only_mean_body_and_keeps_runtime_std(
+    tmp_path,
+):
+    actor_path = tmp_path / "actor_adopt.pt"
+    perception_path = tmp_path / "perception.pt"
+    teacher_path = tmp_path / "teacher.pt"
+    policy = _bare_policy(
+        actor_adopt_checkpoint_path=str(actor_path),
+        perception_checkpoint_path=str(perception_path),
+        student_actor_initialization="teacher_bc",
+        in_keys=(
+            "command",
+            "policy",
+            "object_",
+            "priv",
+            "object_geo_",
+            "vel_command",
+            "depth",
+        ),
+        latent_dim=256,
+        sac_action_distribution=PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
+        load_noise_scale=0.05,
+    )
+    policy.actor_adapt = _TinyPhysicalActor(2, mean_weight=0.25, std=0.05)
+    policy.actor_adapt.actor_core.load_noise_scale = 0.05
+    for index, name in enumerate(PRETRAINED_PERCEPTION_MODULES):
+        with torch.random.fork_rng():
+            torch.manual_seed(100 + index)
+            setattr(policy, name, nn.Linear(2, 2))
+    perception = {
+        name: copy.deepcopy(getattr(policy, name).state_dict())
+        for name in PRETRAINED_PERCEPTION_MODULES
+    }
+    source_actor_state = copy.deepcopy(policy.actor_adapt.state_dict())
+    for key, value in source_actor_state.items():
+        if key.endswith("actor_std"):
+            value.fill_(0.19)
+        else:
+            value.fill_(7.0)
+    torch.save(
+        _actor_adopt_checkpoint_payload(
+            source_actor_state,
+            perception,
+            teacher_path=str(teacher_path),
+        ),
+        actor_path,
+    )
+    torch.save({"policy": perception}, perception_path)
+    torch.save({"policy": {}}, teacher_path)
+    parameter_ids = tuple(id(item) for item in policy.actor_adapt.parameters())
+    optimizer = torch.optim.Adam(policy.actor_adapt.parameters(), lr=1.0e-3)
+    optimizer_ids = tuple(
+        id(item)
+        for group in optimizer.param_groups
+        for item in group["params"]
+    )
+
+    provenance = policy._load_actor_adopt_checkpoint(
+        str(actor_path),
+        teacher_source_policy={"actor": {}, "encoder_priv": {}, "critic": {}},
+    )
+
+    assert policy.actor_adapt.mean_weight.eq(7.0).all()
+    assert policy.actor_adapt.actor_core.actor_mean.weight.eq(7.0).all()
+    assert policy.actor_adapt.actor_core.actor_std.eq(0.05).all()
+    assert tuple(id(item) for item in policy.actor_adapt.parameters()) == parameter_ids
+    assert optimizer_ids == tuple(
+        id(item)
+        for group in optimizer.param_groups
+        for item in group["params"]
+    )
+    assert provenance["perception_exact_match"] is True
+    assert provenance["perception_mismatched_modules"] == ()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_checkpoint_module_comparison_is_device_neutral():
+    cpu_state = {"module": {"weight": torch.tensor([1.0])}}
+    cuda_state = {"module": {"weight": torch.tensor([1.0], device="cuda")}}
+
+    assert checkpoint_module_mismatches(
+        cpu_state, cuda_state, ("module",)
+    ) == ()
+
+
+def test_actor_initialization_provenance_must_match_backend_runtime_and_flags():
+    policy = _bare_policy(student_actor_initialization="fresh")
+    valid = {
+        "dagger_backend_config": {"student_actor_initialization": "fresh"},
+        "actor_initialization": {
+            "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
+            "mode": "fresh",
+            "teacher_actor_loaded": True,
+            "actor_adapt_mean_loaded": False,
+            "actor_adapt_mean_fresh": True,
+        },
+    }
+    policy._restore_actor_initialization_provenance(valid)
+    assert policy._actor_initialization["mode"] == "fresh"
+
+    backend_mismatch = copy.deepcopy(valid)
+    backend_mismatch["dagger_backend_config"][
+        "student_actor_initialization"
+    ] = "teacher_bc"
+    with pytest.raises(ValueError, match="initialization/backend mismatch"):
+        policy._restore_actor_initialization_provenance(backend_mismatch)
+
+    runtime_policy = _bare_policy(student_actor_initialization="teacher_bc")
+    with pytest.raises(ValueError, match="initialization/runtime mismatch"):
+        runtime_policy._restore_actor_initialization_provenance(valid)
+
+    invalid_flags = copy.deepcopy(valid)
+    invalid_flags["actor_initialization"]["actor_adapt_mean_loaded"] = True
+    with pytest.raises(ValueError, match="flags are inconsistent"):
+        policy._restore_actor_initialization_provenance(invalid_flags)
+
+
+def test_legacy_actor_initialization_provenance_infers_only_teacher_bc():
+    legacy = _bare_policy(student_actor_initialization="teacher_bc")
+    legacy._restore_actor_initialization_provenance(
+        {"dagger_backend_config": {}}
+    )
+    assert legacy._actor_initialization["mode"] == "teacher_bc"
+    assert legacy._actor_initialization["legacy_inferred"] is True
+
+    fresh = _bare_policy(student_actor_initialization="fresh")
+    with pytest.raises(ValueError, match="initialization/runtime mismatch"):
+        fresh._restore_actor_initialization_provenance(
+            {"dagger_backend_config": {}}
+        )
+
+
+def test_actor_adopt_resume_provenance_is_strict_and_source_files_are_not_opened():
+    actor_path = "/historical/actor.pt"
+    perception_path = "/historical/perception.pt"
+    policy = _bare_policy(
+        actor_adopt_checkpoint_path=actor_path,
+        perception_checkpoint_path=perception_path,
+    )
+    provenance = {
+        "semantics": ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
+        "loaded": True,
+        "source_path": actor_path,
+        "source_algorithm": PERCEPTION_ACTOR_TRAINING_ALGORITHM,
+        "source_phase": "finetune",
+        "source_iter": 1200,
+        "source_actor_bc_update_count": 1201,
+        "source_actor_objective_semantics": PERCEPTION_ACTOR_OBJECTIVE_SEMANTICS,
+        "source_actor_initialization_semantics": (
+            PERCEPTION_ACTOR_INITIALIZATION_SEMANTICS
+        ),
+        "source_actor_bc_perception_source": (
+            PERCEPTION_ACTOR_BC_PERCEPTION_SOURCE
+        ),
+        "source_teacher_checkpoint_path": "/historical/teacher.pt",
+        "source_task_name": "G1SkateboardGeneralTracking",
+        "module": "actor_adapt",
+        "runtime_std_source": "load_noise_scale",
+        "perception_source_path": perception_path,
+        "perception_exact_match": False,
+        "perception_mismatched_modules": ("adapt_module",),
+    }
+    state = {
+        "dagger_backend_config": {
+            "actor_adopt_checkpoint_path": actor_path,
+            "load_pretrained_perception": True,
+            "perception_checkpoint_path": perception_path,
+        },
+        "actor_adopt_initialization": provenance,
+    }
+
+    policy._restore_actor_adopt_initialization_provenance(state)
+    assert policy._actor_adopt_initialization == provenance
+
+    tampered = copy.deepcopy(state)
+    tampered["actor_adopt_initialization"][
+        "perception_mismatched_modules"
+    ] = ("actor",)
+    with pytest.raises(ValueError, match="mismatch modules are invalid"):
+        policy._restore_actor_adopt_initialization_provenance(tampered)
+
+    tampered = copy.deepcopy(state)
+    tampered["dagger_backend_config"]["perception_checkpoint_path"] = (
+        "/historical/other.pt"
+    )
+    with pytest.raises(ValueError, match="perception source path mismatch"):
+        policy._restore_actor_adopt_initialization_provenance(tampered)
 
 
 def _tiny_physical_policy(*, q_slope: float = 1.0, action_dim: int = 1):
