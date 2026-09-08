@@ -1,0 +1,5 @@
+# @package algo
+
+# Diagnostic cell: retain historical depth VecNorm while applying only the
+# corrected depth-CNN initialization.
+perception_pipeline_contract: depth_init_only_v1

@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import torch.distributions as D
 import warnings
 import functools
+import logging
+import math
 import torch.utils._pytree as pytree
 import einops
 import copy
@@ -30,6 +32,12 @@ from ..utils.valuenorm import ValueNorm1, ValueNormFake
 from ..modules.distributions import IndependentNormal
 from ..modules.rnn import set_recurrent_mode, recurrent_mode
 from .common import *
+from .perception_pipeline_contract import (
+    LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+    contract_uses_corrected_depth_init,
+    contract_uses_identity_depth,
+    validate_perception_pipeline_contract,
+)
 
 torch.set_float32_matmul_precision('high')
 
@@ -86,6 +94,7 @@ class PPOConfig:
     # Ablation flags
     use_object_adapt: bool = True   # False → no object state prediction (no object_adapt, no object_trans in adapt_module)
     use_depth: bool = True          # False → depth feature always zero (no temporal_depth_gru even in finetune)
+    perception_pipeline_contract: str = LEGACY_PERCEPTION_PIPELINE_CONTRACT
 
     # lr linear schedule or adaptive lr
     lr: float = 3e-4
@@ -298,9 +307,65 @@ class TemporalDepthGRU(TensorDictModuleBase):
         self.depth_cnn = depth_cnn
         self.gru = GRU(hidden_dim, hidden_size=hidden_dim, burn_in=False)
         self.out = nn.LayerNorm(hidden_dim)
+        self._check_unit_interval_depth = False
+        self._unit_interval_depth_checked = False
+        self.first_depth_input_stats = None
+
+    def enable_unit_interval_depth_check(self) -> None:
+        """Fail on the first real corrected-contract input outside [0, 1]."""
+
+        self._check_unit_interval_depth = True
+        self._unit_interval_depth_checked = False
+        self.first_depth_input_stats = None
+
+    def _validate_first_unit_interval_depth(self, depth_frame: torch.Tensor) -> None:
+        if not self._check_unit_interval_depth or self._unit_interval_depth_checked:
+            return
+        if depth_frame.numel() == 0:
+            raise ValueError("corrected depth CNN received an empty input")
+        detached = depth_frame.detach()
+        if not bool(torch.isfinite(detached).all().item()):
+            raise ValueError("corrected depth CNN input contains NaN or Inf")
+        minimum = float(detached.amin().item())
+        maximum = float(detached.amax().item())
+        flattened = detached.flatten()
+        max_quantile_samples = 4096
+        stride = max(1, math.ceil(flattened.numel() / max_quantile_samples))
+        quantile_sample = flattened[::stride][:max_quantile_samples].float()
+        percentiles = torch.quantile(
+            quantile_sample,
+            quantile_sample.new_tensor([0.01, 0.99]),
+        )
+        percentile_1, percentile_99 = (float(value.item()) for value in percentiles)
+        self.first_depth_input_stats = {
+            "min": minimum,
+            "max": maximum,
+            "p1": percentile_1,
+            "p99": percentile_99,
+            "sample_count": int(quantile_sample.numel()),
+            "total_count": int(flattened.numel()),
+        }
+        logging.info(
+            "Corrected depth CNN input: min=%.6g max=%.6g p1=%.6g "
+            "p99=%.6g (quantile sample %d/%d)",
+            minimum,
+            maximum,
+            percentile_1,
+            percentile_99,
+            quantile_sample.numel(),
+            flattened.numel(),
+        )
+        tolerance = 1e-4
+        if minimum < -tolerance or maximum > 1.0 + tolerance:
+            raise ValueError(
+                "corrected depth CNN expects post-transform depth in [0, 1], "
+                f"got min={minimum:.6g}, max={maximum:.6g}"
+            )
+        self._unit_interval_depth_checked = True
 
     def forward(self, tensordict):
         depth_frame = tensordict[DEPTH_KEY]  # [N, 1, H, W]
+        self._validate_first_unit_interval_depth(depth_frame)
         is_init = tensordict["is_init"]
         depth_hx = tensordict["depth_hx"]
 
@@ -311,6 +376,46 @@ class TemporalDepthGRU(TensorDictModuleBase):
         tensordict["_depth_feature"] = self.out(out)
         tensordict.set(("next", "depth_hx"), depth_hx)
         return tensordict
+
+
+def _initialize_corrected_depth_cnn(depth_cnn: nn.Module) -> None:
+    """Reinitialize only the materialized depth-image encoder.
+
+    PPOVEL's historical global initializer gives every Linear and Conv2d a
+    gain of 0.01.  The corrected contract changes only the three hidden depth
+    convolutions and the depth CNN's final Linear.  ``fork_rng`` makes this a
+    seed-dependent reinitialization without advancing either the CPU or the
+    depth module's CUDA RNG stream, so every non-depth parameter and all
+    constructor-visible RNG state stay identical to the legacy contract.
+    """
+
+    conv_layers = [module for module in depth_cnn.modules() if isinstance(module, nn.Conv2d)]
+    linear_layers = [module for module in depth_cnn.modules() if isinstance(module, nn.Linear)]
+    if len(conv_layers) != 3 or len(linear_layers) != 1:
+        raise RuntimeError(
+            "corrected depth initialization expects exactly three materialized "
+            f"Conv2d layers and one materialized Linear, got {len(conv_layers)} "
+            f"and {len(linear_layers)}"
+        )
+
+    parameters = tuple(depth_cnn.parameters())
+    if not parameters:
+        raise RuntimeError("corrected depth initialization requires materialized parameters")
+    devices = {parameter.device for parameter in parameters}
+    if len(devices) != 1:
+        raise RuntimeError("corrected depth CNN parameters must reside on one device")
+    device = next(iter(devices))
+    cuda_devices = [device.index] if device.type == "cuda" else []
+
+    with torch.random.fork_rng(devices=cuda_devices):
+        for module in conv_layers:
+            nn.init.orthogonal_(module.weight, gain=math.sqrt(2.0))
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        final_linear = linear_layers[0]
+        nn.init.orthogonal_(final_linear.weight, gain=1.0)
+        if final_linear.bias is not None:
+            nn.init.zeros_(final_linear.bias)
 
 
 class TransformObject(TensorDictModuleBase):
@@ -362,6 +467,13 @@ class PPOVEL(TensorDictModuleBase):
         self.cfg = cfg
         self.device = device
         self.observation_spec = observation_spec
+        self.perception_pipeline_contract = validate_perception_pipeline_contract(
+            getattr(
+                self.cfg,
+                "perception_pipeline_contract",
+                LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+            )
+        )
         assert self.cfg.phase in ["train", "finetune"]
 
         self.entropy_coef = self.cfg.entropy_coef_start
@@ -595,6 +707,17 @@ class PPOVEL(TensorDictModuleBase):
                 nn.init.constant_(module.bias, 0.)
 
         self.apply(init_)
+        if has_depth and contract_uses_identity_depth(
+            self.perception_pipeline_contract
+        ):
+            # The earlier zero-valued fake forward exists only to materialize
+            # lazy modules. Enable the one-shot assertion afterwards so the
+            # first observation that can reach the policy is what gets checked.
+            self.temporal_depth_gru.enable_unit_interval_depth_check()
+        if has_depth and contract_uses_corrected_depth_init(
+            self.perception_pipeline_contract
+        ):
+            _initialize_corrected_depth_cnn(self.depth_cnn)
         self.adapt_ema = copy.deepcopy(self.adapt_module).requires_grad_(False)
         if self.cfg.use_object_adapt:
             self.object_adapt_ema = copy.deepcopy(self.object_adapt).requires_grad_(False)
@@ -1267,12 +1390,63 @@ class PPOVEL(TensorDictModuleBase):
         state_dict = OrderedDict()
         for name, module in self.named_children():
             state_dict[name] = module.state_dict()
+        # A few lightweight derived-policy fixtures construct the module via
+        # ``__new__`` and intentionally bypass PPOVEL.__init__.  They represent
+        # the historical pipeline, so keep that checkpoint seam backward
+        # compatible while still rejecting any malformed explicit value.
+        state_dict["perception_pipeline_contract"] = (
+            validate_perception_pipeline_contract(
+                getattr(
+                    self,
+                    "perception_pipeline_contract",
+                    LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+                )
+            )
+        )
         state_dict["last_phase"] = self.cfg.phase
         state_dict["last_iter"] = self.env.current_iter
         state_dict["lr_policy"] = self.lr_policy
         return state_dict
     
     def load_state_dict(self, state_dict, strict=True):
+        # Historical checkpoints predate this metadata and therefore encode
+        # legacy_v1. A depth-less train-phase Teacher may initialize a corrected
+        # Student because all depth modules remain constructor-fresh. Once any
+        # depth stack is present, however, its input/initialization semantics
+        # must exactly match the receiving policy.
+        saved_pipeline_contract = validate_perception_pipeline_contract(
+            state_dict.get(
+                "perception_pipeline_contract",
+                LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+            )
+        )
+        runtime_pipeline_contract = validate_perception_pipeline_contract(
+            getattr(
+                self,
+                "perception_pipeline_contract",
+                LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+            )
+        )
+        depth_checkpoint_modules = (
+            "depth_cnn",
+            "temporal_depth_gru",
+            "temporal_depth_gru_ema",
+        )
+        has_saved_depth = any(
+            name in state_dict for name in depth_checkpoint_modules
+        )
+        depthless_teacher_warmstart = (
+            not has_saved_depth and state_dict.get("last_phase") == "train"
+        )
+        if (
+            saved_pipeline_contract != runtime_pipeline_contract
+            and not depthless_teacher_warmstart
+        ):
+            raise ValueError(
+                "PPOVEL checkpoint perception_pipeline_contract mismatch: "
+                f"checkpoint={saved_pipeline_contract!r}, "
+                f"runtime={runtime_pipeline_contract!r}"
+            )
         succeed_keys = []
         failed_keys = []
         for name, module in self.named_children():

@@ -1,0 +1,5 @@
+# @package algo
+
+# Production candidate: raw unit-interval depth bypasses VecNorm and the depth
+# CNN receives its corrected initialization.
+perception_pipeline_contract: corrected_v1

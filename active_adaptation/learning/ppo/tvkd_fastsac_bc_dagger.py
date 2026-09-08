@@ -73,6 +73,10 @@ from .ppo_bc_dagger import (
     DAGGER_REPLAY_MIN_STEP_COUNT,
     DAGGER_REPLAY_TEACHER_ACTIONS,
 )
+from .perception_pipeline_contract import (
+    LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+    validate_perception_pipeline_contract,
+)
 from .ppo_vel import DEPTH_KEY, OBJECT_GEO_KEY, OBJECT_KEY, VEL_CMD_KEY
 from .ppo_vel import PPOVEL, PRIV_FEATURE_KEY, PRIV_PRED_KEY, DepthResidualGRUModule
 from .td3_bc_dagger import (
@@ -125,6 +129,7 @@ EXPECTED_ALGO_TARGET = (
     "active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger."
     "TVKDDistributionalFastSACTeacherBC"
 )
+PERCEPTION_PIPELINE_CONTRACT_KEY = "perception_pipeline_contract"
 CRITIC_LEARNING_SEMANTICS = (
     "frozen_raw_scale_ppo_value_potential_shaped_soft_c51_target_v3"
 )
@@ -442,6 +447,94 @@ def _saved_online_replay_latent_mode(state: Mapping, backend: Mapping) -> str:
     return mode
 
 
+def _runtime_perception_pipeline_contract(config) -> str:
+    """Resolve an absent historical/runtime field to the legacy pipeline."""
+    if isinstance(config, Mapping):
+        value = config.get(
+            PERCEPTION_PIPELINE_CONTRACT_KEY,
+            LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+        )
+    else:
+        value = getattr(
+            config,
+            PERCEPTION_PIPELINE_CONTRACT_KEY,
+            LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+        )
+    return validate_perception_pipeline_contract(value)
+
+
+def _saved_perception_pipeline_contract(
+    state: Mapping,
+    backend: Mapping,
+) -> str:
+    """Resolve and cross-check the two checkpoint metadata locations.
+
+    Each missing location independently denotes ``legacy_v1``.  Therefore a
+    partially written corrected checkpoint fails closed instead of silently
+    inheriting its other metadata copy.
+    """
+    top_level = validate_perception_pipeline_contract(
+        state.get(
+            PERCEPTION_PIPELINE_CONTRACT_KEY,
+            LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+        )
+    )
+    backend_value = validate_perception_pipeline_contract(
+        backend.get(
+            PERCEPTION_PIPELINE_CONTRACT_KEY,
+            LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+        )
+    )
+    if top_level != backend_value:
+        raise ValueError(
+            "checkpoint perception_pipeline_contract metadata is inconsistent"
+        )
+    return top_level
+
+
+def _saved_perception_warmstart_pipeline_contract(
+    policy_state: Mapping,
+) -> str:
+    """Resolve metadata from either a PPOVEL or DAgger perception source.
+
+    Plain PPOVEL/perception-only checkpoints have one policy-level contract.
+    DAgger-family checkpoints additionally have a backend copy; once that
+    mapping exists, its missing field independently means ``legacy_v1`` and
+    must agree with the policy-level value.
+    """
+    if "dagger_backend_config" not in policy_state:
+        return validate_perception_pipeline_contract(
+            policy_state.get(
+                PERCEPTION_PIPELINE_CONTRACT_KEY,
+                LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+            )
+        )
+    backend = policy_state["dagger_backend_config"]
+    if not isinstance(backend, Mapping):
+        raise ValueError(
+            "perception checkpoint has invalid dagger_backend_config metadata"
+        )
+    return _saved_perception_pipeline_contract(policy_state, backend)
+
+
+def _require_same_stage_perception_pipeline_contract(
+    config,
+    state: Mapping,
+    backend: Mapping,
+    *,
+    context: str,
+) -> str:
+    """Reject construction/loading under a different perception pipeline."""
+    saved = _saved_perception_pipeline_contract(state, backend)
+    runtime = _runtime_perception_pipeline_contract(config)
+    if saved != runtime:
+        raise ValueError(
+            f"{context} perception_pipeline_contract mismatch: "
+            f"checkpoint={saved!r}, runtime={runtime!r}"
+        )
+    return saved
+
+
 def _saved_actor_replay_observation_semantics(state: Mapping, backend: Mapping) -> str:
     if _saved_online_replay_latent_mode(state, backend) == "exact_current_ema":
         return _tvkd_actor_replay_observation_semantics(None)
@@ -558,6 +651,7 @@ def _install_v3_replay_migration(
 
 def _validate_tvkd_algorithm_config(cfg) -> None:
     """Validate controls shared by direct construction and the Hydra CLI."""
+    _runtime_perception_pipeline_contract(cfg)
     if hasattr(cfg, "online_replay_latent_mode"):
         raise ValueError(
             "online_replay_latent_mode is not configurable; remove the argument. "
@@ -1442,9 +1536,76 @@ def compute_teacher_value_terms(
 class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
     """Twin-C51 FastSAC with frozen shaping and bottleneck-aligned replay."""
 
+    _PERCEPTION_WARMSTART_DEPTH_MODULES = (
+        "depth_cnn",
+        "temporal_depth_gru",
+        "temporal_depth_gru_ema",
+    )
+
     def _exact_online_replay_enabled(self) -> bool:
         """Online replay and live carry always use reset-rooted current EMA."""
         return True
+
+    def _checkpoint_perception_pipeline_contract(self) -> str:
+        """Bind checkpoint metadata to the contract used at construction."""
+        runtime = _runtime_perception_pipeline_contract(self.cfg)
+        constructed = validate_perception_pipeline_contract(
+            getattr(self, "perception_pipeline_contract", runtime)
+        )
+        if constructed != runtime:
+            raise RuntimeError(
+                "TVKD perception_pipeline_contract changed after policy "
+                f"construction: constructed={constructed!r}, runtime={runtime!r}"
+            )
+        return constructed
+
+    def _validate_explicit_perception_warmstart_pipeline(
+        self,
+        policy_state: Mapping,
+    ) -> dict[str, object]:
+        """Protect depth weights from crossing incompatible pipelines."""
+        saved = _saved_perception_warmstart_pipeline_contract(policy_state)
+        runtime = _runtime_perception_pipeline_contract(self.cfg)
+        present_depth_modules = tuple(
+            name
+            for name in self._PERCEPTION_WARMSTART_DEPTH_MODULES
+            if name in policy_state
+        )
+        if present_depth_modules and saved != runtime:
+            raise ValueError(
+                "perception_checkpoint_path perception_pipeline_contract "
+                f"mismatch: checkpoint={saved!r}, runtime={runtime!r}"
+            )
+        return {
+            "source_perception_pipeline_contract": saved,
+            "runtime_perception_pipeline_contract": runtime,
+            "pipeline_contract_match_required": bool(present_depth_modules),
+            "source_depth_modules": present_depth_modules,
+        }
+
+    def _load_pretrained_perception_checkpoint(self, path) -> dict:
+        """Validate explicit perception-source depth semantics before overlay."""
+        if getattr(self, "_tvkd_explicit_perception_warmstart", False):
+            raise RuntimeError("reentrant TVKD perception warm start")
+        self._tvkd_explicit_perception_warmstart = True
+        self.__dict__.pop("_tvkd_perception_pipeline_provenance", None)
+        try:
+            metadata = super()._load_pretrained_perception_checkpoint(path)
+            provenance = self.__dict__.pop(
+                "_tvkd_perception_pipeline_provenance",
+                None,
+            )
+            if not isinstance(provenance, Mapping):
+                raise RuntimeError(
+                    "TVKD perception warm start lost pipeline provenance"
+                )
+            metadata = dict(metadata)
+            metadata.update(copy.deepcopy(dict(provenance)))
+            self._perception_initialization = copy.deepcopy(metadata)
+            return copy.deepcopy(metadata)
+        finally:
+            self.__dict__.pop("_tvkd_explicit_perception_warmstart", None)
+            self.__dict__.pop("_tvkd_perception_pipeline_provenance", None)
 
     def _prepare_perception_warmstart(self, policy_state):
         """Add only absent depth projections when initializing from an old model.
@@ -1453,6 +1614,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         A learned projection must exist in both online and EMA state; only a
         source with no projection in either is eligible for zero expansion.
         """
+        if getattr(self, "_tvkd_explicit_perception_warmstart", False):
+            self._tvkd_perception_pipeline_provenance = (
+                self._validate_explicit_perception_warmstart_pipeline(
+                    policy_state
+                )
+            )
         if not getattr(self.cfg, "perception_depth_residual", False):
             return policy_state
         names = ("adapt_module", "adapt_ema")
@@ -3803,6 +3970,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
     def _checkpoint_config(self):
         common = DistributionalFastSACTeacherBC._checkpoint_config(self)
+        common[PERCEPTION_PIPELINE_CONTRACT_KEY] = (
+            self._checkpoint_perception_pipeline_contract()
+        )
         common.update(
             {
                 name: getattr(self.cfg, name)
@@ -4356,6 +4526,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             {
                 "training_algorithm": TRAINING_ALGORITHM,
                 "checkpoint_version": CHECKPOINT_VERSION,
+                PERCEPTION_PIPELINE_CONTRACT_KEY: (
+                    self._checkpoint_perception_pipeline_contract()
+                ),
                 "critic_learning_semantics": critic_semantics,
                 "actor_learning_semantics": _tvkd_actor_learning_semantics(
                     self.cfg
@@ -4499,10 +4672,24 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         backend = state.get("dagger_backend_config")
         if not isinstance(backend, Mapping):
             raise ValueError("TVKD checkpoint lacks backend config")
+        saved_pipeline_contract = (
+            _require_same_stage_perception_pipeline_contract(
+                self.cfg,
+                state,
+                backend,
+                context="TVKD resume",
+            )
+        )
         saved_latent_mode = _saved_online_replay_latent_mode(state, backend)
         # The obsolete selector is historical metadata, never runtime config.
         backend = dict(backend)
         backend.pop("online_replay_latent_mode", None)
+        # Complete the historical schema only after both absent metadata
+        # locations have independently resolved to legacy_v1 above.
+        backend.setdefault(
+            PERCEPTION_PIPELINE_CONTRACT_KEY,
+            saved_pipeline_contract,
+        )
         if current and "student_buffer_capacity" not in backend:
             # Early v9 checkpoints stored one total online capacity. Recreate
             # their exact DAgger/pure-Student allocation before enforcing the
@@ -5051,6 +5238,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         saved_backend = state_dict.get("dagger_backend_config", {})
         if not isinstance(saved_backend, Mapping):
             raise ValueError("TVKD inference checkpoint has invalid backend config")
+        _require_same_stage_perception_pipeline_contract(
+            getattr(self, "cfg", None),
+            state_dict,
+            saved_backend,
+            context="TVKD inference",
+        )
         _saved_online_replay_latent_mode(state_dict, saved_backend)
         algorithm = state_dict.get("training_algorithm")
         version = state_dict.get("checkpoint_version", -1)
@@ -5209,6 +5402,7 @@ __all__ = [
     "LEGACY_TRAINING_ALGORITHM",
     "NORMALIZED_ACTOR_LEARNING_SEMANTICS",
     "OBJECT_GEO_REPLAY_SEMANTICS",
+    "PERCEPTION_PIPELINE_CONTRACT_KEY",
     "PHASE_FADED_CRITIC_LEARNING_SEMANTICS",
     "PHASE_FADED_TEACHER_VALUE_POTENTIAL_SEMANTICS",
     "Q_NORMALIZED_ACTOR_LEARNING_SEMANTICS",
@@ -5249,6 +5443,10 @@ __all__ = [
     "_tvkd_actor_learning_semantics",
     "_tvkd_critic_learning_semantics",
     "_tvkd_teacher_value_potential_semantics",
+    "_require_same_stage_perception_pipeline_contract",
+    "_runtime_perception_pipeline_contract",
+    "_saved_perception_pipeline_contract",
+    "_saved_perception_warmstart_pipeline_contract",
     "compute_continuation_coefficient",
     "compute_teacher_value_continuation",
     "compute_teacher_value_terms",

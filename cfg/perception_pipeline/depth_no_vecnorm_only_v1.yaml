@@ -1,0 +1,5 @@
+# @package algo
+
+# Diagnostic cell: raw unit-interval depth bypasses VecNorm while depth-CNN
+# initialization remains historical.
+perception_pipeline_contract: depth_no_vecnorm_only_v1

@@ -26,6 +26,11 @@ from collections import OrderedDict
 import imageio
 from omegaconf import OmegaConf, DictConfig, open_dict
 import active_adaptation.learning
+from active_adaptation.learning.ppo.perception_pipeline_contract import (
+    LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+    contract_uses_identity_depth,
+    validate_perception_pipeline_contract,
+)
 from active_adaptation.utils.wandb import parse_checkpoint_path
 import active_adaptation
 if __package__:
@@ -34,6 +39,23 @@ else:
     from eval_oracles import load_oracle_teacher
 if TYPE_CHECKING:
     from active_adaptation.envs.base import _Env
+
+
+def _resolve_perception_pipeline_contract(algo_cfg) -> str:
+    """Resolve legacy configs explicitly and reject unknown contracts."""
+    contract = algo_cfg.get(
+        "perception_pipeline_contract",
+        LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+    )
+    return validate_perception_pipeline_contract(contract)
+
+
+def _vecnorm_observation_keys(obs_keys, perception_pipeline_contract: str):
+    """Select normalized keys without changing the raw replay key set."""
+    if contract_uses_identity_depth(perception_pipeline_contract):
+        return [key for key in obs_keys if key != "depth"]
+    return list(obs_keys)
+
 
 class Every:
     def __init__(self, func, steps):
@@ -588,12 +610,12 @@ def _fill_replayless_inference_algo_defaults(
     *,
     inference_only: bool,
 ) -> dict[str, tuple[str, ...]]:
-    """Complete legacy TD3/FastSAC configs only for model-only evaluation.
+    """Restore checkpoint-native model contracts for replayless evaluation.
 
-    Older checkpoints predate fields that their current policy dataclasses
-    require during construction.  Preserve the loaded Hydra config exactly
-    where it has a value, then source any missing current field from the
-    checkpoint's own backend contract before falling back to today's default.
+    Plain PPO/VAIC needs its depth-pipeline contract before VecNorm is built.
+    Older TD3/FastSAC checkpoints also predate fields that their current policy
+    dataclasses require during construction. Preserve the checkpoint's own
+    semantics, then fall back to current defaults only for truly absent fields.
     Training never enters this migration path.
     """
     empty = {"checkpoint": (), "defaults": ()}
@@ -601,6 +623,23 @@ def _fill_replayless_inference_algo_defaults(
         return empty
 
     algorithm = policy_state.get("training_algorithm")
+    tvkd_checkpoint = str(algorithm).startswith(
+        "distributional_tvkd_fastsac_teacher_bc_"
+    )
+    pipeline_contract_key = "perception_pipeline_contract"
+    pipeline_metadata_relevant = (
+        pipeline_contract_key in policy_state
+        or any(
+            name in policy_state
+            for name in (
+                "depth_cnn",
+                "temporal_depth_gru",
+                "temporal_depth_gru_ema",
+            )
+        )
+    )
+    filled_checkpoint = []
+    filled_defaults = []
     if algorithm == "distributional_td3_teacher_bc_v1":
         from active_adaptation.learning.ppo.td3_bc_dagger import (
             DistributionalTD3TeacherBCConfig,
@@ -630,12 +669,42 @@ def _fill_replayless_inference_algo_defaults(
 
         default_config = TVKDDistributionalFastSACTeacherBCConfig()
     else:
-        return empty
+        default_config = None
 
     if "algo" not in cfg or cfg.algo is None:
+        if default_config is None and not pipeline_metadata_relevant:
+            return empty
         raise ValueError(
-            "inference-only TD3/FastSAC checkpoint reload requires cfg.algo"
+            "inference-only policy checkpoint reload requires cfg.algo"
         )
+    if not tvkd_checkpoint and pipeline_metadata_relevant:
+        saved_pipeline_contract = validate_perception_pipeline_contract(
+            policy_state.get(
+                pipeline_contract_key,
+                LEGACY_PERCEPTION_PIPELINE_CONTRACT,
+            )
+        )
+        with open_dict(cfg.algo):
+            if cfg.algo.get(pipeline_contract_key) != saved_pipeline_contract:
+                cfg.algo[pipeline_contract_key] = saved_pipeline_contract
+                filled_checkpoint.append(pipeline_contract_key)
+
+    # Plain PPO/VAIC checkpoints need only the perception contract hydration.
+    # Algorithm-specific TD3/FastSAC checkpoints continue through the complete
+    # backend migration below.
+    if default_config is None:
+        result = {
+            "checkpoint": tuple(filled_checkpoint),
+            "defaults": (),
+        }
+        if filled_checkpoint:
+            print(colored(
+                "[Info]: Restored checkpoint-native perception pipeline "
+                "contract before inference environment construction.",
+                "green",
+            ))
+        return result
+
     current_fields = {
         field.name: copy.deepcopy(getattr(default_config, field.name))
         for field in fields(default_config)
@@ -647,10 +716,26 @@ def _fill_replayless_inference_algo_defaults(
     if not isinstance(q_backend, Mapping):
         q_backend = {}
 
-    filled_checkpoint = []
-    filled_defaults = []
     with open_dict(cfg.algo):
         if str(algorithm).startswith("distributional_tvkd_fastsac_teacher_bc_"):
+            from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
+                PERCEPTION_PIPELINE_CONTRACT_KEY,
+                _saved_perception_pipeline_contract,
+            )
+
+            saved_pipeline_contract = _saved_perception_pipeline_contract(
+                policy_state,
+                backend,
+            )
+            if (
+                PERCEPTION_PIPELINE_CONTRACT_KEY not in cfg.algo
+                or cfg.algo.get(PERCEPTION_PIPELINE_CONTRACT_KEY)
+                != saved_pipeline_contract
+            ):
+                cfg.algo[PERCEPTION_PIPELINE_CONTRACT_KEY] = (
+                    saved_pipeline_contract
+                )
+                filled_checkpoint.append(PERCEPTION_PIPELINE_CONTRACT_KEY)
             residual_flags = [
                 source["perception_depth_residual"]
                 for source in (policy_state, backend)
@@ -1556,11 +1641,23 @@ def make_env_policy(
         key for key, spec in base_env.observation_spec.items(True, True) 
         if not (spec.dtype == bool or key.endswith("_"))
     ]
+    perception_pipeline_contract = _resolve_perception_pipeline_contract(
+        cfg.algo
+    )
+    vecnorm_obs_keys = _vecnorm_observation_keys(
+        obs_keys,
+        perception_pipeline_contract,
+    )
     transform = Compose(InitTracker(), StepCounter())
 
     assert cfg.vecnorm in ("train", "eval", None)
-    print(colored(f"[Info]: create VecNorm for keys: {obs_keys}", "green"))
-    vecnorm = VecNorm(obs_keys, decay=0.9999)
+    print(colored(
+        "[Info]: create VecNorm for keys: "
+        f"{vecnorm_obs_keys} "
+        f"(perception_pipeline_contract={perception_pipeline_contract}).",
+        "green",
+    ))
+    vecnorm = VecNorm(vecnorm_obs_keys, decay=0.9999)
     vecnorm(base_env.fake_tensordict())
 
     raw_replay_observations = (

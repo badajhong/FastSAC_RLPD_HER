@@ -35,6 +35,7 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     online_rollout_perception_semantics,
     PERCEPTION_REPLAY_SEMANTICS,
+    PERCEPTION_PIPELINE_CONTRACT_KEY,
     PREVIOUS_CHECKPOINT_VERSION,
     PREVIOUS_TRAINING_ALGORITHM,
     REPLAY_RESUME_SEMANTICS,
@@ -66,6 +67,7 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     TVKDDistributionalFastSACTeacherBCConfig,
     _lambda_bc_fork_override_active,
     _migrate_explicit_online_replay_capacities,
+    _require_same_stage_perception_pipeline_contract,
     _same_verified_histogram_state,
     _saved_online_replay_latent_mode,
     _saved_actor_replay_observation_semantics,
@@ -1274,6 +1276,12 @@ def _prepare_tvkd_checkpoint(
     backend = policy_state.get("dagger_backend_config")
     if not isinstance(backend, Mapping):
         raise ValueError("TVKD resume checkpoint lacks backend config")
+    saved_pipeline_contract = _require_same_stage_perception_pipeline_contract(
+        cfg.algo,
+        policy_state,
+        backend,
+        context="TVKD CLI resume",
+    )
     saved_latent_mode = _saved_online_replay_latent_mode(policy_state, backend)
     explicit_latent_mode = any(
         str(override).split("=", 1)[0].lstrip("+") == "algo.online_replay_latent_mode"
@@ -1286,6 +1294,10 @@ def _prepare_tvkd_checkpoint(
         )
     backend = dict(backend)
     backend.pop("online_replay_latent_mode", None)
+    backend.setdefault(
+        PERCEPTION_PIPELINE_CONTRACT_KEY,
+        saved_pipeline_contract,
+    )
     if current and "student_buffer_capacity" not in backend:
         backend = _migrate_explicit_online_replay_capacities(backend)
     saved_lambda_bc = backend.get("lambda_bc")
@@ -1371,6 +1383,10 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault("actor_adopt_checkpoint_path", None)
     source_algo_contract.setdefault("perception_action_consistency_coef", 0.0)
     source_algo_contract.setdefault("perception_depth_residual", False)
+    source_algo_contract.setdefault(
+        PERCEPTION_PIPELINE_CONTRACT_KEY,
+        saved_pipeline_contract,
+    )
     historical_latent_mode = source_algo_contract.pop("online_replay_latent_mode", saved_latent_mode)
     if historical_latent_mode != saved_latent_mode:
         raise ValueError("TVKD resume online_replay_latent_mode config metadata is inconsistent")

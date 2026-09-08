@@ -4,6 +4,9 @@
 # replay, perception, randomization, C51, UTD, and target-update default.
 defaults:
   - fastSAC_bc_dagger
+  # Versioned depth-pipeline contract. Select another preset with, for example,
+  # `perception_pipeline=corrected_v1`; existing runs remain bit-for-bit legacy.
+  - perception_pipeline: legacy_v1
   - override /algo: tvkd_fastsac_bc_dagger_finetune
   - _self_
 

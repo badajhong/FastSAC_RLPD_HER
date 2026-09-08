@@ -1,0 +1,5 @@
+# @package algo
+
+# Historical behavior: VecNorm transforms depth and the depth CNN retains the
+# legacy low-gain initialization.
+perception_pipeline_contract: legacy_v1
