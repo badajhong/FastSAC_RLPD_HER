@@ -67,6 +67,9 @@ from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     _lambda_bc_fork_override_active,
     _migrate_explicit_online_replay_capacities,
     _same_verified_histogram_state,
+    _saved_online_replay_latent_mode,
+    _saved_actor_replay_observation_semantics,
+    _warn_collection_latent_upgrade,
     _tvkd_actor_learning_semantics,
     _tvkd_critic_learning_semantics,
     _validate_tvkd_algorithm_config,
@@ -76,6 +79,7 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     ACTOR_ADOPT_CHECKPOINT_SEMANTICS,
     PERCEPTION_ACTOR_TRAINING_ALGORITHM,
     _fastsac_actor_backend,
+    _fastsac_noise_scale,
 )
 from active_adaptation.learning.ppo.td3_bc_dagger import (
     apply_perception_training_source,
@@ -871,7 +875,9 @@ def _validate_v5_policy_contract(policy_state: Mapping, cfg: DictConfig) -> None
         exact.update(
             {
                 "actor_replay_observation_semantics": (
-                    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                    _saved_actor_replay_observation_semantics(
+                        policy_state, policy_state.get("dagger_backend_config", {})
+                    )
                 ),
                 "teacher_episode_sidecar_semantics": (
                     TEACHER_EPISODE_SIDECAR_SEMANTICS
@@ -1268,6 +1274,18 @@ def _prepare_tvkd_checkpoint(
     backend = policy_state.get("dagger_backend_config")
     if not isinstance(backend, Mapping):
         raise ValueError("TVKD resume checkpoint lacks backend config")
+    saved_latent_mode = _saved_online_replay_latent_mode(policy_state, backend)
+    explicit_latent_mode = any(
+        str(override).split("=", 1)[0].lstrip("+") == "algo.online_replay_latent_mode"
+        for override in task_overrides
+    )
+    if explicit_latent_mode or "online_replay_latent_mode" in cfg.algo:
+        raise ValueError(
+            "online_replay_latent_mode is no longer configurable; TVKD always "
+            "uses exact current-EMA online replay"
+        )
+    backend = dict(backend)
+    backend.pop("online_replay_latent_mode", None)
     if current and "student_buffer_capacity" not in backend:
         backend = _migrate_explicit_online_replay_capacities(backend)
     saved_lambda_bc = backend.get("lambda_bc")
@@ -1353,6 +1371,9 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault("actor_adopt_checkpoint_path", None)
     source_algo_contract.setdefault("perception_action_consistency_coef", 0.0)
     source_algo_contract.setdefault("perception_depth_residual", False)
+    historical_latent_mode = source_algo_contract.pop("online_replay_latent_mode", saved_latent_mode)
+    if historical_latent_mode != saved_latent_mode:
+        raise ValueError("TVKD resume online_replay_latent_mode config metadata is inconsistent")
     # Older FastSAC/TVKD checkpoints accidentally reused q_weight_decay for the
     # Actor optimizer and therefore had no independent Actor-decay field.  The
     # bug-fixed resume contract is explicit zero; policy loading retains the
@@ -1514,6 +1535,8 @@ def _prepare_tvkd_checkpoint(
             f"{float(cfg.algo.lambda_bc):g}; Actor/std/alpha optimizer state "
             "was verified pristine."
         )
+    if saved_latent_mode == "collection":
+        _warn_collection_latent_upgrade()
     return {
         "path": resolved,
         "rollout_count": int(rollout_count),
@@ -1649,12 +1672,14 @@ def main(cfg: DictConfig):
         "actor_adapt_checkpoint="
         f"{cfg.algo.get('actor_adopt_checkpoint_path', None)}, "
         f"action_distribution={cfg.algo.get('sac_action_distribution', 'normalized_tanh')}, "
-        f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "
+        f"teacher_noise_scale={_fastsac_noise_scale(cfg.algo, 'teacher')}, "
+        f"student_noise_scale={_fastsac_noise_scale(cfg.algo, 'student')}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence}, "
         f"{replay_mix_summary('q')}; "
         f"{replay_mix_summary('actor')}; "
         f"{replay_mix_summary('perception')}; "
-        f"perception_mode={cfg.algo.perception_replay_mode}"
+        f"perception_mode={cfg.algo.perception_replay_mode}, "
+        "online_replay_latents=exact_current_ema (fixed)"
     )
     if replay_mix_from_aliases:
         print(

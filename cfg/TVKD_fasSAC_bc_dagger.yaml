@@ -62,6 +62,8 @@ algo:
   perception_uniform_teacher_fraction: 0.0
   perception_failure_teacher_fraction: 0.0
   perception_replay_mode: online_student_rollout
+  # TVKD always reconstructs online Actor inputs and live recurrent carry
+  # from the actual reset with the current EMA. There is no latent-mode knob.
 
   # Diagnostic only, opt-in: set num_envs > 0 to journal a few live Student
   # episodes from their true reset and compare collection-time Actor inputs

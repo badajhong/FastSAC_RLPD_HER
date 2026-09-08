@@ -305,6 +305,27 @@ ALL_LIVE_ROLLOUT_PERCEPTION_SEMANTICS = (
 )
 
 
+def _scalar_metrics_to_python(metrics: Mapping) -> dict:
+    """Export reduced diagnostics with one transfer per device/dtype group.
+
+    Reductions remain on their original device with their original dtype.
+    Grouping by dtype avoids lossy promotion (notably int64 mixed with floats),
+    and stacking detached scalars only changes transport, not metric values.
+    Non-tensor values and insertion order are preserved.
+    """
+    result = dict(metrics)
+    groups = {}
+    for key, value in metrics.items():
+        if isinstance(value, torch.Tensor):
+            scalar = value.detach().reshape(())
+            groups.setdefault((scalar.device, scalar.dtype), []).append((key, scalar))
+    for group in groups.values():
+        values = torch.stack([value for _, value in group]).cpu().tolist()
+        for (key, _), value in zip(group, values, strict=True):
+            result[key] = value
+    return result
+
+
 def apply_perception_training_source(cfg) -> str | None:
     """Resolve the public perception source onto the legacy internal knobs.
 
@@ -618,7 +639,17 @@ def _encode_replay_depth_u8(depth: torch.Tensor) -> torch.Tensor:
         or not torch.allclose(scaled, bins, rtol=0.0, atol=tolerance)
     ):
         raise ValueError("raw replay depth must lie in [0,1] on the task's 0.01 grid")
-    return bins.clamp_(0, 100).to(torch.uint8)
+    encoded = bins.clamp_(0, 100).to(torch.uint8)
+    # Being close to a grid point is insufficient: rounding a neighboring
+    # floating-point value would change the perception input.  Require the
+    # exact decoder round trip used during replay before discarding the raw
+    # frame.  The task already quantizes with integer-bin / 100 arithmetic.
+    decoded = _decode_replay_depth_u8(encoded).to(dtype=depth.dtype)
+    if not torch.equal(decoded, depth):
+        raise ValueError(
+            "raw replay depth cannot be encoded losslessly on the task's 0.01 grid"
+        )
+    return encoded
 
 
 @torch.no_grad()
@@ -3980,6 +4011,10 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _student_mean_action(self, td: TensorDict) -> torch.Tensor:
         """Return the deterministic Student action inside execution support."""
         raw_mean = self._student_raw_action_proposal(td)
+        return self._student_action_from_raw_mean(raw_mean)
+
+    def _student_action_from_raw_mean(self, raw_mean: torch.Tensor) -> torch.Tensor:
+        """Apply the evaluation action contract to a Student Actor proposal."""
         if not torch.isfinite(raw_mean).all():
             raise RuntimeError("TD3 evaluation Actor produced non-finite raw actions")
         return self._bounded_actor_mean(raw_mean)
@@ -6355,20 +6390,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             return encoded.detach().clone()
 
     @torch.no_grad()
-    def _decode_replay_object_geo(
+    def _replay_object_geo_bank_for(
         self,
-        geometry_ids: torch.Tensor,
         *,
         device: torch.device | str,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Resolve transition-aligned IDs to exact PPOVEL geometry values."""
+        """Return the ordinary, generation-checked lossless geometry table."""
         self._ensure_replay_object_geo_codebook()
         bank = self._replay_object_geo_bank
         if bank is None or int(bank.shape[0]) < 1:
             raise RuntimeError("raw perception replay has no object geometry codebook")
-        if geometry_ids.dtype not in (torch.int32, torch.int64):
-            raise TypeError("object geometry replay IDs must be int32 or int64")
         output_device = torch.device(device)
         cache_key = (str(output_device), dtype)
         cached = self._replay_object_geo_device_banks.get(cache_key)
@@ -6390,6 +6422,21 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
             )
         else:
             device_bank = cached[1]
+        return device_bank
+
+    @torch.no_grad()
+    def _decode_replay_object_geo(
+        self,
+        geometry_ids: torch.Tensor,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Resolve transition-aligned IDs to exact PPOVEL geometry values."""
+        if geometry_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("object geometry replay IDs must be int32 or int64")
+        device_bank = self._replay_object_geo_bank_for(device=device, dtype=dtype)
+        output_device = device_bank.device
         flat_ids = geometry_ids.reshape(-1).to(
             device=output_device, dtype=torch.long
         )
@@ -9512,14 +9559,14 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
     def _mean_metric_dict(metrics: list[dict[str, torch.Tensor]], keys):
         if not metrics:
             return {key: 0.0 for key in keys}
-        return {
+        reduced = {
             key: torch.stack(
                 [torch.as_tensor(item[key]).detach().float() for item in metrics]
             )
             .mean()
-            .item()
             for key in keys
         }
+        return _scalar_metrics_to_python(reduced)
 
     def _q_updates_due(self, accepted_student_rows: int) -> int:
         """Return Q updates from total sampled-row/new-Student-row credit.
@@ -10026,6 +10073,8 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                         generator=self.q_rng,
                     )
                 )
+            if hasattr(self, "_prepare_exact_online_replay_cache"):
+                self._prepare_exact_online_replay_cache(sample_plans)
             for update_index in range(q_updates):
                 sample_plan = (
                     None if sample_plans is None else sample_plans[update_index]

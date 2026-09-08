@@ -28,6 +28,10 @@ from omegaconf import OmegaConf, DictConfig, open_dict
 import active_adaptation.learning
 from active_adaptation.utils.wandb import parse_checkpoint_path
 import active_adaptation
+if __package__:
+    from .eval_oracles import load_oracle_teacher
+else:
+    from eval_oracles import load_oracle_teacher
 if TYPE_CHECKING:
     from active_adaptation.envs.base import _Env
 
@@ -672,6 +676,15 @@ def _fill_replayless_inference_algo_defaults(
             "distributional_tvkd_fastsac_teacher_bc_v8",
             "distributional_tvkd_fastsac_teacher_bc_v9",
         }
+        if algorithm in fastsac_algorithms:
+            from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
+                _saved_online_replay_latent_mode,
+            )
+
+            _saved_online_replay_latent_mode(policy_state, backend)
+            # Old checkpoints may include the removed selector in cfg.algo.
+            # Replay-free inference preserves weights, not a training knob.
+            cfg.algo.pop("online_replay_latent_mode", None)
         saved_q_critic_type = str(
             policy_state.get(
                 "q_critic_type",
@@ -1630,6 +1643,9 @@ def make_env_policy(
             state_dict["policy"],
             inference_only=inference_only,
         )
+
+    if inference_only and cfg.get("oracle_priv_pred", False):
+        load_oracle_teacher(policy, state_dict.get("policy"))
 
     if (
         configure_replay

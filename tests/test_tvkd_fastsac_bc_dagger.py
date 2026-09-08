@@ -48,6 +48,9 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     REPLAY_PERCEPTION_EMA_GENERATION_KEY,
     REPLAY_MOTION_ID_KEY,
     REPLAY_SAMPLE_PROVENANCE_KEY,
+    REPLAY_SAMPLE_IS_TEACHER_KEY,
+    REPLAY_SAMPLE_IS_DAGGER_ENV_KEY,
+    REPLAY_SAMPLE_PHYSICAL_INDEX_KEY,
     REPLAY_SOURCE_ORDER,
     REPLAY_TERMINATED_KEY,
     REPLAY_TIME_LIMIT_KEY,
@@ -337,8 +340,9 @@ def _strict_v5_policy_metadata(
             tvkd_module.ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS
         ),
         "actor_replay_observation_semantics": (
-            tvkd_module.COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+            tvkd_module._tvkd_actor_replay_observation_semantics(cfg)
         ),
+        "online_replay_latent_mode": "exact_current_ema",
         "teacher_episode_sidecar_semantics": (
             tvkd_module.TEACHER_EPISODE_SIDECAR_SEMANTICS
         ),
@@ -402,6 +406,7 @@ def _legacy_saved_config(saved_cfg, *, include_student_focus: bool):
     v4_only_fields.update(
         {
             "perception_replay_mode",
+            "online_replay_latent_mode",
             "bottleneck_fallback_mode",
             "bottleneck_include_unsuccessful_timeouts",
             "max_teacher_phase_match_distance",
@@ -1306,6 +1311,9 @@ def test_cache_validation_consumes_prepared_normalized_observations_once():
         NEXT_REFERENCE_PHASE_KEY: torch.tensor([0.2, 0.3]),
         REPLAY_TEACHER_V_CURRENT_KEY: torch.tensor([11.0, 12.0]),
         REPLAY_TEACHER_V_NEXT_KEY: torch.tensor([13.0, 14.0]),
+        REPLAY_SAMPLE_IS_TEACHER_KEY: torch.ones(2, dtype=torch.bool),
+        REPLAY_SAMPLE_IS_DAGGER_ENV_KEY: torch.zeros(2, dtype=torch.bool),
+        REPLAY_SAMPLE_PHYSICAL_INDEX_KEY: torch.arange(2),
     }
 
     prepared = policy._prepare_dagger_learning_batch(raw)
@@ -3840,8 +3848,11 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
     assert state["training_algorithm"] == TVKD_TRAINING_ALGORITHM
     assert state["checkpoint_version"] == TVKD_CHECKPOINT_VERSION
     assert state["actor_replay_observation_semantics"] == (
-        tvkd_module.COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+        tvkd_module._tvkd_actor_replay_observation_semantics(policy.cfg)
     )
+    assert state["online_replay_latent_mode"] == "exact_current_ema"
+    assert "online_replay_latent_mode" not in state["dagger_backend_config"]
+    assert not hasattr(policy.cfg, "online_replay_latent_mode")
     assert state["teacher_episode_sidecar_semantics"] == (
         tvkd_module.TEACHER_EPISODE_SIDECAR_SEMANTICS
     )
@@ -3972,6 +3983,23 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
     depth_state["dagger_backend_config"]["perception_depth_residual"] = True
     policy._load_fastsac_checkpoint_state(depth_state, load_modules=False)
     assert policy._fastsac_checkpoint_state()["dagger_backend_config"]["perception_depth_residual"] is True
+
+    # Direct/programmatic loading must validate the old replay contract too,
+    # then upgrade it explicitly without creating a runtime selector.
+    policy.cfg.perception_depth_residual = False
+    historical_state = copy.deepcopy(state)
+    historical_state["online_replay_latent_mode"] = "collection"
+    historical_state["dagger_backend_config"]["online_replay_latent_mode"] = "collection"
+    with pytest.raises(ValueError, match="actor_replay_observation_semantics"):
+        policy._load_fastsac_checkpoint_state(historical_state, load_modules=False)
+    historical_state["actor_replay_observation_semantics"] = (
+        tvkd_module.COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+    )
+    with pytest.warns(UserWarning, match="not an exact continuation"):
+        policy._load_fastsac_checkpoint_state(historical_state, load_modules=False)
+    assert not hasattr(policy.cfg, "online_replay_latent_mode")
+    assert "online_replay_latent_mode" not in translated[-1][0]["dagger_backend_config"]
+    assert policy._fastsac_checkpoint_state()["online_replay_latent_mode"] == "exact_current_ema"
 
 
 def test_v5_checkpoint_rejects_binwise_motion_histogram_mismatch(monkeypatch):
@@ -4186,6 +4214,43 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
     assert cfg._tvkd_model_only_resume is True
     assert cfg._bc_dagger_fresh_source is True
     assert cfg.algo.value_norm is False
+
+    # Historical collection checkpoints upgrade explicitly to fixed exact
+    # replay with rebuilt rings. The removed selector is never reintroduced
+    # into runtime config, even when it was stored by an older checkpoint.
+    for saved_latent_mode in (None, "collection", "exact_current_ema"):
+        latent_cfg = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
+        latent_policy = copy.deepcopy(policy_state)
+        resolved_mode = saved_latent_mode or "collection"
+        if saved_latent_mode is None:
+            latent_cfg.algo.pop("online_replay_latent_mode", None)
+            latent_policy["dagger_backend_config"].pop("online_replay_latent_mode", None)
+            latent_policy.pop("online_replay_latent_mode", None)
+        else:
+            latent_cfg.algo.online_replay_latent_mode = saved_latent_mode
+            latent_policy["dagger_backend_config"]["online_replay_latent_mode"] = saved_latent_mode
+            latent_policy["online_replay_latent_mode"] = saved_latent_mode
+        latent_policy["actor_replay_observation_semantics"] = (
+            tvkd_module._tvkd_actor_replay_observation_semantics(None)
+            if resolved_mode == "exact_current_ema"
+            else tvkd_module.COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+        )
+        latent_path = checkpoint_path.with_name(f"checkpoint_latent_{saved_latent_mode}.pt")
+        torch.save({"policy": latent_policy, "vecnorm": {}, "cfg": latent_cfg}, latent_path)
+        runtime = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
+        runtime.fastsac_bc_dagger_checkpoint = str(latent_path)
+        if resolved_mode == "collection":
+            with pytest.warns(UserWarning, match="not an exact continuation"):
+                assert _prepare_tvkd_checkpoint(runtime)["rollout_count"] == 600
+        else:
+            assert _prepare_tvkd_checkpoint(runtime)["rollout_count"] == 600
+        assert "online_replay_latent_mode" not in runtime.algo
+        runtime.algo.online_replay_latent_mode = "exact_current_ema"
+        with pytest.raises(ValueError, match="online_replay_latent_mode"):
+            _prepare_tvkd_checkpoint(
+                runtime,
+                task_overrides=[f"algo.online_replay_latent_mode={runtime.algo.online_replay_latent_mode}"],
+            )
 
     # Saved configs from before action supervision retain their exact zero
     # coefficient. Both enabled round-trips and mismatched objectives are
@@ -5431,7 +5496,7 @@ def test_tvkd_hydra_resolves_independent_q_and_actor_four_way_mixes():
     ) == pytest.approx((1.0, 0.0, 0.0, 0.0))
 
 
-def test_tvkd_hydra_allows_teacher_perception_four_way_alias():
+def test_tvkd_hydra_rejects_four_way_mode_incompatible_with_fixed_exact_replay():
     config_dir = Path(__file__).resolve().parents[1] / "cfg"
     overrides = [
         "task=G1/vaic/skateboard_stu",
@@ -5456,7 +5521,8 @@ def test_tvkd_hydra_allows_teacher_perception_four_way_alias():
         float(cfg.algo[f"perception_{source}_fraction"])
         for source in REPLAY_SOURCE_ORDER
     ) == pytest.approx((0.5, 0.0, 0.5, 0.0))
-    validate_tvkd_fastsac_bc_dagger_config(cfg)
+    with pytest.raises(ValueError, match="online_student_rollout"):
+        validate_tvkd_fastsac_bc_dagger_config(cfg)
 
 
 def test_tvkd_hydra_allows_teacher_perception_warmup_before_live_student_mode():

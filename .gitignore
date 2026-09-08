@@ -179,6 +179,7 @@ artifacts/
 
 # local scripts
 *.sh
+!scripts/run_eval_oracles.sh
 scripts/*.png
 scripts/*.pt
 scripts/*.onnx

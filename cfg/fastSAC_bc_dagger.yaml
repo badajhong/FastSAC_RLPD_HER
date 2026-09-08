@@ -118,8 +118,11 @@ algo:
   # Student actor_adapt mean initialization at the fresh PPO-source boundary.
   # teacher_bc preserves the checkpoint-trained BC mean; fresh keeps the
   # constructor mean while the privileged Teacher still loads and remains
-  # frozen. In both modes PPO actor_std is reset by algo.load_noise_scale.
+  # frozen. Their PPO std resets can be configured independently; null keeps
+  # legacy algo.load_noise_scale for older commands.
   student_actor_initialization: teacher_bc
+  teacher_noise_scale: null
+  student_noise_scale: null
   # Optional actor_adapt-only initialization from scripts/percetpion_actor.py.
   # The public ``adopt`` spelling is intentional. The privileged Teacher still
   # comes only from root checkpoint_path; this source never overlays Teacher,

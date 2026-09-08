@@ -34,6 +34,7 @@ from active_adaptation.learning.ppo.fastsac_bc_dagger import (
     PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION,
     UNIFORM_PHYSICAL_STD_BOUND_MODE,
     TRAINING_ALGORITHM,
+    _fastsac_noise_scale,
     _validate_fastsac_entropy_target_controls,
     checkpoint_module_mismatches,
     validate_actor_adopt_checkpoint_payload,
@@ -853,9 +854,10 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
             field_prefix="algo",
         )
     else:
-        _finite_positive(
-            "algo.load_noise_scale", cfg.algo.get("load_noise_scale", None)
-        )
+        teacher_noise_scale = _fastsac_noise_scale(cfg.algo, "teacher")
+        student_noise_scale = _fastsac_noise_scale(cfg.algo, "student")
+        _finite_positive("algo.teacher_noise_scale (or legacy algo.load_noise_scale)", teacher_noise_scale)
+        _finite_positive("algo.student_noise_scale (or legacy algo.load_noise_scale)", student_noise_scale)
         _finite_positive(
             "algo.sac_target_entropy_ratio",
             cfg.algo.get("sac_target_entropy_ratio", None),
@@ -869,15 +871,14 @@ def _validate_sac_controls(cfg: DictConfig) -> None:
             _finite_positive(f"algo.{name}", cfg.algo.get(name, None))
         std_min = float(cfg.algo.sac_physical_std_min)
         std_max = float(cfg.algo.sac_physical_std_max)
-        load_noise_scale = float(cfg.algo.load_noise_scale)
         if not std_min < std_max:
             raise ValueError(
                 "algo.sac_physical_std_min must be smaller than "
                 "algo.sac_physical_std_max"
             )
-        if not std_min <= load_noise_scale <= std_max:
+        if not std_min <= student_noise_scale <= std_max:
             raise ValueError(
-                "algo.load_noise_scale must lie inside the physical std bounds"
+                "algo.student_noise_scale must lie inside the physical std bounds"
             )
         bound_mode = str(
             cfg.algo.get(
@@ -1235,7 +1236,8 @@ def main(cfg: DictConfig):
         f"{cfg.algo.get('actor_adopt_checkpoint_path', None)}, "
         "action_distribution="
         f"{cfg.algo.get('sac_action_distribution', NORMALIZED_TANH_ACTION_DISTRIBUTION)}, "
-        f"load_noise_scale={cfg.algo.get('load_noise_scale', None)}, "
+        f"teacher_noise_scale={_fastsac_noise_scale(cfg.algo, 'teacher')}, "
+        f"student_noise_scale={_fastsac_noise_scale(cfg.algo, 'student')}, "
         f"alpha_init={float(cfg.algo.sac_alpha_init):g}, "
         f"alpha_update_cadence={cfg.algo.sac_alpha_update_cadence} "
         f"(every {int(cfg.algo.sac_policy_frequency)} Critic updates); "

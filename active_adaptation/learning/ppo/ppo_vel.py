@@ -8,6 +8,9 @@ import torch.utils._pytree as pytree
 import einops
 import copy
 import numpy as np
+from contextlib import contextmanager
+from contextvars import ContextVar
+from numbers import Integral
 
 from torchrl.data import CompositeSpec, TensorSpec, Unbounded
 from torchrl.modules import ProbabilisticActor
@@ -41,6 +44,27 @@ OBJECT_PRED_KEY = "object_pred"
 OBJECT_GEO_KEY = "object_geo_"
 OBJECT_TRANS_KEY = "object_trans"
 OBJECT_PRED_TRANS_KEY = "object_pred_trans"
+
+
+def _scalar_metrics_to_python(metrics):
+    """Transfer already-reduced diagnostics once per device/dtype group.
+
+    Keep each original reduction and scalar dtype unchanged. Grouping only
+    the resulting scalars avoids repeated CUDA synchronization without
+    promoting float64/low-precision diagnostics to another numeric type.
+    """
+    groups = {}
+    for key, value in metrics.items():
+        value = value.detach()
+        if value.numel() != 1:
+            raise ValueError("Perception diagnostics must be reduced scalars")
+        groups.setdefault((value.device, value.dtype), []).append((key, value))
+    result = {}
+    for group in groups.values():
+        values = torch.stack([value.reshape(()) for _, value in group]).cpu().tolist()
+        result.update((key, value) for (key, _), value in zip(group, values))
+    return {key: result[key] for key in metrics}
+
 
 @dataclass
 class PPOConfig:
@@ -116,6 +140,40 @@ cs.store("ppo_vel_train_nogru", node=PPOConfig(phase="train", vecnorm="train", e
 cs.store("ppo_vel_finetune_nogru", node=PPOConfig(phase="finetune", vecnorm="eval", entropy_coef_start=0.001, entropy_coef_end=0.001, enable_residual_distillation=False, adapt_module="mlp", in_keys=(CMD_KEY, OBS_KEY, OBJECT_KEY, OBS_PRIV_KEY, OBJECT_GEO_KEY, VEL_CMD_KEY, DEPTH_KEY)), group="algo")
 
 
+_EXACT_RECURRENT_LENGTHS = ContextVar("ppo_vel_exact_recurrent_lengths", default=None)
+
+
+@contextmanager
+def exact_recurrent_lengths(lengths_cpu, lengths_device):
+    """Select true final recurrent states for trailing-padded inference batches.
+
+    ``lengths_device`` must contain the same values as ``lengths_cpu``. The
+    caller constructs both together; bounds are checked from the CPU values
+    without reading device scalars. This context changes no model parameters
+    or real-timestep outputs and is forbidden for gradient-enabled execution.
+    It applies to both perception GRUs and restores the outer context on exit.
+    """
+    if torch.is_grad_enabled() or not recurrent_mode():
+        raise RuntimeError("exact_recurrent_lengths requires no_grad and recurrent mode")
+    lengths_cpu = tuple(lengths_cpu)
+    if not lengths_cpu or any(
+        not isinstance(length, Integral) or isinstance(length, bool) or length < 1
+        for length in lengths_cpu
+    ):
+        raise ValueError("exact recurrent lengths must be positive CPU integers")
+    if not isinstance(lengths_device, torch.Tensor):
+        raise TypeError("exact recurrent device lengths must be a tensor")
+    if lengths_device.dtype != torch.long or lengths_device.shape != (len(lengths_cpu),):
+        raise ValueError("exact recurrent device lengths must be a matching 1D torch.long tensor")
+    if lengths_device.device.type == "cpu" and lengths_device.tolist() != list(lengths_cpu):
+        raise ValueError("exact recurrent CPU and device lengths must match")
+    token = _EXACT_RECURRENT_LENGTHS.set((lengths_cpu, lengths_device))
+    try:
+        yield
+    finally:
+        _EXACT_RECURRENT_LENGTHS.reset(token)
+
+
 class GRU(nn.Module):
     def __init__(self, input_size, hidden_size, burn_in=True):
         super().__init__()
@@ -124,6 +182,15 @@ class GRU(nn.Module):
         self.burn_in = burn_in
 
     def forward(self, x: torch.Tensor, is_init: torch.Tensor, hx: torch.Tensor):
+        exact_lengths = _EXACT_RECURRENT_LENGTHS.get()
+        if exact_lengths is not None:
+            lengths_cpu, lengths_device = exact_lengths
+            if torch.is_grad_enabled() or not recurrent_mode():
+                raise RuntimeError("exact_recurrent_lengths requires no_grad and recurrent mode")
+            if x.ndim != 3 or len(lengths_cpu) != x.shape[0] or max(lengths_cpu) > x.shape[1]:
+                raise ValueError("exact recurrent lengths must fit the [N, T] input batch")
+            if lengths_device.device != x.device:
+                raise ValueError("exact recurrent lengths and inputs must be on the same device")
         if recurrent_mode():
             N, T = x.shape[:2]
             hx = hx[:, 0]
@@ -135,6 +202,12 @@ class GRU(nn.Module):
                     hx = hx.detach()
                 output.append(hx)
             output = torch.stack(output, dim=1)
+            if exact_lengths is not None:
+                # Preserve raw GRU state, before LayerNorm. A padded tail must
+                # never become the initial hidden state of the next chunk.
+                hx = output.gather(
+                    1, (lengths_device - 1).view(N, 1, 1).expand(N, 1, output.shape[-1])
+                ).squeeze(1)
             output = self.ln(output)
             return output, einops.repeat(hx, "b h -> b t h", t=T)
         else:
@@ -854,6 +927,15 @@ class PPOVEL(TensorDictModuleBase):
         """
         return None, {}
 
+    def _perception_minibatch_inputs(self, tensordict: TensorDict):
+        """Optional post-target input view; preserve generic PPO/custom hooks.
+
+        Subclasses with a known complete loss/input contract can avoid
+        gathering unrelated rollout fields for every recurrent minibatch.
+        This hook runs after frozen Teacher targets have been materialized.
+        """
+        return tensordict
+
     @set_recurrent_mode(True)
     def train_adapt(self, tensordict: TensorDict):
         infos = []
@@ -865,8 +947,9 @@ class PPOVEL(TensorDictModuleBase):
                 self.height_encoder(tensordict)
             self.encoder_priv(tensordict)
 
+        minibatch_inputs = self._perception_minibatch_inputs(tensordict)
         for epoch in range(2):
-            for minibatch in make_batch(tensordict, self.cfg.num_minibatches, self.cfg.train_every):
+            for minibatch in make_batch(minibatch_inputs, self.cfg.num_minibatches, self.cfg.train_every):
                 # Student: encode depth image sequence via TemporalDepthGRU
                 if hasattr(self, "temporal_depth_gru"):
                     self.temporal_depth_gru(minibatch)
@@ -990,7 +1073,7 @@ class PPOVEL(TensorDictModuleBase):
         if hasattr(self, "temporal_depth_gru"):
             soft_copy_(self.temporal_depth_gru, self.temporal_depth_gru_ema, 0.04)
         
-        infos = {k: v.mean().item() for k, v in sorted(torch.stack(infos).items())}
+        infos = {k: v.mean() for k, v in sorted(torch.stack(infos).items())}
         if hasattr(self, "temporal_depth_gru"):
             with torch.no_grad():
                 squared_error = torch.zeros((), device=self.device)
@@ -1003,8 +1086,8 @@ class PPOVEL(TensorDictModuleBase):
                     parameter_count += online.numel()
                 infos["adapt/depth_ema_rms_gap"] = (
                     squared_error / max(parameter_count, 1)
-                ).sqrt().item()
-        return infos
+                ).sqrt()
+        return _scalar_metrics_to_python(infos)
     
     @torch.no_grad()
     def _compute_advantage(

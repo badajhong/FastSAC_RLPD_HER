@@ -13,6 +13,9 @@ total_frames: -1
 max_iters: -1
 eval_interval: -1
 eval_render: false
+# Student evaluation oracles; priv_pred takes precedence when both are enabled.
+oracle_object_pose: false
+oracle_priv_pred: false
 render_mode: rgb_array
 save_interval: -1
 seed: 0

@@ -1249,12 +1249,9 @@ def test_raw_replay_and_teacher_prefill_implementation_is_inherited_unchanged():
         "configure_teacher_replay",
         "snapshot_teacher_replay",
         "_raw_perception_values",
-        "_prepare_raw_final_state",
         "capture_truncation_final_observations",
         "capture_rollout_final_observation",
-        "_dagger_transition_chunks",
         "_reencode_perception_windows",
-        "_prepare_dagger_learning_batch",
         "_sample_balanced_q_batch",
         "_sample_actor_batch",
         "_update_failure_phase_histogram",
@@ -1381,6 +1378,7 @@ def test_fresh_ppo_source_selects_student_mean_without_touching_teacher_or_perce
         q_seed=13,
     )
     policy.actor = nn.Linear(1, 1, bias=False)
+    policy.actor.add_module("actor_core", Actor(1, init_noise_scale=0.17))
     policy.actor_adapt = _TinyPhysicalActor(
         1, mean_weight=0.25, std=0.17
     )
@@ -1421,6 +1419,7 @@ def test_fresh_ppo_source_selects_student_mean_without_touching_teacher_or_perce
         del state, strict
         with torch.no_grad():
             owner.actor.weight.fill_(5.0)
+            owner.actor.actor_core.actor_std.fill_(owner.actor.actor_core.load_noise_scale)
             owner.actor_adapt.mean_weight.fill_(7.0)
             owner.actor_adapt.actor_core.actor_mean.weight.fill_(8.0)
             owner.actor_adapt.actor_core.actor_mean.bias.fill_(9.0)
@@ -2067,6 +2066,75 @@ def test_physical_rollout_applies_cumulative_kl_once_after_all_replay_updates(
     assert info["fastsac/actor_std_q_normalized_l2"] == pytest.approx(
         torch.linalg.vector_norm(final_std).item()
     )
+
+
+@pytest.mark.parametrize("performed", [(), (0.0, 0.0), (1.0, 0.0, 1.0)])
+def test_physical_rollout_metric_export_matches_legacy_scalar_bits(
+    performed, monkeypatch,
+):
+    policy = _tiny_physical_policy(action_dim=3)
+    policy.joint_names = ("joint_0", "joint_1", "joint_2")
+    policy.target_entropy = -2.0
+    policy.alpha_update_count = 0
+    policy._fastsac_q_action_scale = torch.tensor([0.7, 1.3, 2.1])
+    with torch.no_grad():
+        policy._ppo_actor_std_parameter().copy_(torch.tensor([0.123, 0.234, 0.345]))
+
+    rows = [
+        {
+            "alpha_update_performed_fraction": torch.tensor(flag),
+            "alpha_loss": torch.tensor((index + 1) * 0.123456789),
+            "alpha_grad_norm": torch.tensor((index + 1) * 0.987654321),
+        }
+        for index, flag in enumerate(performed)
+    ]
+
+    def replay_updates(owner, tensordict):
+        owner._fastsac_rollout_critic_metrics.extend(rows)
+        return {}
+
+    monkeypatch.setattr(DistributionalTD3TeacherBC, "train_op", replay_updates)
+    # The aggregate mean exporter is covered independently; this isolates
+    # FastSAC's weighted alpha and per-joint/summary std export paths.
+    policy._mean_metric_dict = lambda metrics, keys: {key: 0.0 for key in keys}
+    info = DistributionalFastSACTeacherBC.train_op(
+        policy, TensorDict({}, batch_size=[])
+    )
+
+    std = policy._bounded_physical_actor_std(detach=True)
+    normalized = std / policy._fastsac_q_action_scale.detach().to(std)
+    lower, upper = policy._physical_std_bounds()
+    expected = {
+        "actor_std_physical_mean": std.float().mean().item(),
+        "actor_std_physical_geometric_mean": std.float().log().mean().exp().item(),
+        "actor_std_q_normalized_l2": torch.linalg.vector_norm(normalized.float()).item(),
+        "actor_std_q_normalized_rms": normalized.float().square().mean().sqrt().item(),
+        "actor_std_q_normalized_geometric_mean": normalized.float().log().mean().exp().item(),
+        "actor_std_q_normalized_min": normalized.float().min().item(),
+        "actor_std_q_normalized_max": normalized.float().max().item(),
+        "physical_std_lower_bound_min": lower.float().min().item(),
+        "physical_std_lower_bound_max": lower.float().max().item(),
+        "physical_std_upper_bound_min": upper.float().min().item(),
+        "physical_std_upper_bound_max": upper.float().max().item(),
+        "alpha": policy.log_alpha.detach().exp().item(),
+    }
+    expected.update({
+        f"actor_std/{name}": value
+        for name, value in zip(policy.joint_names, std.float().cpu().tolist(), strict=True)
+    })
+    for key in ("alpha_loss", "alpha_grad_norm"):
+        if rows:
+            weights = torch.stack([
+                row["alpha_update_performed_fraction"].detach().float() for row in rows
+            ])
+            values = torch.stack([row[key].detach().float() for row in rows])
+            expected[key] = ((values * weights).sum() / weights.sum().clamp_min(1.0)).item()
+        else:
+            expected[key] = 0.0
+    for key, value in expected.items():
+        actual = info[f"fastsac/{key}"]
+        assert type(actual) is float
+        assert actual.hex() == value.hex(), key
 
 
 def test_physical_std_projection_and_nonfinite_failure_are_explicit():

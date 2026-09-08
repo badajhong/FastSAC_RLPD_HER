@@ -9,8 +9,12 @@ from omegaconf import OmegaConf, DictConfig
 
 try:
     from ._isaaclab_bootstrap import AppLauncher
+    from .eval_cli import normalize_eval_argv
+    from .eval_oracles import make_eval_policy
 except ImportError:
     from _isaaclab_bootstrap import AppLauncher
+    from eval_cli import normalize_eval_argv
+    from eval_oracles import make_eval_policy
 
 import wandb
 import logging
@@ -20,6 +24,8 @@ from helpers import make_env_policy, evaluate
 import os
 import datetime
 import termcolor
+
+_ORIGINAL_ARGV = None
 
 @hydra.main(config_path="../cfg", config_name="eval", version_base=None)
 def main(cfg: DictConfig):
@@ -50,7 +56,13 @@ def main(cfg: DictConfig):
 
     policy_keys = ["dr_", "dr_pred"]
     
-    policy_eval = agent.get_rollout_policy("eval")
+    oracle_object_pose = cfg.get("oracle_object_pose", False)
+    oracle_priv_pred = cfg.get("oracle_priv_pred", False)
+    policy_eval = make_eval_policy(
+        agent,
+        oracle_object_pose=oracle_object_pose,
+        oracle_priv_pred=oracle_priv_pred,
+    )
     render_mode = cfg.get("render_mode", "rgb_array")
     info, trajs, stats, policy_trajs = evaluate(env, policy_eval, render=cfg.eval_render, render_mode=render_mode, seed=cfg.seed, keys=keys, policy_keys=policy_keys)
     
@@ -67,7 +79,12 @@ def main(cfg: DictConfig):
     info["task"] = cfg.task.name
     info["algo"] = cfg.algo.name
     info["checkpoint_path"] = cfg.checkpoint_path
-    info["argv"] = sys.argv
+    info["argv"] = _ORIGINAL_ARGV if _ORIGINAL_ARGV is not None else sys.argv.copy()
+    info["oracle_object_pose"] = oracle_object_pose
+    info["oracle_priv_pred"] = oracle_priv_pred
+    info["oracle_effective_mode"] = (
+        "priv_pred" if oracle_priv_pred else "object_pose" if oracle_object_pose else "none"
+    )
     print(OmegaConf.to_yaml(info))
     
     time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
@@ -84,4 +101,6 @@ def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
+    _ORIGINAL_ARGV = sys.argv.copy()
+    sys.argv[:] = normalize_eval_argv(sys.argv)
     main()

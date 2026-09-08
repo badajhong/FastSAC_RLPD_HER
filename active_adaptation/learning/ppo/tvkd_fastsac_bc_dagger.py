@@ -4,8 +4,8 @@ This entrypoint is intentionally layered on top of the repository's current
 ``DistributionalFastSACTeacherBC`` implementation.  It therefore preserves
 the existing stochastic Student rollout, frozen successful-Teacher prefill,
 independently configured Student/Teacher Q and Actor mixtures, PPOVEL-style
-live Student perception training, collection-exact Student Actor inputs plus
-current-EMA full-episode Teacher Actor inputs,
+live Student perception training, current-EMA reset-rooted online and Teacher
+Actor inputs,
 timeout-final-observation handling, twin C51 critics, and target-update cadence.
 
 The two additions are deliberately narrow:
@@ -423,6 +423,43 @@ def _checkpoint_replay_mix(cfg) -> dict[str, dict[str, float]]:
     }
 
 
+def _tvkd_actor_replay_observation_semantics(cfg) -> str:
+    """TVKD always reconstructs online latents with the current EMA."""
+    from .exact_online_perception import EXACT_ONLINE_ACTOR_REPLAY_SEMANTICS
+
+    return EXACT_ONLINE_ACTOR_REPLAY_SEMANTICS
+
+
+def _saved_online_replay_latent_mode(state: Mapping, backend: Mapping) -> str:
+    """Missing legacy metadata denotes the historical collection-time latent."""
+    mode = backend.get(
+        "online_replay_latent_mode", state.get("online_replay_latent_mode", "collection")
+    )
+    if mode not in ("collection", "exact_current_ema"):
+        raise ValueError("checkpoint online_replay_latent_mode is invalid")
+    if state.get("online_replay_latent_mode", mode) != mode:
+        raise ValueError("checkpoint online_replay_latent_mode metadata is inconsistent")
+    return mode
+
+
+def _saved_actor_replay_observation_semantics(state: Mapping, backend: Mapping) -> str:
+    if _saved_online_replay_latent_mode(state, backend) == "exact_current_ema":
+        return _tvkd_actor_replay_observation_semantics(None)
+    return COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+
+
+def _warn_collection_latent_upgrade() -> None:
+    warnings.warn(
+        "Upgrading a historical TVKD collection-time latent checkpoint to fixed "
+        "exact current-EMA online replay: model and optimizer state are retained, "
+        "but replay rings and episode histories are rebuilt. This changes the "
+        "online latent learning contract and is not an exact continuation of "
+        "the historical training run.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 def _same_verified_histogram_state(left: Mapping, right: Mapping) -> bool:
     """Compare the verified histogram and compatibility alias tensor-exactly."""
     scalar_fields = (
@@ -521,6 +558,15 @@ def _install_v3_replay_migration(
 
 def _validate_tvkd_algorithm_config(cfg) -> None:
     """Validate controls shared by direct construction and the Hydra CLI."""
+    if hasattr(cfg, "online_replay_latent_mode"):
+        raise ValueError(
+            "online_replay_latent_mode is not configurable; remove the argument. "
+            "TVKD always uses exact_current_ema online replay."
+        )
+    if cfg.perception_replay_mode != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE:
+        raise ValueError("TVKD exact_current_ema replay requires online_student_rollout perception")
+    if getattr(cfg, "sac_actor_observation_mode", "student_perception") != "student_perception":
+        raise ValueError("TVKD exact_current_ema replay requires student_perception Actor observations")
     depth_residual = getattr(cfg, "perception_depth_residual", False)
     if not isinstance(depth_residual, bool):
         raise ValueError("perception_depth_residual must be boolean")
@@ -1396,6 +1442,10 @@ def compute_teacher_value_terms(
 class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
     """Twin-C51 FastSAC with frozen shaping and bottleneck-aligned replay."""
 
+    def _exact_online_replay_enabled(self) -> bool:
+        """Online replay and live carry always use reset-rooted current EMA."""
+        return True
+
     def _prepare_perception_warmstart(self, policy_state):
         """Add only absent depth projections when initializing from an old model.
 
@@ -1438,6 +1488,46 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             for key in projection_keys[name]:
                 expanded[name][key] = torch.zeros_like(target_states[name][key])
         return expanded
+
+    def _perception_minibatch_inputs(self, tensordict: TensorDict):
+        """Gather only the established TVKD online-perception dependencies.
+
+        The frozen Teacher targets already exist when PPOVEL calls this hook.
+        A shallow selection preserves tensor values, sequence geometry, and
+        minibatch RNG while omitting raw Teacher maps and collector diagnostics.
+        Unknown custom modules/loss hooks keep the unrestricted original view.
+        """
+        if (
+            bool(self.cfg.enable_residual_distillation)
+            or bool(self.cfg.train_dr_estimator)
+            or getattr(self._perception_auxiliary_loss, "__func__", None)
+            is not TVKDDistributionalFastSACTeacherBC._perception_auxiliary_loss
+        ):
+            return tensordict
+        required = dict.fromkeys(("is_init", PRIV_FEATURE_KEY))
+        produced = set()
+        modules = []
+        if hasattr(self, "temporal_depth_gru"):
+            modules.append(self.temporal_depth_gru)
+        else:
+            produced.add("_depth_feature")  # PPOVEL's zero injector.
+        if bool(self.cfg.use_object_adapt):
+            modules.extend((self.object_adapt, self.object_pred_transform))
+            required[OBJECT_KEY] = None  # Supervised object reconstruction.
+        modules.append(self.adapt_module)
+        for module in modules:
+            inputs, outputs = getattr(module, "in_keys", None), getattr(module, "out_keys", None)
+            if inputs is None or outputs is None:
+                return tensordict
+            for key in inputs:
+                if key not in produced:
+                    required[key] = None
+            produced.update(outputs)
+        if float(self.cfg.perception_action_consistency_coef) != 0.0:
+            required.update(dict.fromkeys((OBS_KEY, VEL_CMD_KEY)))
+        if "_height_feature" in tensordict:
+            required["_height_feature"] = None  # Preserve its existing metric.
+        return tensordict.select(*required)
 
     def _perception_auxiliary_loss(self, tensordict: TensorDict):
         """Match this actor's oracle-latent actions on live recurrent histories.
@@ -4287,8 +4377,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     else PERCEPTION_REPLAY_SEMANTICS
                 ),
                 "actor_replay_observation_semantics": (
-                    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                    _tvkd_actor_replay_observation_semantics(self.cfg)
                 ),
+                "online_replay_latent_mode": "exact_current_ema",
                 "teacher_episode_sidecar_semantics": (
                     TEACHER_EPISODE_SIDECAR_SEMANTICS
                 ),
@@ -4408,6 +4499,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         backend = state.get("dagger_backend_config")
         if not isinstance(backend, Mapping):
             raise ValueError("TVKD checkpoint lacks backend config")
+        saved_latent_mode = _saved_online_replay_latent_mode(state, backend)
+        # The obsolete selector is historical metadata, never runtime config.
+        backend = dict(backend)
+        backend.pop("online_replay_latent_mode", None)
         if current and "student_buffer_capacity" not in backend:
             # Early v9 checkpoints stored one total online capacity. Recreate
             # their exact DAgger/pure-Student allocation before enforcing the
@@ -4635,7 +4730,9 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 exact_metadata.update(
                     {
                         "actor_replay_observation_semantics": (
-                            COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
+                            _tvkd_actor_replay_observation_semantics(None)
+                            if saved_latent_mode == "exact_current_ema"
+                            else COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
                         ),
                         "teacher_episode_sidecar_semantics": (
                             TEACHER_EPISODE_SIDECAR_SEMANTICS
@@ -4896,11 +4993,12 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                     f"{sorted(failed)}"
                 )
 
-        # Reuse the baseline's strict optimizer/RNG/counter restoration after
-        # translating only its two format sentinels.
+        # Reuse strict optimizer/RNG/counter restoration after translating
+        # format sentinels and stripping the obsolete backend selector.
         baseline_state = dict(state)
         baseline_state["training_algorithm"] = BASE_FASTSAC_TRAINING_ALGORITHM
         baseline_state["checkpoint_version"] = BASE_FASTSAC_CHECKPOINT_VERSION
+        baseline_state["dagger_backend_config"] = backend
         if not current:
             baseline_state["actor_std_update_count"] = 0
             optimizer_resume_state = dict(
@@ -4911,6 +5009,8 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         DistributionalFastSACTeacherBC._load_fastsac_checkpoint_state(
             self, baseline_state, load_modules=load_modules
         )
+        if saved_latent_mode == "collection":
+            _warn_collection_latent_upgrade()
         if bool(self.cfg.train_dr_estimator):
             self.opt_dr_estimator.load_state_dict(dr_optimizer_state)
         self.num_updates = resume_counters["num_updates"]
@@ -4948,6 +5048,10 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
     def load_inference_state_dict(self, state_dict, strict=True):
         """Restore a TVKD model for replayless deterministic evaluation."""
+        saved_backend = state_dict.get("dagger_backend_config", {})
+        if not isinstance(saved_backend, Mapping):
+            raise ValueError("TVKD inference checkpoint has invalid backend config")
+        _saved_online_replay_latent_mode(state_dict, saved_backend)
         algorithm = state_dict.get("training_algorithm")
         version = state_dict.get("checkpoint_version", -1)
         if isinstance(version, bool) or not isinstance(version, int):

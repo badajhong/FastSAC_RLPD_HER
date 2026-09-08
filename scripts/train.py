@@ -1072,6 +1072,23 @@ def run_training(cfg: DictConfig):
             # episode can never inherit a Teacher-controlled prefix.
             carry = _reset_after_teacher_prefill(env, episode_stats)
             _set_environment_stats_ema_mask(env, student_only_metric_env_mask)
+        if hasattr(policy, "refresh_exact_perception_carry"):
+            exact_nodes_before_refresh = int(getattr(policy, "_exact_online_encoded_nodes", 0))
+            exact_carry_refresh_start = time.perf_counter()
+            exact_batches_before_refresh = int(getattr(policy, "_exact_online_encoder_batches", 0))
+            exact_padding_before_refresh = int(getattr(policy, "_exact_online_padded_nodes", 0))
+            carry = policy.refresh_exact_perception_carry(carry)
+            if "replay/exact_current_ema/enabled" in info:
+                info["replay/exact_current_ema/carry_refresh_nodes"] = float(
+                    int(getattr(policy, "_exact_online_encoded_nodes", 0)) - exact_nodes_before_refresh
+                )
+                info["replay/exact_current_ema/carry_refresh_seconds"] = time.perf_counter() - exact_carry_refresh_start
+                info["replay/exact_current_ema/carry_refresh_batches"] = float(
+                    int(getattr(policy, "_exact_online_encoder_batches", 0)) - exact_batches_before_refresh
+                )
+                info["replay/exact_current_ema/carry_refresh_padded_nodes"] = float(
+                    int(getattr(policy, "_exact_online_padded_nodes", 0)) - exact_padding_before_refresh
+                )
         training_time = time.perf_counter() - training_start + interleaved_training_time
         info.update(env.extra)
         if not prefill_active_before_rollout:

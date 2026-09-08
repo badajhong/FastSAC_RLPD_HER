@@ -114,9 +114,11 @@ from .td3_bc_dagger import (
     _joint_normalized_action_discrepancy,
     _polyak_update_,
     _project_c51_probabilities,
+    _scalar_metrics_to_python,
     _split_count,
     _valid_raw_action_rows,
 )
+from .exact_online_perception import ExactOnlinePerceptionReplayMixin
 
 
 TRAINING_ALGORITHM = "distributional_fastsac_teacher_bc_v1"
@@ -492,6 +494,22 @@ def _fastsac_actor_backend(cfg) -> str:
     if _fastsac_action_distribution(cfg) == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
         return PPO_PHYSICAL_GAUSSIAN_ACTOR_BACKEND
     return ACTOR_BACKEND
+
+
+def _fastsac_noise_scale(cfg, role: str) -> float | None:
+    """Resolve a role-specific PPO std reset, preserving old run configs."""
+    if role not in {"teacher", "student"}:
+        raise ValueError(f"unsupported FastSAC noise-scale role {role!r}")
+    scale = getattr(cfg, f"{role}_noise_scale", None)
+    if scale is None:
+        scale = getattr(cfg, "load_noise_scale", None)
+    if scale is None:
+        return None
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        raise ValueError(
+            f"{role}_noise_scale (or legacy load_noise_scale) must be numeric"
+        )
+    return float(scale)
 
 
 def _fastsac_actor_weight_decay(cfg) -> float:
@@ -920,9 +938,14 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # The frozen privileged Teacher always loads from the PPO checkpoint.
     # ``teacher_bc`` also loads that checkpoint's distilled actor_adapt mean,
     # preserving all existing runs. ``fresh`` retains the constructor-created
-    # actor_adapt mean while still resetting its PPO std through
-    # ``load_noise_scale`` and independently applying any perception overlay.
+    # actor_adapt mean while still resetting its PPO std independently from
+    # the frozen Teacher and applying any perception overlay.
     student_actor_initialization: str = TEACHER_BC_STUDENT_ACTOR_INITIALIZATION
+    # The frozen privileged Teacher's rollout std and the Student's initial
+    # PPO physical std are separate in FastSAC. ``None`` retains the inherited
+    # ``load_noise_scale`` for compatibility with historical commands.
+    teacher_noise_scale: float | None = None
+    student_noise_scale: float | None = None
     # Optional final actor_adapt-only overlay from percetpion_actor.py.  The
     # public ``adopt`` spelling is retained exactly for command compatibility;
     # no Teacher, Critic, Q, or perception tensor is loaded through this field.
@@ -1012,7 +1035,7 @@ class DistributionalFastSACTeacherBCConfig(DistributionalTD3TeacherBCConfig):
     # Q+entropy objective chooses the std direction; dedicated controls below
     # only slow and bound its movement.
     sac_action_distribution: str = NORMALIZED_TANH_ACTION_DISTRIBUTION
-    # PPOVEL finetune starts every joint at load_noise_scale=0.5 and uses a
+    # PPOVEL finetune starts every Student joint at student_noise_scale and uses a
     # small Adam LR. A rollout-old scale-only KL cap is a trust guard, never a
     # destination or checkpoint-derived prior.
     sac_physical_std_lr: float = 1e-5
@@ -1179,6 +1202,9 @@ class _DistributionalFastSACDaggerRolloutPolicy(_DaggerRolloutPolicy):
             td[STUDENT_COLLECTION_ACTOR_OBSERVATIONS_KEY] = (
                 owner._collection_actor_observations(td)
             )
+        capture_exact = getattr(owner, "_capture_exact_online_live_state", None)
+        if capture_exact is not None:
+            capture_exact(td)
         for scratch_key in (
             "_depth_feature",
             OBJECT_PRED_KEY,
@@ -1426,7 +1452,7 @@ class _DeterministicFastSACStudentEvalPolicy(_DeterministicTD3StudentEvalPolicy)
     """Mode-consistent Student mean; never samples or computes log-prob."""
 
 
-class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
+class DistributionalFastSACTeacherBC(ExactOnlinePerceptionReplayMixin, DistributionalTD3TeacherBC):
     """Twin-C51 FastSAC with stochastic SAC and exact mean-only Teacher BC."""
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
@@ -1629,6 +1655,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             self._fresh_student_actor_constructor_parameter_ids = tuple(
                 id(parameter) for parameter in self.actor_adapt.parameters()
             )
+        self._configure_runtime_ppo_noise_scales()
 
     def _configure_student_action_support(self) -> None:
         """Use nominal joint coordinates as the one Student SAC action Box."""
@@ -1896,17 +1923,20 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         if not isinstance(cfg.sac_use_autotune, bool):
             raise ValueError("sac_use_autotune must be a boolean")
         if action_distribution == PPO_PHYSICAL_GAUSSIAN_ACTION_DISTRIBUTION:
-            load_noise_scale = getattr(cfg, "load_noise_scale", None)
-            if (
-                isinstance(load_noise_scale, bool)
-                or not isinstance(load_noise_scale, (int, float))
-                or not math.isfinite(float(load_noise_scale))
-                or float(load_noise_scale) <= 0.0
-            ):
-                raise ValueError(
-                    "ppo_physical_gaussian requires a finite positive "
-                    "load_noise_scale, matching PPOVEL finetune initialization"
-                )
+            noise_scales = {
+                role: _fastsac_noise_scale(cfg, role)
+                for role in ("teacher", "student")
+            }
+            for role, noise_scale in noise_scales.items():
+                if (
+                    noise_scale is None
+                    or not math.isfinite(noise_scale)
+                    or noise_scale <= 0.0
+                ):
+                    raise ValueError(
+                        "ppo_physical_gaussian requires a finite positive "
+                        f"{role}_noise_scale (or legacy load_noise_scale)"
+                    )
             physical_std_controls = {
                 name: getattr(cfg, name, None)
                 for name in (
@@ -1931,9 +1961,9 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "sac_physical_std_min must be smaller than "
                     "sac_physical_std_max"
                 )
-            if not std_min <= float(load_noise_scale) <= std_max:
+            if not std_min <= noise_scales["student"] <= std_max:
                 raise ValueError(
-                    "load_noise_scale must lie inside the physical std bounds"
+                    "student_noise_scale must lie inside the physical std bounds"
                 )
             bound_mode = str(
                 getattr(
@@ -2200,18 +2230,34 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         )
 
     def _ppo_actor_core(self) -> Actor:
-        cores = [
-            module for module in self.actor_adapt.modules() if isinstance(module, Actor)
-        ]
+        return self._ppo_actor_core_for(self.actor_adapt, "Student actor_adapt")
+
+    @staticmethod
+    def _ppo_actor_core_for(actor: nn.Module, label: str) -> Actor:
+        cores = [module for module in actor.modules() if isinstance(module, Actor)]
         if len(cores) != 1:
             raise RuntimeError(
-                "FastSAC Teacher-BC requires exactly one legacy Actor core; "
+                f"FastSAC {label} requires exactly one legacy Actor core; "
                 f"found {len(cores)}"
             )
         core = cores[0]
         if bool(core.predict_std):
-            raise RuntimeError("FastSAC mean transfer requires a separate legacy std")
+            raise RuntimeError(f"FastSAC {label} requires a separate legacy std")
         return core
+
+    def _configure_runtime_ppo_noise_scales(self) -> None:
+        """Set independent checkpoint-load std resets for Teacher and Student."""
+        teacher_scale = _fastsac_noise_scale(self.cfg, "teacher")
+        student_scale = _fastsac_noise_scale(self.cfg, "student")
+        if teacher_scale is None or student_scale is None:
+            raise RuntimeError(
+                "FastSAC requires teacher_noise_scale and student_noise_scale "
+                "(or legacy load_noise_scale) before loading a PPO source"
+            )
+        teacher_core = self._ppo_actor_core_for(self.actor, "Teacher actor")
+        student_core = self._ppo_actor_core()
+        teacher_core.load_noise_scale = teacher_scale
+        student_core.load_noise_scale = student_scale
 
     def _ppo_actor_std_parameter(self) -> nn.Parameter:
         return self._ppo_actor_core().actor_std
@@ -2671,6 +2717,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
     def _student_mean_action(self, td: TensorDict) -> torch.Tensor:
         """Use the distribution-consistent deterministic Student action."""
         raw_mean = self._student_raw_action_proposal(td)
+        return self._student_action_from_raw_mean(raw_mean)
+
+    def _student_action_from_raw_mean(self, raw_mean: torch.Tensor) -> torch.Tensor:
+        """Apply the evaluation action contract to a Student Actor proposal."""
         if not torch.isfinite(raw_mean).all():
             raise RuntimeError("FastSAC evaluation Actor produced non-finite actions")
         if self._uses_ppo_physical_gaussian():
@@ -3335,16 +3385,16 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 q_noise = tensordict[FASTSAC_PREFILL_TEACHER_NOISE_KEY].reshape(
                     -1, self.action_dim
                 )[teacher_rows]
-                prefill_teacher_noise_q_rms = float(
-                    q_noise.float().square().mean().sqrt().item()
+                prefill_teacher_noise_q_rms = (
+                    q_noise.float().square().mean().sqrt()
                 )
                 physical_noise = (
                     q_noise
                     / float(self.cfg.q_action_input_gain)
                     * self._fastsac_q_action_scale.to(q_noise)
                 )
-                prefill_teacher_noise_physical_rms = float(
-                    physical_noise.float().square().mean().sqrt().item()
+                prefill_teacher_noise_physical_rms = (
+                    physical_noise.float().square().mean().sqrt()
                 )
                 if (
                     FASTSAC_PREFILL_TEACHER_PROJECTION_KEY
@@ -3353,8 +3403,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     projection = tensordict[
                         FASTSAC_PREFILL_TEACHER_PROJECTION_KEY
                     ].reshape(-1).bool()
-                    prefill_teacher_projection_fraction = float(
-                        projection[teacher_rows].float().mean().item()
+                    prefill_teacher_projection_fraction = (
+                        projection[teacher_rows].float().mean()
                     )
         if self._uses_ppo_physical_gaussian():
             self._project_physical_actor_std_()
@@ -3372,28 +3422,53 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             projected = tensordict[FASTSAC_ACTION_PROJECTION_KEY].reshape(-1).bool()
             student = tensordict[DAGGER_IS_STUDENT_ACTION_KEY].reshape(-1).bool()
             if bool(student.any()):
-                action_projection_fraction = float(
-                    projected[student].float().mean().item()
+                action_projection_fraction = (
+                    projected[student].float().mean()
                 )
                 sampled = tensordict[TD3_EXPLORATORY_STUDENT_ACTION_KEY].reshape(
                     -1, self.action_dim
                 )[student]
                 low, high, _, _ = self._student_action_support(sampled)
                 violations = ((sampled < low) | (sampled > high)).any(dim=-1)
-                student_nominal_bound_violation_fraction = float(
-                    violations.float().mean().item()
+                student_nominal_bound_violation_fraction = (
+                    violations.float().mean()
                 )
                 endpoint_tolerance = (high - low) * 1.0e-6
                 saturated = ((sampled - low) <= endpoint_tolerance) | (
                     (high - sampled) <= endpoint_tolerance
                 )
-                student_support_saturation_fraction = float(
-                    saturated.float().mean().item()
+                student_support_saturation_fraction = (
+                    saturated.float().mean()
                 )
-                student_q_action_abs_max = float(
-                    self._q_action_input(sampled).abs().amax().item()
+                student_q_action_abs_max = (
+                    self._q_action_input(sampled).abs().amax()
                 )
+        exact_nodes_before = int(getattr(self, "_exact_online_encoded_nodes", 0))
+        exact_hits_before = int(getattr(self, "_exact_online_cache_hits", 0))
+        exact_work_counters = {
+            "reused_live_nodes": "_exact_online_reused_live_nodes",
+            "encoder_batches": "_exact_online_encoder_batches",
+            "padded_nodes": "_exact_online_padded_nodes",
+            "encode_seconds": "_exact_online_encode_seconds",
+        }
+        exact_work_before = {
+            name: float(getattr(self, attribute, 0))
+            for name, attribute in exact_work_counters.items()
+        }
         td3_info = DistributionalTD3TeacherBC.train_op(self, tensordict)
+        if self._exact_online_replay_enabled():
+            self._ensure_exact_online_state()
+            td3_info.update({
+                "replay/exact_current_ema/enabled": 1.0,
+                "replay/exact_current_ema/encoded_nodes": float(self._exact_online_encoded_nodes - exact_nodes_before),
+                "replay/exact_current_ema/cached_prefix_hits": float(self._exact_online_cache_hits - exact_hits_before),
+                "replay/exact_current_ema/history_nodes": float(self._exact_online_store.node_count),
+                "replay/exact_current_ema/history_episodes": float(self._exact_online_store.episode_count),
+            })
+            td3_info.update({
+                f"replay/exact_current_ema/{name}": float(getattr(self, attribute, 0)) - exact_work_before[name]
+                for name, attribute in exact_work_counters.items()
+            })
         physical_rollout_std_metrics = {}
         if self._uses_ppo_physical_gaussian():
             # Replay optimization has finished and no environment action can be
@@ -3405,10 +3480,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     self._physical_std_rollout_reference
                 )
             )
-            physical_rollout_std_metrics = {
-                "actor_std_rollout_scale_kl": float(rollout_scale_kl.item()),
-                "actor_std_kl_cap_fraction": float(rollout_kl_capped.item()),
-            }
+            physical_rollout_std_metrics = _scalar_metrics_to_python({
+                "actor_std_rollout_scale_kl": rollout_scale_kl,
+                "actor_std_kl_cap_fraction": rollout_kl_capped,
+            })
 
         replacements = {
             "method_distributional_td3_teacher_bc_v1": (
@@ -3420,6 +3495,14 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         }
         info = {}
         for key, value in td3_info.items():
+            if self._exact_online_replay_enabled() and key.startswith((
+                "replay/staleness/q_student_ema_generation_age_",
+                "replay/staleness/actor_student_ema_generation_age_",
+            )):
+                # These measure the stored historical collection, not the
+                # current-EMA latents actually used by the learner.
+                info[key.replace("replay/staleness/", "replay/collection_age/", 1)] = value
+                continue
             if not key.startswith("td3/"):
                 info[key] = value
                 continue
@@ -3431,15 +3514,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         info["fastsac/prefill_teacher_ppo_noise_enabled"] = float(
             bool(getattr(self.cfg, "teacher_prefill_use_ppo_noise", False))
         )
-        info["fastsac/prefill_teacher_ppo_noise_q_rms"] = (
-            prefill_teacher_noise_q_rms
-        )
-        info["fastsac/prefill_teacher_ppo_noise_physical_rms"] = (
-            prefill_teacher_noise_physical_rms
-        )
-        info["fastsac/prefill_teacher_action_projection_fraction"] = (
-            prefill_teacher_projection_fraction
-        )
+        info.update(_scalar_metrics_to_python({
+            "fastsac/prefill_teacher_ppo_noise_q_rms": prefill_teacher_noise_q_rms,
+            "fastsac/prefill_teacher_ppo_noise_physical_rms": prefill_teacher_noise_physical_rms,
+            "fastsac/prefill_teacher_action_projection_fraction": prefill_teacher_projection_fraction,
+        }))
 
         critic_keys = (
             "target_sample_action_abs_mean",
@@ -3501,6 +3580,7 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         # Skipped Critic steps intentionally carry zero temperature metrics.
         # Report loss/gradient over optimizer steps only, so a delayed cadence
         # does not dilute them in the rollout aggregate.
+        alpha_metrics = {}
         if self._fastsac_rollout_critic_metrics:
             performed = torch.stack(
                 [
@@ -3516,24 +3596,23 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                         for metrics in self._fastsac_rollout_critic_metrics
                     ]
                 )
-                critic[key] = ((values * performed).sum() / performed_count).item()
+                alpha_metrics[key] = (values * performed).sum() / performed_count
         else:
-            critic.update({"alpha_loss": 0.0, "alpha_grad_norm": 0.0})
+            alpha_metrics.update({"alpha_loss": 0.0, "alpha_grad_norm": 0.0})
         # Publish the temperature actually available to the next rollout,
         # rather than the within-rollout mean of stale and updated values.
-        critic["alpha"] = self.log_alpha.detach().exp().item()
+        alpha_metrics["alpha"] = self.log_alpha.detach().exp()
+        critic.update(_scalar_metrics_to_python(alpha_metrics))
         actor = self._mean_metric_dict(self._fastsac_rollout_actor_metrics, actor_keys)
         actor.update(physical_rollout_std_metrics)
         info.update({f"fastsac/{key}": value for key, value in critic.items()})
         info.update({f"fastsac/{key}": value for key, value in actor.items()})
-        info["fastsac/action_projection_fraction"] = action_projection_fraction
-        info["fastsac/student_nominal_bound_violation_fraction"] = (
-            student_nominal_bound_violation_fraction
-        )
-        info["fastsac/student_support_saturation_fraction"] = (
-            student_support_saturation_fraction
-        )
-        info["fastsac/student_q_action_abs_max"] = student_q_action_abs_max
+        info.update(_scalar_metrics_to_python({
+            "fastsac/action_projection_fraction": action_projection_fraction,
+            "fastsac/student_nominal_bound_violation_fraction": student_nominal_bound_violation_fraction,
+            "fastsac/student_support_saturation_fraction": student_support_saturation_fraction,
+            "fastsac/student_q_action_abs_max": student_q_action_abs_max,
+        }))
         info["fastsac/alpha_update_count"] = self.alpha_update_count
         info["fastsac/actor_std_update_count"] = int(
             getattr(self, "actor_std_update_count", 0)
@@ -3543,44 +3622,46 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
             q_scale = self._fastsac_q_action_scale.detach().to(current_std)
             normalized_std = current_std / q_scale
             lower, upper = self._physical_std_bounds()
-            current_std_values = current_std.float().cpu().tolist()
+            current_std_values = current_std.float().unbind()
+            std_metrics = {}
             for joint_name, std in zip(
                 self.joint_names, current_std_values, strict=True
             ):
-                info[f"fastsac/actor_std/{joint_name}"] = float(std)
-            info["fastsac/actor_std_physical_mean"] = float(
-                current_std.float().mean().item()
+                std_metrics[f"fastsac/actor_std/{joint_name}"] = std
+            std_metrics["fastsac/actor_std_physical_mean"] = (
+                current_std.float().mean()
             )
-            info["fastsac/actor_std_physical_geometric_mean"] = float(
-                current_std.float().log().mean().exp().item()
+            std_metrics["fastsac/actor_std_physical_geometric_mean"] = (
+                current_std.float().log().mean().exp()
             )
-            info["fastsac/actor_std_q_normalized_l2"] = float(
-                torch.linalg.vector_norm(normalized_std.float()).item()
+            std_metrics["fastsac/actor_std_q_normalized_l2"] = (
+                torch.linalg.vector_norm(normalized_std.float())
             )
-            info["fastsac/actor_std_q_normalized_rms"] = float(
-                normalized_std.float().square().mean().sqrt().item()
+            std_metrics["fastsac/actor_std_q_normalized_rms"] = (
+                normalized_std.float().square().mean().sqrt()
             )
-            info["fastsac/actor_std_q_normalized_geometric_mean"] = float(
-                normalized_std.float().log().mean().exp().item()
+            std_metrics["fastsac/actor_std_q_normalized_geometric_mean"] = (
+                normalized_std.float().log().mean().exp()
             )
-            info["fastsac/actor_std_q_normalized_min"] = float(
-                normalized_std.float().min().item()
+            std_metrics["fastsac/actor_std_q_normalized_min"] = (
+                normalized_std.float().min()
             )
-            info["fastsac/actor_std_q_normalized_max"] = float(
-                normalized_std.float().max().item()
+            std_metrics["fastsac/actor_std_q_normalized_max"] = (
+                normalized_std.float().max()
             )
-            info["fastsac/physical_std_lower_bound_min"] = float(
-                lower.float().min().item()
+            std_metrics["fastsac/physical_std_lower_bound_min"] = (
+                lower.float().min()
             )
-            info["fastsac/physical_std_lower_bound_max"] = float(
-                lower.float().max().item()
+            std_metrics["fastsac/physical_std_lower_bound_max"] = (
+                lower.float().max()
             )
-            info["fastsac/physical_std_upper_bound_min"] = float(
-                upper.float().min().item()
+            std_metrics["fastsac/physical_std_upper_bound_min"] = (
+                upper.float().min()
             )
-            info["fastsac/physical_std_upper_bound_max"] = float(
-                upper.float().max().item()
+            std_metrics["fastsac/physical_std_upper_bound_max"] = (
+                upper.float().max()
             )
+            info.update(_scalar_metrics_to_python(std_metrics))
             entropy_min, entropy_max = self._physical_normalized_entropy_bounds()
             info["fastsac/physical_entropy_bound_min"] = entropy_min
             info["fastsac/physical_entropy_bound_max"] = entropy_max
@@ -3744,6 +3825,8 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "q_residual_film_scale",
                     "sac_actor_lr",
                     "student_actor_initialization",
+                    "teacher_noise_scale",
+                    "student_noise_scale",
                     "actor_adopt_checkpoint_path",
                     "sac_action_distribution",
                     "sac_physical_std_lr",
@@ -4205,14 +4288,14 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         if self._uses_ppo_physical_gaussian():
             expected_std = torch.full_like(
                 self._ppo_actor_std_parameter().detach(),
-                float(self.cfg.load_noise_scale),
+                _fastsac_noise_scale(self.cfg, "student"),
             )
             if not torch.equal(
                 self._ppo_actor_std_parameter().detach(), expected_std
             ):
                 raise RuntimeError(
                     "actor_adopt overlay imported checkpoint actor_std instead "
-                    "of resetting it from runtime load_noise_scale"
+                    "of resetting it from runtime student_noise_scale"
                 )
 
         provenance.update(
@@ -4783,14 +4866,11 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                     "fresh_only_online_exact_actor_rings_and_teacher_episode_"
                     "sidecars_not_serialized_v2"
                 ),
-                "perception_replay_semantics": (
-                    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
-                    if self._student_collection_actor_cache_enabled()
-                    else PERCEPTION_REPLAY_SEMANTICS
+                "online_replay_latent_mode": (
+                    "exact_current_ema" if self._exact_online_replay_enabled() else "collection"
                 ),
-                "actor_replay_observation_semantics": (
-                    COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS
-                ),
+                "perception_replay_semantics": self._actor_replay_observation_semantics(),
+                "actor_replay_observation_semantics": self._actor_replay_observation_semantics(),
                 "teacher_episode_sidecar_semantics": (
                     TEACHER_EPISODE_SIDECAR_SEMANTICS
                     if self._teacher_episode_cache_enabled()
@@ -4839,6 +4919,10 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 f"unsupported FastSAC Teacher-BC source algorithm={algorithm!r}"
             )
 
+        # PPOVEL loads both actor modules through Actor's std-reset hook. Set
+        # their role-specific values immediately before that loader runs.
+        self._configure_runtime_ppo_noise_scales()
+
         # Reuse the rigorously validated raw PPO source loading in the replay
         # base. It transiently creates a TD3 target Actor, which is discarded
         # immediately and never participates in FastSAC behavior or learning.
@@ -4872,6 +4956,16 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         padded_source["qnet"] = self.qnet.state_dict()
         padded_source["qnet_target"] = self.qnet_target.state_dict()
         failed = DistributionalTD3TeacherBC.load_state_dict(self, padded_source, strict)
+        teacher_scale = _fastsac_noise_scale(self.cfg, "teacher")
+        teacher_std = self._ppo_actor_core_for(
+            self.actor, "Teacher actor"
+        ).actor_std.detach()
+        if not torch.equal(
+            teacher_std, torch.full_like(teacher_std, teacher_scale)
+        ):
+            raise RuntimeError(
+                "frozen Teacher actor_std was not reset from teacher_noise_scale"
+            )
         if constructor_actor_state is not None:
             # Load tensors into the existing module rather than replacing it:
             # actor/std optimizer Parameter identities therefore remain valid.
@@ -4882,13 +4976,13 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
                 raise RuntimeError(
                     "fresh Student Actor initialization replaced Parameter objects"
                 )
-            load_noise_scale = getattr(self.cfg, "load_noise_scale", None)
-            if load_noise_scale is not None:
+            student_noise_scale = _fastsac_noise_scale(self.cfg, "student")
+            if student_noise_scale is not None:
                 actual_std = self._ppo_actor_std_parameter().detach()
-                expected_std = torch.full_like(actual_std, float(load_noise_scale))
+                expected_std = torch.full_like(actual_std, student_noise_scale)
                 if not torch.equal(actual_std, expected_std):
                     raise RuntimeError(
-                        "fresh Student actor_std was not reset from load_noise_scale"
+                        "fresh Student actor_std was not reset from student_noise_scale"
                     )
         self._actor_initialization = {
             "semantics": STUDENT_ACTOR_INITIALIZATION_SEMANTICS,
@@ -4939,14 +5033,14 @@ class DistributionalFastSACTeacherBC(DistributionalTD3TeacherBC):
         self.actor_adapt.requires_grad_(True).train()
         self._configure_training_actor_std()
         if self._uses_ppo_physical_gaussian():
-            expected_std = float(self.cfg.load_noise_scale)
+            expected_std = _fastsac_noise_scale(self.cfg, "student")
             actual_std = self._ppo_actor_std_parameter().detach()
             if not torch.equal(
                 actual_std, torch.full_like(actual_std, expected_std)
             ):
                 raise RuntimeError(
                     "PPOVEL fresh finetune did not initialize every physical "
-                    "actor_std from load_noise_scale"
+                    "actor_std from student_noise_scale"
                 )
             # In q-normalized mode the scalar PPO-compatible reset is only the
             # fresh source value.  Resolve it through the joint-wise envelope

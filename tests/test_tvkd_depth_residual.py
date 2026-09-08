@@ -148,9 +148,9 @@ def test_new_checkpoint_keeps_learned_projection_and_parameter_identity():
             assert torch.equal(value, source[name][key])
 
 
-def build_full_ppovel(residual):
+def build_full_ppovel(residual, latent_dim=8):
     cfg = Config(perception_depth_residual=residual)
-    cfg.latent_dim = 8
+    cfg.latent_dim = latent_dim
     cfg.enable_residual_distillation = False
     env = SimpleNamespace(cfg=SimpleNamespace(reward={'tracking': {}}),
                           action_manager=SimpleNamespace(joint_names=['left', 'right']))
