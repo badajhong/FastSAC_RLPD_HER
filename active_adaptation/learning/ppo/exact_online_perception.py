@@ -17,6 +17,7 @@ from tensordict import TensorDict
 
 from .exact_episode_replay import ExactEpisodePrefixStore, _copy_cpu_tensor_
 from .exact_gru_cuda_graph import exact_gru_cuda_graphs
+from .replay_provenance import prepared_with_provenance_snapshot
 from .ppo_vel import (
     DEPTH_KEY, OBS_KEY, VEL_CMD_KEY, OBJECT_GEO_KEY, PRIV_PRED_KEY,
     exact_recurrent_lengths, set_recurrent_mode,
@@ -599,7 +600,9 @@ class ExactOnlinePerceptionReplayMixin:
         required = (REPLAY_SAMPLE_IS_TEACHER_KEY, REPLAY_SAMPLE_IS_DAGGER_ENV_KEY, REPLAY_SAMPLE_PHYSICAL_INDEX_KEY)
         if any(key not in batch for key in required):
             raise RuntimeError("Exact online replay requires explicit sampled ring provenance")
-        teacher, dagger, physical = (batch[key].detach().cpu().reshape(-1) for key in required)
+        prepared, (teacher, dagger, physical) = prepared_with_provenance_snapshot(
+            prepared, batch, required
+        )
         for output, next_state in (("observations", False), ("next_observations", True)):
             if output not in prepared:
                 continue

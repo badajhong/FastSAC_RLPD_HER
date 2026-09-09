@@ -116,6 +116,11 @@ from .teacher_episode_replay import (
     classify_teacher_boundary,
 )
 from .exact_gru_cuda_graph import exact_gru_cuda_graphs
+from .replay_sample_staging import (
+    _gather_packed_replay,
+    _packed_replay_layout,
+    _unpack_replay_sample,
+)
 
 
 TRAINING_ALGORITHM = "distributional_td3_teacher_bc_v1"
@@ -1106,10 +1111,9 @@ class _TD3DeviceReplay(_DeviceReplay):
     Random physical indices are supplied by the rollout-level prefetch plan,
     avoiding a CUDA-index-to-CPU synchronization for every sampled source.
     CPU fields are gathered with the same row/index semantics as
-    :class:`_DeviceReplay`, then packed by dtype into reusable pinned staging
-    buffers.  A blocking packed transfer is intentional: it is safe to reuse
-    the staging allocation on the next call while reducing pageable H2D calls
-    from one per field to one per dtype.
+    :class:`_DeviceReplay`, then packed losslessly into one pinned byte buffer.
+    A single blocking transfer permits safe staging reuse on the next call;
+    independent typed device views retain each field's original dtype.
     """
 
     def __init__(self, capacity: int, device):
@@ -1235,39 +1239,23 @@ class _TD3DeviceReplay(_DeviceReplay):
                 for key, value in sampled.items()
             }
 
-        # Replay includes float, bool, and compact integer geometry IDs.
-        # Grouping by dtype keeps every field exact while coalescing transfers.
-        dtype_groups: dict[torch.dtype, list[str]] = {}
-        for key in fields:
-            dtype_groups.setdefault(self.data[key].dtype, []).append(key)
-        transferred: dict[str, torch.Tensor] = {}
+        if not fields:
+            return {}
         row_count = int(indices.numel())
-        for dtype, keys in dtype_groups.items():
-            shapes = [(row_count, *self.data[key].shape[1:]) for key in keys]
-            sizes = [math.prod(shape) for shape in shapes]
-            total_size = sum(sizes)
-            staging_key = (dtype, row_count, total_size)
-            staging = self._pinned_sample_staging.get(staging_key)
-            if staging is None:
-                staging = torch.empty(
-                    (total_size,),
-                    dtype=dtype,
-                    device="cpu",
-                    pin_memory=True,
-                )
-                self._pinned_sample_staging[staging_key] = staging
-            offset = 0
-            for key, shape, size in zip(keys, shapes, sizes):
-                destination = staging[offset : offset + size].view(shape)
-                torch.index_select(self.data[key], 0, indices, out=destination)
-                offset += size
-            # Blocking transfer makes reuse of the pinned buffer race-free.
-            packed = staging.to(output_device, non_blocking=False)
-            offset = 0
-            for key, shape, size in zip(keys, shapes, sizes):
-                transferred[key] = packed[offset : offset + size].view(shape)
-                offset += size
-        return {key: transferred[key] for key in fields}
+        layout, byte_count = _packed_replay_layout(self.data, fields, row_count)
+        staging_key = (torch.uint8, row_count, byte_count)
+        staging = self._pinned_sample_staging.get(staging_key)
+        if staging is None:
+            # Ordinary storage remains writable if a first call originated
+            # under inference_mode and a later call uses no_grad instead.
+            with torch.inference_mode(False):
+                staging = torch.empty(byte_count, dtype=torch.uint8, device="cpu", pin_memory=True)
+            self._pinned_sample_staging[staging_key] = staging
+        _gather_packed_replay(self.data, indices, layout, staging)
+        # A blocking transfer preserves the existing ownership/lifetime
+        # contract and does not require a stream/event pool for staging reuse.
+        packed = staging.to(output_device, non_blocking=False)
+        return _unpack_replay_sample(packed, layout)
 
 
 @dataclass(frozen=True)

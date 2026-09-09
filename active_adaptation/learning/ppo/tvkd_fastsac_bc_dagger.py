@@ -78,6 +78,7 @@ from .ppo_bc_dagger import (
 )
 from .ppo_vel import DEPTH_KEY, OBJECT_GEO_KEY, OBJECT_KEY, VEL_CMD_KEY
 from .ppo_vel import PPOVEL, PRIV_FEATURE_KEY, PRIV_PRED_KEY, DepthResidualGRUModule
+from .replay_provenance import replay_provenance_cpu
 from .td3_bc_dagger import (
     COLLECTION_EXACT_ACTOR_REPLAY_SEMANTICS,
     FAILURE_PHASE_STUDENT_SOURCE_KEY,
@@ -1649,9 +1650,7 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         missing = [key for key in metadata_keys if key not in batch]
         if missing:
             raise KeyError(f"Actor GT-latent replay lacks sample provenance: {missing}")
-        teacher, dagger, physical = (
-            batch[key].detach().cpu().reshape(-1) for key in metadata_keys
-        )
+        teacher, dagger, physical = replay_provenance_cpu(batch, metadata_keys)
         if any(value.numel() != row_count for value in (teacher, dagger, physical)):
             raise ValueError("Actor GT-latent sample provenance is batch-misaligned")
         if teacher.dtype != torch.bool or dagger.dtype != torch.bool or physical.dtype not in (

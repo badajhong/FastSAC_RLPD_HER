@@ -19,6 +19,7 @@ from active_adaptation.learning.ppo.td3_bc_dagger import (
     TEACHER_EPISODE_STEP_KEY, TEACHER_EPISODE_UID_KEY,
 )
 from active_adaptation.learning.ppo.teacher_episode_replay import TeacherEpisodeSequenceStore
+from active_adaptation.learning.ppo.replay_provenance import prepared_with_provenance_snapshot
 from active_adaptation.learning.ppo.tvkd_fastsac_bc_dagger import (
     TVKDDistributionalFastSACTeacherBC as TVKD,
 )
@@ -161,6 +162,32 @@ def test_oracle_reconstruction_rejects_unavailable_or_misaligned_state():
     batch[REPLAY_SAMPLE_PHYSICAL_INDEX_KEY][0] = 2
     with pytest.raises(IndexError, match="outside its replay ring"):
         policy._actor_oracle_observations(batch)
+
+
+def test_actor_oracle_reuses_prepared_provenance_and_revalidates_mutation(monkeypatch):
+    policy, batch = _policy_and_batch()
+    expected = policy._actor_oracle_observations(batch)
+    keys = (REPLAY_SAMPLE_IS_TEACHER_KEY, REPLAY_SAMPLE_IS_DAGGER_ENV_KEY,
+            REPLAY_SAMPLE_PHYSICAL_INDEX_KEY)
+    prepared, _ = prepared_with_provenance_snapshot(dict(batch), batch, keys)
+    original_keys = list(batch)
+    # Cached metadata must not be copied again by Actor GT construction.
+    metadata_storage = {batch[key].untyped_storage().data_ptr() for key in keys}
+    original_cpu = torch.Tensor.cpu
+
+    def no_second_metadata_copy(value, *args, **kwargs):
+        assert value.untyped_storage().data_ptr() not in metadata_storage
+        return original_cpu(value, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "cpu", no_second_metadata_copy)
+        actual = policy._actor_oracle_observations(prepared)
+    assert list(prepared) == original_keys
+    assert torch.equal(actual, expected)
+    assert all(prepared[key] is batch[key] for key in original_keys)
+    prepared[REPLAY_SAMPLE_PHYSICAL_INDEX_KEY][0] = 2
+    with pytest.raises(IndexError, match="outside its replay ring"):
+        policy._actor_oracle_observations(prepared)
 
 
 @pytest.mark.parametrize("consistency,gt_bc", [(1, 0), (0, 1)])
