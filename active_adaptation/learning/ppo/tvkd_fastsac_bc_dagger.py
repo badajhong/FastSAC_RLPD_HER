@@ -8,13 +8,15 @@ live Student perception training, current-EMA reset-rooted online and Teacher
 Actor inputs,
 timeout-final-observation handling, twin C51 critics, and target-update cadence.
 
-The two additions are deliberately narrow:
+The TVKD additions are:
 
 * the frozen PPO Teacher critic is reused as a potential function in the
-  FastSAC C51 target; and
+  FastSAC C51 target;
 * failed mixed-control episodes use Student-executed Teacher-TD residuals to
   register bottleneck-aligned phases in the existing successful-Teacher replay
-  curriculum.
+  curriculum; and
+* optional deterministic Student Actor consistency and GT-latent Teacher BC
+  compare the two latent inputs at the same sampled replay state.
 
 The PPO critic consumes the same observation *fields* as the SAC critic, but
 its internal ``CatTensors`` module sorts keys.  Consequently this module never
@@ -72,6 +74,7 @@ from .ppo_bc_dagger import (
     DAGGER_IS_STUDENT_ACTION_KEY,
     DAGGER_REPLAY_MIN_STEP_COUNT,
     DAGGER_REPLAY_TEACHER_ACTIONS,
+    DAGGER_TEACHER_ACTION_VALID_KEY,
 )
 from .ppo_vel import DEPTH_KEY, OBJECT_GEO_KEY, OBJECT_KEY, VEL_CMD_KEY
 from .ppo_vel import PPOVEL, PRIV_FEATURE_KEY, PRIV_PRED_KEY, DepthResidualGRUModule
@@ -81,24 +84,31 @@ from .td3_bc_dagger import (
     OBJECT_GEO_REPLAY_SEMANTICS,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE,
     ONLINE_STUDENT_ROLLOUT_PERCEPTION_SEMANTICS,
+    PERCEPTION_OBJECT_GEO_ID_KEY,
     PERCEPTION_REPLAY_SEMANTICS,
     NEXT_REFERENCE_PHASE_KEY,
     NEXT_Q_ACTUATOR_CONTEXT_KEY,
     REFERENCE_PHASE_KEY,
     REPLAY_COMMAND_FINISHED_KEY,
     REPLAY_MOTION_ID_KEY,
+    REPLAY_SAMPLE_IS_DAGGER_ENV_KEY,
+    REPLAY_SAMPLE_IS_TEACHER_KEY,
+    REPLAY_SAMPLE_PHYSICAL_INDEX_KEY,
     REPLAY_TERMINATED_KEY,
     REPLAY_TIME_LIMIT_KEY,
     STUDENT_COLLECTION_NEXT_ACTOR_OBSERVATIONS_KEY,
     STUDENT_REPLAY_EPISODE_ID_KEY,
     STUDENT_REPLAY_EPISODE_STEP_KEY,
     TEACHER_EPISODE_SIDECAR_SEMANTICS,
+    TEACHER_EPISODE_STEP_KEY,
+    TEACHER_EPISODE_UID_KEY,
     online_rollout_perception_semantics,
     _PREFILL_ENV_INDEX_KEY,
     _PREFILL_COMMAND_FINISHED_KEY,
     _PREFILL_STEP_INDEX_KEY,
     _PREFILL_TERMINATED_KEY,
     allocate_source_counts,
+    _exact_teacher_bc_loss,
     _project_c51_probabilities,
 )
 
@@ -192,6 +202,12 @@ def _tvkd_actor_learning_semantics(config) -> str:
         if "twin_min" not in semantics:
             raise RuntimeError("TVKD Actor semantics lack the twin-min marker")
         semantics = semantics.replace("twin_min", "twin_mean", 1)
+    if getattr(config, "actor_bc_loss_type", "huber") == "mse":
+        semantics += "_with_normalized_mse_bc_v1"
+    if getattr(config, "actor_consistency_coef", 0.0) > 0.0:
+        semantics += "_with_same_state_student_gt_stop_gradient_normalized_mse_consistency_v1"
+    if getattr(config, "actor_gt_bc_coef", 0.0) > 0.0:
+        semantics += "_with_fixed_joint_valid_gt_latent_teacher_label_normalized_mse_bc_v1"
     if getattr(config, "use_q_filtered_bc", False):
         return f"{semantics}_with_{SPRED_P_BC_SEMANTICS}"
     return semantics
@@ -587,6 +603,20 @@ def _validate_tvkd_algorithm_config(cfg) -> None:
             raise ValueError("perception_action_consistency_coef requires train_perception=true")
         if cfg.perception_replay_mode != ONLINE_STUDENT_ROLLOUT_PERCEPTION_MODE:
             raise ValueError("perception action consistency requires online_student_rollout")
+    for name in ("actor_consistency_coef", "actor_gt_bc_coef"):
+        value = getattr(cfg, name, 0.0)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0.0
+        ):
+            raise ValueError(f"{name} must be finite and nonnegative")
+    actor_bc_loss_type = getattr(cfg, "actor_bc_loss_type", "huber")
+    if not isinstance(actor_bc_loss_type, str) or actor_bc_loss_type not in {
+        "huber", "mse"
+    }:
+        raise ValueError("actor_bc_loss_type must be 'huber' or 'mse'")
     if getattr(cfg, "sac_alpha_update_cadence", None) not in {"actor", "critic"}:
         raise ValueError("sac_alpha_update_cadence must be 'actor' or 'critic'")
     for name in ("q_n_step", "q_teacher_n_step"):
@@ -747,6 +777,15 @@ class TVKDDistributionalFastSACTeacherBCConfig(DistributionalFastSACTeacherBCCon
     # Zero-initialized direct temporal-depth projection before adaptation GRU.
     # Nested in adapt_module/adapt_ema; no extra optimizer or recurrent state.
     perception_depth_residual: bool = False
+
+    # Deterministic same-state supervision of the shared Student Actor.
+    # Both auxiliary terms use squared action errors normalized by joint
+    # action scale. Zero coefficients retain the historical SAC+BC objective.
+    actor_consistency_coef: float = 0.0
+    actor_gt_bc_coef: float = 0.0
+    # Select MSE to make the existing predicted-latent BC term squared too;
+    # its coefficient remains lambda_bc. Huber preserves existing behavior.
+    actor_bc_loss_type: str = "huber"
 
     # Every source uses the standard one-step SAC Bellman contract.  This is
     # especially important for the online DAgger partition, where Student and
@@ -1489,6 +1528,55 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 expanded[name][key] = torch.zeros_like(target_states[name][key])
         return expanded
 
+    def _actor_auxiliary_loss(self, batch, prediction_action):
+        """Same-state deterministic consistency and GT-latent Teacher BC.
+
+        Both forwards use actor_adapt at the current parameter values. Only
+        the consistency target stops Actor gradients; GT-BC trains the oracle
+        branch. Replay latents and frozen Teacher labels are never optimized.
+        """
+        consistency_coef = float(getattr(self.cfg, "actor_consistency_coef", 0.0))
+        gt_bc_coef = float(getattr(self.cfg, "actor_gt_bc_coef", 0.0))
+        if consistency_coef == 0.0 and gt_bc_coef == 0.0:
+            return None, {}
+
+        oracle_input = batch["actor_gt_observations"].detach()
+        if gt_bc_coef > 0.0:
+            oracle_action = self._actor_dist_from_flat(oracle_input).mean
+        else:
+            with torch.no_grad():
+                oracle_action = self._actor_dist_from_flat(oracle_input).mean
+        if oracle_action.shape != prediction_action.shape:
+            raise ValueError("Actor predicted/GT action shapes must match")
+        scale = self._fastsac_q_action_scale.detach().to(prediction_action)
+        consistency_loss = (
+            ((prediction_action - oracle_action.detach()) / scale).square().mean()
+            if consistency_coef > 0.0
+            else prediction_action.new_zeros(())
+        )
+        gt_bc_loss = prediction_action.new_zeros(())
+        if gt_bc_coef > 0.0:
+            teacher_action = self._project_student_policy_action(
+                batch[DAGGER_REPLAY_TEACHER_ACTIONS].detach()
+            )
+            gt_bc_loss = _exact_teacher_bc_loss(
+                oracle_action,
+                teacher_action,
+                batch[DAGGER_TEACHER_ACTION_VALID_KEY],
+                self._fastsac_q_action_center,
+                scale,
+                float(self.cfg.dagger_actor_huber_delta),
+                loss_type="mse",
+            )
+        weighted_consistency = consistency_coef * consistency_loss
+        weighted_gt_bc = gt_bc_coef * gt_bc_loss
+        return weighted_consistency + weighted_gt_bc, {
+            "actor_consistency_loss": consistency_loss.detach(),
+            "weighted_actor_consistency_loss": weighted_consistency.detach(),
+            "actor_gt_bc_loss": gt_bc_loss.detach(),
+            "weighted_actor_gt_bc_loss": weighted_gt_bc.detach(),
+        }
+
     def _perception_minibatch_inputs(self, tensordict: TensorDict):
         """Gather only the established TVKD online-perception dependencies.
 
@@ -1528,6 +1616,102 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         if "_height_feature" in tensordict:
             required["_height_feature"] = None  # Preserve its existing metric.
         return tensordict.select(*required)
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def _actor_oracle_observations(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Replace only the sampled state's latent with its frozen GT encoding.
+
+        The Critic replay holds privileged/object observations, while exact
+        raw episode journals own the missing object geometry. Replay source
+        and physical-row metadata resolve that geometry from the same current
+        state for Teacher, DAgger, and pure-Student samples alike.
+        """
+        if hasattr(self, "height_encoder"):
+            raise ValueError(
+                "Actor GT-latent losses require replayed Teacher height inputs; "
+                "the current TVKD replay does not store height maps"
+            )
+        observations = batch["observations"].detach()
+        critic_observations = batch["critic_observations"].detach()
+        if tuple(self.q_actor_keys) != (VEL_CMD_KEY, OBS_KEY, PRIV_PRED_KEY):
+            raise ValueError("Actor GT-latent losses require command/policy/priv_pred inputs")
+        if observations.ndim != 2 or observations.shape[-1] != sum(self._q_actor_widths):
+            raise ValueError("Actor GT-latent replay observations have an invalid shape")
+        row_count = observations.shape[0]
+        if critic_observations.shape != (row_count, sum(self._q_critic_widths)):
+            raise ValueError("Actor GT-latent Critic observations are batch-misaligned")
+        metadata_keys = (
+            REPLAY_SAMPLE_IS_TEACHER_KEY,
+            REPLAY_SAMPLE_IS_DAGGER_ENV_KEY,
+            REPLAY_SAMPLE_PHYSICAL_INDEX_KEY,
+        )
+        missing = [key for key in metadata_keys if key not in batch]
+        if missing:
+            raise KeyError(f"Actor GT-latent replay lacks sample provenance: {missing}")
+        teacher, dagger, physical = (
+            batch[key].detach().cpu().reshape(-1) for key in metadata_keys
+        )
+        if any(value.numel() != row_count for value in (teacher, dagger, physical)):
+            raise ValueError("Actor GT-latent sample provenance is batch-misaligned")
+        if teacher.dtype != torch.bool or dagger.dtype != torch.bool or physical.dtype not in (
+            torch.int32, torch.int64,
+        ):
+            raise ValueError("Actor GT-latent sample provenance has invalid dtypes")
+        geometry_ids = torch.empty(row_count, dtype=torch.long, device="cpu")
+        for replay, mask, is_teacher in (
+            (self.q_teacher_replay, teacher, True),
+            (self.dagger_replay, ~teacher & dagger, False),
+            (self.student_replay, ~teacher & ~dagger, False),
+        ):
+            rows = mask.nonzero().flatten()
+            if not rows.numel():
+                continue
+            indices = physical[rows].long()
+            if bool(((indices < 0) | (indices >= int(replay.size))).any()):
+                raise IndexError("Actor GT-latent sample index is outside its replay ring")
+            if is_teacher:
+                ring_indices = indices.to(replay.device)
+                uids = replay.data[TEACHER_EPISODE_UID_KEY].index_select(0, ring_indices)
+                steps = replay.data[TEACHER_EPISODE_STEP_KEY].index_select(0, ring_indices)
+                store = self._teacher_episode_store
+                nodes = store.resolve_node_indices(uids, steps, next_state=False)
+                ids = store.raw_fields[PERCEPTION_OBJECT_GEO_ID_KEY].index_select(0, nodes)
+            else:
+                refs = self._exact_ring_refs(replay, indices, next_state=False)
+                ids = self._exact_online_store.gather_field(PERCEPTION_OBJECT_GEO_ID_KEY, refs)
+            if ids.numel() != rows.numel():
+                raise ValueError("Actor GT-latent geometry IDs are batch-misaligned")
+            geometry_ids.index_copy_(0, rows, ids.reshape(-1).long().cpu())
+
+        target = TensorDict(
+            dict(zip(self.q_critic_keys, critic_observations.split(self._q_critic_widths, dim=-1))),
+            batch_size=(row_count,),
+            device=observations.device,
+        )
+        target[OBJECT_GEO_KEY] = self._decode_replay_object_geo(
+            geometry_ids, device=observations.device, dtype=observations.dtype
+        )
+        self.object_transform(target)
+        self.encoder_priv(target)
+        oracle = target[PRIV_FEATURE_KEY].detach()
+        if oracle.shape != (row_count, int(self._q_actor_widths[-1])):
+            raise ValueError("Actor GT latent and predicted latent have different shapes")
+        if not bool(torch.isfinite(oracle).all()):
+            raise ValueError("Actor GT latent contains NaN/Inf")
+        result = torch.cat((observations[:, : -int(self._q_actor_widths[-1])], oracle), dim=-1)
+        if not bool(torch.isfinite(result).all()):
+            raise ValueError("Actor GT-latent observations contain NaN/Inf")
+        return result.detach()
+
+    def _sample_actor_batch(self, *args, **kwargs):
+        prepared = super()._sample_actor_batch(*args, **kwargs)
+        if any(
+            float(getattr(self.cfg, name, 0.0)) > 0.0
+            for name in ("actor_consistency_coef", "actor_gt_bc_coef")
+        ):
+            prepared["actor_gt_observations"] = self._actor_oracle_observations(prepared)
+        return prepared
 
     def _perception_auxiliary_loss(self, tensordict: TensorDict):
         """Match this actor's oracle-latent actions on live recurrent histories.
@@ -1590,6 +1774,14 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
 
     def __init__(self, cfg, observation_spec, action_spec, reward_spec, device, env):
         super().__init__(cfg, observation_spec, action_spec, reward_spec, device, env)
+        if hasattr(self, "height_encoder") and any(
+            float(getattr(cfg, name, 0.0)) > 0.0
+            for name in ("actor_consistency_coef", "actor_gt_bc_coef")
+        ):
+            raise ValueError(
+                "Actor GT-latent losses require replayed Teacher height inputs; "
+                "the current TVKD replay does not store height maps"
+            )
         self.teacher_value_wrapper = FrozenTeacherValueWrapper(
             self.actor,
             self.critic,
@@ -3765,6 +3957,19 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
         )
         info["loss/bc"] = self._mean_optional_metric(actor_metrics, "exact_bc_loss")
         info["loss/fixed_bc_coefficient"] = float(self.cfg.lambda_bc)
+        for name in (
+            "actor_consistency_loss",
+            "weighted_actor_consistency_loss",
+            "actor_gt_bc_loss",
+            "weighted_actor_gt_bc_loss",
+        ):
+            info[f"loss/{name}"] = self._mean_optional_metric(actor_metrics, name)
+        info["loss/actor_consistency_coefficient"] = float(
+            getattr(self.cfg, "actor_consistency_coef", 0.0)
+        )
+        info["loss/actor_gt_bc_coefficient"] = float(
+            getattr(self.cfg, "actor_gt_bc_coef", 0.0)
+        )
         info["loss/alpha"] = self._mean_optional_metric(critic_metrics, "alpha_loss")
         info["source/student_transition_count"] = float(
             info.get("fastsac/student_replay_rows_this_rollout", 0.0)
@@ -3868,7 +4073,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
                 "teacher_value_potential_semantics": (
                     _tvkd_teacher_value_potential_semantics(self.cfg)
                 ),
-                "bc_loss": "fixed_joint_valid_teacher_label_normalized_smooth_l1",
+                "bc_loss": (
+                    "fixed_joint_valid_teacher_label_normalized_mse"
+                    if self.cfg.actor_bc_loss_type == "mse"
+                    else "fixed_joint_valid_teacher_label_normalized_smooth_l1"
+                ),
                 "teacher_value_cache_semantics": (
                     TEACHER_VALUE_CACHE_SEMANTICS
                     if self._needs_teacher_value_cache()
@@ -4534,6 +4743,11 @@ class TVKDDistributionalFastSACTeacherBC(DistributionalFastSACTeacherBC):
             backend = dict(backend)
             backend.setdefault("perception_action_consistency_coef", 0.0)
             backend.setdefault("perception_depth_residual", False)
+            # Earlier checkpoints used Huber BC without either Actor-only
+            # auxiliary loss. Exact continuation keeps that objective.
+            backend.setdefault("actor_bc_loss_type", "huber")
+            backend.setdefault("actor_consistency_coef", 0.0)
+            backend.setdefault("actor_gt_bc_coef", 0.0)
             if "sac_action_distribution" not in backend:
                 if (
                     state.get("actor_backend") != ACTOR_BACKEND

@@ -1412,6 +1412,32 @@ def test_cache_validation_fraction_rejects_values_outside_unit_interval(fraction
         tvkd_module._validate_tvkd_algorithm_config(cfg)
 
 
+@pytest.mark.parametrize("name", ("actor_consistency_coef", "actor_gt_bc_coef"))
+@pytest.mark.parametrize("value", (-0.1, float("nan"), float("inf"), True, "1.0"))
+def test_actor_auxiliary_coefficients_require_finite_nonnegative_numbers(name, value):
+    cfg = TVKDDistributionalFastSACTeacherBCConfig()
+    setattr(cfg, name, value)
+    with pytest.raises(ValueError, match=name):
+        tvkd_module._validate_tvkd_algorithm_config(cfg)
+
+
+@pytest.mark.parametrize("value", ("l1", "MSE", 1, True, None, []))
+def test_actor_bc_loss_type_rejects_unsupported_values(value):
+    cfg = TVKDDistributionalFastSACTeacherBCConfig(actor_bc_loss_type=value)
+    with pytest.raises(ValueError, match="actor_bc_loss_type"):
+        tvkd_module._validate_tvkd_algorithm_config(cfg)
+
+
+def test_actor_auxiliary_losses_do_not_require_perception_training():
+    cfg = TVKDDistributionalFastSACTeacherBCConfig(
+        actor_consistency_coef=1.0,
+        actor_gt_bc_coef=1.0,
+        actor_bc_loss_type="mse",
+        train_perception=False,
+    )
+    tvkd_module._validate_tvkd_algorithm_config(cfg)
+
+
 def test_phase_faded_teacher_potential_flag_requires_a_real_boolean():
     cfg = TVKDDistributionalFastSACTeacherBCConfig()
     cfg.use_phase_faded_teacher_potential = 1
@@ -3480,6 +3506,30 @@ def test_tvkd_v8_actor_semantics_follow_selected_action_distribution():
     )
 
 
+def test_actor_auxiliary_objectives_have_distinct_checkpoint_semantics():
+    cfg = TVKDDistributionalFastSACTeacherBCConfig(use_q_filtered_bc=True)
+    base = tvkd_module._tvkd_actor_learning_semantics(cfg)
+    selected = {base}
+    for name, value in (
+        ("actor_bc_loss_type", "mse"),
+        ("actor_consistency_coef", 1.0),
+        ("actor_gt_bc_coef", 1.0),
+    ):
+        variant = copy.deepcopy(cfg)
+        setattr(variant, name, value)
+        semantics = tvkd_module._tvkd_actor_learning_semantics(variant)
+        assert semantics not in selected
+        assert semantics.endswith(f"_with_{tvkd_module.SPRED_P_BC_SEMANTICS}")
+        selected.add(semantics)
+        backend = _strict_v5_backend_config(variant)
+        assert backend[name] == value
+        assert backend["bc_loss"] == (
+            "fixed_joint_valid_teacher_label_normalized_mse"
+            if name == "actor_bc_loss_type"
+            else "fixed_joint_valid_teacher_label_normalized_smooth_l1"
+        )
+
+
 @pytest.mark.parametrize("q_critic_type", ("scalar", "distributional"))
 def test_tvkd_mean_q_reduction_has_distinct_actor_and_target_semantics(
     q_critic_type,
@@ -3921,6 +3971,8 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
         "perception_action_consistency_coef"
     )
     pre_geometry_codebook_state["dagger_backend_config"].pop("perception_depth_residual")
+    for name in ("actor_bc_loss_type", "actor_consistency_coef", "actor_gt_bc_coef"):
+        pre_geometry_codebook_state["dagger_backend_config"].pop(name)
     policy._load_fastsac_checkpoint_state(
         pre_geometry_codebook_state, load_modules=False
     )
@@ -3963,6 +4015,25 @@ def test_tvkd_v8_checkpoint_saves_state_and_accepts_safe_v5_migration(
     with pytest.raises(ValueError, match="v5 training resume is incompatible"):
         policy._load_fastsac_checkpoint_state(v5_state, load_modules=False)
     assert len(translated) == 1
+
+    # Old metadata means Huber/zero/zero; enabling any new Actor objective
+    # requires an explicitly matching checkpoint contract.
+    for name, enabled in (
+        ("actor_bc_loss_type", "mse"),
+        ("actor_consistency_coef", 1.0),
+        ("actor_gt_bc_coef", 1.0),
+    ):
+        previous_value = getattr(policy.cfg, name)
+        setattr(policy.cfg, name, enabled)
+        with pytest.raises(ValueError, match=f"{name}|bc_loss"):
+            policy._load_fastsac_checkpoint_state(
+                pre_geometry_codebook_state, load_modules=False
+            )
+        actor_state = copy.deepcopy(state)
+        actor_state["dagger_backend_config"] = _strict_v5_backend_config(policy.cfg)
+        actor_state["actor_learning_semantics"] = tvkd_module._tvkd_actor_learning_semantics(policy.cfg)
+        policy._load_fastsac_checkpoint_state(actor_state, load_modules=False)
+        setattr(policy.cfg, name, previous_value)
 
     # A new objective is recorded and must agree on exact resume. Legacy
     # checkpoints missing the field mean coefficient zero, never runtime 1.
@@ -4275,6 +4346,40 @@ def test_tvkd_resume_entrypoint_accepts_checkpoint_and_uses_additional_budget(
             else:
                 with pytest.raises(ValueError, match="algorithm config"):
                     _prepare_tvkd_checkpoint(runtime)
+
+    # Actor objective defaults from older saved configs must also be explicit
+    # at the CLI boundary. Check matching active objectives and drift rejection.
+    for saved_actor_fields in (
+        None,
+        {"actor_bc_loss_type": "mse", "actor_consistency_coef": 1.0, "actor_gt_bc_coef": 1.0},
+    ):
+        actor_cfg = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
+        actor_policy = copy.deepcopy(policy_state)
+        actor_fields = ("actor_bc_loss_type", "actor_consistency_coef", "actor_gt_bc_coef")
+        if saved_actor_fields is None:
+            for name in actor_fields:
+                del actor_cfg.algo[name]
+                actor_policy["dagger_backend_config"].pop(name)
+        else:
+            for name, value in saved_actor_fields.items():
+                actor_cfg.algo[name] = value
+            actor_policy["dagger_backend_config"] = _strict_v5_backend_config(actor_cfg.algo)
+            actor_policy["actor_learning_semantics"] = tvkd_module._tvkd_actor_learning_semantics(actor_cfg.algo)
+        actor_path = checkpoint_path.with_name(f"checkpoint_actor_{saved_actor_fields is not None}.pt")
+        torch.save({"policy": actor_policy, "vecnorm": {}, "cfg": actor_cfg}, actor_path)
+        runtime = OmegaConf.create(OmegaConf.to_container(saved_cfg, resolve=False))
+        runtime.fastsac_bc_dagger_checkpoint = str(actor_path)
+        if saved_actor_fields is not None:
+            for name, value in saved_actor_fields.items():
+                runtime.algo[name] = value
+        assert _prepare_tvkd_checkpoint(runtime)["rollout_count"] == 600
+        for name in actor_fields:
+            drifted = copy.deepcopy(runtime)
+            drifted.algo[name] = (
+                "mse" if drifted.algo[name] == "huber" else "huber"
+            ) if name == "actor_bc_loss_type" else 1.0 - drifted.algo[name]
+            with pytest.raises(ValueError, match="algorithm config"):
+                _prepare_tvkd_checkpoint(drifted)
 
     # Early v9 checkpoints already had the three-source collector but stored
     # the combined online allocation in dagger_buffer_capacity. Exercise the

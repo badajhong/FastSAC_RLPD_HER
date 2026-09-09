@@ -25,6 +25,27 @@ algo:
   # the existing adaptation MLP feature, before the GRU and residual output.
   perception_depth_residual: false
 
+  # Actor-only supervision uses deterministic actions at the same replay
+  # state: p = Student(x, predicted latent), g = Student(x, GT latent), and
+  # t = frozen Teacher action. Both Student forwards share Actor parameters;
+  # the consistency target g is detached, while GT-BC trains the g branch.
+  # L_actor = eta_sac * L_SAC + lambda_bc * BC(p, t)
+  #           + actor_consistency_coef * MSE(p, stop_gradient(g))
+  #           + actor_gt_bc_coef * MSE(g, t).
+  # Losses normalize each action dimension by its joint action scale. The
+  # auxiliary terms are always squared; select mse for squared BC(p, t) too.
+  # Consistency uses every Actor row; both Teacher BC terms use valid labels.
+  # Keep use_q_filtered_bc=false for the equation above; enabling it retains
+  # the existing SPReD weighting of BC(p, t) only.
+  # Enable all three squared terms with:
+  # algo.actor_bc_loss_type=mse algo.actor_consistency_coef=1.0 algo.actor_gt_bc_coef=1.0
+  # Defaults retain the historical Huber BC objective and support old resumes.
+  # GT-latent replay currently supports Teacher encoders without height maps;
+  # height inputs are not stored in replay, so enabling these terms rejects them.
+  actor_bc_loss_type: huber
+  actor_consistency_coef: 0.0
+  actor_gt_bc_coef: 0.0
+
   # Fresh TVKD runs inherit the parent FastSAC Actor-cadence temperature
   # update. A resumed v3 checkpoint may explicitly retain its saved Critic
   # cadence as a legacy compatibility contract.

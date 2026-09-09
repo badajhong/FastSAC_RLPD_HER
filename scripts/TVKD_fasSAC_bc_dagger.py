@@ -1286,6 +1286,10 @@ def _prepare_tvkd_checkpoint(
         )
     backend = dict(backend)
     backend.pop("online_replay_latent_mode", None)
+    # Missing fields describe the historical Huber-only Actor objective.
+    backend.setdefault("actor_bc_loss_type", "huber")
+    backend.setdefault("actor_consistency_coef", 0.0)
+    backend.setdefault("actor_gt_bc_coef", 0.0)
     if current and "student_buffer_capacity" not in backend:
         backend = _migrate_explicit_online_replay_capacities(backend)
     saved_lambda_bc = backend.get("lambda_bc")
@@ -1371,6 +1375,9 @@ def _prepare_tvkd_checkpoint(
     source_algo_contract.setdefault("actor_adopt_checkpoint_path", None)
     source_algo_contract.setdefault("perception_action_consistency_coef", 0.0)
     source_algo_contract.setdefault("perception_depth_residual", False)
+    source_algo_contract.setdefault("actor_bc_loss_type", "huber")
+    source_algo_contract.setdefault("actor_consistency_coef", 0.0)
+    source_algo_contract.setdefault("actor_gt_bc_coef", 0.0)
     historical_latent_mode = source_algo_contract.pop("online_replay_latent_mode", saved_latent_mode)
     if historical_latent_mode != saved_latent_mode:
         raise ValueError("TVKD resume online_replay_latent_mode config metadata is inconsistent")

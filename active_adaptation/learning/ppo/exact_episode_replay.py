@@ -263,6 +263,40 @@ class ExactEpisodePrefixStore:
                     _copy_cpu_tensor_(result[key][offset : offset + right - left], value[left:right])
         return result
 
+    def gather_field(self, key: str, refs: torch.Tensor) -> torch.Tensor:
+        """Copy one field at ordered ``(episode_uid, step)`` references.
+
+        Actor supervision needs only object-geometry IDs. Selecting that field
+        directly avoids copying depth images or materializing episode prefixes.
+        Duplicate references preserve their positions in the returned batch.
+        """
+        if refs.ndim != 2 or refs.shape[-1] != 2 or refs.dtype not in (
+            torch.int32, torch.int64,
+        ):
+            raise ValueError("Exact replay field references must be an integer [N, 2] tensor")
+        if self._field_specs is None or key not in self._field_specs:
+            raise KeyError(f"Exact replay raw history lacks field {key!r}")
+        dtype, shape = self._field_specs[key]
+        groups: dict[tuple[int, int], tuple[torch.Tensor, list[int], list[int]]] = {}
+        for row, (uid, step) in enumerate(refs.detach().cpu().tolist()):
+            episode = self._episode(uid)
+            if not 0 <= step < episode.length:
+                raise IndexError("Exact replay field reference is outside its episode")
+            chunk_index = bisect_right(episode.starts, step) - 1
+            group = groups.setdefault(
+                (uid, chunk_index), (episode.chunks[chunk_index][key], [], [])
+            )
+            group[1].append(row)
+            group[2].append(step - episode.starts[chunk_index])
+        with torch.inference_mode(False), torch.no_grad():
+            result = torch.empty((refs.shape[0], *shape), dtype=dtype, device="cpu")
+            for source, rows, offsets in groups.values():
+                result.index_copy_(
+                    0, torch.tensor(rows, dtype=torch.long),
+                    source.index_select(0, torch.tensor(offsets, dtype=torch.long)),
+                )
+        return result
+
     def batch_slice(
         self,
         intervals: Iterable[tuple[int, int, int]],

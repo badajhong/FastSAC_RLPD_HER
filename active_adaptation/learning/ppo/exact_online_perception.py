@@ -11,10 +11,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import time
 
+import numpy as np
 import torch
 from tensordict import TensorDict
 
 from .exact_episode_replay import ExactEpisodePrefixStore, _copy_cpu_tensor_
+from .exact_gru_cuda_graph import exact_gru_cuda_graphs
 from .ppo_vel import (
     DEPTH_KEY, OBS_KEY, VEL_CMD_KEY, OBJECT_GEO_KEY, PRIV_PRED_KEY,
     exact_recurrent_lengths, set_recurrent_mode,
@@ -329,7 +331,22 @@ class ExactOnlinePerceptionReplayMixin:
                     referenced.append(replay.data[key][:replay.size, 0].cpu())
         if self._exact_online_carry_refs is not None:
             referenced.append(self._exact_online_carry_refs[:, 0])
-        keep = set(torch.cat(referenced).unique().tolist()) if referenced else set()
+        if referenced and all(
+            value.device.type == "cpu" and value.dtype in (torch.int32, torch.int64)
+            for value in referenced
+        ):
+            # Sort owned CPU integer storage, preserving every ID bit without
+            # launching a Torch thread team or modifying replay reference views.
+            episode_ids = np.concatenate([value.numpy() for value in referenced])
+            episode_ids.sort(kind="stable")
+            if episode_ids.size > 1:
+                distinct = np.empty(episode_ids.size, dtype=np.bool_)
+                distinct[0] = True
+                np.not_equal(episode_ids[1:], episode_ids[:-1], out=distinct[1:])
+                episode_ids = episode_ids[distinct]
+            keep = set(episode_ids.tolist())
+        else:
+            keep = set(torch.cat(referenced).unique().tolist()) if referenced else set()
         self._exact_online_store.retain(keep)
         if set(self._exact_online_prefixes).difference(keep):
             self._exact_online_actor_bank = None
@@ -476,7 +493,7 @@ class ExactOnlinePerceptionReplayMixin:
                     encoded = TensorDict(data, batch_size=(len(group), length), device=self.device)
                     # Padding follows real data only. Both GRUs return the
                     # raw hx at each row's true last state, not the padded end.
-                    with exact_recurrent_lengths(lengths, device_lengths):
+                    with exact_recurrent_lengths(lengths, device_lengths), exact_gru_cuda_graphs():
                         self.temporal_depth_gru_ema(encoded)
                         if bool(self.cfg.use_object_adapt):
                             self.object_adapt_ema(encoded)

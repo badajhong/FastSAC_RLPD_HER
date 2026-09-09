@@ -3053,8 +3053,12 @@ class DistributionalFastSACTeacherBC(ExactOnlinePerceptionReplayMixin, Distribut
             self._fastsac_rollout_critic_metrics.append(metrics)
         return metrics
 
+    def _actor_auxiliary_loss(self, batch, prediction_action):
+        """Optional mean-action objectives included in the same Actor step."""
+        return None, {}
+
     def _actor_update(self, batch: dict[str, torch.Tensor]):
-        """One mean-only BC step plus the ordinary reparameterized SAC step."""
+        """One joint mean-BC/auxiliary and reparameterized SAC Actor step."""
         raw_prediction = self._actor_mean_from_flat(batch["observations"])
         physical_gaussian = self._uses_ppo_physical_gaussian()
         std_before = None
@@ -3173,12 +3177,19 @@ class DistributionalFastSACTeacherBC(ExactOnlinePerceptionReplayMixin, Distribut
             if teacher_valid.any():
                 center = self._fastsac_q_action_center.to(prediction_action)
                 scale = self._fastsac_q_action_scale.to(prediction_action)
-                per_element_bc = F.smooth_l1_loss(
-                    (prediction_action - center) / scale,
-                    (safe_teacher_actions.detach() - center) / scale,
-                    beta=float(self.cfg.dagger_actor_huber_delta),
-                    reduction="none",
-                )
+                normalized_prediction = (prediction_action - center) / scale
+                normalized_teacher = (safe_teacher_actions.detach() - center) / scale
+                if getattr(self.cfg, "actor_bc_loss_type", "huber") == "mse":
+                    per_element_bc = F.mse_loss(
+                        normalized_prediction, normalized_teacher, reduction="none"
+                    )
+                else:
+                    per_element_bc = F.smooth_l1_loss(
+                        normalized_prediction,
+                        normalized_teacher,
+                        beta=float(self.cfg.dagger_actor_huber_delta),
+                        reduction="none",
+                    )
                 per_row_bc = per_element_bc.flatten(start_dim=1).mean(dim=1)
                 bc_weights = torch.where(
                     teacher_valid,
@@ -3270,10 +3281,16 @@ class DistributionalFastSACTeacherBC(ExactOnlinePerceptionReplayMixin, Distribut
                 self._fastsac_q_action_center,
                 self._fastsac_q_action_scale,
                 float(self.cfg.dagger_actor_huber_delta),
+                loss_type=getattr(self.cfg, "actor_bc_loss_type", "huber"),
             )
         weighted_sac = float(self.cfg.eta_sac) * sac_actor_loss
         weighted_bc = float(self.cfg.lambda_bc) * exact_bc_loss
         total_actor_loss = weighted_sac + weighted_bc
+        auxiliary_loss, auxiliary_metrics = self._actor_auxiliary_loss(
+            batch, prediction_action
+        )
+        if auxiliary_loss is not None:
+            total_actor_loss = total_actor_loss + auxiliary_loss
         total_actor_loss.backward()
         if physical_gaussian and self._ppo_actor_std_parameter().grad is None:
             raise RuntimeError(
@@ -3318,6 +3335,7 @@ class DistributionalFastSACTeacherBC(ExactOnlinePerceptionReplayMixin, Distribut
             "weighted_sac_actor_loss": weighted_sac.detach(),
             "weighted_bc_loss": weighted_bc.detach(),
             "total_actor_loss": total_actor_loss.detach(),
+            **auxiliary_metrics,
             "actor_grad_norm": torch.as_tensor(actor_grad).detach(),
             "actor_mean_grad_norm": torch.as_tensor(actor_grad).detach(),
             "actor_expected_q1_mean": twin_expected[0].detach().mean(),

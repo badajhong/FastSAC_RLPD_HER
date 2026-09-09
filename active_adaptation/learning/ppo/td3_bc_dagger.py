@@ -115,6 +115,7 @@ from .teacher_episode_replay import (
     TeacherEpisodeSequenceStore,
     classify_teacher_boundary,
 )
+from .exact_gru_cuda_graph import exact_gru_cuda_graphs
 
 
 TRAINING_ALGORITHM = "distributional_td3_teacher_bc_v1"
@@ -935,8 +936,12 @@ def _exact_teacher_bc_loss(
     action_center: torch.Tensor,
     action_scale: torch.Tensor,
     huber_delta: float,
+    *,
+    loss_type: str = "huber",
 ) -> torch.Tensor:
-    """SmoothL1 between raw actions after joint-wise coordinate normalization."""
+    """Masked, detached Teacher BC in joint-normalized action coordinates."""
+    if loss_type not in {"huber", "mse"}:
+        raise ValueError("BC loss_type must be 'huber' or 'mse'")
     valid = valid_mask.reshape(-1).bool()
     if prediction_action.shape != teacher_action.shape:
         raise ValueError("BC prediction and Teacher action shapes must match")
@@ -958,6 +963,8 @@ def _exact_teacher_bc_loss(
         raise ValueError("BC action scale must be finite and positive")
     prediction_normalized = (selected_prediction - center) / scale
     teacher_normalized = (selected_teacher - center) / scale
+    if loss_type == "mse":
+        return F.mse_loss(prediction_normalized, teacher_normalized)
     return F.smooth_l1_loss(
         prediction_normalized,
         teacher_normalized,
@@ -6547,11 +6554,37 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
         device_raw_fields = self._teacher_episode_device_raw_fields
         if device_raw_fields is None:  # pragma: no cover - guarded above
             raise RuntimeError("Teacher raw device mirror is unavailable")
+        geometry_bank = None
+        if getattr(self._decode_replay_object_geo, "__func__", None) is (
+            DistributionalTD3TeacherBC._decode_replay_object_geo
+        ):
+            # The immutable CPU store owns exactly the IDs in the lineage-
+            # checked device mirror. Validate them once before streaming,
+            # avoiding two GPU scalar synchronizations in every chunk.
+            # Padded positions use ID zero, which exists in every valid bank.
+            geometry_ids = store.raw_fields[PERCEPTION_OBJECT_GEO_ID_KEY]
+            if geometry_ids.device.type != "cpu":
+                raise ValueError("Teacher raw geometry IDs must be stored on CPU")
+            if geometry_ids.dtype not in (torch.int32, torch.int64):
+                raise TypeError("object geometry replay IDs must be int32 or int64")
+            self._ensure_replay_object_geo_codebook()
+            host_bank = self._replay_object_geo_bank
+            if host_bank is None or int(host_bank.shape[0]) < 1:
+                raise RuntimeError("raw perception replay has no object geometry codebook")
+            if bool((geometry_ids < 0).any()) or bool(
+                (geometry_ids >= int(host_bank.shape[0])).any()
+            ):
+                raise IndexError("object geometry replay ID is outside the codebook")
+            geometry_bank = self._replay_object_geo_bank_for(
+                device=self.device,
+                dtype=device_raw_fields[PERCEPTION_POLICY_RAW_KEY].dtype,
+            )
         current_group = None
         depth_state = None
         adapt_state = None
 
-        with set_recurrent_mode(True):
+        use_exact_graphs = getattr(self, "_exact_online_replay_enabled", lambda: False)()
+        with set_recurrent_mode(True), exact_gru_cuda_graphs(enabled=use_exact_graphs):
             for chunk in store.iter_sequence_chunks(
                 episode_batch_size=episode_batch_size,
                 time_chunk_size=time_chunk_size,
@@ -6585,11 +6618,17 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 vel_raw = chunk.raw_fields[PERCEPTION_VEL_COMMAND_RAW_KEY].to(
                     self.device
                 )
-                geometry = self._decode_replay_object_geo(
-                    chunk.raw_fields[PERCEPTION_OBJECT_GEO_ID_KEY],
-                    device=self.device,
-                    dtype=policy_raw.dtype,
-                )
+                geometry_ids = chunk.raw_fields[PERCEPTION_OBJECT_GEO_ID_KEY]
+                if geometry_bank is None:
+                    # Custom decoders retain their complete existing contract.
+                    geometry = self._decode_replay_object_geo(
+                        geometry_ids, device=self.device, dtype=policy_raw.dtype
+                    )
+                else:
+                    with torch.inference_mode(False):
+                        geometry = geometry_bank.index_select(
+                            0, geometry_ids.reshape(-1).long()
+                        ).reshape(*geometry_ids.shape, int(geometry_bank.shape[-1]))
                 depth = self._normalize_replay_value(
                     DEPTH_KEY, _decode_replay_depth_u8(depth_u8), snapshot
                 )
@@ -6662,12 +6701,15 @@ class DistributionalTD3TeacherBC(PPOBCDaggerFinetune):
                 actor = torch.cat(actor_parts, dim=-1)
                 if actor.shape != (*td.batch_size, self._q_actor_dim):
                     raise RuntimeError("Teacher Actor cache has an invalid shape")
-                valid_device = chunk.valid.to(self.device)
+                # Valid positions are already authoritative CPU metadata.
+                # Integer selection avoids CUDA boolean indexing's dynamic
+                # nonzero extraction while preserving the same row order.
+                valid_indices = chunk.valid.reshape(-1).nonzero().flatten().to(self.device)
                 node_indices = chunk.flat_node_indices[chunk.valid].to(self.device)
                 actor_by_node.index_copy_(
                     0,
                     node_indices,
-                    actor[valid_device].float(),
+                    actor.flatten(0, 1).index_select(0, valid_indices).float(),
                 )
                 write_counts.index_add_(
                     0,

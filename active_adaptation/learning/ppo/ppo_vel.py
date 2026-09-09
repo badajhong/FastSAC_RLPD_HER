@@ -30,6 +30,7 @@ from ..utils.valuenorm import ValueNorm1, ValueNormFake
 from ..modules.distributions import IndependentNormal
 from ..modules.rnn import set_recurrent_mode, recurrent_mode
 from .common import *
+from .exact_gru_cuda_graph import run_exact_gru_sequence
 
 torch.set_float32_matmul_precision('high')
 
@@ -181,6 +182,17 @@ class GRU(nn.Module):
         self.ln = nn.LayerNorm(hidden_size)
         self.burn_in = burn_in
 
+    def _sequence_raw(self, x, is_init, hx):
+        N, T = x.shape[:2]
+        output = []
+        reset = 1. - is_init.float().reshape(N, T, 1)
+        for i, x_t, reset_t in zip(range(T), x.unbind(1), reset.unbind(1)):
+            hx = self.gru(x_t, hx * reset_t)
+            if self.burn_in and i < T // 4:
+                hx = hx.detach()
+            output.append(hx)
+        return torch.stack(output, dim=1), hx
+
     def forward(self, x: torch.Tensor, is_init: torch.Tensor, hx: torch.Tensor):
         exact_lengths = _EXACT_RECURRENT_LENGTHS.get()
         if exact_lengths is not None:
@@ -193,15 +205,9 @@ class GRU(nn.Module):
                 raise ValueError("exact recurrent lengths and inputs must be on the same device")
         if recurrent_mode():
             N, T = x.shape[:2]
-            hx = hx[:, 0]
-            output = []
-            reset = 1. - is_init.float().reshape(N, T, 1)
-            for i, x_t, reset_t in zip(range(T), x.unbind(1), reset.unbind(1)):
-                hx = self.gru(x_t, hx * reset_t)
-                if self.burn_in and i < T // 4:
-                    hx = hx.detach()
-                output.append(hx)
-            output = torch.stack(output, dim=1)
+            output, hx = run_exact_gru_sequence(
+                self, x, is_init, hx[:, 0], self._sequence_raw
+            )
             if exact_lengths is not None:
                 # Preserve raw GRU state, before LayerNorm. A padded tail must
                 # never become the initial hidden state of the next chunk.
